@@ -1,7 +1,11 @@
+pub mod ask_user;
+pub mod bash;
 pub mod edit;
 pub mod glob;
 pub mod grep;
+pub mod list_directory;
 pub mod read;
+pub mod skill;
 pub mod subagent;
 pub mod todo;
 pub mod write;
@@ -55,11 +59,14 @@ impl ToolRegistry {
 
     pub fn register_defaults(working_dir: &std::path::Path) -> Self {
         let mut registry = Self::new();
+        registry.register(Box::new(bash::BashTool::new(working_dir)));
         registry.register(Box::new(read::ReadTool::new(working_dir)));
         registry.register(Box::new(write::WriteTool::new(working_dir)));
         registry.register(Box::new(edit::EditTool::new(working_dir)));
         registry.register(Box::new(glob::GlobTool::new(working_dir)));
         registry.register(Box::new(grep::GrepTool::new(working_dir)));
+        registry.register(Box::new(list_directory::ListDirectoryTool::new(working_dir)));
+        registry.register(Box::new(skill::SkillTool::new(working_dir)));
         registry.register(Box::new(todo::TodoTool::new()));
         registry
     }

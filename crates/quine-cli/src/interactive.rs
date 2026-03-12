@@ -6,6 +6,7 @@ use quine_core::config::Config;
 use quine_core::conversation::{Entry, ToolCall, ToolOutput};
 use quine_core::log::ConversationLog;
 use quine_core::prompt::build_system_prompt;
+use quine_core::tool::ask_user::AskUserTool;
 use quine_core::tool::subagent::SubagentTool;
 use quine_core::tool::ToolRegistry;
 use quine_llm::anthropic::AnthropicProvider;
@@ -588,6 +589,21 @@ fn build_registry_with_subagent(
         });
 
     registry.register(Box::new(SubagentTool::new(completion_fn)));
+
+    // AskUserQuestion tool: prompts the user for input via stdin
+    let ask_fn: quine_core::tool::ask_user::AskUserFn = Arc::new(|question: String| {
+        Box::pin(async move {
+            println!("\n\x1b[1;33m? {}\x1b[0m", question);
+            let mut line = String::new();
+            match std::io::stdin().read_line(&mut line) {
+                Ok(0) => Err(anyhow::anyhow!("EOF")),
+                Ok(_) => Ok(line.trim_end().to_string()),
+                Err(e) => Err(e.into()),
+            }
+        })
+    });
+    registry.register(Box::new(AskUserTool::new(ask_fn)));
+
     registry
 }
 

@@ -338,11 +338,14 @@ fn tool_registry_register_defaults_has_all_tools() {
     let tmp = TempDir::new().unwrap();
     let registry = ToolRegistry::register_defaults(tmp.path());
 
+    assert!(registry.get("Bash").is_some(), "should have Bash tool");
     assert!(registry.get("Read").is_some(), "should have Read tool");
     assert!(registry.get("Write").is_some(), "should have Write tool");
     assert!(registry.get("Edit").is_some(), "should have Edit tool");
     assert!(registry.get("Glob").is_some(), "should have Glob tool");
     assert!(registry.get("Grep").is_some(), "should have Grep tool");
+    assert!(registry.get("ListDirectory").is_some(), "should have ListDirectory tool");
+    assert!(registry.get("Skill").is_some(), "should have Skill tool");
     assert!(registry.get("Todo").is_some(), "should have Todo tool");
 }
 
@@ -359,7 +362,7 @@ fn tool_registry_all_schemas_returns_correct_count() {
     let registry = ToolRegistry::register_defaults(tmp.path());
     let schemas = registry.all_schemas();
 
-    assert_eq!(schemas.len(), 6, "should have exactly 6 tool schemas");
+    assert_eq!(schemas.len(), 9, "should have exactly 9 tool schemas (Bash, Read, Write, Edit, Glob, Grep, ListDirectory, Skill, Todo)");
 
     for schema in &schemas {
         assert!(schema["name"].is_string(), "each schema should have a name");
