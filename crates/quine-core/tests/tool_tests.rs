@@ -1,10 +1,15 @@
-use quine_core::tool::read::ReadTool;
-use quine_core::tool::write::WriteTool;
+use quine_core::tool::ask_user::AskUserTool;
+use quine_core::tool::bash::BashTool;
 use quine_core::tool::edit::EditTool;
 use quine_core::tool::glob::GlobTool;
 use quine_core::tool::grep::GrepTool;
+use quine_core::tool::list_directory::ListDirectoryTool;
+use quine_core::tool::read::ReadTool;
+use quine_core::tool::skill::SkillTool;
+use quine_core::tool::write::WriteTool;
 use quine_core::tool::{Tool, ToolRegistry};
 use serde_json::json;
+use std::sync::Arc;
 use tempfile::TempDir;
 
 // --- ReadTool ---
@@ -329,6 +334,431 @@ async fn grep_tool_invalid_regex() {
 
     assert_eq!(result.success, false, "invalid regex should fail");
     assert!(result.output.contains("Invalid regex"));
+}
+
+// --- BashTool ---
+
+#[tokio::test]
+async fn bash_tool_runs_simple_command() {
+    let tmp = TempDir::new().unwrap();
+    let tool = BashTool::new(tmp.path());
+    let result = tool.execute(json!({"command": "echo hello"})).await.unwrap();
+
+    assert_eq!(result.success, true, "echo should succeed");
+    assert_eq!(result.output, "hello\n", "should capture exact stdout of echo");
+}
+
+#[tokio::test]
+async fn bash_tool_runs_in_working_directory() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("marker.txt"), "found_it").unwrap();
+
+    let tool = BashTool::new(tmp.path());
+    let result = tool.execute(json!({"command": "cat marker.txt"})).await.unwrap();
+
+    assert_eq!(result.success, true, "cat should find the file in working dir");
+    assert_eq!(result.output, "found_it", "should read the file content from working dir");
+}
+
+#[tokio::test]
+async fn bash_tool_captures_stderr() {
+    let tmp = TempDir::new().unwrap();
+    let tool = BashTool::new(tmp.path());
+    let result = tool
+        .execute(json!({"command": "echo err_msg >&2"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.success, true, "writing to stderr with exit 0 is still success");
+    assert!(
+        result.output.contains("STDERR:"),
+        "output should contain STDERR label, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("err_msg"),
+        "output should contain the stderr content"
+    );
+}
+
+#[tokio::test]
+async fn bash_tool_reports_failure_on_nonzero_exit() {
+    let tmp = TempDir::new().unwrap();
+    let tool = BashTool::new(tmp.path());
+    let result = tool.execute(json!({"command": "exit 42"})).await.unwrap();
+
+    assert_eq!(result.success, false, "nonzero exit code should report failure");
+    assert!(
+        result.output.contains("Exit code 42"),
+        "output should contain the exact exit code 42, got: {}",
+        result.output
+    );
+}
+
+#[tokio::test]
+async fn bash_tool_no_output_shows_exit_code() {
+    let tmp = TempDir::new().unwrap();
+    let tool = BashTool::new(tmp.path());
+    let result = tool.execute(json!({"command": "true"})).await.unwrap();
+
+    assert_eq!(result.success, true, "true command should succeed");
+    assert_eq!(
+        result.output, "(no output, exit code 0)",
+        "should show exact no-output message with exit code 0"
+    );
+}
+
+#[tokio::test]
+async fn bash_tool_pipes_work() {
+    let tmp = TempDir::new().unwrap();
+    let tool = BashTool::new(tmp.path());
+    let result = tool
+        .execute(json!({"command": "echo 'line1\nline2\nline3' | wc -l"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.success, true, "piped command should succeed");
+    assert!(
+        result.output.trim().contains("3"),
+        "wc -l should count 3 lines, got: {}",
+        result.output
+    );
+}
+
+// --- ListDirectoryTool ---
+
+#[tokio::test]
+async fn list_directory_lists_files_and_dirs() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("file_a.txt"), "").unwrap();
+    std::fs::write(tmp.path().join("file_b.rs"), "").unwrap();
+    std::fs::create_dir(tmp.path().join("subdir")).unwrap();
+
+    let tool = ListDirectoryTool::new(tmp.path());
+    let result = tool.execute(json!({})).await.unwrap();
+
+    assert_eq!(result.success, true, "listing existing directory should succeed");
+    let lines: Vec<&str> = result.output.lines().collect();
+    assert_eq!(lines.len(), 3, "should list exactly 3 entries");
+    assert_eq!(lines[0], "file_a.txt", "first entry should be file_a.txt (sorted)");
+    assert_eq!(lines[1], "file_b.rs", "second entry should be file_b.rs (sorted)");
+    assert_eq!(lines[2], "subdir/", "directories should have trailing /");
+}
+
+#[tokio::test]
+async fn list_directory_with_explicit_path() {
+    let tmp = TempDir::new().unwrap();
+    let sub = tmp.path().join("inner");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("nested.txt"), "").unwrap();
+
+    let tool = ListDirectoryTool::new(tmp.path());
+    let result = tool.execute(json!({"path": "inner"})).await.unwrap();
+
+    assert_eq!(result.success, true);
+    assert_eq!(result.output, "nested.txt", "should list the single file in the subdirectory");
+}
+
+#[tokio::test]
+async fn list_directory_not_a_directory() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("afile.txt"), "").unwrap();
+
+    let tool = ListDirectoryTool::new(tmp.path());
+    let result = tool.execute(json!({"path": "afile.txt"})).await.unwrap();
+
+    assert_eq!(result.success, false, "listing a file (not directory) should fail");
+    assert!(
+        result.output.contains("is not a directory"),
+        "error should say 'is not a directory', got: {}",
+        result.output
+    );
+}
+
+#[tokio::test]
+async fn list_directory_empty_dir() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::create_dir(tmp.path().join("empty")).unwrap();
+
+    let tool = ListDirectoryTool::new(tmp.path());
+    let result = tool.execute(json!({"path": "empty"})).await.unwrap();
+
+    assert_eq!(result.success, true);
+    assert_eq!(result.output, "", "empty directory should produce empty output");
+}
+
+#[tokio::test]
+async fn list_directory_sorted_output() {
+    let tmp = TempDir::new().unwrap();
+    std::fs::write(tmp.path().join("zebra"), "").unwrap();
+    std::fs::write(tmp.path().join("alpha"), "").unwrap();
+    std::fs::write(tmp.path().join("middle"), "").unwrap();
+
+    let tool = ListDirectoryTool::new(tmp.path());
+    let result = tool.execute(json!({})).await.unwrap();
+
+    assert_eq!(result.success, true);
+    let lines: Vec<&str> = result.output.lines().collect();
+    assert_eq!(
+        lines,
+        vec!["alpha", "middle", "zebra"],
+        "entries should be sorted alphabetically"
+    );
+}
+
+// --- AskUserTool ---
+
+#[tokio::test]
+async fn ask_user_returns_user_response() {
+    let ask_fn: quine_core::tool::ask_user::AskUserFn = Arc::new(|_question: String| {
+        Box::pin(async { Ok("yes, proceed".to_string()) })
+    });
+    let tool = AskUserTool::new(ask_fn);
+    let result = tool
+        .execute(json!({"question": "Continue?"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.success, true);
+    assert_eq!(result.output, "yes, proceed", "should return the exact user response");
+}
+
+#[tokio::test]
+async fn ask_user_passes_question_to_callback() {
+    let received = Arc::new(std::sync::Mutex::new(String::new()));
+    let received_clone = Arc::clone(&received);
+
+    let ask_fn: quine_core::tool::ask_user::AskUserFn = Arc::new(move |question: String| {
+        let received = Arc::clone(&received_clone);
+        Box::pin(async move {
+            *received.lock().unwrap() = question;
+            Ok("ok".to_string())
+        })
+    });
+
+    let tool = AskUserTool::new(ask_fn);
+    tool.execute(json!({"question": "What is your name?"}))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        *received.lock().unwrap(),
+        "What is your name?",
+        "callback should receive the exact question text"
+    );
+}
+
+#[tokio::test]
+async fn ask_user_handles_callback_error() {
+    let ask_fn: quine_core::tool::ask_user::AskUserFn = Arc::new(|_question: String| {
+        Box::pin(async { Err(anyhow::anyhow!("connection lost")) })
+    });
+
+    let tool = AskUserTool::new(ask_fn);
+    let result = tool
+        .execute(json!({"question": "Hello?"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.success, false, "callback error should report failure");
+    assert!(
+        result.output.contains("Failed to get user response"),
+        "error should contain failure prefix, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("connection lost"),
+        "error should contain the underlying error message"
+    );
+}
+
+// --- SkillTool ---
+
+#[tokio::test]
+async fn skill_tool_list_no_skills() {
+    let tmp = TempDir::new().unwrap();
+    let tool = SkillTool::new(tmp.path());
+    let result = tool.execute(json!({"action": "list"})).await.unwrap();
+
+    assert_eq!(result.success, true);
+    assert_eq!(
+        result.output,
+        "No skills found. Create skills in `skills/<name>/SKILL.md`.",
+        "should return exact no-skills message"
+    );
+}
+
+#[tokio::test]
+async fn skill_tool_list_discovers_skills() {
+    let tmp = TempDir::new().unwrap();
+    let skill_dir = tmp.path().join("skills").join("my-skill");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: my-skill\ndescription: Does things.\n---\n\nBody.",
+    )
+    .unwrap();
+
+    let tool = SkillTool::new(tmp.path());
+    let result = tool.execute(json!({"action": "list"})).await.unwrap();
+
+    assert_eq!(result.success, true);
+    assert!(
+        result.output.contains("Available skills:"),
+        "should start with header, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("**my-skill**"),
+        "should list skill name in bold"
+    );
+    assert!(
+        result.output.contains("Does things."),
+        "should include skill description"
+    );
+}
+
+#[tokio::test]
+async fn skill_tool_execute_loads_skill_into_context() {
+    let tmp = TempDir::new().unwrap();
+    let skill_dir = tmp.path().join("skills").join("deploy");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: deploy\ndescription: Deploy workflow.\n---\n\n# Deploy\n\nStep 1: Build.\nStep 2: Ship.",
+    )
+    .unwrap();
+
+    let tool = SkillTool::new(tmp.path());
+    let result = tool
+        .execute(json!({"action": "execute", "skill_name": "deploy", "input": "to production"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.success, true);
+    assert!(
+        result.output.contains("# Skill: deploy"),
+        "output should contain skill header"
+    );
+    assert!(
+        result.output.contains("Step 1: Build."),
+        "output should contain skill body"
+    );
+    assert!(
+        result.output.contains("Step 2: Ship."),
+        "output should contain full skill body"
+    );
+    assert!(
+        result.output.contains("## User Input"),
+        "output should contain user input section"
+    );
+    assert!(
+        result.output.contains("to production"),
+        "output should contain the user's input text"
+    );
+}
+
+#[tokio::test]
+async fn skill_tool_execute_includes_references() {
+    let tmp = TempDir::new().unwrap();
+    let skill_dir = tmp.path().join("skills").join("ref-skill");
+    let refs_dir = skill_dir.join("references");
+    std::fs::create_dir_all(&refs_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: ref-skill\ndescription: Has refs.\n---\n\n# Main.",
+    )
+    .unwrap();
+    std::fs::write(refs_dir.join("01-setup.md"), "Setup step.").unwrap();
+    std::fs::write(refs_dir.join("02-run.md"), "Run step.").unwrap();
+
+    let tool = SkillTool::new(tmp.path());
+    let result = tool
+        .execute(json!({"action": "execute", "skill_name": "ref-skill"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.success, true);
+    assert!(
+        result.output.contains("## Reference: 01-setup.md"),
+        "output should contain first reference header"
+    );
+    assert!(
+        result.output.contains("Setup step."),
+        "output should contain first reference content"
+    );
+    assert!(
+        result.output.contains("## Reference: 02-run.md"),
+        "output should contain second reference header"
+    );
+    assert!(
+        result.output.contains("Run step."),
+        "output should contain second reference content"
+    );
+}
+
+#[tokio::test]
+async fn skill_tool_execute_not_found() {
+    let tmp = TempDir::new().unwrap();
+    let tool = SkillTool::new(tmp.path());
+    let result = tool
+        .execute(json!({"action": "execute", "skill_name": "nonexistent"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.success, false, "executing unknown skill should fail");
+    assert!(
+        result.output.contains("Skill 'nonexistent' not found"),
+        "error should name the missing skill, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("Available: none"),
+        "should report no available skills, got: {}",
+        result.output
+    );
+}
+
+#[tokio::test]
+async fn skill_tool_execute_not_found_lists_available() {
+    let tmp = TempDir::new().unwrap();
+    let skill_dir = tmp.path().join("skills").join("existing");
+    std::fs::create_dir_all(&skill_dir).unwrap();
+    std::fs::write(
+        skill_dir.join("SKILL.md"),
+        "---\nname: existing\ndescription: Exists.\n---\n\nBody.",
+    )
+    .unwrap();
+
+    let tool = SkillTool::new(tmp.path());
+    let result = tool
+        .execute(json!({"action": "execute", "skill_name": "wrong-name"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.success, false);
+    assert!(
+        result.output.contains("Available: existing"),
+        "should list available skills in error, got: {}",
+        result.output
+    );
+}
+
+#[tokio::test]
+async fn skill_tool_unknown_action() {
+    let tmp = TempDir::new().unwrap();
+    let tool = SkillTool::new(tmp.path());
+    let result = tool
+        .execute(json!({"action": "delete"}))
+        .await
+        .unwrap();
+
+    assert_eq!(result.success, false, "unknown action should fail");
+    assert_eq!(
+        result.output,
+        "Unknown action 'delete'. Use: list, execute",
+        "should return exact error message for unknown action"
+    );
 }
 
 // --- ToolRegistry ---
