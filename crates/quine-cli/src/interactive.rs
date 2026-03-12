@@ -1,0 +1,491 @@
+use std::path::PathBuf;
+
+use futures::StreamExt;
+use quine_core::config::Config;
+use quine_core::conversation::{Entry, ToolCall, ToolOutput};
+use quine_core::log::ConversationLog;
+use quine_core::prompt::build_system_prompt;
+use quine_core::tool::ToolRegistry;
+use quine_llm::anthropic::AnthropicProvider;
+use quine_llm::openai::OpenAiProvider;
+use quine_llm::provider::LlmProvider;
+use quine_llm::types::*;
+
+use crate::render::Renderer;
+
+pub async fn run_chat(
+    provider_name: &str,
+    model: &str,
+    continue_from: Option<PathBuf>,
+    stream: bool,
+) -> anyhow::Result<()> {
+    let config = Config::new(provider_name, model);
+
+    let provider: Box<dyn LlmProvider> = match provider_name {
+        "anthropic" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY environment variable not set"))?;
+            Box::new(AnthropicProvider::new(api_key))
+        }
+        "openai" => {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
+            Box::new(OpenAiProvider::new(api_key))
+        }
+        _ => anyhow::bail!("Unknown provider: {}. Use 'anthropic' or 'openai'.", provider_name),
+    };
+
+    let system_prompt = build_system_prompt(&config.working_dir);
+    let registry = ToolRegistry::register_defaults(&config.working_dir);
+    let tool_schemas = registry.all_schemas();
+    let renderer = Renderer::new();
+
+    let mut conv_log = if let Some(log_path) = &continue_from {
+        println!("Continuing from: {}", log_path.display());
+        ConversationLog::load(log_path)?
+    } else {
+        ConversationLog::new(model.to_string(), provider_name.to_string(), system_prompt.clone())
+    };
+
+    // Build messages from existing log entries for continuation
+    let mut messages: Vec<ChatMessage> = Vec::new();
+    for entry in &conv_log.entries {
+        match entry {
+            Entry::UserMessage { content } => {
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: ChatContent::Text(content.clone()),
+                });
+            }
+            Entry::AssistantMessage {
+                content,
+                tool_calls,
+            } => {
+                let mut blocks = Vec::new();
+                if !content.is_empty() {
+                    blocks.push(ContentBlock::Text {
+                        text: content.clone(),
+                    });
+                }
+                for tc in tool_calls {
+                    blocks.push(ContentBlock::ToolUse {
+                        id: tc.id.clone(),
+                        name: tc.name.clone(),
+                        input: tc.arguments.clone(),
+                    });
+                }
+                messages.push(ChatMessage {
+                    role: "assistant".to_string(),
+                    content: if blocks.len() == 1 && matches!(&blocks[0], ContentBlock::Text { .. })
+                    {
+                        ChatContent::Text(content.clone())
+                    } else {
+                        ChatContent::Blocks(blocks)
+                    },
+                });
+            }
+            Entry::ToolExecution {
+                tool_call_id,
+                result,
+                ..
+            } => {
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: ChatContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: tool_call_id.clone(),
+                        content: result.output.clone(),
+                    }]),
+                });
+            }
+        }
+    }
+
+    println!("\x1b[1;36mQuine\x1b[0m - Self-bootstrapping CLI assistant");
+    println!("\x1b[90mProvider: {} | Model: {}\x1b[0m", provider_name, model);
+    println!("\x1b[90mType your message (Ctrl+D to exit)\x1b[0m\n");
+
+    loop {
+        renderer.print_user_prompt();
+
+        let user_input = read_user_input()?;
+        if user_input.is_empty() {
+            continue;
+        }
+        if user_input == "/quit" || user_input == "/exit" {
+            break;
+        }
+
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: ChatContent::Text(user_input.clone()),
+        });
+        conv_log.push(Entry::UserMessage {
+            content: user_input,
+        });
+
+        // Conversation loop: keep going while LLM wants to call tools
+        loop {
+            let request = CompletionRequest {
+                model: model.to_string(),
+                system: system_prompt.clone(),
+                messages: messages.clone(),
+                tools: tool_schemas.clone(),
+                max_tokens: 8192,
+            };
+
+            let response = if stream {
+                complete_with_streaming(&*provider, request, &renderer).await?
+            } else {
+                let resp = provider.complete(request).await?;
+                if !resp.content.is_empty() {
+                    renderer.print_assistant_message(&resp.content);
+                }
+                resp
+            };
+
+            // Record assistant message
+            let tool_calls_for_log: Vec<ToolCall> = response
+                .tool_calls
+                .iter()
+                .map(|tc| ToolCall {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                })
+                .collect();
+
+            conv_log.push(Entry::AssistantMessage {
+                content: response.content.clone(),
+                tool_calls: tool_calls_for_log.clone(),
+            });
+
+            // Build assistant message for context
+            let mut assistant_blocks = Vec::new();
+            if !response.content.is_empty() {
+                assistant_blocks.push(ContentBlock::Text {
+                    text: response.content.clone(),
+                });
+            }
+            for tc in &response.tool_calls {
+                assistant_blocks.push(ContentBlock::ToolUse {
+                    id: tc.id.clone(),
+                    name: tc.name.clone(),
+                    input: tc.arguments.clone(),
+                });
+            }
+            messages.push(ChatMessage {
+                role: "assistant".to_string(),
+                content: if assistant_blocks.len() == 1
+                    && matches!(&assistant_blocks[0], ContentBlock::Text { .. })
+                {
+                    ChatContent::Text(response.content.clone())
+                } else {
+                    ChatContent::Blocks(assistant_blocks)
+                },
+            });
+
+            // If no tool calls, we're done with this turn
+            if response.tool_calls.is_empty() {
+                break;
+            }
+
+            // Execute tool calls and feed results back
+            for tc in &response.tool_calls {
+                renderer.print_tool_call(&tc.name, &tc.arguments);
+
+                let result = match registry.get(&tc.name) {
+                    Some(tool) => match tool.execute(tc.arguments.clone()) {
+                        Ok(output) => output,
+                        Err(e) => ToolOutput {
+                            success: false,
+                            output: format!("Tool execution error: {}", e),
+                        },
+                    },
+                    None => ToolOutput {
+                        success: false,
+                        output: format!("Unknown tool: {}", tc.name),
+                    },
+                };
+
+                renderer.print_tool_result(result.success, &result.output);
+
+                // Record tool execution
+                conv_log.push(Entry::ToolExecution {
+                    tool_call_id: tc.id.clone(),
+                    tool_name: tc.name.clone(),
+                    arguments: tc.arguments.clone(),
+                    result: result.clone(),
+                });
+
+                // Add tool result to messages
+                messages.push(ChatMessage {
+                    role: "user".to_string(),
+                    content: ChatContent::Blocks(vec![ContentBlock::ToolResult {
+                        tool_use_id: tc.id.clone(),
+                        content: result.output.clone(),
+                    }]),
+                });
+            }
+        }
+
+        // Save log after each turn
+        let log_path = config.log_dir.join(format!(
+            "{}.json",
+            conv_log.created_at.format("%Y%m%d_%H%M%S")
+        ));
+        conv_log.save(&log_path)?;
+    }
+
+    println!("\n\x1b[90mGoodbye!\x1b[0m");
+    Ok(())
+}
+
+async fn complete_with_streaming(
+    provider: &dyn LlmProvider,
+    request: CompletionRequest,
+    renderer: &Renderer,
+) -> anyhow::Result<CompletionResponse> {
+    let mut stream = provider.complete_stream(request).await?;
+
+    let mut content = String::new();
+    let mut tool_calls: Vec<ToolCall> = Vec::new();
+    let mut current_tool_id = String::new();
+    let mut current_tool_name = String::new();
+    let mut current_tool_args = String::new();
+    let mut stop_reason = StopReason::EndTurn;
+
+    println!();
+    while let Some(event) = stream.next().await {
+        match event? {
+            StreamEvent::ContentDelta(text) => {
+                renderer.print_delta(&text);
+                content.push_str(&text);
+            }
+            StreamEvent::ToolCallStart { id, name } => {
+                current_tool_id = id;
+                current_tool_name = name;
+                current_tool_args.clear();
+            }
+            StreamEvent::ToolCallDelta(json) => {
+                current_tool_args.push_str(&json);
+            }
+            StreamEvent::ToolCallEnd => {
+                if !current_tool_id.is_empty() {
+                    let args: serde_json::Value =
+                        serde_json::from_str(&current_tool_args).unwrap_or(serde_json::Value::Null);
+                    tool_calls.push(ToolCall {
+                        id: current_tool_id.clone(),
+                        name: current_tool_name.clone(),
+                        arguments: args,
+                    });
+                    current_tool_id.clear();
+                    current_tool_name.clear();
+                    current_tool_args.clear();
+                }
+            }
+            StreamEvent::Done(reason) => {
+                stop_reason = reason;
+            }
+        }
+    }
+    println!();
+
+    // Handle any remaining tool call that wasn't closed with ToolCallEnd
+    if !current_tool_id.is_empty() {
+        let args: serde_json::Value =
+            serde_json::from_str(&current_tool_args).unwrap_or(serde_json::Value::Null);
+        tool_calls.push(ToolCall {
+            id: current_tool_id,
+            name: current_tool_name,
+            arguments: args,
+        });
+    }
+
+    Ok(CompletionResponse {
+        content,
+        tool_calls,
+        stop_reason,
+    })
+}
+
+/// Non-interactive print mode: run a single prompt and output the result.
+pub async fn run_print(
+    provider_name: &str,
+    model: &str,
+    prompt: &str,
+    working_dir: Option<PathBuf>,
+    output_format: &str,
+) -> anyhow::Result<()> {
+    let wd = working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let config = Config::new(provider_name, model);
+
+    let provider: Box<dyn LlmProvider> = match provider_name {
+        "anthropic" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY environment variable not set"))?;
+            Box::new(AnthropicProvider::new(api_key))
+        }
+        "openai" => {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
+            Box::new(OpenAiProvider::new(api_key))
+        }
+        _ => anyhow::bail!("Unknown provider: {}", provider_name),
+    };
+
+    let system_prompt = quine_core::prompt::build_system_prompt(&wd);
+    let registry = ToolRegistry::register_defaults(&wd);
+    let tool_schemas = registry.all_schemas();
+
+    let mut conv_log = ConversationLog::new(
+        model.to_string(),
+        provider_name.to_string(),
+        system_prompt.clone(),
+    );
+
+    let mut messages: Vec<ChatMessage> = vec![ChatMessage {
+        role: "user".to_string(),
+        content: ChatContent::Text(prompt.to_string()),
+    }];
+    conv_log.push(Entry::UserMessage {
+        content: prompt.to_string(),
+    });
+
+    // Conversation loop: keep going while LLM wants to call tools
+    loop {
+        let request = CompletionRequest {
+            model: model.to_string(),
+            system: system_prompt.clone(),
+            messages: messages.clone(),
+            tools: tool_schemas.clone(),
+            max_tokens: 8192,
+        };
+
+        let response = provider.complete(request).await?;
+
+        let tool_calls_for_log: Vec<ToolCall> = response
+            .tool_calls
+            .iter()
+            .map(|tc| ToolCall {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                arguments: tc.arguments.clone(),
+            })
+            .collect();
+
+        conv_log.push(Entry::AssistantMessage {
+            content: response.content.clone(),
+            tool_calls: tool_calls_for_log.clone(),
+        });
+
+        let mut assistant_blocks = Vec::new();
+        if !response.content.is_empty() {
+            assistant_blocks.push(ContentBlock::Text {
+                text: response.content.clone(),
+            });
+        }
+        for tc in &response.tool_calls {
+            assistant_blocks.push(ContentBlock::ToolUse {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: tc.arguments.clone(),
+            });
+        }
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: if assistant_blocks.len() == 1
+                && matches!(&assistant_blocks[0], ContentBlock::Text { .. })
+            {
+                ChatContent::Text(response.content.clone())
+            } else {
+                ChatContent::Blocks(assistant_blocks)
+            },
+        });
+
+        if response.tool_calls.is_empty() {
+            break;
+        }
+
+        for tc in &response.tool_calls {
+            let result = match registry.get(&tc.name) {
+                Some(tool) => match tool.execute(tc.arguments.clone()) {
+                    Ok(output) => output,
+                    Err(e) => ToolOutput {
+                        success: false,
+                        output: format!("Tool execution error: {}", e),
+                    },
+                },
+                None => ToolOutput {
+                    success: false,
+                    output: format!("Unknown tool: {}", tc.name),
+                },
+            };
+
+            conv_log.push(Entry::ToolExecution {
+                tool_call_id: tc.id.clone(),
+                tool_name: tc.name.clone(),
+                arguments: tc.arguments.clone(),
+                result: result.clone(),
+            });
+
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: ChatContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: tc.id.clone(),
+                    content: result.output.clone(),
+                }]),
+            });
+        }
+    }
+
+    // Save log
+    let log_path = config.log_dir.join(format!(
+        "{}.json",
+        conv_log.created_at.format("%Y%m%d_%H%M%S")
+    ));
+    conv_log.save(&log_path)?;
+
+    // Output
+    match output_format {
+        "json" => {
+            let output = serde_json::json!({
+                "log_file": log_path.to_string_lossy(),
+                "entries": conv_log.entries,
+            });
+            println!("{}", serde_json::to_string_pretty(&output)?);
+        }
+        _ => {
+            // Print just the final assistant text
+            for entry in conv_log.entries.iter().rev() {
+                if let Entry::AssistantMessage { content, .. } = entry {
+                    if !content.is_empty() {
+                        println!("{}", content);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn read_user_input() -> anyhow::Result<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) => {
+            // EOF
+            if lines.is_empty() {
+                return Ok("/quit".to_string());
+            }
+        }
+        Ok(_) => {
+            lines.push(line.trim_end().to_string());
+        }
+        Err(e) => return Err(e.into()),
+    }
+
+    Ok(lines.join("\n"))
+}

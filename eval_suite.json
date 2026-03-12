@@ -1,0 +1,244 @@
+{
+  "name": "Tool Coverage Suite",
+  "description": "Tests exercising each of Quine's five tools: Read, Write, Edit, Glob, Grep",
+  "tests": [
+    {
+      "id": "write-single-file",
+      "description": "Write: create a single file from scratch",
+      "prompt": "Create a file called greeting.txt containing exactly: Hello from Quine!",
+      "setup_files": [],
+      "expected_files": [
+        { "path": "greeting.txt", "contains": "Hello from Quine!" }
+      ],
+      "eval_criteria": [
+        "File greeting.txt exists with the exact content requested",
+        "No extra files were created"
+      ]
+    },
+    {
+      "id": "write-nested-dirs",
+      "description": "Write: create a file in nested directories that don't exist yet",
+      "prompt": "Create the file src/utils/helpers.py with a function called 'add' that returns the sum of two arguments a and b.",
+      "setup_files": [],
+      "expected_files": [
+        { "path": "src/utils/helpers.py", "contains": "def add" }
+      ],
+      "eval_criteria": [
+        "The file is at the correct nested path",
+        "The function signature accepts two parameters",
+        "The function returns their sum"
+      ]
+    },
+    {
+      "id": "read-and-answer",
+      "description": "Read: read a file and answer a question about its content",
+      "prompt": "Read the file data.json and tell me the exact value of the 'version' field.",
+      "setup_files": [
+        {
+          "path": "data.json",
+          "content": "{\n  \"name\": \"quine\",\n  \"version\": \"3.7.2\",\n  \"license\": \"MIT\"\n}\n"
+        }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The answer includes the exact version string '3.7.2'",
+        "The Read tool was used to access the file rather than guessing"
+      ]
+    },
+    {
+      "id": "read-line-count",
+      "description": "Read: read a file and report structural information",
+      "prompt": "Read the file poem.txt and tell me how many lines it has and what the last line says.",
+      "setup_files": [
+        {
+          "path": "poem.txt",
+          "content": "Roses are red,\nViolets are blue,\nSugar is sweet,\nAnd so are you."
+        }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "Correctly states the file has 4 lines",
+        "Correctly identifies the last line as 'And so are you.'"
+      ]
+    },
+    {
+      "id": "edit-single-replacement",
+      "description": "Edit: replace one string in a file",
+      "prompt": "In config.yaml, change the port from 8080 to 9090.",
+      "setup_files": [
+        {
+          "path": "config.yaml",
+          "content": "server:\n  host: localhost\n  port: 8080\n  debug: false\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "config.yaml", "contains": "port: 9090" }
+      ],
+      "eval_criteria": [
+        "The port value was changed to 9090",
+        "All other fields (host, debug) remain unchanged",
+        "The YAML structure is preserved"
+      ]
+    },
+    {
+      "id": "edit-add-function",
+      "description": "Edit: add new content to an existing file",
+      "prompt": "In math_utils.py, add a function called 'multiply' that takes two arguments and returns their product. Place it after the existing 'add' function.",
+      "setup_files": [
+        {
+          "path": "math_utils.py",
+          "content": "def add(a, b):\n    return a + b\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "math_utils.py", "contains": "def multiply" },
+        { "path": "math_utils.py", "contains": "def add" }
+      ],
+      "eval_criteria": [
+        "The multiply function is present and correct",
+        "The original add function is preserved unchanged",
+        "multiply appears after add in the file"
+      ]
+    },
+    {
+      "id": "edit-rename-variable",
+      "description": "Edit: rename a variable throughout a file using replace_all",
+      "prompt": "In app.js, rename all occurrences of the variable 'tmp' to 'result'.",
+      "setup_files": [
+        {
+          "path": "app.js",
+          "content": "function process(data) {\n  let tmp = data.filter(x => x > 0);\n  tmp = tmp.map(x => x * 2);\n  console.log(tmp);\n  return tmp;\n}\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "app.js", "contains": "result" }
+      ],
+      "eval_criteria": [
+        "All 4 occurrences of 'tmp' are replaced with 'result'",
+        "No occurrences of 'tmp' remain",
+        "The logic and structure of the code is unchanged"
+      ]
+    },
+    {
+      "id": "glob-find-files",
+      "description": "Glob: find files matching a pattern and report them",
+      "prompt": "Find all .rs files in this project and list their paths.",
+      "setup_files": [
+        { "path": "src/main.rs", "content": "fn main() {}\n" },
+        { "path": "src/lib.rs", "content": "pub mod utils;\n" },
+        { "path": "src/utils/mod.rs", "content": "pub fn helper() {}\n" },
+        { "path": "tests/test_basic.rs", "content": "#[test]\nfn it_works() {}\n" },
+        { "path": "README.md", "content": "# Project\n" },
+        { "path": "Cargo.toml", "content": "[package]\nname = \"demo\"\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "Lists all 4 .rs files: main.rs, lib.rs, mod.rs, test_basic.rs",
+        "Does not include README.md or Cargo.toml in the list",
+        "The Glob tool was used"
+      ]
+    },
+    {
+      "id": "grep-find-pattern",
+      "description": "Grep: search for a pattern across multiple files",
+      "prompt": "Search all .py files for the word 'TODO' and tell me which files and line numbers contain it.",
+      "setup_files": [
+        { "path": "app.py", "content": "# Main app\ndef run():\n    pass  # TODO: implement\n" },
+        { "path": "utils.py", "content": "def helper():\n    return 42\n" },
+        { "path": "tests.py", "content": "# TODO: add more tests\ndef test_one():\n    assert True\n    # TODO: check edge cases\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "Identifies app.py line 3 as containing TODO",
+        "Identifies tests.py lines 1 and 4 as containing TODO",
+        "Does not falsely report utils.py as containing TODO",
+        "Reports exactly 3 total matches"
+      ]
+    },
+    {
+      "id": "grep-no-matches",
+      "description": "Grep: search for a pattern that doesn't exist",
+      "prompt": "Search all files for the string 'FIXME' and report what you find.",
+      "setup_files": [
+        { "path": "clean.py", "content": "def clean():\n    return True\n" },
+        { "path": "tidy.rs", "content": "fn tidy() -> bool { true }\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "Correctly reports that no matches were found",
+        "Does not fabricate any results"
+      ]
+    },
+    {
+      "id": "read-then-write",
+      "description": "Multi-tool: read a file, transform its content, write the result",
+      "prompt": "Read the file names.txt, sort the names alphabetically, and write the sorted list to sorted_names.txt (one name per line).",
+      "setup_files": [
+        { "path": "names.txt", "content": "Charlie\nAlice\nDave\nBob\n" }
+      ],
+      "expected_files": [
+        { "path": "sorted_names.txt", "contains": "Alice" },
+        { "path": "sorted_names.txt", "contains": "Bob" }
+      ],
+      "eval_criteria": [
+        "The sorted file contains all 4 names",
+        "The names appear in alphabetical order: Alice, Bob, Charlie, Dave",
+        "The original names.txt is not modified"
+      ]
+    },
+    {
+      "id": "glob-then-grep",
+      "description": "Multi-tool: find files by pattern, then search their content",
+      "prompt": "Find all .toml files, then check which ones contain a 'version' key. List the file paths and their version values.",
+      "setup_files": [
+        { "path": "Cargo.toml", "content": "[package]\nname = \"myapp\"\nversion = \"0.2.0\"\n" },
+        { "path": "config.toml", "content": "[database]\nhost = \"localhost\"\nport = 5432\n" },
+        { "path": "pyproject.toml", "content": "[project]\nname = \"mypkg\"\nversion = \"1.5.3\"\n" },
+        { "path": "data.json", "content": "{\"version\": \"ignored\"}\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "Identifies Cargo.toml with version 0.2.0",
+        "Identifies pyproject.toml with version 1.5.3",
+        "Reports that config.toml has no version key",
+        "Does not include data.json (not a .toml file)"
+      ]
+    },
+    {
+      "id": "read-edit-verify",
+      "description": "Multi-tool: read, edit, then read again to verify",
+      "prompt": "Read the file settings.ini, change the 'theme' value from 'dark' to 'light', then read the file again and confirm the change was applied.",
+      "setup_files": [
+        {
+          "path": "settings.ini",
+          "content": "[ui]\ntheme = dark\nfont_size = 14\nlanguage = en\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "settings.ini", "contains": "theme = light" }
+      ],
+      "eval_criteria": [
+        "The theme value was changed from 'dark' to 'light'",
+        "font_size and language remain unchanged",
+        "The assistant verified the edit by reading the file afterward"
+      ]
+    },
+    {
+      "id": "write-multiple-files",
+      "description": "Write: create multiple related files",
+      "prompt": "Create a simple Python package: __init__.py (empty), models.py with a class 'User' that has 'name' and 'email' attributes, and views.py with a function 'get_user' that returns a User instance. All files should go in the 'myapp' directory.",
+      "setup_files": [],
+      "expected_files": [
+        { "path": "myapp/__init__.py" },
+        { "path": "myapp/models.py", "contains": "class User" },
+        { "path": "myapp/views.py", "contains": "def get_user" }
+      ],
+      "eval_criteria": [
+        "All three files are created in the myapp/ directory",
+        "User class has name and email attributes",
+        "get_user function returns a User instance",
+        "views.py imports from models.py correctly"
+      ]
+    }
+  ]
+}
