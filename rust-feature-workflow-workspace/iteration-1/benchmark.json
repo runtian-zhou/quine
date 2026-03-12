@@ -1,0 +1,141 @@
+{
+  "metadata": {
+    "skill_name": "rust-feature-workflow",
+    "skill_path": "/Users/runtianz/quine/skills/rust-feature-workflow",
+    "executor_model": "claude-opus-4-6",
+    "analyzer_model": "claude-opus-4-6",
+    "timestamp": "2026-03-11T23:23:00Z",
+    "evals_run": ["json-output-flag", "http-cache-layer", "fromstr-config"],
+    "runs_per_configuration": 3
+  },
+  "runs": [
+    {
+      "eval_name": "json-output-flag",
+      "configuration": "with_skill",
+      "pass_rate": 1.0,
+      "passed": 6,
+      "total": 6,
+      "time_seconds": 194.5,
+      "tokens": 22153,
+      "expectations": [
+        {"text": "A design doc file exists with clear structure", "passed": true},
+        {"text": "Design doc includes Summary, Motivation, Design, Alternatives, and Testing Plan sections", "passed": true},
+        {"text": "A feature branch name is specified", "passed": true},
+        {"text": "Implementation uses serde/serde_json for JSON serialization", "passed": true},
+        {"text": "Tests cover both human-readable and JSON output modes", "passed": true},
+        {"text": "Evidence of review/quality pass (clippy, fmt, test commands mentioned)", "passed": true}
+      ]
+    },
+    {
+      "eval_name": "json-output-flag",
+      "configuration": "without_skill",
+      "pass_rate": 0.333,
+      "passed": 2,
+      "total": 6,
+      "time_seconds": 105.9,
+      "tokens": 15119,
+      "expectations": [
+        {"text": "A design doc file exists with clear structure", "passed": false},
+        {"text": "Design doc includes Summary, Motivation, Design, Alternatives, and Testing Plan sections", "passed": false},
+        {"text": "A feature branch name is specified", "passed": false},
+        {"text": "Implementation uses serde/serde_json for JSON serialization", "passed": true},
+        {"text": "Tests cover both human-readable and JSON output modes", "passed": true},
+        {"text": "Evidence of review/quality pass (clippy, fmt, test commands mentioned)", "passed": false}
+      ]
+    },
+    {
+      "eval_name": "http-cache-layer",
+      "configuration": "with_skill",
+      "pass_rate": 1.0,
+      "passed": 6,
+      "total": 6,
+      "time_seconds": 157.2,
+      "tokens": 20000,
+      "expectations": [
+        {"text": "A design doc file exists with clear structure", "passed": true},
+        {"text": "Design doc includes Summary, Motivation, Design, Alternatives, and Testing Plan sections", "passed": true},
+        {"text": "Implementation includes TTL/expiry logic", "passed": true},
+        {"text": "Design or code explicitly limits caching to GET requests only", "passed": true},
+        {"text": "Tests cover cache hit, cache miss, and TTL expiry scenarios", "passed": true},
+        {"text": "Evidence of review/quality pass (clippy, fmt, test commands mentioned)", "passed": true}
+      ]
+    },
+    {
+      "eval_name": "http-cache-layer",
+      "configuration": "without_skill",
+      "pass_rate": 0.5,
+      "passed": 3,
+      "total": 6,
+      "time_seconds": 121.6,
+      "tokens": 17097,
+      "expectations": [
+        {"text": "A design doc file exists with clear structure", "passed": false},
+        {"text": "Design doc includes Summary, Motivation, Design, Alternatives, and Testing Plan sections", "passed": false},
+        {"text": "Implementation includes TTL/expiry logic", "passed": true},
+        {"text": "Design or code explicitly limits caching to GET requests only", "passed": true},
+        {"text": "Tests cover cache hit, cache miss, and TTL expiry scenarios", "passed": true},
+        {"text": "Evidence of review/quality pass (clippy, fmt, test commands mentioned)", "passed": false}
+      ]
+    },
+    {
+      "eval_name": "fromstr-config",
+      "configuration": "with_skill",
+      "pass_rate": 1.0,
+      "passed": 6,
+      "total": 6,
+      "time_seconds": 130.5,
+      "tokens": 17123,
+      "expectations": [
+        {"text": "A design doc file exists with clear structure", "passed": true},
+        {"text": "Design doc includes Summary, Motivation, Design, Alternatives, and Testing Plan sections", "passed": true},
+        {"text": "A custom error type is defined for parse failures", "passed": true},
+        {"text": "Tests or code handle edge cases (empty string, missing value, duplicate keys)", "passed": true},
+        {"text": "Tests exist for both valid and invalid inputs", "passed": true},
+        {"text": "Evidence of review/quality pass (clippy, fmt, test commands mentioned)", "passed": true}
+      ]
+    },
+    {
+      "eval_name": "fromstr-config",
+      "configuration": "without_skill",
+      "pass_rate": 0.5,
+      "passed": 3,
+      "total": 6,
+      "time_seconds": 96.0,
+      "tokens": 11621,
+      "expectations": [
+        {"text": "A design doc file exists with clear structure", "passed": false},
+        {"text": "Design doc includes Summary, Motivation, Design, Alternatives, and Testing Plan sections", "passed": false},
+        {"text": "A custom error type is defined for parse failures", "passed": true},
+        {"text": "Tests or code handle edge cases (empty string, missing value, duplicate keys)", "passed": true},
+        {"text": "Tests exist for both valid and invalid inputs", "passed": true},
+        {"text": "Evidence of review/quality pass (clippy, fmt, test commands mentioned)", "passed": false}
+      ]
+    }
+  ],
+  "run_summary": {
+    "with_skill": {
+      "mean_pass_rate": 1.0,
+      "stddev_pass_rate": 0.0,
+      "mean_time_seconds": 160.7,
+      "mean_tokens": 19759
+    },
+    "without_skill": {
+      "mean_pass_rate": 0.444,
+      "stddev_pass_rate": 0.096,
+      "mean_time_seconds": 107.8,
+      "mean_tokens": 14612
+    },
+    "delta": {
+      "pass_rate": "+0.556",
+      "time_seconds": "+52.9",
+      "tokens": "+5147"
+    }
+  },
+  "notes": [
+    "The skill adds ~56 percentage points to the pass rate (100% vs 44%).",
+    "The with-skill runs are consistently slower (~53s more) and use ~5K more tokens due to design doc and review workflow overhead.",
+    "All baseline runs pass the implementation-quality assertions (serde usage, TTL logic, edge cases, tests). The skill's value-add is entirely in process artifacts: design docs, branch conventions, and review checklists.",
+    "The 3 assertions that discriminate between with-skill and without-skill are: design_doc_exists, design_doc_has_sections, and review_checklist_applied. These are the workflow-process assertions.",
+    "Implementation quality (code correctness, test coverage) is comparable between with-skill and without-skill runs."
+  ]
+}

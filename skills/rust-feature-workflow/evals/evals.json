@@ -1,0 +1,23 @@
+{
+  "skill_name": "rust-feature-workflow",
+  "evals": [
+    {
+      "id": 0,
+      "prompt": "Add a --json output flag to the CLI so results can be piped to jq. Right now the tool only prints human-readable text. I want a --json flag that makes every command output structured JSON instead.",
+      "expected_output": "Design doc created, feature branch, CLI flag implemented with serde_json, tests for both text and JSON output modes, all checks pass.",
+      "files": []
+    },
+    {
+      "id": 1,
+      "prompt": "I want a caching layer for the HTTP client. It should cache GET responses in memory with a configurable TTL. Cache misses should fetch from the network as normal. Don't cache POST/PUT/DELETE.",
+      "expected_output": "Design doc with cache design, feature branch, cache struct with TTL support, tests for cache hit/miss/expiry, all checks pass.",
+      "files": []
+    },
+    {
+      "id": 2,
+      "prompt": "Implement trait FromStr for the Config type so users can parse config from a string like 'key1=val1,key2=val2'. It should return a helpful error if the format is wrong.",
+      "expected_output": "Design doc, feature branch, FromStr impl with custom error type, tests for valid/invalid/edge-case inputs, all checks pass.",
+      "files": []
+    }
+  ]
+}
