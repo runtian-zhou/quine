@@ -1,6 +1,6 @@
 {
   "name": "Tool Coverage Suite",
-  "description": "Tests exercising each of Quine's five tools: Read, Write, Edit, Glob, Grep",
+  "description": "Tests exercising each of Quine's tools: Read, Write, Edit, Glob, Grep, Bash, ListDirectory, Skill",
   "tests": [
     {
       "id": "write-single-file",
@@ -238,6 +238,260 @@
         "User class has name and email attributes",
         "get_user function returns a User instance",
         "views.py imports from models.py correctly"
+      ]
+    },
+    {
+      "id": "bash-run-command",
+      "description": "Bash: run a shell command and report its output",
+      "prompt": "Use a shell command to count the number of lines in data.csv and tell me the exact count.",
+      "setup_files": [
+        {
+          "path": "data.csv",
+          "content": "name,age\nAlice,30\nBob,25\nCharlie,35\nDiana,28\n"
+        }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The Bash tool was used to run a command like 'wc -l'",
+        "Correctly reports the file has 5 lines (including the header)",
+        "Does not fabricate the count"
+      ]
+    },
+    {
+      "id": "bash-create-directory-structure",
+      "description": "Bash: use shell commands to create a directory tree",
+      "prompt": "Use mkdir to create the directory structure: project/src, project/tests, project/docs. Then create an empty .gitkeep file in each directory.",
+      "setup_files": [],
+      "expected_files": [
+        { "path": "project/src/.gitkeep" },
+        { "path": "project/tests/.gitkeep" },
+        { "path": "project/docs/.gitkeep" }
+      ],
+      "eval_criteria": [
+        "The Bash tool was used for directory creation",
+        "All three directories exist with .gitkeep files",
+        "The directory structure matches exactly what was requested"
+      ]
+    },
+    {
+      "id": "bash-pipeline",
+      "description": "Bash: run a multi-step shell pipeline",
+      "prompt": "Use a shell command to find all unique extensions in this directory (ignoring files without extensions) and write them to extensions.txt, one per line, sorted alphabetically.",
+      "setup_files": [
+        { "path": "main.py", "content": "print('hello')\n" },
+        { "path": "utils.py", "content": "pass\n" },
+        { "path": "app.js", "content": "console.log('hi');\n" },
+        { "path": "style.css", "content": "body {}\n" },
+        { "path": "README.md", "content": "# Readme\n" },
+        { "path": "data.json", "content": "{}\n" }
+      ],
+      "expected_files": [
+        { "path": "extensions.txt", "contains": ".css" },
+        { "path": "extensions.txt", "contains": ".js" },
+        { "path": "extensions.txt", "contains": ".json" },
+        { "path": "extensions.txt", "contains": ".md" },
+        { "path": "extensions.txt", "contains": ".py" }
+      ],
+      "eval_criteria": [
+        "The Bash tool was used with a pipeline (e.g. ls, find, sort, uniq)",
+        "extensions.txt contains exactly 5 unique extensions",
+        "Extensions are sorted alphabetically",
+        "Each extension appears only once"
+      ]
+    },
+    {
+      "id": "bash-error-handling",
+      "description": "Bash: handle a failing command gracefully",
+      "prompt": "Try to compile the file broken.c with gcc and report what errors you find. Then fix the errors and compile again.",
+      "setup_files": [
+        {
+          "path": "broken.c",
+          "content": "#include <stdio.h>\nint main() {\n    printf(\"Hello, World!\")\n    return 0;\n}\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "broken.c", "contains": "printf(\"Hello, World!\");" }
+      ],
+      "eval_criteria": [
+        "The Bash tool was used to run gcc",
+        "The missing semicolon error was identified",
+        "The file was fixed (semicolon added after printf)",
+        "A second compilation attempt succeeded or the fix is clearly correct"
+      ]
+    },
+    {
+      "id": "listdir-explore-project",
+      "description": "ListDirectory: explore a project structure and describe it",
+      "prompt": "List the contents of the project root and the src/ directory. Describe the project structure.",
+      "setup_files": [
+        { "path": "Cargo.toml", "content": "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n" },
+        { "path": "README.md", "content": "# Demo Project\n" },
+        { "path": "src/main.rs", "content": "fn main() { println!(\"hi\"); }\n" },
+        { "path": "src/lib.rs", "content": "pub mod utils;\n" },
+        { "path": "src/utils.rs", "content": "pub fn helper() -> i32 { 42 }\n" },
+        { "path": "tests/integration.rs", "content": "#[test]\nfn it_works() {}\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The ListDirectory tool was used to list directory contents",
+        "Correctly identifies it as a Rust/Cargo project",
+        "Mentions key files: Cargo.toml, README.md, src/ directory",
+        "Mentions the source files: main.rs, lib.rs, utils.rs"
+      ]
+    },
+    {
+      "id": "listdir-find-hidden-files",
+      "description": "ListDirectory: list directory contents including hidden indicators",
+      "prompt": "List the contents of the config/ directory and tell me how many files and how many subdirectories it contains.",
+      "setup_files": [
+        { "path": "config/settings.yaml", "content": "debug: true\n" },
+        { "path": "config/routes.json", "content": "[]\n" },
+        { "path": "config/certs/ca.pem", "content": "CERT\n" },
+        { "path": "config/certs/key.pem", "content": "KEY\n" },
+        { "path": "config/templates/base.html", "content": "<html></html>\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The ListDirectory tool was used",
+        "Correctly reports 2 files (settings.yaml, routes.json) in config/",
+        "Correctly reports 2 subdirectories (certs/, templates/) in config/",
+        "Distinguishes files from directories in the listing"
+      ]
+    },
+    {
+      "id": "skill-list-empty",
+      "description": "Skill: list skills when none are defined",
+      "prompt": "List all available skills.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "The Skill tool was used with the 'list' action",
+        "Reports that no skills are available",
+        "Does not fabricate skill names"
+      ]
+    },
+    {
+      "id": "skill-list-and-execute",
+      "description": "Skill: discover and load a skill",
+      "prompt": "List the available skills, then execute the 'code-review' skill with input 'Review the main.py file for bugs'.",
+      "setup_files": [
+        {
+          "path": "skills/code-review/SKILL.md",
+          "content": "---\nname: code-review\ndescription: Review code for bugs, style issues, and improvements.\n---\n\n# Code Review Skill\n\n1. Read the specified file.\n2. Check for common bugs (off-by-one, null checks, resource leaks).\n3. Check for style issues.\n4. Suggest improvements.\n5. Summarize findings."
+        },
+        {
+          "path": "main.py",
+          "content": "def divide(a, b):\n    return a / b\n\ndef read_file(path):\n    f = open(path)\n    data = f.read()\n    return data\n"
+        }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The Skill tool was used with 'list' action first",
+        "The code-review skill was found and listed",
+        "The Skill tool was used with 'execute' action to load the skill",
+        "The loaded skill prompt was used to guide a code review of main.py",
+        "Identified the division-by-zero risk in divide()",
+        "Identified the unclosed file handle in read_file()"
+      ]
+    },
+    {
+      "id": "skill-with-references",
+      "description": "Skill: load a skill that has reference files",
+      "prompt": "Execute the 'setup-project' skill to set up a new Python project called 'mylib'.",
+      "setup_files": [
+        {
+          "path": "skills/setup-project/SKILL.md",
+          "content": "---\nname: setup-project\ndescription: Set up a new Python project with standard structure.\n---\n\n# Project Setup\n\nFollow the reference files in order to set up the project."
+        },
+        {
+          "path": "skills/setup-project/references/01-structure.md",
+          "content": "# Directory Structure\n\nCreate the following:\n- <name>/\n- <name>/__init__.py\n- tests/\n- tests/__init__.py\n- setup.py\n- README.md"
+        },
+        {
+          "path": "skills/setup-project/references/02-setup-py.md",
+          "content": "# setup.py Template\n\nCreate setup.py with:\n```python\nfrom setuptools import setup, find_packages\nsetup(name='<name>', version='0.1.0', packages=find_packages())\n```"
+        }
+      ],
+      "expected_files": [
+        { "path": "mylib/__init__.py" },
+        { "path": "tests/__init__.py" },
+        { "path": "setup.py", "contains": "mylib" },
+        { "path": "README.md" }
+      ],
+      "eval_criteria": [
+        "The Skill tool loaded the setup-project skill with references",
+        "The directory structure from 01-structure.md was followed",
+        "setup.py follows the template from 02-setup-py.md",
+        "The project name 'mylib' was substituted correctly",
+        "All expected files were created"
+      ]
+    },
+    {
+      "id": "bash-then-edit",
+      "description": "Multi-tool: use Bash to inspect, then Edit to fix",
+      "prompt": "Run the Python script test_math.py and fix any failing tests, then run it again to confirm all tests pass.",
+      "setup_files": [
+        {
+          "path": "math_ops.py",
+          "content": "def square(x):\n    return x * x\n\ndef cube(x):\n    return x * x  # bug: should be x * x * x\n"
+        },
+        {
+          "path": "test_math.py",
+          "content": "from math_ops import square, cube\n\ndef test_square():\n    assert square(3) == 9, f\"Expected 9, got {square(3)}\"\n    assert square(0) == 0, f\"Expected 0, got {square(0)}\"\n    print('test_square passed')\n\ndef test_cube():\n    assert cube(2) == 8, f\"Expected 8, got {cube(2)}\"\n    assert cube(3) == 27, f\"Expected 27, got {cube(3)}\"\n    print('test_cube passed')\n\nif __name__ == '__main__':\n    test_square()\n    test_cube()\n    print('All tests passed!')\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "math_ops.py", "contains": "x * x * x" }
+      ],
+      "eval_criteria": [
+        "The Bash tool was used to run the test script initially",
+        "The test_cube failure was identified from the output",
+        "The bug in cube() was fixed (x * x changed to x * x * x)",
+        "The Bash tool was used again to verify the fix",
+        "All tests pass after the fix"
+      ]
+    },
+    {
+      "id": "listdir-then-read",
+      "description": "Multi-tool: use ListDirectory to explore, then Read to inspect",
+      "prompt": "List the contents of the configs/ directory, find which file defines the database settings, and tell me the database host and port.",
+      "setup_files": [
+        { "path": "configs/app.yaml", "content": "app:\n  name: myapp\n  version: 2.1\n  log_level: info\n" },
+        { "path": "configs/database.yaml", "content": "database:\n  host: db.internal.example.com\n  port: 5432\n  name: production\n  pool_size: 10\n" },
+        { "path": "configs/cache.yaml", "content": "cache:\n  backend: redis\n  host: cache.internal\n  ttl: 3600\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The ListDirectory tool was used to list configs/",
+        "Identified database.yaml as the file with database settings",
+        "The Read tool was used to read database.yaml",
+        "Correctly reports host as 'db.internal.example.com'",
+        "Correctly reports port as 5432"
+      ]
+    },
+    {
+      "id": "bash-grep-edit-workflow",
+      "description": "Multi-tool: use Bash + Grep + Edit in a debugging workflow",
+      "prompt": "There's a bug in the app. Run 'python app.py' to see the error, find the problematic function using Grep, fix the bug, and run the app again to verify.",
+      "setup_files": [
+        {
+          "path": "app.py",
+          "content": "from utils import format_name, calculate_total\n\ndef main():\n    name = format_name('john', 'doe')\n    print(f'Name: {name}')\n    \n    items = [10.0, 20.0, 30.0]\n    total = calculate_total(items)\n    print(f'Total: ${total:.2f}')\n\nif __name__ == '__main__':\n    main()\n"
+        },
+        {
+          "path": "utils.py",
+          "content": "def format_name(first, last):\n    return f'{first.capitalize()} {last.capitalize()}'\n\ndef calculate_total(items):\n    total = 0\n    for item in items:\n        total += item\n    return total / 0  # bug: division by zero\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "utils.py", "contains": "return total" }
+      ],
+      "eval_criteria": [
+        "Bash was used to run app.py and see the ZeroDivisionError",
+        "Grep or Read was used to locate the division by zero in utils.py",
+        "The bug was fixed (removed '/ 0' so it returns 'total' directly)",
+        "Bash was used to run app.py again to confirm it works",
+        "The output shows Name: John Doe and Total: $60.00"
       ]
     }
   ]
