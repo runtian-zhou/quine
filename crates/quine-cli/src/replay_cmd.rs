@@ -4,7 +4,7 @@ use quine_core::log::ConversationLog;
 use quine_core::replay::{ReplayEngine, ReplayOptions};
 use quine_core::tool::ToolRegistry;
 
-pub fn run_replay(log_file: &Path, strict: bool, dry_run: bool) -> anyhow::Result<()> {
+pub async fn run_replay(log_file: &Path, strict: bool, dry_run: bool) -> anyhow::Result<()> {
     println!("\x1b[1;36mQuine Replay\x1b[0m");
     println!("\x1b[90mLog: {}\x1b[0m", log_file.display());
 
@@ -29,7 +29,7 @@ pub fn run_replay(log_file: &Path, strict: bool, dry_run: bool) -> anyhow::Resul
     println!();
 
     let engine = ReplayEngine::new(log, registry, options);
-    let result = engine.run()?;
+    let result = engine.run().await?;
 
     println!("\n\x1b[1;36m--- Replay Summary ---\x1b[0m");
     println!("  Entries processed: {}", result.entries_processed);

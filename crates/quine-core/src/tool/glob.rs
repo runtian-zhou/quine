@@ -1,4 +1,5 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -17,6 +18,7 @@ impl GlobTool {
     }
 }
 
+#[async_trait]
 impl Tool for GlobTool {
     fn name(&self) -> &str {
         "Glob"
@@ -43,7 +45,7 @@ impl Tool for GlobTool {
         })
     }
 
-    fn execute(&self, arguments: Value) -> Result<ToolOutput> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput> {
         let pattern = arguments["pattern"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("pattern is required"))?;

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::Value;
 use std::sync::Mutex;
 
@@ -144,6 +145,7 @@ impl TodoTool {
     }
 }
 
+#[async_trait]
 impl Tool for TodoTool {
     fn name(&self) -> &str {
         "Todo"
@@ -185,7 +187,7 @@ impl Tool for TodoTool {
         })
     }
 
-    fn execute(&self, arguments: Value) -> Result<ToolOutput> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput> {
         let action = arguments["action"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("action is required"))?;

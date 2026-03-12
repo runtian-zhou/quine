@@ -2,20 +2,23 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod read;
+pub mod subagent;
 pub mod todo;
 pub mod write;
 
 use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::conversation::ToolOutput;
 
+#[async_trait]
 pub trait Tool: Send + Sync {
     fn name(&self) -> &str;
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> Value;
-    fn execute(&self, arguments: Value) -> Result<ToolOutput>;
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput>;
 }
 
 pub struct ToolRegistry {

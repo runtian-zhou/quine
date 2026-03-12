@@ -37,15 +37,15 @@ fn make_log_with_write(tmp: &TempDir, file_name: &str, content: &str) -> Convers
     log
 }
 
-#[test]
-fn replay_executes_tools_and_creates_files() {
+#[tokio::test]
+async fn replay_executes_tools_and_creates_files() {
     let tmp = TempDir::new().unwrap();
     let log = make_log_with_write(&tmp, "replay_test.txt", "replay content");
     let registry = ToolRegistry::register_defaults(tmp.path());
     let options = ReplayOptions::default();
 
     let engine = ReplayEngine::new(log, registry, options);
-    let result = engine.run().unwrap();
+    let result = engine.run().await.unwrap();
 
     assert_eq!(result.entries_processed, 3, "should process all 3 entries");
     assert_eq!(result.tools_executed, 1, "should execute exactly 1 tool");
@@ -55,8 +55,8 @@ fn replay_executes_tools_and_creates_files() {
     assert_eq!(content, "replay content", "file should be created by replay");
 }
 
-#[test]
-fn replay_detects_drift_when_output_differs() {
+#[tokio::test]
+async fn replay_detects_drift_when_output_differs() {
     let tmp = TempDir::new().unwrap();
 
     // Pre-create the file with different content so Write succeeds but Read output differs
@@ -84,15 +84,15 @@ fn replay_detects_drift_when_output_differs() {
     };
 
     let engine = ReplayEngine::new(log, registry, options);
-    let result = engine.run().unwrap();
+    let result = engine.run().await.unwrap();
 
     assert_eq!(result.tools_executed, 1, "should execute exactly 1 tool");
     assert_eq!(result.drift_warnings.len(), 1, "should detect exactly 1 drift");
     assert_eq!(result.drift_warnings[0].tool_name, "Read");
 }
 
-#[test]
-fn replay_strict_mode_aborts_on_drift() {
+#[tokio::test]
+async fn replay_strict_mode_aborts_on_drift() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("strict.txt"), "actual").unwrap();
 
@@ -118,7 +118,7 @@ fn replay_strict_mode_aborts_on_drift() {
     };
 
     let engine = ReplayEngine::new(log, registry, options);
-    let result = engine.run();
+    let result = engine.run().await;
 
     assert!(result.is_err(), "strict mode should abort on drift");
     let err_msg = result.unwrap_err().to_string();
@@ -129,8 +129,8 @@ fn replay_strict_mode_aborts_on_drift() {
     );
 }
 
-#[test]
-fn replay_dry_run_does_not_execute_tools() {
+#[tokio::test]
+async fn replay_dry_run_does_not_execute_tools() {
     let tmp = TempDir::new().unwrap();
     let log = make_log_with_write(&tmp, "should_not_exist.txt", "data");
     let registry = ToolRegistry::register_defaults(tmp.path());
@@ -140,7 +140,7 @@ fn replay_dry_run_does_not_execute_tools() {
     };
 
     let engine = ReplayEngine::new(log, registry, options);
-    let result = engine.run().unwrap();
+    let result = engine.run().await.unwrap();
 
     assert_eq!(result.tools_executed, 1, "dry-run should still count the tool");
     assert_eq!(result.drift_warnings.len(), 0, "dry-run produces 0 drift warnings");
@@ -150,21 +150,21 @@ fn replay_dry_run_does_not_execute_tools() {
     );
 }
 
-#[test]
-fn replay_no_drift_when_output_matches() {
+#[tokio::test]
+async fn replay_no_drift_when_output_matches() {
     let tmp = TempDir::new().unwrap();
     let log = make_log_with_write(&tmp, "match.txt", "exact content");
     let registry = ToolRegistry::register_defaults(tmp.path());
     let options = ReplayOptions::default();
 
     let engine = ReplayEngine::new(log, registry, options);
-    let result = engine.run().unwrap();
+    let result = engine.run().await.unwrap();
 
     assert_eq!(result.drift_warnings.len(), 0, "no drift when output matches");
 }
 
-#[test]
-fn replay_unknown_tool_in_non_strict_mode() {
+#[tokio::test]
+async fn replay_unknown_tool_in_non_strict_mode() {
     let tmp = TempDir::new().unwrap();
     let mut log = ConversationLog::new(
         "test".to_string(),
@@ -185,14 +185,14 @@ fn replay_unknown_tool_in_non_strict_mode() {
     let options = ReplayOptions::default();
 
     let engine = ReplayEngine::new(log, registry, options);
-    let result = engine.run().unwrap();
+    let result = engine.run().await.unwrap();
 
     // Unknown tool is skipped in non-strict mode (not counted as executed)
     assert_eq!(result.tools_executed, 0, "unknown tool should not be counted as executed");
 }
 
-#[test]
-fn replay_unknown_tool_in_strict_mode_errors() {
+#[tokio::test]
+async fn replay_unknown_tool_in_strict_mode_errors() {
     let tmp = TempDir::new().unwrap();
     let mut log = ConversationLog::new(
         "test".to_string(),
@@ -216,13 +216,13 @@ fn replay_unknown_tool_in_strict_mode_errors() {
     };
 
     let engine = ReplayEngine::new(log, registry, options);
-    let result = engine.run();
+    let result = engine.run().await;
 
     assert!(result.is_err(), "strict mode should error on unknown tool");
 }
 
-#[test]
-fn replay_multiple_tool_executions() {
+#[tokio::test]
+async fn replay_multiple_tool_executions() {
     let tmp = TempDir::new().unwrap();
     let mut log = ConversationLog::new(
         "test".to_string(),
@@ -250,7 +250,7 @@ fn replay_multiple_tool_executions() {
 
     let registry = ToolRegistry::register_defaults(tmp.path());
     let engine = ReplayEngine::new(log, registry, ReplayOptions::default());
-    let result = engine.run().unwrap();
+    let result = engine.run().await.unwrap();
 
     assert_eq!(result.entries_processed, 3, "should process all 3 entries");
     assert_eq!(result.tools_executed, 3, "should execute all 3 tools");

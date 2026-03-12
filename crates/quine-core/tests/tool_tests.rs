@@ -9,13 +9,13 @@ use tempfile::TempDir;
 
 // --- ReadTool ---
 
-#[test]
-fn read_tool_reads_file_with_line_numbers() {
+#[tokio::test]
+async fn read_tool_reads_file_with_line_numbers() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("hello.txt"), "line one\nline two\nline three").unwrap();
 
     let tool = ReadTool::new(tmp.path());
-    let result = tool.execute(json!({"file_path": "hello.txt"})).unwrap();
+    let result = tool.execute(json!({"file_path": "hello.txt"})).await.unwrap();
 
     assert_eq!(result.success, true);
     assert!(
@@ -31,8 +31,8 @@ fn read_tool_reads_file_with_line_numbers() {
     assert!(result.output.contains("3\t"), "output should contain line number 3");
 }
 
-#[test]
-fn read_tool_with_offset_and_limit() {
+#[tokio::test]
+async fn read_tool_with_offset_and_limit() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(
         tmp.path().join("nums.txt"),
@@ -43,6 +43,7 @@ fn read_tool_with_offset_and_limit() {
     let tool = ReadTool::new(tmp.path());
     let result = tool
         .execute(json!({"file_path": "nums.txt", "offset": 2, "limit": 2}))
+        .await
         .unwrap();
 
     assert_eq!(result.success, true);
@@ -52,12 +53,13 @@ fn read_tool_with_offset_and_limit() {
     assert!(!result.output.contains("delta"), "should not include line beyond limit");
 }
 
-#[test]
-fn read_tool_nonexistent_file_returns_failure() {
+#[tokio::test]
+async fn read_tool_nonexistent_file_returns_failure() {
     let tmp = TempDir::new().unwrap();
     let tool = ReadTool::new(tmp.path());
     let result = tool
         .execute(json!({"file_path": "no_such_file.txt"}))
+        .await
         .unwrap();
 
     assert_eq!(result.success, false, "reading nonexistent file should fail");
@@ -67,8 +69,8 @@ fn read_tool_nonexistent_file_returns_failure() {
     );
 }
 
-#[test]
-fn read_tool_absolute_path() {
+#[tokio::test]
+async fn read_tool_absolute_path() {
     let tmp = TempDir::new().unwrap();
     let file_path = tmp.path().join("abs.txt");
     std::fs::write(&file_path, "absolute content").unwrap();
@@ -76,6 +78,7 @@ fn read_tool_absolute_path() {
     let tool = ReadTool::new(tmp.path());
     let result = tool
         .execute(json!({"file_path": file_path.to_str().unwrap()}))
+        .await
         .unwrap();
 
     assert_eq!(result.success, true);
@@ -84,13 +87,14 @@ fn read_tool_absolute_path() {
 
 // --- WriteTool ---
 
-#[test]
-fn write_tool_creates_file() {
+#[tokio::test]
+async fn write_tool_creates_file() {
     let tmp = TempDir::new().unwrap();
     let tool = WriteTool::new(tmp.path());
 
     let result = tool
         .execute(json!({"file_path": "new_file.txt", "content": "hello world"}))
+        .await
         .unwrap();
 
     assert_eq!(result.success, true);
@@ -98,13 +102,14 @@ fn write_tool_creates_file() {
     assert_eq!(content, "hello world", "file content should match exactly");
 }
 
-#[test]
-fn write_tool_creates_parent_directories() {
+#[tokio::test]
+async fn write_tool_creates_parent_directories() {
     let tmp = TempDir::new().unwrap();
     let tool = WriteTool::new(tmp.path());
 
     let result = tool
         .execute(json!({"file_path": "sub/dir/file.txt", "content": "nested"}))
+        .await
         .unwrap();
 
     assert_eq!(result.success, true);
@@ -112,14 +117,15 @@ fn write_tool_creates_parent_directories() {
     assert_eq!(content, "nested", "nested file content should match exactly");
 }
 
-#[test]
-fn write_tool_overwrites_existing_file() {
+#[tokio::test]
+async fn write_tool_overwrites_existing_file() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("existing.txt"), "old content").unwrap();
 
     let tool = WriteTool::new(tmp.path());
     let result = tool
         .execute(json!({"file_path": "existing.txt", "content": "new content"}))
+        .await
         .unwrap();
 
     assert_eq!(result.success, true);
@@ -129,8 +135,8 @@ fn write_tool_overwrites_existing_file() {
 
 // --- EditTool ---
 
-#[test]
-fn edit_tool_replaces_unique_string() {
+#[tokio::test]
+async fn edit_tool_replaces_unique_string() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("edit_me.txt"), "foo bar baz").unwrap();
 
@@ -141,6 +147,7 @@ fn edit_tool_replaces_unique_string() {
             "old_string": "bar",
             "new_string": "qux"
         }))
+        .await
         .unwrap();
 
     assert_eq!(result.success, true);
@@ -148,8 +155,8 @@ fn edit_tool_replaces_unique_string() {
     assert_eq!(content, "foo qux baz", "should replace 'bar' with 'qux'");
 }
 
-#[test]
-fn edit_tool_rejects_ambiguous_match() {
+#[tokio::test]
+async fn edit_tool_rejects_ambiguous_match() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("dup.txt"), "aaa bbb aaa").unwrap();
 
@@ -160,6 +167,7 @@ fn edit_tool_rejects_ambiguous_match() {
             "old_string": "aaa",
             "new_string": "ccc"
         }))
+        .await
         .unwrap();
 
     assert_eq!(result.success, false, "should fail when old_string matches multiple times");
@@ -169,8 +177,8 @@ fn edit_tool_rejects_ambiguous_match() {
     );
 }
 
-#[test]
-fn edit_tool_replace_all_replaces_all_occurrences() {
+#[tokio::test]
+async fn edit_tool_replace_all_replaces_all_occurrences() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("multi.txt"), "aaa bbb aaa").unwrap();
 
@@ -182,6 +190,7 @@ fn edit_tool_replace_all_replaces_all_occurrences() {
             "new_string": "ccc",
             "replace_all": true
         }))
+        .await
         .unwrap();
 
     assert_eq!(result.success, true);
@@ -189,8 +198,8 @@ fn edit_tool_replace_all_replaces_all_occurrences() {
     assert_eq!(content, "ccc bbb ccc", "all occurrences of 'aaa' should be replaced");
 }
 
-#[test]
-fn edit_tool_old_string_not_found() {
+#[tokio::test]
+async fn edit_tool_old_string_not_found() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("nope.txt"), "hello world").unwrap();
 
@@ -201,14 +210,15 @@ fn edit_tool_old_string_not_found() {
             "old_string": "xyz",
             "new_string": "abc"
         }))
+        .await
         .unwrap();
 
     assert_eq!(result.success, false, "should fail when old_string is not found");
     assert!(result.output.contains("not found"));
 }
 
-#[test]
-fn edit_tool_nonexistent_file() {
+#[tokio::test]
+async fn edit_tool_nonexistent_file() {
     let tmp = TempDir::new().unwrap();
     let tool = EditTool::new(tmp.path());
     let result = tool
@@ -217,6 +227,7 @@ fn edit_tool_nonexistent_file() {
             "old_string": "a",
             "new_string": "b"
         }))
+        .await
         .unwrap();
 
     assert_eq!(result.success, false, "editing nonexistent file should fail");
@@ -224,15 +235,15 @@ fn edit_tool_nonexistent_file() {
 
 // --- GlobTool ---
 
-#[test]
-fn glob_tool_finds_matching_files() {
+#[tokio::test]
+async fn glob_tool_finds_matching_files() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("a.rs"), "").unwrap();
     std::fs::write(tmp.path().join("b.rs"), "").unwrap();
     std::fs::write(tmp.path().join("c.txt"), "").unwrap();
 
     let tool = GlobTool::new(tmp.path());
-    let result = tool.execute(json!({"pattern": "*.rs"})).unwrap();
+    let result = tool.execute(json!({"pattern": "*.rs"})).await.unwrap();
 
     assert_eq!(result.success, true);
     assert!(result.output.contains("a.rs"), "should find a.rs");
@@ -240,11 +251,11 @@ fn glob_tool_finds_matching_files() {
     assert!(!result.output.contains("c.txt"), "should not match c.txt");
 }
 
-#[test]
-fn glob_tool_no_matches() {
+#[tokio::test]
+async fn glob_tool_no_matches() {
     let tmp = TempDir::new().unwrap();
     let tool = GlobTool::new(tmp.path());
-    let result = tool.execute(json!({"pattern": "*.xyz"})).unwrap();
+    let result = tool.execute(json!({"pattern": "*.xyz"})).await.unwrap();
 
     assert_eq!(result.success, true);
     assert_eq!(
@@ -253,15 +264,15 @@ fn glob_tool_no_matches() {
     );
 }
 
-#[test]
-fn glob_tool_recursive_pattern() {
+#[tokio::test]
+async fn glob_tool_recursive_pattern() {
     let tmp = TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
     std::fs::write(tmp.path().join("top.rs"), "").unwrap();
     std::fs::write(tmp.path().join("sub/nested.rs"), "").unwrap();
 
     let tool = GlobTool::new(tmp.path());
-    let result = tool.execute(json!({"pattern": "**/*.rs"})).unwrap();
+    let result = tool.execute(json!({"pattern": "**/*.rs"})).await.unwrap();
 
     assert_eq!(result.success, true);
     assert!(result.output.contains("nested.rs"), "should find nested files");
@@ -269,8 +280,8 @@ fn glob_tool_recursive_pattern() {
 
 // --- GrepTool ---
 
-#[test]
-fn grep_tool_finds_matching_lines() {
+#[tokio::test]
+async fn grep_tool_finds_matching_lines() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(
         tmp.path().join("code.rs"),
@@ -281,6 +292,7 @@ fn grep_tool_finds_matching_lines() {
     let tool = GrepTool::new(tmp.path());
     let result = tool
         .execute(json!({"pattern": "println", "file_pattern": "*.rs"}))
+        .await
         .unwrap();
 
     assert_eq!(result.success, true);
@@ -291,14 +303,15 @@ fn grep_tool_finds_matching_lines() {
     );
 }
 
-#[test]
-fn grep_tool_no_matches() {
+#[tokio::test]
+async fn grep_tool_no_matches() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("empty_match.txt"), "nothing here").unwrap();
 
     let tool = GrepTool::new(tmp.path());
     let result = tool
         .execute(json!({"pattern": "xyz123", "file_pattern": "*.txt"}))
+        .await
         .unwrap();
 
     assert_eq!(result.success, true);
@@ -308,11 +321,11 @@ fn grep_tool_no_matches() {
     );
 }
 
-#[test]
-fn grep_tool_invalid_regex() {
+#[tokio::test]
+async fn grep_tool_invalid_regex() {
     let tmp = TempDir::new().unwrap();
     let tool = GrepTool::new(tmp.path());
-    let result = tool.execute(json!({"pattern": "[invalid"})).unwrap();
+    let result = tool.execute(json!({"pattern": "[invalid"})).await.unwrap();
 
     assert_eq!(result.success, false, "invalid regex should fail");
     assert!(result.output.contains("Invalid regex"));

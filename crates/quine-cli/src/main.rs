@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
             strict,
             dry_run,
         } => {
-            replay_cmd::run_replay(&log_file, strict, dry_run)?;
+            replay_cmd::run_replay(&log_file, strict, dry_run).await?;
         }
     }
 

@@ -47,7 +47,7 @@ impl ReplayEngine {
         }
     }
 
-    pub fn run(&self) -> anyhow::Result<ReplayResult> {
+    pub async fn run(&self) -> anyhow::Result<ReplayResult> {
         let mut tools_executed = 0;
         let mut drift_warnings = Vec::new();
 
@@ -85,7 +85,7 @@ impl ReplayEngine {
 
                     match self.registry.get(tool_name) {
                         Some(tool) => {
-                            let actual_result = tool.execute(arguments.clone())?;
+                            let actual_result = tool.execute(arguments.clone()).await?;
                             tools_executed += 1;
 
                             if actual_result.output != expected_result.output {

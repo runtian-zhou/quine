@@ -1,10 +1,12 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use futures::StreamExt;
 use quine_core::config::Config;
 use quine_core::conversation::{Entry, ToolCall, ToolOutput};
 use quine_core::log::ConversationLog;
 use quine_core::prompt::build_system_prompt;
+use quine_core::tool::subagent::SubagentTool;
 use quine_core::tool::ToolRegistry;
 use quine_llm::anthropic::AnthropicProvider;
 use quine_llm::openai::OpenAiProvider;
@@ -21,22 +23,27 @@ pub async fn run_chat(
 ) -> anyhow::Result<()> {
     let config = Config::new(provider_name, model);
 
-    let provider: Box<dyn LlmProvider> = match provider_name {
+    let provider: Arc<dyn LlmProvider> = match provider_name {
         "anthropic" => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY environment variable not set"))?;
-            Box::new(AnthropicProvider::new(api_key))
+            Arc::new(AnthropicProvider::new(api_key))
         }
         "openai" => {
             let api_key = std::env::var("OPENAI_API_KEY")
                 .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
-            Box::new(OpenAiProvider::new(api_key))
+            Arc::new(OpenAiProvider::new(api_key))
         }
         _ => anyhow::bail!("Unknown provider: {}. Use 'anthropic' or 'openai'.", provider_name),
     };
 
     let system_prompt = build_system_prompt(&config.working_dir);
-    let registry = ToolRegistry::register_defaults(&config.working_dir);
+    let registry = build_registry_with_subagent(
+        &config.working_dir,
+        Arc::clone(&provider),
+        model.to_string(),
+        system_prompt.clone(),
+    );
     let tool_schemas = registry.all_schemas();
     let renderer = Renderer::new();
 
@@ -194,7 +201,7 @@ pub async fn run_chat(
                 renderer.print_tool_call(&tc.name, &tc.arguments);
 
                 let result = match registry.get(&tc.name) {
-                    Some(tool) => match tool.execute(tc.arguments.clone()) {
+                    Some(tool) => match tool.execute(tc.arguments.clone()).await {
                         Ok(output) => output,
                         Err(e) => ToolOutput {
                             success: false,
@@ -319,22 +326,27 @@ pub async fn run_print(
     let wd = working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let config = Config::new(provider_name, model);
 
-    let provider: Box<dyn LlmProvider> = match provider_name {
+    let provider: Arc<dyn LlmProvider> = match provider_name {
         "anthropic" => {
             let api_key = std::env::var("ANTHROPIC_API_KEY")
                 .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY environment variable not set"))?;
-            Box::new(AnthropicProvider::new(api_key))
+            Arc::new(AnthropicProvider::new(api_key))
         }
         "openai" => {
             let api_key = std::env::var("OPENAI_API_KEY")
                 .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
-            Box::new(OpenAiProvider::new(api_key))
+            Arc::new(OpenAiProvider::new(api_key))
         }
         _ => anyhow::bail!("Unknown provider: {}", provider_name),
     };
 
     let system_prompt = quine_core::prompt::build_system_prompt(&wd);
-    let registry = ToolRegistry::register_defaults(&wd);
+    let registry = build_registry_with_subagent(
+        &wd,
+        Arc::clone(&provider),
+        model.to_string(),
+        system_prompt.clone(),
+    );
     let tool_schemas = registry.all_schemas();
 
     let mut conv_log = ConversationLog::new(
@@ -408,7 +420,7 @@ pub async fn run_print(
 
         for tc in &response.tool_calls {
             let result = match registry.get(&tc.name) {
-                Some(tool) => match tool.execute(tc.arguments.clone()) {
+                Some(tool) => match tool.execute(tc.arguments.clone()).await {
                     Ok(output) => output,
                     Err(e) => ToolOutput {
                         success: false,
@@ -468,6 +480,115 @@ pub async fn run_print(
     }
 
     Ok(())
+}
+
+/// Run a single-prompt agent loop (used by subagents). Returns the final assistant text.
+/// The tool registry should NOT include the Subagent tool.
+async fn run_subagent_loop(
+    provider: &dyn LlmProvider,
+    model: &str,
+    system_prompt: &str,
+    registry: &ToolRegistry,
+    prompt: &str,
+) -> anyhow::Result<String> {
+    let tool_schemas = registry.all_schemas();
+    let mut messages: Vec<ChatMessage> = vec![ChatMessage {
+        role: "user".to_string(),
+        content: ChatContent::Text(prompt.to_string()),
+    }];
+
+    loop {
+        let request = CompletionRequest {
+            model: model.to_string(),
+            system: system_prompt.to_string(),
+            messages: messages.clone(),
+            tools: tool_schemas.clone(),
+            max_tokens: 8192,
+        };
+
+        let response = provider.complete(request).await?;
+
+        let mut assistant_blocks = Vec::new();
+        if !response.content.is_empty() {
+            assistant_blocks.push(ContentBlock::Text {
+                text: response.content.clone(),
+            });
+        }
+        for tc in &response.tool_calls {
+            assistant_blocks.push(ContentBlock::ToolUse {
+                id: tc.id.clone(),
+                name: tc.name.clone(),
+                input: tc.arguments.clone(),
+            });
+        }
+        messages.push(ChatMessage {
+            role: "assistant".to_string(),
+            content: if assistant_blocks.len() == 1
+                && matches!(&assistant_blocks[0], ContentBlock::Text { .. })
+            {
+                ChatContent::Text(response.content.clone())
+            } else {
+                ChatContent::Blocks(assistant_blocks)
+            },
+        });
+
+        if response.tool_calls.is_empty() {
+            return Ok(response.content);
+        }
+
+        for tc in &response.tool_calls {
+            let result = match registry.get(&tc.name) {
+                Some(tool) => match tool.execute(tc.arguments.clone()).await {
+                    Ok(output) => output,
+                    Err(e) => ToolOutput {
+                        success: false,
+                        output: format!("Tool execution error: {}", e),
+                    },
+                },
+                None => ToolOutput {
+                    success: false,
+                    output: format!("Unknown tool: {}", tc.name),
+                },
+            };
+
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: ChatContent::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: tc.id.clone(),
+                    content: result.output.clone(),
+                }]),
+            });
+        }
+    }
+}
+
+/// Build a ToolRegistry with the Subagent tool included.
+/// The subagent's inner loop uses a registry WITHOUT the Subagent tool.
+fn build_registry_with_subagent(
+    working_dir: &Path,
+    provider: Arc<dyn LlmProvider>,
+    model: String,
+    system_prompt: String,
+) -> ToolRegistry {
+    let mut registry = ToolRegistry::register_defaults(working_dir);
+
+    // Build the inner registry (no subagent) for the subagent's own tool loop
+    let inner_working_dir = working_dir.to_path_buf();
+    let completion_fn: quine_core::tool::subagent::CompletionFn =
+        Arc::new(move |prompt: String| {
+            let provider = Arc::clone(&provider);
+            let model = model.clone();
+            let system_prompt = system_prompt.clone();
+            let working_dir = inner_working_dir.clone();
+            Box::pin(async move {
+                let inner_registry = ToolRegistry::register_defaults(&working_dir);
+                run_subagent_loop(&*provider, &model, &system_prompt, &inner_registry, &prompt)
+                    .await
+            })
+        });
+
+    registry.register(Box::new(SubagentTool::new(completion_fn)));
+    registry
 }
 
 fn read_user_input() -> anyhow::Result<String> {

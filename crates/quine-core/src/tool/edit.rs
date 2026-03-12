@@ -1,4 +1,5 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -26,6 +27,7 @@ impl EditTool {
     }
 }
 
+#[async_trait]
 impl Tool for EditTool {
     fn name(&self) -> &str {
         "Edit"
@@ -60,7 +62,7 @@ impl Tool for EditTool {
         })
     }
 
-    fn execute(&self, arguments: Value) -> Result<ToolOutput> {
+    async fn execute(&self, arguments: Value) -> Result<ToolOutput> {
         let file_path = arguments["file_path"]
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("file_path is required"))?;
