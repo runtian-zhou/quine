@@ -321,7 +321,7 @@ fn grep_tool_invalid_regex() {
 // --- ToolRegistry ---
 
 #[test]
-fn tool_registry_register_defaults_has_all_five_tools() {
+fn tool_registry_register_defaults_has_all_tools() {
     let tmp = TempDir::new().unwrap();
     let registry = ToolRegistry::register_defaults(tmp.path());
 
@@ -330,6 +330,7 @@ fn tool_registry_register_defaults_has_all_five_tools() {
     assert!(registry.get("Edit").is_some(), "should have Edit tool");
     assert!(registry.get("Glob").is_some(), "should have Glob tool");
     assert!(registry.get("Grep").is_some(), "should have Grep tool");
+    assert!(registry.get("Todo").is_some(), "should have Todo tool");
 }
 
 #[test]
@@ -345,7 +346,7 @@ fn tool_registry_all_schemas_returns_correct_count() {
     let registry = ToolRegistry::register_defaults(tmp.path());
     let schemas = registry.all_schemas();
 
-    assert_eq!(schemas.len(), 5, "should have exactly 5 tool schemas");
+    assert_eq!(schemas.len(), 6, "should have exactly 6 tool schemas");
 
     for schema in &schemas {
         assert!(schema["name"].is_string(), "each schema should have a name");

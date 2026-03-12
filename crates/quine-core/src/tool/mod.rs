@@ -2,6 +2,7 @@ pub mod edit;
 pub mod glob;
 pub mod grep;
 pub mod read;
+pub mod todo;
 pub mod write;
 
 use anyhow::Result;
@@ -56,6 +57,7 @@ impl ToolRegistry {
         registry.register(Box::new(edit::EditTool::new(working_dir)));
         registry.register(Box::new(glob::GlobTool::new(working_dir)));
         registry.register(Box::new(grep::GrepTool::new(working_dir)));
+        registry.register(Box::new(todo::TodoTool::new()));
         registry
     }
 }
