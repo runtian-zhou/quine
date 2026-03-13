@@ -1,5 +1,8 @@
 # Quine
 
+[![CI](https://github.com/runtian-zhou/quine/actions/workflows/ci.yml/badge.svg)](https://github.com/runtian-zhou/quine/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE-MIT)
+
 A self-bootstrapping CLI assistant. Quine records its own construction conversation as a JSON log, then can replay that log to rebuild itself from scratch — like a compiler bootstrapping itself.
 
 ## Features
@@ -11,7 +14,7 @@ A self-bootstrapping CLI assistant. Quine records its own construction conversat
 - **Conversation logging** — every session saved as structured JSON
 - **Replay engine** — re-execute a recorded session, detect drift
 - **Self-bootstrap** — replay the construction log to rebuild from scratch
-- **A/B eval** — compare Quine against Claude Code with LLM-as-judge scoring
+- **Eval harness** — run test suites against Quine with file checks and LLM-as-judge scoring
 
 ## Quick Start
 
@@ -46,15 +49,15 @@ cargo run --bin quine -- replay --dry-run .quine/logs/20260312_100000.json
 cargo run --bin quine -- replay --strict .quine/logs/20260312_100000.json
 ```
 
-## A/B Eval
+## Eval
 
-Compare Quine against Claude Code on identical prompts, with automated LLM-as-judge scoring.
+Run test suites against Quine with file checks and optional LLM-as-judge scoring.
 
 ```bash
 # Generate an example test suite
 cargo run --bin quine-eval -- init eval_suite.json
 
-# Run the comparison
+# Run the eval
 cargo run --bin quine-eval -- run eval_suite.json
 
 # Skip LLM judge (file checks + timing only)
@@ -86,7 +89,7 @@ Test suites are JSON files with test cases:
 }
 ```
 
-Each test runs both CLIs in isolated temp directories, checks expected files, and optionally sends results to an LLM judge that scores each 0–10.
+Each test runs Quine in an isolated temp directory, checks expected files, and optionally sends results to an LLM judge that scores 0–10.
 
 ## Architecture
 
@@ -108,7 +111,7 @@ quine/
       main.rs           clap CLI (chat, replay subcommands)
       interactive.rs    Conversation loop + print mode
       render.rs         Markdown + syntax highlighting
-    quine-eval/       A/B testing harness
+    quine-eval/       Eval harness
       harness.rs        Orchestrates both CLIs in temp dirs
       judge.rs          LLM-as-judge evaluation
       report.rs         Terminal summary + scoreboard
