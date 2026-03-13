@@ -344,6 +344,18 @@ impl Dispatcher {
             .map(|(&id, _)| id)
     }
 
+    /// If any agent is waiting for tool input, print its question and prompt the user.
+    fn prompt_next_waiting_question(&self) {
+        if let Some(agent_id) = self.find_agent_waiting_tool_input() {
+            let agent = self.agents.get(&agent_id).unwrap();
+            if let crate::agent::AgentState::WaitingToolInput { ref arguments, .. } = agent.state {
+                let question = arguments["question"].as_str().unwrap_or("?");
+                println!("\n  \x1b[1;33m? {}\x1b[0m", question);
+                self.signal_ready_for_input(PROMPT_ANSWER);
+            }
+        }
+    }
+
     /// Handle user input. Returns true if the loop should exit.
     async fn handle_user_input(&mut self, text: String) -> Result<bool> {
         // First priority: route to any agent waiting for tool input (AskUserQuestion)
@@ -362,6 +374,9 @@ impl Dispatcher {
             } else {
                 self.dispatch_next_tool(agent_id).await?;
             }
+
+            // Check if another agent is still waiting for input
+            self.prompt_next_waiting_question();
             return Ok(false);
         }
 
