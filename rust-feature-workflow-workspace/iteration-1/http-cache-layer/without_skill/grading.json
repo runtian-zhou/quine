@@ -1,0 +1,13 @@
+{
+  "eval_id": 1,
+  "eval_name": "http-cache-layer",
+  "configuration": "without_skill",
+  "expectations": [
+    {"text": "A design doc file exists with clear structure", "passed": false, "evidence": "No design doc file created. Implementation went straight to code."},
+    {"text": "Design doc includes Summary, Motivation, Design, Alternatives, and Testing Plan sections", "passed": false, "evidence": "No design doc at all."},
+    {"text": "Implementation includes TTL/expiry logic", "passed": true, "evidence": "CacheConfig with TTL Duration. CacheEntry with insertion timestamp. Expired entries lazily evicted on read via Instant::elapsed()."},
+    {"text": "Design or code explicitly limits caching to GET requests only", "passed": true, "evidence": "execute() method checks method == Method::GET. POST/PUT/DELETE return raw RequestBuilder and never touch cache."},
+    {"text": "Tests cover cache hit, cache miss, and TTL expiry scenarios", "passed": true, "evidence": "9 integration tests using wiremock covering caching, POST/PUT/DELETE bypass, invalidation, clearing, non-200 caching."},
+    {"text": "Evidence of review/quality pass (clippy, fmt, test commands mentioned)", "passed": false, "evidence": "No review process mentioned. No cargo fmt/clippy/test workflow documented."}
+  ]
+}

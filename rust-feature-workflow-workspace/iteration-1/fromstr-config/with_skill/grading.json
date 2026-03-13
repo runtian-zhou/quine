@@ -1,0 +1,13 @@
+{
+  "eval_id": 2,
+  "eval_name": "fromstr-config",
+  "configuration": "with_skill",
+  "expectations": [
+    {"text": "A design doc file exists with clear structure", "passed": true, "evidence": "design-doc.md with Status, Summary, Motivation, Design (Public API, Internal Design, Error Handling), Alternatives Considered, Testing Plan, Unresolved Questions."},
+    {"text": "Design doc includes Summary, Motivation, Design, Alternatives, and Testing Plan sections", "passed": true, "evidence": "All sections present with code examples, numbered test scenarios, and error message examples."},
+    {"text": "A custom error type is defined for parse failures", "passed": true, "evidence": "ConfigParseError enum with 5 variants (EmptyInput, MissingEquals, EmptyKey, EmptyValue, DuplicateKey), each carrying context. Implements Display and Error."},
+    {"text": "Tests or code handle edge cases (empty string, missing value, duplicate keys)", "passed": true, "evidence": "Tests for empty input, whitespace-only, missing equals, empty key, empty value, duplicate key, values containing equals."},
+    {"text": "Tests exist for both valid and invalid inputs", "passed": true, "evidence": "17 unit tests covering happy paths (single, multiple, whitespace, equals in value) and error paths (all 5 error variants)."},
+    {"text": "Evidence of review/quality pass (clippy, fmt, test commands mentioned)", "passed": true, "evidence": "workflow-log.md Phase 5 includes cargo fmt, clippy, cargo test, and detailed self-review checklist with pass/fail table."}
+  ]
+}

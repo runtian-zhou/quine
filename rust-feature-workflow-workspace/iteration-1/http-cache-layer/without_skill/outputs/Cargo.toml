@@ -1,0 +1,16 @@
+[package]
+name = "http-cache-layer"
+version = "0.1.0"
+edition = "2021"
+description = "A caching layer for HTTP clients with configurable TTL"
+
+[dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+
+[dev-dependencies]
+wiremock = "0.6"
+tokio = { version = "1", features = ["full", "test-util"] }
