@@ -391,9 +391,14 @@ async fn bash_tool_runs_simple_command() {
         .unwrap();
 
     assert!(result.success, "echo should succeed");
-    assert_eq!(
-        result.output, "hello\n",
-        "should capture exact stdout of echo"
+    assert!(
+        result.output.starts_with("hello\n"),
+        "should capture stdout of echo, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("(completed in"),
+        "should contain elapsed time"
     );
 }
 
@@ -409,9 +414,10 @@ async fn bash_tool_runs_in_working_directory() {
         .unwrap();
 
     assert!(result.success, "cat should find the file in working dir");
-    assert_eq!(
-        result.output, "found_it",
-        "should read the file content from working dir"
+    assert!(
+        result.output.starts_with("found_it"),
+        "should read the file content from working dir, got: {}",
+        result.output
     );
 }
 
@@ -460,9 +466,14 @@ async fn bash_tool_no_output_shows_exit_code() {
     let result = tool.execute(json!({"command": "true"})).await.unwrap();
 
     assert!(result.success, "true command should succeed");
-    assert_eq!(
-        result.output, "(no output, exit code 0)",
-        "should show exact no-output message with exit code 0"
+    assert!(
+        result.output.starts_with("(no output, exit code 0)"),
+        "should show no-output message with exit code 0, got: {}",
+        result.output
+    );
+    assert!(
+        result.output.contains("(completed in"),
+        "should contain elapsed time"
     );
 }
 
