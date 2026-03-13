@@ -14,6 +14,7 @@ use crate::types::*;
 pub struct AnthropicProvider {
     client: Client,
     api_key: String,
+    base_url: String,
 }
 
 impl AnthropicProvider {
@@ -21,7 +22,13 @@ impl AnthropicProvider {
         Self {
             client: Client::new(),
             api_key,
+            base_url: "https://api.anthropic.com".to_string(),
         }
+    }
+
+    pub fn with_base_url(mut self, base_url: String) -> Self {
+        self.base_url = base_url;
+        self
     }
 
     fn build_request(&self, request: &CompletionRequest, stream: bool) -> AnthropicRequest {
@@ -87,7 +94,7 @@ impl LlmProvider for AnthropicProvider {
 
         let response = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")
@@ -145,7 +152,7 @@ impl LlmProvider for AnthropicProvider {
 
         let req = self
             .client
-            .post("https://api.anthropic.com/v1/messages")
+            .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", "2023-06-01")
             .header("content-type", "application/json")

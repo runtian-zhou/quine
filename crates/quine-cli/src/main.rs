@@ -24,6 +24,10 @@ enum Commands {
         #[arg(long, default_value = "claude-sonnet-4-20250514")]
         model: String,
 
+        /// Override the base URL for the LLM provider API
+        #[arg(long)]
+        base_url: Option<String>,
+
         /// Continue from a previous log file
         #[arg(long, value_name = "LOG_FILE")]
         r#continue: Option<PathBuf>,
@@ -69,6 +73,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Chat {
             provider,
             model,
+            base_url,
             r#continue,
             stream,
             print,
@@ -79,13 +84,14 @@ async fn main() -> anyhow::Result<()> {
                 interactive::run_print(
                     &provider,
                     &model,
+                    base_url.as_deref(),
                     &prompt,
                     working_dir,
                     &output_format,
                 )
                 .await?;
             } else {
-                interactive::run_chat(&provider, &model, r#continue, stream).await?;
+                interactive::run_chat(&provider, &model, base_url.as_deref(), r#continue, stream).await?;
             }
         }
         Commands::Replay {

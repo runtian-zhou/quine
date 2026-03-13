@@ -19,24 +19,12 @@ use crate::render::Renderer;
 pub async fn run_chat(
     provider_name: &str,
     model: &str,
+    base_url: Option<&str>,
     continue_from: Option<PathBuf>,
     stream: bool,
 ) -> anyhow::Result<()> {
     let config = Config::new(provider_name, model);
-
-    let provider: Arc<dyn LlmProvider> = match provider_name {
-        "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY environment variable not set"))?;
-            Arc::new(AnthropicProvider::new(api_key))
-        }
-        "openai" => {
-            let api_key = std::env::var("OPENAI_API_KEY")
-                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
-            Arc::new(OpenAiProvider::new(api_key))
-        }
-        _ => anyhow::bail!("Unknown provider: {}. Use 'anthropic' or 'openai'.", provider_name),
-    };
+    let provider = create_provider(provider_name, base_url)?;
 
     let system_prompt = build_system_prompt(&config.working_dir);
     let registry = build_registry_with_subagent(
@@ -320,26 +308,14 @@ async fn complete_with_streaming(
 pub async fn run_print(
     provider_name: &str,
     model: &str,
+    base_url: Option<&str>,
     prompt: &str,
     working_dir: Option<PathBuf>,
     output_format: &str,
 ) -> anyhow::Result<()> {
     let wd = working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let config = Config::new(provider_name, model);
-
-    let provider: Arc<dyn LlmProvider> = match provider_name {
-        "anthropic" => {
-            let api_key = std::env::var("ANTHROPIC_API_KEY")
-                .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY environment variable not set"))?;
-            Arc::new(AnthropicProvider::new(api_key))
-        }
-        "openai" => {
-            let api_key = std::env::var("OPENAI_API_KEY")
-                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
-            Arc::new(OpenAiProvider::new(api_key))
-        }
-        _ => anyhow::bail!("Unknown provider: {}", provider_name),
-    };
+    let provider = create_provider(provider_name, base_url)?;
 
     let system_prompt = quine_core::prompt::build_system_prompt(&wd);
     let registry = build_registry_with_subagent(
@@ -605,6 +581,33 @@ fn build_registry_with_subagent(
     registry.register(Box::new(AskUserTool::new(ask_fn)));
 
     registry
+}
+
+fn create_provider(
+    provider_name: &str,
+    base_url: Option<&str>,
+) -> anyhow::Result<Arc<dyn LlmProvider>> {
+    match provider_name {
+        "anthropic" => {
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| anyhow::anyhow!("ANTHROPIC_API_KEY environment variable not set"))?;
+            let mut provider = AnthropicProvider::new(api_key);
+            if let Some(url) = base_url.or(std::env::var("ANTHROPIC_BASE_URL").ok().as_deref()) {
+                provider = provider.with_base_url(url.to_string());
+            }
+            Ok(Arc::new(provider))
+        }
+        "openai" => {
+            let api_key = std::env::var("OPENAI_API_KEY")
+                .map_err(|_| anyhow::anyhow!("OPENAI_API_KEY environment variable not set"))?;
+            let mut provider = OpenAiProvider::new(api_key);
+            if let Some(url) = base_url.or(std::env::var("OPENAI_BASE_URL").ok().as_deref()) {
+                provider = provider.with_base_url(url.to_string());
+            }
+            Ok(Arc::new(provider))
+        }
+        _ => anyhow::bail!("Unknown provider: {}. Use 'anthropic' or 'openai'.", provider_name),
+    }
 }
 
 fn read_user_input() -> anyhow::Result<String> {
