@@ -8,7 +8,7 @@ use quine_core::log::ConversationLog;
 use quine_core::prompt::build_system_prompt;
 use quine_core::tool::ask_user::AskUserTool;
 use quine_core::tool::subagent::SubagentTool;
-use quine_core::tool::ToolRegistry;
+use quine_core::tool::{GlobalContext, ToolRegistry};
 use quine_llm::anthropic::AnthropicProvider;
 use quine_llm::openai::OpenAiProvider;
 use quine_llm::provider::LlmProvider;
@@ -29,11 +29,13 @@ pub async fn run_chat(
     let provider = create_provider(provider_name, base_url)?;
 
     let system_prompt = build_system_prompt(&config.working_dir);
+    let ctx = GlobalContext::new();
     let registry = build_registry_with_subagent(
         &config.working_dir,
         Arc::clone(&provider),
         model.to_string(),
         system_prompt.clone(),
+        ctx,
     );
     let tool_schemas = registry.all_schemas();
     let renderer = Renderer::new();
@@ -359,11 +361,13 @@ pub async fn run_print(
     let provider = create_provider(provider_name, base_url)?;
 
     let system_prompt = quine_core::prompt::build_system_prompt(&wd);
+    let ctx = GlobalContext::new();
     let registry = build_registry_with_subagent(
         &wd,
         Arc::clone(&provider),
         model.to_string(),
         system_prompt.clone(),
+        ctx,
     );
     let tool_schemas = registry.all_schemas();
 
@@ -589,16 +593,17 @@ async fn run_subagent_loop(
 }
 
 /// Build a ToolRegistry with the Subagent tool included.
-/// The subagent's inner loop uses a registry WITHOUT the Subagent tool.
+/// The subagent's inner loop uses a registry WITHOUT the Subagent tool,
+/// but shares the same GlobalContext so stateful tools (e.g. Todo) are shared.
 fn build_registry_with_subagent(
     working_dir: &Path,
     provider: Arc<dyn LlmProvider>,
     model: String,
     system_prompt: String,
+    ctx: GlobalContext,
 ) -> ToolRegistry {
-    let mut registry = ToolRegistry::register_defaults(working_dir);
+    let mut registry = ToolRegistry::register_defaults_with_context(working_dir, &ctx);
 
-    // Build the inner registry (no subagent) for the subagent's own tool loop
     let inner_working_dir = working_dir.to_path_buf();
     let completion_fn: quine_core::tool::subagent::CompletionFn =
         Arc::new(move |prompt: String| {
@@ -606,8 +611,10 @@ fn build_registry_with_subagent(
             let model = model.clone();
             let system_prompt = system_prompt.clone();
             let working_dir = inner_working_dir.clone();
+            let ctx = ctx.clone();
             Box::pin(async move {
-                let inner_registry = ToolRegistry::register_defaults(&working_dir);
+                let inner_registry =
+                    ToolRegistry::register_defaults_with_context(&working_dir, &ctx);
                 run_subagent_loop(&*provider, &model, &system_prompt, &inner_registry, &prompt)
                     .await
             })

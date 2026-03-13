@@ -1,3 +1,4 @@
+use quine_core::tool::todo::TodoTool;
 use quine_core::tool::ask_user::AskUserTool;
 use quine_core::tool::bash::BashTool;
 use quine_core::tool::edit::EditTool;
@@ -814,4 +815,218 @@ fn tool_schema_has_required_fields() {
         required.contains(&json!("file_path")),
         "file_path should be in required"
     );
+}
+
+// --- TodoTool ---
+
+#[tokio::test]
+async fn todo_add_and_list() {
+    let tool = Arc::new(TodoTool::new());
+    let r = tool.execute(json!({"action": "add", "content": "Write tests", "priority": "high"})).await.unwrap();
+    assert!(r.success);
+    assert!(r.output.contains("#1"), "should assign id 1");
+
+    let r = tool.execute(json!({"action": "list"})).await.unwrap();
+    assert!(r.output.contains("Write tests"));
+    assert!(r.output.contains("[ ]"), "new task should be pending");
+    assert!(r.output.contains("high"));
+}
+
+#[tokio::test]
+async fn todo_list_empty() {
+    let tool = Arc::new(TodoTool::new());
+    let r = tool.execute(json!({"action": "list"})).await.unwrap();
+    assert_eq!(r.output, "No todos.");
+}
+
+#[tokio::test]
+async fn todo_update_status() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "Task A"})).await.unwrap();
+    let r = tool.execute(json!({"action": "update", "id": 1, "status": "done"})).await.unwrap();
+    assert!(r.success);
+    assert!(r.output.contains("done"));
+
+    let r = tool.execute(json!({"action": "list"})).await.unwrap();
+    assert!(r.output.contains("[x]"), "done task should show [x]");
+}
+
+#[tokio::test]
+async fn todo_update_in_progress_marker() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "Task B"})).await.unwrap();
+    tool.execute(json!({"action": "update", "id": 1, "status": "in_progress"})).await.unwrap();
+
+    let r = tool.execute(json!({"action": "list"})).await.unwrap();
+    assert!(r.output.contains("[~]"), "in_progress task should show [~]");
+}
+
+#[tokio::test]
+async fn todo_remove() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "Temporary"})).await.unwrap();
+    let r = tool.execute(json!({"action": "remove", "id": 1})).await.unwrap();
+    assert!(r.success);
+
+    let r = tool.execute(json!({"action": "list"})).await.unwrap();
+    assert_eq!(r.output, "No todos.");
+}
+
+#[tokio::test]
+async fn todo_remove_nonexistent() {
+    let tool = Arc::new(TodoTool::new());
+    let r = tool.execute(json!({"action": "remove", "id": 99})).await.unwrap();
+    assert!(r.output.contains("not found"));
+}
+
+#[tokio::test]
+async fn todo_update_nonexistent() {
+    let tool = Arc::new(TodoTool::new());
+    let r = tool.execute(json!({"action": "update", "id": 99, "status": "done"})).await.unwrap();
+    assert!(r.output.contains("not found"));
+}
+
+#[tokio::test]
+async fn todo_add_with_depends_on() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "Step 1"})).await.unwrap();
+    let r = tool.execute(json!({"action": "add", "content": "Step 2", "depends_on": [1]})).await.unwrap();
+    assert!(r.success);
+    assert!(r.output.contains("#2"));
+
+    let r = tool.execute(json!({"action": "list"})).await.unwrap();
+    // Step 2 should show dep on #1 as unfinished
+    assert!(r.output.contains("#1 ✗"), "unfinished dep should show ✗");
+}
+
+#[tokio::test]
+async fn todo_dep_shows_done_checkmark() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "Step 1"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Step 2", "depends_on": [1]})).await.unwrap();
+    tool.execute(json!({"action": "update", "id": 1, "status": "done"})).await.unwrap();
+
+    let r = tool.execute(json!({"action": "list"})).await.unwrap();
+    assert!(r.output.contains("#1 ✓"), "finished dep should show ✓");
+}
+
+#[tokio::test]
+async fn todo_blocked_task_cannot_start() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "Prereq"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Dependent", "depends_on": [1]})).await.unwrap();
+
+    // Try to start task 2 while task 1 is still pending
+    let r = tool.execute(json!({"action": "update", "id": 2, "status": "in_progress"})).await.unwrap();
+    assert!(r.output.contains("blocked"), "should report blocked");
+    assert!(r.output.contains("#1"), "should name the blocking task");
+}
+
+#[tokio::test]
+async fn todo_unblocked_after_dep_done() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "Prereq"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Dependent", "depends_on": [1]})).await.unwrap();
+
+    tool.execute(json!({"action": "update", "id": 1, "status": "done"})).await.unwrap();
+    let r = tool.execute(json!({"action": "update", "id": 2, "status": "in_progress"})).await.unwrap();
+    assert!(r.output.contains("in_progress"), "should succeed once dep is done");
+}
+
+#[tokio::test]
+async fn todo_add_dep_action() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "A"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "B"})).await.unwrap();
+
+    let r = tool.execute(json!({"action": "add_dep", "id": 2, "dep_id": 1})).await.unwrap();
+    assert!(r.success);
+    assert!(r.output.contains("#2") && r.output.contains("#1"));
+
+    let r = tool.execute(json!({"action": "list"})).await.unwrap();
+    assert!(r.output.contains("#1 ✗"), "dep should appear in list");
+}
+
+#[tokio::test]
+async fn todo_remove_dep_action() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "A"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "B", "depends_on": [1]})).await.unwrap();
+
+    let r = tool.execute(json!({"action": "remove_dep", "id": 2, "dep_id": 1})).await.unwrap();
+    assert!(r.success);
+
+    let r = tool.execute(json!({"action": "list"})).await.unwrap();
+    assert!(!r.output.contains("deps:"), "dep should be gone from list");
+}
+
+#[tokio::test]
+async fn todo_cycle_detection_self_dep() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "Solo"})).await.unwrap();
+
+    let r = tool.execute(json!({"action": "add_dep", "id": 1, "dep_id": 1})).await.unwrap();
+    assert!(r.output.contains("itself") || r.output.contains("cycle") || r.output.contains("self"),
+        "self-dep should be rejected, got: {}", r.output);
+}
+
+#[tokio::test]
+async fn todo_cycle_detection_indirect() {
+    let tool = Arc::new(TodoTool::new());
+    // A -> B -> C, then try C -> A (would create cycle)
+    tool.execute(json!({"action": "add", "content": "A"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "B", "depends_on": [1]})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "C", "depends_on": [2]})).await.unwrap();
+
+    let r = tool.execute(json!({"action": "add_dep", "id": 1, "dep_id": 3})).await.unwrap();
+    assert!(r.output.contains("cycle"), "indirect cycle should be rejected, got: {}", r.output);
+}
+
+#[tokio::test]
+async fn todo_remove_cleans_up_deps() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "A"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "B", "depends_on": [1]})).await.unwrap();
+
+    // Remove A; B should no longer list it as a dep
+    tool.execute(json!({"action": "remove", "id": 1})).await.unwrap();
+    let r = tool.execute(json!({"action": "list"})).await.unwrap();
+    assert!(!r.output.contains("deps:"), "removed task's dep entry should be cleaned up");
+}
+
+#[tokio::test]
+async fn todo_add_dep_nonexistent_dep() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "A"})).await.unwrap();
+
+    let r = tool.execute(json!({"action": "add_dep", "id": 1, "dep_id": 99})).await.unwrap();
+    assert!(r.output.contains("not found"), "should reject dep on nonexistent task");
+}
+
+#[tokio::test]
+async fn todo_add_with_nonexistent_dep_in_depends_on() {
+    let tool = Arc::new(TodoTool::new());
+    let r = tool.execute(json!({"action": "add", "content": "X", "depends_on": [42]})).await.unwrap();
+    assert!(r.output.contains("not found"), "should reject add with nonexistent dep");
+}
+
+#[tokio::test]
+async fn todo_invalid_status() {
+    let tool = Arc::new(TodoTool::new());
+    tool.execute(json!({"action": "add", "content": "Task"})).await.unwrap();
+    let r = tool.execute(json!({"action": "update", "id": 1, "status": "flying"})).await.unwrap();
+    assert!(r.output.contains("Invalid status"));
+}
+
+#[tokio::test]
+async fn todo_schema_includes_dag_fields() {
+    let tool = Arc::new(TodoTool::new());
+    let schema = tool.parameters_schema();
+    let props = &schema["properties"];
+    assert!(props["depends_on"].is_object(), "schema should include depends_on");
+    assert!(props["dep_id"].is_object(), "schema should include dep_id");
+    let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
+    let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
+    assert!(action_strs.contains(&"add_dep"), "schema should list add_dep action");
+    assert!(action_strs.contains(&"remove_dep"), "schema should list remove_dep action");
 }

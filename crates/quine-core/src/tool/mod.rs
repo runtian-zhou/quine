@@ -14,6 +14,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::conversation::ToolOutput;
 
@@ -23,6 +24,21 @@ pub trait Tool: Send + Sync {
     fn description(&self) -> &str;
     fn parameters_schema(&self) -> Value;
     async fn execute(&self, arguments: Value) -> Result<ToolOutput>;
+}
+
+/// Shared state that persists across the parent agent and all subagents.
+/// Clone is cheap — every field is an Arc.
+#[derive(Clone)]
+pub struct GlobalContext {
+    pub todo: Arc<todo::TodoTool>,
+}
+
+impl GlobalContext {
+    pub fn new() -> Self {
+        Self {
+            todo: Arc::new(todo::TodoTool::new()),
+        }
+    }
 }
 
 pub struct ToolRegistry {
@@ -57,7 +73,19 @@ impl ToolRegistry {
             .collect()
     }
 
+    /// Build a registry with stateless defaults plus a fresh GlobalContext.
+    /// Use this when you don't need to share state with another registry.
     pub fn register_defaults(working_dir: &std::path::Path) -> Self {
+        Self::register_defaults_with_context(working_dir, &GlobalContext::new())
+    }
+
+    /// Build a registry that shares the given GlobalContext.
+    /// Pass the same context to every registry (parent + subagents) so stateful
+    /// tools like Todo are shared across all of them.
+    pub fn register_defaults_with_context(
+        working_dir: &std::path::Path,
+        ctx: &GlobalContext,
+    ) -> Self {
         let mut registry = Self::new();
         registry.register(Box::new(bash::BashTool::new(working_dir)));
         registry.register(Box::new(read::ReadTool::new(working_dir)));
@@ -67,7 +95,9 @@ impl ToolRegistry {
         registry.register(Box::new(grep::GrepTool::new(working_dir)));
         registry.register(Box::new(list_directory::ListDirectoryTool::new(working_dir)));
         registry.register(Box::new(skill::SkillTool::new(working_dir)));
-        registry.register(Box::new(todo::TodoTool::new()));
+        // Register the shared Arc — all registries built from the same context
+        // point at the same TodoTool instance.
+        registry.register(Box::new(Arc::clone(&ctx.todo)));
         registry
     }
 }

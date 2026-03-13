@@ -493,6 +493,75 @@
         "Bash was used to run app.py again to confirm it works",
         "The output shows Name: John Doe and Total: $60.00"
       ]
+    },
+    {
+      "id": "todo-basic-dag",
+      "description": "Todo: create tasks with dependency relationships and track them",
+      "prompt": "I have a release process with these steps: (1) Write tests, (2) Fix bugs (depends on Write tests), (3) Code review (depends on Fix bugs), (4) Deploy (depends on Code review). Use the Todo tool to model this as a DAG. Add all four tasks with their dependencies, then list them to show the dependency graph.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "The Todo tool was used with 'add' action for all four tasks",
+        "Fix bugs declares a dependency on Write tests",
+        "Code review declares a dependency on Fix bugs",
+        "Deploy declares a dependency on Code review",
+        "The 'list' action was called and shows the dependency chain",
+        "Unfinished dependencies are marked with ✗ in the listing"
+      ]
+    },
+    {
+      "id": "todo-blocked-enforcement",
+      "description": "Todo: verify that a blocked task cannot be started until its dependency is done",
+      "prompt": "Use the Todo tool to: (1) Add task 'Setup database' and task 'Run migrations' that depends on 'Setup database'. (2) Try to mark 'Run migrations' as in_progress — it should be blocked. (3) Mark 'Setup database' as done. (4) Now mark 'Run migrations' as in_progress — it should succeed. Show the final list.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "Both tasks were added with the correct dependency",
+        "The first attempt to start 'Run migrations' was rejected with a blocked message",
+        "After marking 'Setup database' as done, 'Run migrations' was successfully started",
+        "The final list shows 'Setup database' as done and 'Run migrations' as in_progress",
+        "The dependency on 'Setup database' shows ✓ in the final listing"
+      ]
+    },
+    {
+      "id": "todo-cycle-rejection",
+      "description": "Todo: verify that circular dependencies are rejected",
+      "prompt": "Use the Todo tool to add three tasks: 'A', 'B' (depends on A), and 'C' (depends on B). Then try to add a dependency from A to C (which would create a cycle A→B→C→A). The tool should reject it. Report what happened.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "Tasks A, B, C were added with the linear dependency chain A←B←C",
+        "The attempt to make A depend on C was rejected",
+        "The rejection message mentions 'cycle'",
+        "The existing tasks and their valid dependencies remain intact after the rejection"
+      ]
+    },
+    {
+      "id": "todo-add-remove-dep",
+      "description": "Todo: dynamically add and remove dependencies between existing tasks",
+      "prompt": "Use the Todo tool to: (1) Add tasks 'Build frontend', 'Build backend', and 'Integration test'. (2) Use add_dep to make 'Integration test' depend on both 'Build frontend' and 'Build backend'. (3) List to confirm. (4) Use remove_dep to remove the dependency on 'Build frontend'. (5) List again to confirm it's gone.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "All three tasks were added",
+        "add_dep was used to add both dependencies to 'Integration test'",
+        "The list after step 3 shows both deps on 'Integration test'",
+        "remove_dep was used to remove the 'Build frontend' dependency",
+        "The final list shows 'Integration test' depending only on 'Build backend'"
+      ]
+    },
+    {
+      "id": "todo-remove-cascades",
+      "description": "Todo: removing a task cleans up its references in other tasks' dependency lists",
+      "prompt": "Use the Todo tool to: (1) Add 'Task A' and 'Task B' where B depends on A. (2) Remove 'Task A'. (3) List the remaining tasks and confirm that 'Task B' no longer shows any dependencies.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "Both tasks were added with B depending on A",
+        "Task A was removed",
+        "The list shows only Task B with no dependency entries",
+        "Task B can now be started without being blocked"
+      ]
     }
   ]
 }
