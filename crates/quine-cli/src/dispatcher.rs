@@ -42,6 +42,7 @@ pub struct Dispatcher {
     renderer: Renderer,
     stream: bool,
     next_id: u64,
+    spinner: Option<crate::render::Spinner>,
 }
 
 impl Dispatcher {
@@ -92,6 +93,7 @@ impl Dispatcher {
             renderer: Renderer::new(),
             stream,
             next_id: 1,
+            spinner: None,
         }
     }
 
@@ -103,6 +105,28 @@ impl Dispatcher {
         let id = AgentId(self.next_id);
         self.next_id += 1;
         id
+    }
+
+    /// Count how many subagents are currently in flight for a given parent.
+    fn subagents_in_flight_for(&self, parent_id: AgentId) -> usize {
+        self.subagent_info
+            .values()
+            .filter(|info| info.parent_id == parent_id)
+            .count()
+    }
+
+    /// Start a spinner if one isn't already running.
+    fn start_spinner(&mut self, label: &str) {
+        if self.spinner.is_none() {
+            self.spinner = Some(crate::render::Spinner::start(label));
+        }
+    }
+
+    /// Stop the spinner if running.
+    fn stop_spinner(&mut self) {
+        if let Some(spinner) = self.spinner.take() {
+            spinner.stop();
+        }
     }
 
     pub async fn run(&mut self) -> Result<()> {
@@ -348,10 +372,17 @@ impl Dispatcher {
         agent_id: AgentId,
         response: CompletionResponse,
     ) -> Result<()> {
-        let has_tool_calls = !response.tool_calls.is_empty();
+        self.stop_spinner();
 
-        // Print content if non-streaming
-        if !self.stream && !response.content.is_empty() {
+        let has_tool_calls = !response.tool_calls.is_empty();
+        let is_root = self
+            .agents
+            .get(&agent_id)
+            .map(|a| a.is_root)
+            .unwrap_or(false);
+
+        // Print content for root agent (non-streaming mode)
+        if is_root && !response.content.is_empty() {
             self.renderer.print_assistant_message(&response.content);
         }
 
@@ -374,6 +405,14 @@ impl Dispatcher {
         agent_id: AgentId,
         event: StreamEvent,
     ) -> Result<()> {
+        // Stop spinner on first content or tool call
+        if matches!(
+            event,
+            StreamEvent::ContentDelta(_) | StreamEvent::ToolCallStart { .. }
+        ) {
+            self.stop_spinner();
+        }
+
         // Print content deltas immediately
         if let StreamEvent::ContentDelta(ref text) = event {
             self.renderer.print_delta(text);
@@ -397,7 +436,8 @@ impl Dispatcher {
         Ok(())
     }
 
-    /// Record a tool result and continue executing remaining tools or finalize.
+    /// Record a tool result and finalize if all tools (including subagents) are done.
+    /// Returns true if the agent was finalized and a new LLM call was spawned.
     fn record_and_check_tools(
         &mut self,
         agent_id: AgentId,
@@ -408,17 +448,20 @@ impl Dispatcher {
     ) -> Result<bool> {
         self.renderer.print_tool_result(result.success, &result.output);
 
-        let all_done = {
+        let pending_empty = {
             let agent = self.agents.get_mut(&agent_id).unwrap();
             agent.record_tool_result(tool_call_id, tool_name, arguments, result)
         };
 
-        if all_done {
+        // Only finalize when pending queue is empty AND no subagents are in flight
+        if pending_empty && self.subagents_in_flight_for(agent_id) == 0 {
             let agent = self.agents.get_mut(&agent_id).unwrap();
             agent.finalize_tool_results()?;
             self.spawn_llm_call(agent_id);
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        Ok(all_done)
     }
 
     async fn handle_tool_result(
@@ -467,7 +510,9 @@ impl Dispatcher {
         .await
     }
 
-    /// Execute tools sequentially in a loop (avoids async recursion).
+    /// Dispatch tools from the pending queue. Regular tools execute inline.
+    /// Subagents are spawned concurrently and their results arrive later via events.
+    /// AskUserQuestion pauses the agent until user input arrives.
     async fn dispatch_next_tool(&mut self, agent_id: AgentId) -> Result<()> {
         loop {
             let tc = {
@@ -477,16 +522,22 @@ impl Dispatcher {
 
             let tc = match tc {
                 Some(tc) => tc,
-                None => return Ok(()),
+                None => {
+                    // All tools dispatched. If subagents are in flight, they'll
+                    // trigger finalization when they complete. Nothing to do now.
+                    return Ok(());
+                }
             };
 
             self.renderer.print_tool_call(&tc.name, &tc.arguments);
 
-            // Handle special tools that the dispatcher intercepts
+            // Subagent: spawn concurrently and continue dispatching remaining tools
             if tc.name == "Subagent" {
-                return self.dispatch_subagent(agent_id, tc).await;
+                self.dispatch_subagent(agent_id, tc).await?;
+                continue;
             }
 
+            // AskUserQuestion: pause until user responds
             if tc.name == "AskUserQuestion" {
                 return self.dispatch_ask_user(agent_id, tc);
             }
@@ -498,20 +549,20 @@ impl Dispatcher {
                     success: false,
                     output: "Permission denied by user.".to_string(),
                 };
-                let all_done = self.record_and_check_tools(
+                let finalized = self.record_and_check_tools(
                     agent_id,
                     tc.id,
                     tc.name,
                     tc.arguments,
                     result,
                 )?;
-                if all_done {
+                if finalized {
                     return Ok(());
                 }
                 continue;
             }
 
-            // Execute tool directly
+            // Execute tool inline
             let tool_call_id = tc.id.clone();
             let tool_name = tc.name.clone();
             let arguments = tc.arguments.clone();
@@ -533,9 +584,9 @@ impl Dispatcher {
                 }
             };
 
-            let all_done =
+            let finalized =
                 self.record_and_check_tools(agent_id, tool_call_id, tool_name, arguments, result)?;
-            if all_done {
+            if finalized {
                 return Ok(());
             }
         }
@@ -605,15 +656,23 @@ impl Dispatcher {
         Ok(())
     }
 
-    fn spawn_llm_call(&self, agent_id: AgentId) {
+    fn spawn_llm_call(&mut self, agent_id: AgentId) {
         let agent = self.agents.get(&agent_id).unwrap();
         let registry = self.registries.get(&agent_id).unwrap();
         let tool_schemas = registry.all_schemas();
         let request = agent.build_request(&tool_schemas);
+        let is_root = agent.is_root;
+
+        // Start spinner while waiting for LLM
+        if is_root {
+            self.start_spinner("Thinking...");
+        } else {
+            self.start_spinner("Subagent thinking...");
+        }
 
         let provider = Arc::clone(&self.provider);
         let tx = self.event_tx.clone();
-        let stream = self.stream && agent.is_root; // Only stream for root agent
+        let stream = self.stream && is_root; // Only stream for root agent
 
         tokio::spawn(async move {
             if stream {
