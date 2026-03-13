@@ -349,8 +349,7 @@ impl Dispatcher {
         if let Some(agent_id) = self.find_agent_waiting_tool_input() {
             let agent = self.agents.get(&agent_id).unwrap();
             if let crate::agent::AgentState::WaitingToolInput { ref arguments, .. } = agent.state {
-                let question = arguments["question"].as_str().unwrap_or("?");
-                println!("\n  \x1b[1;33m? {}\x1b[0m", question);
+                render_question(arguments);
                 self.signal_ready_for_input(PROMPT_ANSWER);
             }
         }
@@ -360,9 +359,21 @@ impl Dispatcher {
     async fn handle_user_input(&mut self, text: String) -> Result<bool> {
         // First priority: route to any agent waiting for tool input (AskUserQuestion)
         if let Some(agent_id) = self.find_agent_waiting_tool_input() {
+            // Resolve numbered selections against options if present
+            let resolved = {
+                let agent = self.agents.get(&agent_id).unwrap();
+                if let crate::agent::AgentState::WaitingToolInput { ref arguments, .. } =
+                    agent.state
+                {
+                    resolve_answer(arguments, &text)
+                } else {
+                    text
+                }
+            };
+
             let result = ToolOutput {
                 success: true,
-                output: text,
+                output: resolved,
             };
 
             let agent = self.agents.get_mut(&agent_id).unwrap();
@@ -717,10 +728,7 @@ impl Dispatcher {
         agent.enter_waiting_tool_input(tc.clone())?;
 
         if !already_waiting {
-            let question = tc.arguments["question"]
-                .as_str()
-                .unwrap_or("?");
-            println!("\n  \x1b[1;33m? {}\x1b[0m", question);
+            render_question(&tc.arguments);
             self.signal_ready_for_input(PROMPT_ANSWER);
         }
 
@@ -852,6 +860,65 @@ impl Dispatcher {
 }
 
 /// Summarize tool arguments for permission prompt context.
+/// Print a question with optional numbered options.
+fn render_question(args: &serde_json::Value) {
+    let question = args["question"].as_str().unwrap_or("?");
+    println!("\n  \x1b[1;33m? {}\x1b[0m", question);
+
+    if let Some(options) = args["options"].as_array() {
+        for (i, opt) in options.iter().enumerate() {
+            let label = opt.as_str().unwrap_or("?");
+            println!("  \x1b[36m  {})\x1b[0m {}", i + 1, label);
+        }
+        let allow_text = args["allow_text"].as_bool().unwrap_or(false);
+        if allow_text {
+            println!("  \x1b[90m  (enter number(s) or type your own response)\x1b[0m");
+        } else {
+            println!("  \x1b[90m  (enter number(s), comma-separated for multiple)\x1b[0m");
+        }
+    }
+}
+
+/// Parse user input against the options in the tool arguments.
+/// If options are present, try to interpret the input as comma-separated numbers.
+/// Returns the resolved text to send back as the tool result.
+fn resolve_answer(args: &serde_json::Value, input: &str) -> String {
+    let options = match args["options"].as_array() {
+        Some(opts) if !opts.is_empty() => opts,
+        _ => return input.to_string(), // freeform mode
+    };
+
+    let allow_text = args["allow_text"].as_bool().unwrap_or(false);
+
+    // Try to parse as comma-separated numbers
+    let parts: Vec<&str> = input.split(',').map(|s| s.trim()).collect();
+    let mut selections = Vec::new();
+    let mut all_numeric = true;
+
+    for part in &parts {
+        if let Ok(n) = part.parse::<usize>() {
+            if n >= 1 && n <= options.len() {
+                selections.push(options[n - 1].as_str().unwrap_or("?").to_string());
+            } else {
+                all_numeric = false;
+                break;
+            }
+        } else {
+            all_numeric = false;
+            break;
+        }
+    }
+
+    if all_numeric && !selections.is_empty() {
+        selections.join(", ")
+    } else if allow_text {
+        input.to_string()
+    } else {
+        // Invalid selection — return raw input so the LLM can handle it
+        input.to_string()
+    }
+}
+
 fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
     match tool_name {
         "Bash" => args["command"]
@@ -866,5 +933,57 @@ fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
             .unwrap_or_default(),
         "Write" | "Edit" => args["file_path"].as_str().unwrap_or("").to_string(),
         _ => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn resolve_answer_freeform_no_options() {
+        let args = json!({"question": "What file?"});
+        assert_eq!(resolve_answer(&args, "main.rs"), "main.rs");
+    }
+
+    #[test]
+    fn resolve_answer_single_selection() {
+        let args = json!({"question": "Pick one", "options": ["alpha", "beta", "gamma"]});
+        assert_eq!(resolve_answer(&args, "2"), "beta");
+    }
+
+    #[test]
+    fn resolve_answer_multiple_selections() {
+        let args = json!({"question": "Pick", "options": ["a", "b", "c"]});
+        assert_eq!(resolve_answer(&args, "1, 3"), "a, c");
+    }
+
+    #[test]
+    fn resolve_answer_out_of_range_returns_raw() {
+        let args = json!({"question": "Pick", "options": ["a", "b"]});
+        assert_eq!(resolve_answer(&args, "5"), "5");
+    }
+
+    #[test]
+    fn resolve_answer_text_with_allow_text() {
+        let args = json!({"question": "Pick or type", "options": ["a", "b"], "allow_text": true});
+        assert_eq!(resolve_answer(&args, "something else"), "something else");
+    }
+
+    #[test]
+    fn resolve_answer_text_without_allow_text() {
+        let args = json!({"question": "Pick", "options": ["a", "b"]});
+        assert_eq!(
+            resolve_answer(&args, "something else"),
+            "something else",
+            "raw input passed through when not parseable as numbers"
+        );
+    }
+
+    #[test]
+    fn resolve_answer_empty_options_is_freeform() {
+        let args = json!({"question": "What?", "options": []});
+        assert_eq!(resolve_answer(&args, "hello"), "hello");
     }
 }
