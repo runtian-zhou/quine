@@ -1,24 +1,23 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
 
 use crate::conversation::ToolOutput;
 use crate::tool::Tool;
 
-/// An async function that displays a question to the user and returns their response.
-pub type AskUserFn =
-    Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync>;
+/// Schema-only tool — the dispatcher intercepts AskUserQuestion calls and handles
+/// them directly (prompting the user via stdin). The `execute` method is never called.
+pub struct AskUserTool;
 
-pub struct AskUserTool {
-    ask_fn: AskUserFn,
+impl Default for AskUserTool {
+    fn default() -> Self {
+        Self
+    }
 }
 
 impl AskUserTool {
-    pub fn new(ask_fn: AskUserFn) -> Self {
-        Self { ask_fn }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -45,20 +44,9 @@ impl Tool for AskUserTool {
         })
     }
 
-    async fn execute(&self, arguments: Value) -> Result<ToolOutput> {
-        let question = arguments["question"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("question is required"))?;
-
-        match (self.ask_fn)(question.to_string()).await {
-            Ok(response) => Ok(ToolOutput {
-                success: true,
-                output: response,
-            }),
-            Err(e) => Ok(ToolOutput {
-                success: false,
-                output: format!("Failed to get user response: {}", e),
-            }),
-        }
+    async fn execute(&self, _arguments: Value) -> Result<ToolOutput> {
+        // The dispatcher intercepts AskUserQuestion calls before reaching execute().
+        // If we get here, something is misconfigured.
+        anyhow::bail!("AskUserTool.execute() should never be called — the dispatcher handles user prompting directly")
     }
 }

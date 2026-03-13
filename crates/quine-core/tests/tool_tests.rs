@@ -579,67 +579,28 @@ async fn list_directory_sorted_output() {
     );
 }
 
-// --- AskUserTool ---
+// --- AskUserTool (schema-only) ---
 
-#[tokio::test]
-async fn ask_user_returns_user_response() {
-    let ask_fn: quine_core::tool::ask_user::AskUserFn =
-        Arc::new(|_question: String| Box::pin(async { Ok("yes, proceed".to_string()) }));
-    let tool = AskUserTool::new(ask_fn);
-    let result = tool
-        .execute(json!({"question": "Continue?"}))
-        .await
-        .unwrap();
-
-    assert!(result.success);
+#[test]
+fn ask_user_schema_has_required_question() {
+    let tool = AskUserTool::new();
+    assert_eq!(tool.name(), "AskUserQuestion");
+    let schema = tool.parameters_schema();
+    let required = schema["required"].as_array().unwrap();
     assert_eq!(
-        result.output, "yes, proceed",
-        "should return the exact user response"
+        required,
+        &[json!("question")],
+        "schema should require 'question' parameter"
     );
 }
 
 #[tokio::test]
-async fn ask_user_passes_question_to_callback() {
-    let received = Arc::new(std::sync::Mutex::new(String::new()));
-    let received_clone = Arc::clone(&received);
-
-    let ask_fn: quine_core::tool::ask_user::AskUserFn = Arc::new(move |question: String| {
-        let received = Arc::clone(&received_clone);
-        Box::pin(async move {
-            *received.lock().unwrap() = question;
-            Ok("ok".to_string())
-        })
-    });
-
-    let tool = AskUserTool::new(ask_fn);
-    tool.execute(json!({"question": "What is your name?"}))
-        .await
-        .unwrap();
-
-    assert_eq!(
-        *received.lock().unwrap(),
-        "What is your name?",
-        "callback should receive the exact question text"
-    );
-}
-
-#[tokio::test]
-async fn ask_user_handles_callback_error() {
-    let ask_fn: quine_core::tool::ask_user::AskUserFn =
-        Arc::new(|_question: String| Box::pin(async { Err(anyhow::anyhow!("connection lost")) }));
-
-    let tool = AskUserTool::new(ask_fn);
-    let result = tool.execute(json!({"question": "Hello?"})).await.unwrap();
-
-    assert!(!result.success, "callback error should report failure");
+async fn ask_user_execute_returns_error() {
+    let tool = AskUserTool::new();
+    let result = tool.execute(json!({"question": "Hello?"})).await;
     assert!(
-        result.output.contains("Failed to get user response"),
-        "error should contain failure prefix, got: {}",
-        result.output
-    );
-    assert!(
-        result.output.contains("connection lost"),
-        "error should contain the underlying error message"
+        result.is_err(),
+        "execute() should always error — dispatcher handles this tool"
     );
 }
 
@@ -872,7 +833,7 @@ fn tool_registry_all_schemas_returns_correct_count() {
     let registry = ToolRegistry::register_defaults(tmp.path());
     let schemas = registry.all_schemas();
 
-    assert_eq!(schemas.len(), 11, "should have exactly 11 tool schemas (Bash, Read, Write, Edit, Glob, Grep, ListDirectory, Skill, Todo, WebFetch, WebSearch)");
+    assert_eq!(schemas.len(), 13, "should have exactly 13 tool schemas (Bash, Read, Write, Edit, Glob, Grep, ListDirectory, Skill, Todo, WebFetch, WebSearch, Subagent, AskUserQuestion)");
 
     for schema in &schemas {
         assert!(schema["name"].is_string(), "each schema should have a name");

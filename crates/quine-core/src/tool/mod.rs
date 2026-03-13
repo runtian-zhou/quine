@@ -116,6 +116,8 @@ impl ToolRegistry {
         registry.register(Box::new(Arc::clone(&ctx.todo)));
         registry.register(Box::new(web_fetch::WebFetchTool::new()));
         registry.register(Box::new(web_search::WebSearchTool::new()));
+        registry.register(Box::new(subagent::SubagentTool::new()));
+        registry.register(Box::new(ask_user::AskUserTool::new()));
         registry
     }
 }

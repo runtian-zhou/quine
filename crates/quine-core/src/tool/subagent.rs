@@ -1,25 +1,23 @@
 use anyhow::Result;
 use async_trait::async_trait;
 use serde_json::Value;
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
 
 use crate::conversation::ToolOutput;
 use crate::tool::Tool;
 
-/// An async function that takes a prompt and worktree flag, returns the final assistant response text.
-/// The implementation is responsible for running the full agent loop (LLM calls + tool execution).
-pub type CompletionFn =
-    Arc<dyn Fn(String, bool) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync>;
+/// Schema-only tool — the dispatcher intercepts Subagent calls and handles them
+/// directly (spawning a child agent). The `execute` method is never called.
+pub struct SubagentTool;
 
-pub struct SubagentTool {
-    completion_fn: CompletionFn,
+impl Default for SubagentTool {
+    fn default() -> Self {
+        Self
+    }
 }
 
 impl SubagentTool {
-    pub fn new(completion_fn: CompletionFn) -> Self {
-        Self { completion_fn }
+    pub fn new() -> Self {
+        Self
     }
 }
 
@@ -50,22 +48,9 @@ impl Tool for SubagentTool {
         })
     }
 
-    async fn execute(&self, arguments: Value) -> Result<ToolOutput> {
-        let prompt = arguments["prompt"]
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("prompt is required"))?;
-
-        let use_worktree = arguments["worktree"].as_bool().unwrap_or(false);
-
-        match (self.completion_fn)(prompt.to_string(), use_worktree).await {
-            Ok(response) => Ok(ToolOutput {
-                success: true,
-                output: response,
-            }),
-            Err(e) => Ok(ToolOutput {
-                success: false,
-                output: format!("Subagent error: {}", e),
-            }),
-        }
+    async fn execute(&self, _arguments: Value) -> Result<ToolOutput> {
+        // The dispatcher intercepts Subagent tool calls before reaching execute().
+        // If we get here, something is misconfigured.
+        anyhow::bail!("SubagentTool.execute() should never be called — the dispatcher handles subagent spawning directly")
     }
 }

@@ -1,3 +1,6 @@
+/// Indent prefix for all LLM response output.
+const INDENT: &str = "  ";
+
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,7 +24,12 @@ impl Spinner {
             let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
             let mut i = 0;
             while running_clone.load(Ordering::Relaxed) {
-                print!("\r\x1b[90m{} {}\x1b[0m", frames[i % frames.len()], label);
+                print!(
+                    "\r{}\x1b[90m{} {}\x1b[0m",
+                    INDENT,
+                    frames[i % frames.len()],
+                    label
+                );
                 std::io::stdout().flush().ok();
                 i += 1;
                 std::thread::sleep(std::time::Duration::from_millis(80));
@@ -68,7 +76,21 @@ impl Renderer {
 
     /// Print a streamed content delta (no newline, flush immediately)
     pub fn print_delta(&self, text: &str) {
-        print!("{}", text);
+        // Indent each new line in the delta
+        let mut first = true;
+        for part in text.split('\n') {
+            if !first {
+                print!("\n{}", INDENT);
+            }
+            print!("{}", part);
+            first = false;
+        }
+        std::io::stdout().flush().ok();
+    }
+
+    /// Print the indent prefix at the start of a streaming response.
+    pub fn print_stream_start(&self) {
+        print!("{}", INDENT);
         std::io::stdout().flush().ok();
     }
 
@@ -109,18 +131,23 @@ impl Renderer {
 
     fn print_markdown_line(&self, line: &str) {
         if line.starts_with("# ") {
-            println!("\x1b[1;36m{}\x1b[0m", line);
+            println!("{}\x1b[1;36m{}\x1b[0m", INDENT, line);
         } else if line.starts_with("## ") {
-            println!("\x1b[1;33m{}\x1b[0m", line);
+            println!("{}\x1b[1;33m{}\x1b[0m", INDENT, line);
         } else if line.starts_with("### ") {
-            println!("\x1b[1;32m{}\x1b[0m", line);
+            println!("{}\x1b[1;32m{}\x1b[0m", INDENT, line);
         } else if line.starts_with("- ") || line.starts_with("* ") {
-            println!("  {}•{}", SetForegroundColor(Color::Cyan), ResetColor);
-            println!(" {}", &line[2..]);
+            println!(
+                "{}  {}•{} {}",
+                INDENT,
+                SetForegroundColor(Color::Cyan),
+                ResetColor,
+                &line[2..]
+            );
         } else if let Some(quoted) = line.strip_prefix("> ") {
-            println!("\x1b[3;37m  │ {}\x1b[0m", quoted);
+            println!("{}\x1b[3;37m  │ {}\x1b[0m", INDENT, quoted);
         } else {
-            println!("{}", line);
+            println!("{}{}", INDENT, line);
         }
     }
 
@@ -136,22 +163,23 @@ impl Renderer {
         let mut highlighter = HighlightLines::new(syntax, theme);
 
         println!(
-            "\x1b[90m┌─ {} ─┐\x1b[0m",
+            "{}\x1b[90m┌─ {} ─┐\x1b[0m",
+            INDENT,
             if lang.is_empty() { "code" } else { lang }
         );
         for line in code.lines() {
             if let Ok(ranges) = highlighter.highlight_line(line, &self.syntax_set) {
                 let escaped = as_24_bit_terminal_escaped(&ranges, false);
-                println!("\x1b[90m│\x1b[0m {}\x1b[0m", escaped);
+                println!("{}\x1b[90m│\x1b[0m {}\x1b[0m", INDENT, escaped);
             } else {
-                println!("\x1b[90m│\x1b[0m {}", line);
+                println!("{}\x1b[90m│\x1b[0m {}", INDENT, line);
             }
         }
-        println!("\x1b[90m└──────┘\x1b[0m");
+        println!("{}\x1b[90m└──────┘\x1b[0m", INDENT);
     }
 
     pub fn print_tool_call(&self, name: &str, args: &serde_json::Value) {
-        println!("\n\x1b[1;33m⚙ Tool: {}\x1b[0m", name);
+        println!("\n{}\x1b[1;33m⚙ Tool: {}\x1b[0m", INDENT, name);
         if let Some(obj) = args.as_object() {
             for (key, value) in obj {
                 let display = match value {
@@ -179,25 +207,29 @@ impl Renderer {
                         }
                     }
                 };
-                println!("  \x1b[90m{}: {}\x1b[0m", key, display);
+                println!("{}  \x1b[90m{}: {}\x1b[0m", INDENT, key, display);
             }
         }
     }
 
     pub fn print_tool_result(&self, success: bool, output: &str) {
         if success {
-            println!("\x1b[32m  ✓ Success\x1b[0m");
+            println!("{}\x1b[32m  ✓ Success\x1b[0m", INDENT);
         } else {
-            println!("\x1b[31m  ✗ Failed\x1b[0m");
+            println!("{}\x1b[31m  ✗ Failed\x1b[0m", INDENT);
         }
         // Print first few lines of output
         let lines: Vec<&str> = output.lines().take(5).collect();
         for line in &lines {
-            println!("  \x1b[90m{}\x1b[0m", line);
+            println!("{}  \x1b[90m{}\x1b[0m", INDENT, line);
         }
         let total_lines = output.lines().count();
         if total_lines > 5 {
-            println!("  \x1b[90m... ({} more lines)\x1b[0m", total_lines - 5);
+            println!(
+                "{}  \x1b[90m... ({} more lines)\x1b[0m",
+                INDENT,
+                total_lines - 5
+            );
         }
     }
 }
