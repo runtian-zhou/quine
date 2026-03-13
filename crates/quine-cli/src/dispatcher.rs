@@ -1,6 +1,5 @@
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 
 use anyhow::Result;
 use futures::StreamExt;
@@ -19,6 +18,9 @@ use crate::commands::{self, CommandResult, SessionUsage};
 use crate::event::Event;
 use crate::permissions::PermissionManager;
 use crate::render::Renderer;
+
+const PROMPT_NORMAL: &str = "\x1b[1;32m❯\x1b[0m ";
+const PROMPT_ANSWER: &str = "\x1b[1;33m>\x1b[0m ";
 
 /// Tracks a subagent's relationship to its parent.
 struct SubagentInfo {
@@ -44,9 +46,17 @@ pub struct Dispatcher {
     stream: bool,
     next_id: u64,
     spinner: Option<crate::render::Spinner>,
-    /// Shared flag: true when an agent is waiting for user input (AskUserQuestion).
-    /// The input reader thread uses this to switch from the normal `❯` prompt to `> `.
-    awaiting_user_answer: Arc<AtomicBool>,
+    /// Shared state for the input reader thread. The reader waits on the condvar
+    /// until the dispatcher sets `ready = true`, then shows the stored prompt.
+    input_signal: Arc<(Mutex<InputPromptState>, Condvar)>,
+}
+
+/// Shared state between the dispatcher and the input reader thread.
+struct InputPromptState {
+    /// When true, the reader should call readline with `prompt`.
+    ready: bool,
+    /// The prompt string to display (normal turn vs answering a question).
+    prompt: String,
 }
 
 impl Dispatcher {
@@ -98,8 +108,23 @@ impl Dispatcher {
             stream,
             next_id: 1,
             spinner: None,
-            awaiting_user_answer: Arc::new(AtomicBool::new(false)),
+            input_signal: Arc::new((
+                Mutex::new(InputPromptState {
+                    ready: false,
+                    prompt: PROMPT_NORMAL.to_string(),
+                }),
+                Condvar::new(),
+            )),
         }
+    }
+
+    /// Signal the input reader thread to show a prompt and accept input.
+    fn signal_ready_for_input(&self, prompt: &str) {
+        let (lock, cvar) = &*self.input_signal;
+        let mut state = lock.lock().unwrap();
+        state.ready = true;
+        state.prompt = prompt.to_string();
+        cvar.notify_one();
     }
 
     fn root_id(&self) -> AgentId {
@@ -143,6 +168,7 @@ impl Dispatcher {
         println!("\x1b[90mType your message, /help for commands, Ctrl+D to exit\x1b[0m\n");
 
         self.spawn_input_reader();
+        self.signal_ready_for_input(PROMPT_NORMAL);
 
         while let Some(event) = self.event_rx.recv().await {
             match event {
@@ -271,16 +297,22 @@ impl Dispatcher {
 
     fn spawn_input_reader(&self) {
         let tx = self.event_tx.clone();
-        let awaiting = Arc::clone(&self.awaiting_user_answer);
+        let signal = Arc::clone(&self.input_signal);
         tokio::task::spawn_blocking(move || {
             let mut rl = rustyline::DefaultEditor::new().unwrap();
             loop {
-                let prompt = if awaiting.load(Ordering::Relaxed) {
-                    "\x1b[1;33m>\x1b[0m "
-                } else {
-                    "\x1b[1;32m❯\x1b[0m "
+                // Wait until the dispatcher signals we should prompt for input.
+                let prompt = {
+                    let (lock, cvar) = &*signal;
+                    let mut state = lock.lock().unwrap();
+                    while !state.ready {
+                        state = cvar.wait(state).unwrap();
+                    }
+                    state.ready = false;
+                    state.prompt.clone()
                 };
-                match rl.readline(prompt) {
+
+                match rl.readline(&prompt) {
                     Ok(line) => {
                         let trimmed = line.trim_end().to_string();
                         if !trimmed.is_empty() {
@@ -316,8 +348,6 @@ impl Dispatcher {
     async fn handle_user_input(&mut self, text: String) -> Result<bool> {
         // First priority: route to any agent waiting for tool input (AskUserQuestion)
         if let Some(agent_id) = self.find_agent_waiting_tool_input() {
-            self.awaiting_user_answer.store(false, Ordering::Relaxed);
-
             let result = ToolOutput {
                 success: true,
                 output: text,
@@ -336,6 +366,7 @@ impl Dispatcher {
         }
 
         if text.is_empty() {
+            self.signal_ready_for_input(PROMPT_NORMAL);
             return Ok(false);
         }
 
@@ -358,13 +389,17 @@ impl Dispatcher {
                 &self.permissions,
             ) {
                 match result {
-                    CommandResult::Continue | CommandResult::Rewound => return Ok(false),
+                    CommandResult::Continue | CommandResult::Rewound => {
+                        self.signal_ready_for_input(PROMPT_NORMAL);
+                        return Ok(false);
+                    }
                     CommandResult::Exit => return Ok(true),
                     CommandResult::Unknown(cmd) => {
                         println!(
                             "\x1b[33mUnknown command: {}. Type /help for available commands.\x1b[0m",
                             cmd
                         );
+                        self.signal_ready_for_input(PROMPT_NORMAL);
                         return Ok(false);
                     }
                 }
@@ -417,12 +452,15 @@ impl Dispatcher {
         agent_id: AgentId,
         event: StreamEvent,
     ) -> Result<()> {
-        // Stop spinner on first content or tool call
+        // Stop spinner and start indent on first content or tool call
         if matches!(
             event,
             StreamEvent::ContentDelta(_) | StreamEvent::ToolCallStart { .. }
-        ) {
+        ) && self.spinner.is_some()
+        {
             self.stop_spinner();
+            // Print the indent prefix at the start of streaming output
+            self.renderer.print_stream_start();
         }
 
         // Print content deltas immediately
@@ -657,17 +695,19 @@ impl Dispatcher {
         agent_id: AgentId,
         tc: quine_core::conversation::ToolCall,
     ) -> Result<()> {
-        // Only print the question if no other agent is already waiting for input
-        if !self.awaiting_user_answer.load(Ordering::Relaxed) {
+        // Only print the question and prompt if no other agent is already waiting
+        let already_waiting = self.find_agent_waiting_tool_input().is_some();
+
+        let agent = self.agents.get_mut(&agent_id).unwrap();
+        agent.enter_waiting_tool_input(tc.clone())?;
+
+        if !already_waiting {
             let question = tc.arguments["question"]
                 .as_str()
                 .unwrap_or("?");
-            println!("\n\x1b[1;33m? {}\x1b[0m", question);
+            println!("\n  \x1b[1;33m? {}\x1b[0m", question);
+            self.signal_ready_for_input(PROMPT_ANSWER);
         }
-
-        let agent = self.agents.get_mut(&agent_id).unwrap();
-        agent.enter_waiting_tool_input(tc)?;
-        self.awaiting_user_answer.store(true, Ordering::Relaxed);
 
         Ok(())
     }
@@ -763,6 +803,9 @@ impl Dispatcher {
                 ));
                 log.save(&log_path)?;
             }
+
+            // Root turn done — prompt for next input
+            self.signal_ready_for_input(PROMPT_NORMAL);
         } else {
             // Subagent: notify parent
             if let Some(info) = self.subagent_info.remove(&agent_id) {
