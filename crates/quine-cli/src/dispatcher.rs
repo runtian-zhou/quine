@@ -384,7 +384,7 @@ impl Dispatcher {
     fn prompt_next_waiting_question(&self) {
         if let Some(agent_id) = self.find_agent_waiting_tool_input() {
             let agent = self.agents.get(&agent_id).unwrap();
-            if let quine_core::agent::AgentState::WaitingToolInput { ref arguments, .. } = agent.state {
+            if let AgentState::WaitingToolInput { ref arguments, .. } = agent.state {
                 signal_question(&self.input_signal, arguments);
             }
         }
@@ -397,7 +397,7 @@ impl Dispatcher {
             // Resolve numbered selections against options if present
             let resolved = {
                 let agent = self.agents.get(&agent_id).unwrap();
-                if let quine_core::agent::AgentState::WaitingToolInput { ref arguments, .. } =
+                if let AgentState::WaitingToolInput { ref arguments, .. } =
                     agent.state
                 {
                     resolve_answer(arguments, &text)
