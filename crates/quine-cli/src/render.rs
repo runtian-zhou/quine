@@ -1,9 +1,57 @@
 use crossterm::style::{Color, SetForegroundColor, ResetColor};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
+
+pub struct Spinner {
+    running: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    pub fn start(label: &str) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
+        let running_clone = Arc::clone(&running);
+        let label = label.to_string();
+        let handle = std::thread::spawn(move || {
+            let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+            let mut i = 0;
+            while running_clone.load(Ordering::Relaxed) {
+                print!("\r\x1b[90m{} {}\x1b[0m", frames[i % frames.len()], label);
+                std::io::stdout().flush().ok();
+                i += 1;
+                std::thread::sleep(std::time::Duration::from_millis(80));
+            }
+            // Clear the spinner line
+            print!("\r\x1b[2K");
+            std::io::stdout().flush().ok();
+        });
+        Self {
+            running,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn stop(mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.join().ok();
+        }
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            h.join().ok();
+        }
+    }
+}
 
 pub struct Renderer {
     syntax_set: SyntaxSet,

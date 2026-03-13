@@ -1,11 +1,43 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CacheControl {
+    #[serde(rename = "type")]
+    pub kind: String, // "ephemeral"
+}
+
+impl CacheControl {
+    pub fn ephemeral() -> Self {
+        Self { kind: "ephemeral".to_string() }
+    }
+}
+
+/// A system prompt block (text with optional cache_control).
+#[derive(Debug, Serialize)]
+pub struct SystemBlock {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
+}
+
+impl SystemBlock {
+    pub fn text(text: String) -> Self {
+        Self { kind: "text".to_string(), text, cache_control: None }
+    }
+
+    pub fn text_cached(text: String) -> Self {
+        Self { kind: "text".to_string(), text, cache_control: Some(CacheControl::ephemeral()) }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct AnthropicRequest {
     pub model: String,
     pub max_tokens: u32,
-    pub system: String,
+    pub system: Vec<SystemBlock>,
     pub messages: Vec<AnthropicMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<Value>,
@@ -30,7 +62,11 @@ pub enum AnthropicContent {
 #[serde(tag = "type")]
 pub enum AnthropicBlock {
     #[serde(rename = "text")]
-    Text { text: String },
+    Text {
+        text: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
+    },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -41,6 +77,8 @@ pub enum AnthropicBlock {
     ToolResult {
         tool_use_id: String,
         content: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        cache_control: Option<CacheControl>,
     },
 }
 

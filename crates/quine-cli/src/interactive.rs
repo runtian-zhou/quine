@@ -43,57 +43,76 @@ pub async fn run_chat(
         ConversationLog::new(model.to_string(), provider_name.to_string(), system_prompt.clone())
     };
 
-    // Build messages from existing log entries for continuation
+    // Build messages from existing log entries for continuation.
+    // Group consecutive ToolExecution entries into a single user message.
     let mut messages: Vec<ChatMessage> = Vec::new();
+    let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
+
     for entry in &conv_log.entries {
         match entry {
-            Entry::UserMessage { content } => {
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: ChatContent::Text(content.clone()),
-                });
-            }
-            Entry::AssistantMessage {
-                content,
-                tool_calls,
-            } => {
-                let mut blocks = Vec::new();
-                if !content.is_empty() {
-                    blocks.push(ContentBlock::Text {
-                        text: content.clone(),
-                    });
-                }
-                for tc in tool_calls {
-                    blocks.push(ContentBlock::ToolUse {
-                        id: tc.id.clone(),
-                        name: tc.name.clone(),
-                        input: tc.arguments.clone(),
-                    });
-                }
-                messages.push(ChatMessage {
-                    role: "assistant".to_string(),
-                    content: if blocks.len() == 1 && matches!(&blocks[0], ContentBlock::Text { .. })
-                    {
-                        ChatContent::Text(content.clone())
-                    } else {
-                        ChatContent::Blocks(blocks)
-                    },
-                });
-            }
             Entry::ToolExecution {
                 tool_call_id,
                 result,
                 ..
             } => {
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: ChatContent::Blocks(vec![ContentBlock::ToolResult {
-                        tool_use_id: tool_call_id.clone(),
-                        content: result.output.clone(),
-                    }]),
+                pending_tool_results.push(ContentBlock::ToolResult {
+                    tool_use_id: tool_call_id.clone(),
+                    content: result.output.clone(),
                 });
             }
+            other => {
+                if !pending_tool_results.is_empty() {
+                    messages.push(ChatMessage {
+                        role: "user".to_string(),
+                        content: ChatContent::Blocks(pending_tool_results.drain(..).collect()),
+                    });
+                }
+                match other {
+                    Entry::UserMessage { content } => {
+                        messages.push(ChatMessage {
+                            role: "user".to_string(),
+                            content: ChatContent::Text(content.clone()),
+                        });
+                    }
+                    Entry::AssistantMessage {
+                        content,
+                        tool_calls,
+                    } => {
+                        let mut blocks = Vec::new();
+                        if !content.is_empty() {
+                            blocks.push(ContentBlock::Text {
+                                text: content.clone(),
+                            });
+                        }
+                        for tc in tool_calls {
+                            blocks.push(ContentBlock::ToolUse {
+                                id: tc.id.clone(),
+                                name: tc.name.clone(),
+                                input: tc.arguments.clone(),
+                            });
+                        }
+                        messages.push(ChatMessage {
+                            role: "assistant".to_string(),
+                            content: if blocks.len() == 1
+                                && matches!(&blocks[0], ContentBlock::Text { .. })
+                            {
+                                ChatContent::Text(content.clone())
+                            } else {
+                                ChatContent::Blocks(blocks)
+                            },
+                        });
+                    }
+                    _ => {}
+                }
+            }
         }
+    }
+    // Flush any remaining tool results
+    if !pending_tool_results.is_empty() {
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: ChatContent::Blocks(pending_tool_results),
+        });
     }
 
     println!("\x1b[1;36mQuine\x1b[0m - Self-bootstrapping CLI assistant");
@@ -132,7 +151,9 @@ pub async fn run_chat(
             let response = if stream {
                 complete_with_streaming(&*provider, request, &renderer).await?
             } else {
+                let spinner = crate::render::Spinner::start("Thinking...");
                 let resp = provider.complete(request).await?;
+                spinner.stop();
                 if !resp.content.is_empty() {
                     renderer.print_assistant_message(&resp.content);
                 }
@@ -186,6 +207,7 @@ pub async fn run_chat(
             }
 
             // Execute tool calls and feed results back
+            let mut tool_result_blocks = Vec::new();
             for tc in &response.tool_calls {
                 renderer.print_tool_call(&tc.name, &tc.arguments);
 
@@ -213,15 +235,17 @@ pub async fn run_chat(
                     result: result.clone(),
                 });
 
-                // Add tool result to messages
-                messages.push(ChatMessage {
-                    role: "user".to_string(),
-                    content: ChatContent::Blocks(vec![ContentBlock::ToolResult {
-                        tool_use_id: tc.id.clone(),
-                        content: result.output.clone(),
-                    }]),
+                tool_result_blocks.push(ContentBlock::ToolResult {
+                    tool_use_id: tc.id.clone(),
+                    content: result.output.clone(),
                 });
             }
+
+            // Add all tool results in a single user message
+            messages.push(ChatMessage {
+                role: "user".to_string(),
+                content: ChatContent::Blocks(tool_result_blocks),
+            });
         }
 
         // Save log after each turn
@@ -250,8 +274,12 @@ async fn complete_with_streaming(
     let mut current_tool_args = String::new();
     let mut stop_reason = StopReason::EndTurn;
 
-    println!();
+    let mut spinner = Some(crate::render::Spinner::start("Thinking..."));
+
     while let Some(event) = stream.next().await {
+        if let Some(s) = spinner.take() {
+            s.stop();
+        }
         match event? {
             StreamEvent::ContentDelta(text) => {
                 renderer.print_delta(&text);
@@ -350,7 +378,9 @@ pub async fn run_print(
             max_tokens: 8192,
         };
 
+        let spinner = crate::render::Spinner::start("Thinking...");
         let response = provider.complete(request).await?;
+        spinner.stop();
 
         let tool_calls_for_log: Vec<ToolCall> = response
             .tool_calls
@@ -395,6 +425,7 @@ pub async fn run_print(
             break;
         }
 
+        let mut tool_result_blocks = Vec::new();
         for tc in &response.tool_calls {
             let result = match registry.get(&tc.name) {
                 Some(tool) => match tool.execute(tc.arguments.clone()).await {
@@ -417,14 +448,16 @@ pub async fn run_print(
                 result: result.clone(),
             });
 
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: ChatContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: tc.id.clone(),
-                    content: result.output.clone(),
-                }]),
+            tool_result_blocks.push(ContentBlock::ToolResult {
+                tool_use_id: tc.id.clone(),
+                content: result.output.clone(),
             });
         }
+
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: ChatContent::Blocks(tool_result_blocks),
+        });
     }
 
     // Save log
@@ -513,6 +546,7 @@ async fn run_subagent_loop(
             return Ok(response.content);
         }
 
+        let mut tool_result_blocks = Vec::new();
         for tc in &response.tool_calls {
             let result = match registry.get(&tc.name) {
                 Some(tool) => match tool.execute(tc.arguments.clone()).await {
@@ -528,14 +562,16 @@ async fn run_subagent_loop(
                 },
             };
 
-            messages.push(ChatMessage {
-                role: "user".to_string(),
-                content: ChatContent::Blocks(vec![ContentBlock::ToolResult {
-                    tool_use_id: tc.id.clone(),
-                    content: result.output.clone(),
-                }]),
+            tool_result_blocks.push(ContentBlock::ToolResult {
+                tool_use_id: tc.id.clone(),
+                content: result.output.clone(),
             });
         }
+
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: ChatContent::Blocks(tool_result_blocks),
+        });
     }
 }
 

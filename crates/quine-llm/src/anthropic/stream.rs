@@ -1,50 +1,45 @@
 use anyhow::Result;
+use eventsource_stream::Eventsource;
 use futures::stream::{BoxStream, StreamExt};
-use reqwest_eventsource::{Event, EventSource};
 
 use super::api_types::{AnthropicBlock, AnthropicStreamEvent, DeltaBlock};
 use crate::types::{StopReason, StreamEvent};
 
-pub fn parse_anthropic_stream(es: EventSource) -> BoxStream<'static, Result<StreamEvent>> {
-    let stream = futures::stream::unfold(es, |mut es| async move {
-        loop {
-            let event = es.next().await?;
-            match event {
-                Ok(Event::Message(msg)) => {
-                    let parsed: std::result::Result<AnthropicStreamEvent, _> =
-                        serde_json::from_str(&msg.data);
-                    match parsed {
-                        Ok(ref ev) if matches!(ev, AnthropicStreamEvent::MessageStop) => {
-                            es.close();
-                            return None;
-                        }
-                        Ok(ev) => {
-                            if let Some(stream_event) = convert_stream_event(ev) {
-                                return Some((stream_event, es));
+pub fn parse_anthropic_sse(response: reqwest::Response) -> BoxStream<'static, Result<StreamEvent>> {
+    let stream = futures::stream::unfold(
+        response.bytes_stream().eventsource(),
+        |mut es| async move {
+            loop {
+                let event = es.next().await?;
+                match event {
+                    Ok(ev) => {
+                        let parsed: std::result::Result<AnthropicStreamEvent, _> =
+                            serde_json::from_str(&ev.data);
+                        match parsed {
+                            Ok(AnthropicStreamEvent::MessageStop) => {
+                                return None;
                             }
-                            // Skip events that convert to None (e.g. MessageStart, Ping)
-                            continue;
-                        }
-                        Err(e) => {
-                            es.close();
-                            return Some((
-                                Err(anyhow::anyhow!("Failed to parse SSE: {}", e)),
-                                es,
-                            ));
+                            Ok(ev) => {
+                                if let Some(stream_event) = convert_stream_event(ev) {
+                                    return Some((stream_event, es));
+                                }
+                                continue;
+                            }
+                            Err(e) => {
+                                return Some((
+                                    Err(anyhow::anyhow!("Failed to parse SSE: {}", e)),
+                                    es,
+                                ));
+                            }
                         }
                     }
-                }
-                Ok(Event::Open) => continue,
-                Err(reqwest_eventsource::Error::StreamEnded) => {
-                    return None;
-                }
-                Err(e) => {
-                    es.close();
-                    return Some((Err(anyhow::anyhow!("SSE error: {}", e)), es));
+                    Err(e) => {
+                        return Some((Err(anyhow::anyhow!("SSE error: {}", e)), es));
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 
     Box::pin(stream)
 }
@@ -78,7 +73,7 @@ fn convert_stream_event(event: AnthropicStreamEvent) -> Option<Result<StreamEven
         }
         AnthropicStreamEvent::Ping => None,
         AnthropicStreamEvent::MessageStart { .. } => None,
-        AnthropicStreamEvent::MessageStop => None, // handled in unfold above
+        AnthropicStreamEvent::MessageStop => None,
         AnthropicStreamEvent::Error { error } => {
             Some(Err(anyhow::anyhow!("Anthropic error: {}", error.message)))
         }

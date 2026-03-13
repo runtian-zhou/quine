@@ -5,8 +5,6 @@ use async_trait::async_trait;
 use futures::stream::BoxStream;
 use quine_core::conversation::ToolCall;
 use reqwest::Client;
-use reqwest_eventsource::EventSource;
-
 use self::api_types::*;
 use crate::provider::LlmProvider;
 use crate::types::*;
@@ -158,7 +156,15 @@ impl LlmProvider for OpenAiProvider {
         if !response.status().is_success() {
             let status = response.status();
             let body = response.text().await.unwrap_or_default();
-            anyhow::bail!("OpenAI API error ({}): {}", status, body);
+            let debug_request = serde_json::to_string_pretty(&api_request)
+                .unwrap_or_else(|_| format!("{:?}", api_request));
+            anyhow::bail!(
+                "OpenAI API error ({}): {}\n\nRequest URL: {}/chat/completions\nRequest body:\n{}",
+                status,
+                body,
+                self.base_url,
+                debug_request
+            );
         }
 
         let api_response: OpenAiResponse = response.json().await?;
@@ -205,14 +211,29 @@ impl LlmProvider for OpenAiProvider {
     ) -> anyhow::Result<BoxStream<'static, anyhow::Result<StreamEvent>>> {
         let api_request = self.build_request(&request, true);
 
-        let req = self
+        let response = self
             .client
             .post(format!("{}/chat/completions", self.base_url))
             .header("Authorization", format!("Bearer {}", self.api_key))
             .header("Content-Type", "application/json")
-            .json(&api_request);
+            .json(&api_request)
+            .send()
+            .await?;
 
-        let es = EventSource::new(req)?;
-        Ok(stream::parse_openai_stream(es))
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let debug_request = serde_json::to_string_pretty(&api_request)
+                .unwrap_or_else(|_| format!("{:?}", api_request));
+            anyhow::bail!(
+                "OpenAI API error ({}): {}\n\nRequest URL: {}/chat/completions\nRequest body:\n{}",
+                status,
+                body,
+                self.base_url,
+                debug_request
+            );
+        }
+
+        Ok(stream::parse_openai_sse(response))
     }
 }
