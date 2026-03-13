@@ -18,6 +18,12 @@ pub enum Event {
         event: StreamEvent,
     },
 
+    /// An LLM call failed.
+    LlmError {
+        agent_id: AgentId,
+        error: String,
+    },
+
     /// Shut down the event loop.
     Shutdown,
 }

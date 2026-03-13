@@ -197,6 +197,9 @@ impl Dispatcher {
                 Event::StreamChunk { agent_id, event } => {
                     self.handle_stream_chunk(agent_id, event).await?;
                 }
+                Event::LlmError { agent_id, error } => {
+                    self.handle_llm_error(agent_id, error).await?;
+                }
                 Event::Shutdown => break,
             }
         }
@@ -543,6 +546,54 @@ impl Dispatcher {
         Ok(())
     }
 
+    /// Handle an LLM error by recovering the agent to an appropriate state.
+    /// Root agents return to WaitingUserInput; subagents report failure to parent.
+    async fn handle_llm_error(&mut self, agent_id: AgentId, error: String) -> Result<()> {
+        self.stop_spinner();
+        eprintln!("\x1b[31mLLM error: {}\x1b[0m", error);
+
+        let is_root = self
+            .agents
+            .get(&agent_id)
+            .map(|a| a.is_root)
+            .unwrap_or(false);
+
+        if is_root {
+            // Recover root agent: go back to WaitingUserInput so the user can retry
+            let agent = self.agents.get_mut(&agent_id).unwrap();
+            agent.state = AgentState::WaitingUserInput;
+            // Remove the last user message so the user can re-send or try something else
+            if let Some(last) = agent.messages.last() {
+                if last.role == "user" {
+                    agent.messages.pop();
+                }
+            }
+            if let Some(log) = &mut agent.conv_log {
+                // Remove the last log entry if it was the user message for this failed turn
+                if let Some(quine_core::conversation::Entry::UserMessage { .. }) =
+                    log.entries.last()
+                {
+                    log.entries.pop();
+                }
+            }
+            self.signal_ready_for_input(PROMPT_NORMAL);
+        } else {
+            // Subagent failed: report error to parent
+            if let Some(info) = self.subagent_info.remove(&agent_id) {
+                self.agents.remove(&agent_id);
+                self.registries.remove(&agent_id);
+                self.handle_subagent_done(
+                    info.parent_id,
+                    info.tool_call_id,
+                    Err(format!("LLM error: {}", error)),
+                )
+                .await?;
+            }
+        }
+
+        Ok(())
+    }
+
     /// Record a tool result and finalize if all tools (including subagents) are done.
     /// Returns true if the agent was finalized and a new LLM call was spawned.
     fn record_and_check_tools(
@@ -727,8 +778,10 @@ impl Dispatcher {
             .map(|w| w.path.as_path())
             .unwrap_or(&self.config.working_dir);
 
-        let sub_registry =
+        let mut sub_registry =
             ToolRegistry::register_defaults_with_context(effective_dir, &self.global_ctx);
+        // Prevent subagents from spawning further subagents
+        sub_registry.unregister("Subagent");
 
         let sub_agent = Agent::new_subagent(sub_config, prompt);
 
@@ -802,14 +855,24 @@ impl Dispatcher {
                                     }
                                 }
                                 Err(e) => {
-                                    eprintln!("\x1b[31mStream error: {}\x1b[0m", e);
+                                    let _ = tx
+                                        .send(Event::LlmError {
+                                            agent_id,
+                                            error: format!("Stream error: {}", e),
+                                        })
+                                        .await;
                                     break;
                                 }
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("\x1b[31mLLM error: {}\x1b[0m", e);
+                        let _ = tx
+                            .send(Event::LlmError {
+                                agent_id,
+                                error: e.to_string(),
+                            })
+                            .await;
                     }
                 }
             } else {
@@ -823,7 +886,12 @@ impl Dispatcher {
                             .await;
                     }
                     Err(e) => {
-                        eprintln!("\x1b[31mLLM error: {}\x1b[0m", e);
+                        let _ = tx
+                            .send(Event::LlmError {
+                                agent_id,
+                                error: e.to_string(),
+                            })
+                            .await;
                     }
                 }
             }
