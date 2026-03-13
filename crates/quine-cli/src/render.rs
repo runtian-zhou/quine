@@ -284,6 +284,22 @@ impl DispatcherUI for CliUI {
     fn start_spinner(&self, label: &str) -> Box<dyn SpinnerHandle> {
         Box::new(Spinner::start(label))
     }
+
+    fn print_info(&self, message: &str) {
+        println!("\x1b[90m{}\x1b[0m", message);
+    }
+
+    fn print_error(&self, message: &str) {
+        eprintln!("\x1b[31m{}\x1b[0m", message);
+    }
+
+    fn normal_prompt(&self) -> &str {
+        "\x1b[1;32m❯\x1b[0m "
+    }
+
+    fn answer_prompt(&self) -> &str {
+        "\x1b[1;33m>\x1b[0m "
+    }
 }
 
 // ─── Input reader ────────────────────────────────────────────────────────────

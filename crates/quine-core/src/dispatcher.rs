@@ -17,9 +17,6 @@ use crate::provider::LlmProvider;
 use crate::tool::{GlobalContext, ToolRegistry};
 use crate::worktree::Worktree;
 
-pub const PROMPT_NORMAL: &str = "\x1b[1;32m❯\x1b[0m ";
-pub const PROMPT_ANSWER: &str = "\x1b[1;33m>\x1b[0m ";
-
 // ─── UI trait ────────────────────────────────────────────────────────────────
 
 /// Abstraction for terminal rendering — implemented by the CLI crate.
@@ -30,6 +27,14 @@ pub trait DispatcherUI: Send {
     fn print_tool_call(&self, name: &str, args: &serde_json::Value);
     fn print_tool_result(&self, success: bool, output: &str);
     fn start_spinner(&self, label: &str) -> Box<dyn SpinnerHandle>;
+    /// Print an informational message (e.g. greeting, goodbye, command output).
+    fn print_info(&self, message: &str);
+    /// Print an error message.
+    fn print_error(&self, message: &str);
+    /// The prompt string shown when waiting for normal user input.
+    fn normal_prompt(&self) -> &str;
+    /// The prompt string shown when answering a question (AskUserQuestion).
+    fn answer_prompt(&self) -> &str;
 }
 
 /// Handle returned by `DispatcherUI::start_spinner`. Call `stop()` to clear it.
@@ -146,7 +151,7 @@ impl Dispatcher {
             input_signal: Arc::new((
                 Mutex::new(InputPromptState {
                     ready: false,
-                    prompt: PROMPT_NORMAL.to_string(),
+                    prompt: String::new(),
                     selection: None,
                 }),
                 Condvar::new(),
@@ -172,6 +177,29 @@ impl Dispatcher {
         state.prompt = prompt.to_string();
         state.selection = None;
         cvar.notify_one();
+    }
+
+    /// Signal the input reader with either a selector or a freeform prompt,
+    /// depending on whether the tool arguments include options.
+    fn signal_question(&self, args: &serde_json::Value) {
+        let answer_prompt = self.ui.answer_prompt().to_string();
+        if let Some(sel) = selection_from_args(args) {
+            let (lock, cvar) = &*self.input_signal;
+            let mut state = lock.lock().unwrap();
+            state.ready = true;
+            state.prompt = answer_prompt;
+            state.selection = Some(sel);
+            cvar.notify_one();
+        } else {
+            let question = args["question"].as_str().unwrap_or("?");
+            self.ui.print_info(&format!("\n  ? {}", question));
+            let (lock, cvar) = &*self.input_signal;
+            let mut state = lock.lock().unwrap();
+            state.ready = true;
+            state.prompt = answer_prompt;
+            state.selection = None;
+            cvar.notify_one();
+        }
     }
 
     fn root_id(&self) -> AgentId {
@@ -207,14 +235,14 @@ impl Dispatcher {
     }
 
     pub async fn run(&mut self) -> Result<()> {
-        println!("\x1b[1;36mQuine\x1b[0m - Self-bootstrapping CLI assistant");
-        println!(
-            "\x1b[90mProvider: {} | Model: {}\x1b[0m",
+        self.ui.print_info("Quine - Self-bootstrapping CLI assistant");
+        self.ui.print_info(&format!(
+            "Provider: {} | Model: {}",
             self.config.provider, self.model
-        );
-        println!("\x1b[90mType your message, /help for commands, Ctrl+D to exit\x1b[0m\n");
+        ));
+        self.ui.print_info("Type your message, /help for commands, Ctrl+D to exit\n");
 
-        self.signal_ready_for_input(PROMPT_NORMAL);
+        self.signal_ready_for_input(self.ui.normal_prompt());
 
         while let Some(event) = self.event_rx.recv().await {
             match event {
@@ -236,7 +264,7 @@ impl Dispatcher {
             }
         }
 
-        println!("\n\x1b[90mGoodbye!\x1b[0m");
+        self.ui.print_info("\nGoodbye!");
         Ok(())
     }
 
@@ -357,7 +385,7 @@ impl Dispatcher {
         if let Some(agent_id) = self.find_agent_waiting_tool_input() {
             let agent = self.agents.get(&agent_id).unwrap();
             if let AgentState::WaitingToolInput { ref arguments, .. } = agent.state {
-                signal_question(&self.input_signal, arguments);
+                self.signal_question(arguments);
             }
         }
     }
@@ -399,7 +427,7 @@ impl Dispatcher {
         }
 
         if text.is_empty() {
-            self.signal_ready_for_input(PROMPT_NORMAL);
+            self.signal_ready_for_input(self.ui.normal_prompt());
             return Ok(false);
         }
 
@@ -423,16 +451,16 @@ impl Dispatcher {
             ) {
                 match result {
                     CommandResult::Continue | CommandResult::Rewound => {
-                        self.signal_ready_for_input(PROMPT_NORMAL);
+                        self.signal_ready_for_input(self.ui.normal_prompt());
                         return Ok(false);
                     }
                     CommandResult::Exit => return Ok(true),
                     CommandResult::Unknown(cmd) => {
-                        println!(
-                            "\x1b[33mUnknown command: {}. Type /help for available commands.\x1b[0m",
+                        self.ui.print_info(&format!(
+                            "Unknown command: {}. Type /help for available commands.",
                             cmd
-                        );
-                        self.signal_ready_for_input(PROMPT_NORMAL);
+                        ));
+                        self.signal_ready_for_input(self.ui.normal_prompt());
                         return Ok(false);
                     }
                 }
@@ -503,7 +531,7 @@ impl Dispatcher {
 
         let agent = self.agents.get_mut(&agent_id).unwrap();
         if let Some(response) = agent.apply_stream_event(event) {
-            println!(); // Newline after streaming
+            self.ui.print_info(""); // Newline after streaming
             // Re-enter as LLM response
             // We need to record it manually since apply_stream_event doesn't record
             let has_tool_calls = !response.tool_calls.is_empty();
@@ -523,7 +551,7 @@ impl Dispatcher {
     /// Root agents return to WaitingUserInput; subagents report failure to parent.
     async fn handle_llm_error(&mut self, agent_id: AgentId, error: String) -> Result<()> {
         self.stop_spinner();
-        eprintln!("\x1b[31mLLM error: {}\x1b[0m", error);
+        self.ui.print_error(&format!("LLM error: {}", error));
 
         let is_root = self
             .agents
@@ -549,7 +577,7 @@ impl Dispatcher {
                     log.entries.pop();
                 }
             }
-            self.signal_ready_for_input(PROMPT_NORMAL);
+            self.signal_ready_for_input(self.ui.normal_prompt());
         } else {
             // Subagent failed: report error to parent
             if let Some(info) = self.subagent_info.remove(&agent_id) {
@@ -785,7 +813,7 @@ impl Dispatcher {
         agent.enter_waiting_tool_input(tc.clone())?;
 
         if !already_waiting {
-            signal_question(&self.input_signal, &tc.arguments);
+            self.signal_question(&tc.arguments);
         }
 
         Ok(())
@@ -899,7 +927,7 @@ impl Dispatcher {
             }
 
             // Root turn done — prompt for next input
-            self.signal_ready_for_input(PROMPT_NORMAL);
+            self.signal_ready_for_input(self.ui.normal_prompt());
         } else {
             // Subagent: notify parent
             if let Some(info) = self.subagent_info.remove(&agent_id) {
@@ -932,33 +960,8 @@ impl Dispatcher {
 
 // ─── Free functions ──────────────────────────────────────────────────────────
 
-/// Signal the input reader with either a selector or a freeform prompt,
-/// depending on whether the tool arguments include options.
-fn signal_question(
-    input_signal: &Arc<(Mutex<InputPromptState>, Condvar)>,
-    args: &serde_json::Value,
-) {
-    if let Some(sel) = selection_from_args(args) {
-        let (lock, cvar) = &**input_signal;
-        let mut state = lock.lock().unwrap();
-        state.ready = true;
-        state.prompt = PROMPT_ANSWER.to_string();
-        state.selection = Some(sel);
-        cvar.notify_one();
-    } else {
-        let question = args["question"].as_str().unwrap_or("?");
-        println!("\n  \x1b[1;33m? {}\x1b[0m", question);
-        let (lock, cvar) = &**input_signal;
-        let mut state = lock.lock().unwrap();
-        state.ready = true;
-        state.prompt = PROMPT_ANSWER.to_string();
-        state.selection = None;
-        cvar.notify_one();
-    }
-}
-
 /// Build a SelectionPrompt from tool arguments, if options are present.
-pub fn selection_from_args(args: &serde_json::Value) -> Option<SelectionPrompt> {
+pub(crate) fn selection_from_args(args: &serde_json::Value) -> Option<SelectionPrompt> {
     let options = args["options"].as_array()?;
     if options.is_empty() {
         return None;
@@ -981,7 +984,7 @@ pub fn selection_from_args(args: &serde_json::Value) -> Option<SelectionPrompt> 
 /// Parse user input against the options in the tool arguments.
 /// If options are present, try to interpret the input as comma-separated numbers.
 /// Returns the resolved text to send back as the tool result.
-pub fn resolve_answer(args: &serde_json::Value, input: &str) -> String {
+pub(crate) fn resolve_answer(args: &serde_json::Value, input: &str) -> String {
     let options = match args["options"].as_array() {
         Some(opts) if !opts.is_empty() => opts,
         _ => return input.to_string(), // freeform mode
@@ -1018,7 +1021,7 @@ pub fn resolve_answer(args: &serde_json::Value, input: &str) -> String {
     }
 }
 
-pub fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
+pub(crate) fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
     match tool_name {
         "Bash" => args["command"]
             .as_str()
