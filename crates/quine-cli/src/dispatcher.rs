@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -43,6 +44,9 @@ pub struct Dispatcher {
     stream: bool,
     next_id: u64,
     spinner: Option<crate::render::Spinner>,
+    /// Shared flag: true when an agent is waiting for user input (AskUserQuestion).
+    /// The input reader thread uses this to switch from the normal `❯` prompt to `> `.
+    awaiting_user_answer: Arc<AtomicBool>,
 }
 
 impl Dispatcher {
@@ -94,6 +98,7 @@ impl Dispatcher {
             stream,
             next_id: 1,
             spinner: None,
+            awaiting_user_answer: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -266,10 +271,16 @@ impl Dispatcher {
 
     fn spawn_input_reader(&self) {
         let tx = self.event_tx.clone();
+        let awaiting = Arc::clone(&self.awaiting_user_answer);
         tokio::task::spawn_blocking(move || {
             let mut rl = rustyline::DefaultEditor::new().unwrap();
             loop {
-                match rl.readline("\x1b[1;32m❯\x1b[0m ") {
+                let prompt = if awaiting.load(Ordering::Relaxed) {
+                    "\x1b[1;33m>\x1b[0m "
+                } else {
+                    "\x1b[1;32m❯\x1b[0m "
+                };
+                match rl.readline(prompt) {
                     Ok(line) => {
                         let trimmed = line.trim_end().to_string();
                         if !trimmed.is_empty() {
@@ -305,6 +316,8 @@ impl Dispatcher {
     async fn handle_user_input(&mut self, text: String) -> Result<bool> {
         // First priority: route to any agent waiting for tool input (AskUserQuestion)
         if let Some(agent_id) = self.find_agent_waiting_tool_input() {
+            self.awaiting_user_answer.store(false, Ordering::Relaxed);
+
             let result = ToolOutput {
                 success: true,
                 output: text,
@@ -312,7 +325,6 @@ impl Dispatcher {
 
             let agent = self.agents.get_mut(&agent_id).unwrap();
             let all_done = agent.resolve_tool_input(result)?;
-            self.renderer.print_tool_result(true, "(user responded)");
 
             if all_done {
                 agent.finalize_tool_results()?;
@@ -645,13 +657,17 @@ impl Dispatcher {
         agent_id: AgentId,
         tc: quine_core::conversation::ToolCall,
     ) -> Result<()> {
-        let question = tc.arguments["question"]
-            .as_str()
-            .unwrap_or("?");
-        println!("\n\x1b[1;33m? {}\x1b[0m", question);
+        // Only print the question if no other agent is already waiting for input
+        if !self.awaiting_user_answer.load(Ordering::Relaxed) {
+            let question = tc.arguments["question"]
+                .as_str()
+                .unwrap_or("?");
+            println!("\n\x1b[1;33m? {}\x1b[0m", question);
+        }
 
         let agent = self.agents.get_mut(&agent_id).unwrap();
         agent.enter_waiting_tool_input(tc)?;
+        self.awaiting_user_answer.store(true, Ordering::Relaxed);
 
         Ok(())
     }
