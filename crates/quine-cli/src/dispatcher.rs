@@ -579,17 +579,17 @@ impl Dispatcher {
                 }
             };
 
+            // AskUserQuestion: skip tool-call rendering, dispatch_ask_user prints the question
+            if tc.name == "AskUserQuestion" {
+                return self.dispatch_ask_user(agent_id, tc);
+            }
+
             self.renderer.print_tool_call(&tc.name, &tc.arguments);
 
             // Subagent: spawn concurrently and continue dispatching remaining tools
             if tc.name == "Subagent" {
                 self.dispatch_subagent(agent_id, tc).await?;
                 continue;
-            }
-
-            // AskUserQuestion: pause until user responds
-            if tc.name == "AskUserQuestion" {
-                return self.dispatch_ask_user(agent_id, tc);
             }
 
             // Permission check
