@@ -4,7 +4,7 @@ use quine_core::conversation::Entry;
 use quine_llm::anthropic::AnthropicProvider;
 use quine_llm::openai::OpenAiProvider;
 use quine_llm::provider::LlmProvider;
-use quine_llm::types::*;
+use quine_core::llm_types::*;
 
 /// Convert conversation log entries into ChatMessage list for the LLM.
 pub fn entries_to_messages(entries: &[Entry]) -> Vec<ChatMessage> {

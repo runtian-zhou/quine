@@ -1,5 +1,5 @@
 use crate::agent::AgentId;
-use quine_llm::types::{CompletionResponse, StreamEvent};
+use crate::llm_types::{CompletionResponse, StreamEvent};
 
 /// Events flow through a single mpsc channel into the Dispatcher.
 pub enum Event {

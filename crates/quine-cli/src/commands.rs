@@ -2,7 +2,7 @@ use crate::interactive::entries_to_messages;
 use crate::permissions::PermissionManager;
 use quine_core::conversation::Entry;
 use quine_core::log::ConversationLog;
-use quine_llm::types::ChatMessage;
+use quine_core::llm_types::ChatMessage;
 
 /// Result of executing a slash command.
 pub enum CommandResult {
