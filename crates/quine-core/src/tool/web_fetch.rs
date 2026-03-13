@@ -98,7 +98,7 @@ impl Tool for WebFetchTool {
 }
 
 /// Simple HTML tag stripping using regex.
-fn strip_html_tags(html: &str) -> String {
+pub fn strip_html_tags(html: &str) -> String {
     // Remove script and style blocks entirely
     let re_script = regex::Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap();
     let text = re_script.replace_all(html, "");

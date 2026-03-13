@@ -125,3 +125,39 @@ fn completion_request_serialization() {
     assert_eq!(value["max_tokens"], 1024);
     assert!(value.get("tools").is_none(), "empty tools should be omitted");
 }
+
+#[test]
+fn usage_default_is_all_zeros() {
+    let usage = quine_llm::types::Usage::default();
+    assert_eq!(usage.input_tokens, 0, "default input_tokens should be exactly 0");
+    assert_eq!(usage.output_tokens, 0, "default output_tokens should be exactly 0");
+    assert_eq!(
+        usage.cache_creation_input_tokens, 0,
+        "default cache_creation_input_tokens should be exactly 0"
+    );
+    assert_eq!(
+        usage.cache_read_input_tokens, 0,
+        "default cache_read_input_tokens should be exactly 0"
+    );
+}
+
+#[test]
+fn usage_clone() {
+    let usage = quine_llm::types::Usage {
+        input_tokens: 42,
+        output_tokens: 99,
+        cache_creation_input_tokens: 7,
+        cache_read_input_tokens: 13,
+    };
+    let cloned = usage.clone();
+    assert_eq!(cloned.input_tokens, 42, "cloned input_tokens should be exactly 42");
+    assert_eq!(cloned.output_tokens, 99, "cloned output_tokens should be exactly 99");
+    assert_eq!(
+        cloned.cache_creation_input_tokens, 7,
+        "cloned cache_creation_input_tokens should be exactly 7"
+    );
+    assert_eq!(
+        cloned.cache_read_input_tokens, 13,
+        "cloned cache_read_input_tokens should be exactly 13"
+    );
+}

@@ -7,6 +7,8 @@ use quine_core::tool::grep::GrepTool;
 use quine_core::tool::list_directory::ListDirectoryTool;
 use quine_core::tool::read::ReadTool;
 use quine_core::tool::skill::SkillTool;
+use quine_core::tool::web_fetch::{strip_html_tags, WebFetchTool};
+use quine_core::tool::web_search::WebSearchTool;
 use quine_core::tool::write::WriteTool;
 use quine_core::tool::{Tool, ToolRegistry};
 use serde_json::json;
@@ -1031,4 +1033,133 @@ async fn todo_schema_includes_dag_fields() {
     let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
     assert!(action_strs.contains(&"add_dep"), "schema should list add_dep action");
     assert!(action_strs.contains(&"remove_dep"), "schema should list remove_dep action");
+}
+
+// --- WebFetchTool ---
+
+#[test]
+fn web_fetch_tool_has_correct_name() {
+    let tool = WebFetchTool::new();
+    assert_eq!(tool.name(), "WebFetch", "WebFetchTool name should be exactly 'WebFetch'");
+}
+
+#[test]
+fn web_fetch_tool_schema_requires_url() {
+    let tool = WebFetchTool::new();
+    let schema = tool.parameters_schema();
+    let required = schema["required"].as_array().unwrap();
+    assert!(
+        required.contains(&json!("url")),
+        "url should be in required fields, got: {:?}",
+        required
+    );
+}
+
+#[tokio::test]
+async fn web_fetch_tool_missing_url_returns_error() {
+    let tool = WebFetchTool::new();
+    let result = tool.execute(json!({})).await;
+    assert!(
+        result.is_err(),
+        "executing WebFetch with no url should return an error"
+    );
+}
+
+#[tokio::test]
+async fn web_fetch_tool_invalid_url_returns_failure() {
+    let tool = WebFetchTool::new();
+    let result = tool
+        .execute(json!({"url": "http://localhost:1"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.success, false,
+        "fetching an unreachable URL should return success=false"
+    );
+}
+
+#[test]
+fn strip_html_tags_removes_tags() {
+    let input = "<p>Hello <b>World</b></p>";
+    let output = strip_html_tags(input);
+    assert_eq!(output, "Hello World", "HTML tags should be stripped, leaving only text content");
+}
+
+#[test]
+fn strip_html_tags_removes_script_blocks() {
+    let input = "<script>alert(1)</script>visible";
+    let output = strip_html_tags(input);
+    assert_eq!(output, "visible", "script blocks and their content should be completely removed");
+}
+
+#[test]
+fn strip_html_tags_removes_style_blocks() {
+    let input = "<style>body{}</style>visible";
+    let output = strip_html_tags(input);
+    assert_eq!(output, "visible", "style blocks and their content should be completely removed");
+}
+
+#[test]
+fn strip_html_tags_decodes_entities() {
+    let input = "&amp; &lt; &gt; &quot; &#39;";
+    let output = strip_html_tags(input);
+    assert_eq!(output, "& < > \" '", "common HTML entities should be decoded to their character equivalents");
+}
+
+// --- WebSearchTool ---
+
+#[test]
+fn web_search_tool_has_correct_name() {
+    let tool = WebSearchTool::new();
+    assert_eq!(tool.name(), "WebSearch", "WebSearchTool name should be exactly 'WebSearch'");
+}
+
+#[test]
+fn web_search_tool_schema_requires_query() {
+    let tool = WebSearchTool::new();
+    let schema = tool.parameters_schema();
+    let required = schema["required"].as_array().unwrap();
+    assert!(
+        required.contains(&json!("query")),
+        "query should be in required fields, got: {:?}",
+        required
+    );
+}
+
+#[tokio::test]
+async fn web_search_tool_missing_query_returns_error() {
+    let tool = WebSearchTool::new();
+    let result = tool.execute(json!({})).await;
+    assert!(
+        result.is_err(),
+        "executing WebSearch with no query should return an error"
+    );
+}
+
+#[tokio::test]
+async fn web_search_tool_missing_api_key_returns_failure() {
+    // Temporarily remove BRAVE_SEARCH_API_KEY if it exists
+    let prev = std::env::var("BRAVE_SEARCH_API_KEY").ok();
+    std::env::remove_var("BRAVE_SEARCH_API_KEY");
+
+    let tool = WebSearchTool::new();
+    let result = tool
+        .execute(json!({"query": "test search"}))
+        .await
+        .unwrap();
+
+    // Restore the env var if it was previously set
+    if let Some(val) = prev {
+        std::env::set_var("BRAVE_SEARCH_API_KEY", val);
+    }
+
+    assert_eq!(
+        result.success, false,
+        "missing BRAVE_SEARCH_API_KEY should return success=false"
+    );
+    assert!(
+        result.output.contains("BRAVE_SEARCH_API_KEY"),
+        "output should mention the missing env var name, got: {}",
+        result.output
+    );
 }
