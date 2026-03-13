@@ -935,6 +935,9 @@ fn selection_from_args(args: &serde_json::Value) -> Option<SelectionPrompt> {
     })
 }
 
+const OTHER_OPTION: &str = "Other (type your own)...";
+const FREEFORM_PROMPT: &str = "Type your response";
+
 /// Run an interactive arrow-key selector. Returns the selected text,
 /// or None if the user cancelled.
 fn run_selector(sel: &SelectionPrompt) -> Option<String> {
@@ -942,20 +945,10 @@ fn run_selector(sel: &SelectionPrompt) -> Option<String> {
 
     let theme = ColorfulTheme::default();
 
-    // If allow_text with no options, just show freeform input directly
-    if sel.options.is_empty() {
-        println!("\n  \x1b[1;33m? {}\x1b[0m", sel.question);
-        let input = Input::<String>::with_theme(&theme)
-            .with_prompt("Your response")
-            .interact_text()
-            .ok()?;
-        return Some(input);
-    }
-
     if sel.multi {
         let mut items = sel.options.clone();
         if sel.allow_text {
-            items.push("Other (type your own)...".to_string());
+            items.push(OTHER_OPTION.to_string());
         }
 
         let chosen = MultiSelect::with_theme(&theme)
@@ -966,26 +959,35 @@ fn run_selector(sel: &SelectionPrompt) -> Option<String> {
 
         let indices = chosen?;
         if indices.is_empty() {
-            return Some(String::new());
+            return Some("(no selection)".to_string());
         }
 
-        if sel.allow_text && indices.contains(&(items.len() - 1)) {
-            let input = Input::<String>::with_theme(&theme)
-                .with_prompt("Type your response")
-                .interact_text()
-                .ok()?;
-            return Some(input);
-        }
+        let other_idx = items.len() - 1;
+        let has_other = sel.allow_text && indices.contains(&other_idx);
 
-        let selected: Vec<String> = indices
+        // Collect the real (non-"Other") selections
+        let mut selected: Vec<String> = indices
             .iter()
+            .filter(|&&i| !(sel.allow_text && i == other_idx))
             .map(|&i| sel.options[i].clone())
             .collect();
+
+        // If "Other..." was checked, prompt for freeform and append it
+        if has_other {
+            let input = Input::<String>::with_theme(&theme)
+                .with_prompt(FREEFORM_PROMPT)
+                .interact_text()
+                .ok()?;
+            if !input.is_empty() {
+                selected.push(input);
+            }
+        }
+
         Some(selected.join(", "))
     } else {
         let mut items = sel.options.clone();
         if sel.allow_text {
-            items.push("Other (type your own)...".to_string());
+            items.push(OTHER_OPTION.to_string());
         }
 
         let chosen = Select::with_theme(&theme)
@@ -999,7 +1001,7 @@ fn run_selector(sel: &SelectionPrompt) -> Option<String> {
 
         if sel.allow_text && idx == items.len() - 1 {
             let input = Input::<String>::with_theme(&theme)
-                .with_prompt("Type your response")
+                .with_prompt(FREEFORM_PROMPT)
                 .interact_text()
                 .ok()?;
             return Some(input);
@@ -1115,5 +1117,49 @@ mod tests {
     fn resolve_answer_empty_options_is_freeform() {
         let args = json!({"question": "What?", "options": []});
         assert_eq!(resolve_answer(&args, "hello"), "hello");
+    }
+
+    #[test]
+    fn selection_from_args_returns_none_without_options() {
+        let args = json!({"question": "What?"});
+        assert!(selection_from_args(&args).is_none());
+    }
+
+    #[test]
+    fn selection_from_args_returns_none_for_empty_options() {
+        let args = json!({"question": "What?", "options": []});
+        assert!(selection_from_args(&args).is_none());
+    }
+
+    #[test]
+    fn selection_from_args_defaults_to_single_select() {
+        let args = json!({"question": "Pick", "options": ["a", "b"]});
+        let sel = selection_from_args(&args).unwrap();
+        assert!(!sel.multi);
+        assert!(!sel.allow_text);
+        assert_eq!(sel.options, vec!["a", "b"]);
+        assert_eq!(sel.question, "Pick");
+    }
+
+    #[test]
+    fn selection_from_args_multi_select_true() {
+        let args = json!({"question": "Pick", "options": ["x", "y"], "multi_select": true});
+        let sel = selection_from_args(&args).unwrap();
+        assert!(sel.multi);
+    }
+
+    #[test]
+    fn selection_from_args_multi_select_false() {
+        let args = json!({"question": "Pick", "options": ["x"], "multi_select": false});
+        let sel = selection_from_args(&args).unwrap();
+        assert!(!sel.multi);
+    }
+
+    #[test]
+    fn selection_from_args_allow_text() {
+        let args = json!({"question": "Pick", "options": ["a"], "allow_text": true, "multi_select": true});
+        let sel = selection_from_args(&args).unwrap();
+        assert!(sel.multi);
+        assert!(sel.allow_text);
     }
 }
