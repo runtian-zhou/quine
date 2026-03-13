@@ -51,12 +51,14 @@ impl Tool for BashTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("command is required"))?;
 
+        let start = std::time::Instant::now();
         let output = Command::new("sh")
             .arg("-c")
             .arg(command)
             .current_dir(&self.working_dir)
             .env("TERM", "dumb")
             .output();
+        let elapsed = start.elapsed();
 
         match output {
             Ok(output) => {
@@ -94,19 +96,33 @@ impl Tool for BashTool {
                     );
                 }
 
+                let time_suffix = format_elapsed(elapsed);
                 Ok(ToolOutput {
                     success: output.status.success(),
                     output: if output.status.success() {
-                        result
+                        format!("{}\n{}", result, time_suffix)
                     } else {
-                        format!("Exit code {}\n{}", exit_code, result)
+                        format!("Exit code {}\n{}\n{}", exit_code, result, time_suffix)
                     },
                 })
             }
             Err(e) => Ok(ToolOutput {
                 success: false,
-                output: format!("Failed to execute command: {}", e),
+                output: format!(
+                    "Failed to execute command: {}\n{}",
+                    e,
+                    format_elapsed(elapsed)
+                ),
             }),
         }
+    }
+}
+
+fn format_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 1.0 {
+        format!("(completed in {:.0}ms)", secs * 1000.0)
+    } else {
+        format!("(completed in {:.1}s)", secs)
     }
 }
