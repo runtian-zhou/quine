@@ -53,10 +53,22 @@ pub struct Dispatcher {
 
 /// Shared state between the dispatcher and the input reader thread.
 struct InputPromptState {
-    /// When true, the reader should call readline with `prompt`.
+    /// When true, the reader should call readline or show a selector.
     ready: bool,
     /// The prompt string to display (normal turn vs answering a question).
     prompt: String,
+    /// When set, show an interactive selector instead of readline.
+    selection: Option<SelectionPrompt>,
+}
+
+/// Configuration for an interactive arrow-key selector.
+struct SelectionPrompt {
+    question: String,
+    options: Vec<String>,
+    /// If true, allow multiple selections.
+    multi: bool,
+    /// If true, allow freeform text as a fallback (adds a "Other..." option).
+    allow_text: bool,
 }
 
 impl Dispatcher {
@@ -112,6 +124,7 @@ impl Dispatcher {
                 Mutex::new(InputPromptState {
                     ready: false,
                     prompt: PROMPT_NORMAL.to_string(),
+                    selection: None,
                 }),
                 Condvar::new(),
             )),
@@ -124,6 +137,7 @@ impl Dispatcher {
         let mut state = lock.lock().unwrap();
         state.ready = true;
         state.prompt = prompt.to_string();
+        state.selection = None;
         cvar.notify_one();
     }
 
@@ -302,15 +316,33 @@ impl Dispatcher {
             let mut rl = rustyline::DefaultEditor::new().unwrap();
             loop {
                 // Wait until the dispatcher signals we should prompt for input.
-                let prompt = {
+                let (prompt, selection) = {
                     let (lock, cvar) = &*signal;
                     let mut state = lock.lock().unwrap();
                     while !state.ready {
                         state = cvar.wait(state).unwrap();
                     }
                     state.ready = false;
-                    state.prompt.clone()
+                    (state.prompt.clone(), state.selection.take())
                 };
+
+                // If we have a selection prompt, use dialoguer instead of readline.
+                if let Some(sel) = selection {
+                    let result = run_selector(&sel);
+                    match result {
+                        Some(text) => {
+                            if tx.blocking_send(Event::UserInput(text)).is_err() {
+                                break;
+                            }
+                        }
+                        None => {
+                            // User cancelled (Esc / Ctrl+C)
+                            let _ = tx.blocking_send(Event::Shutdown);
+                            break;
+                        }
+                    }
+                    continue;
+                }
 
                 match rl.readline(&prompt) {
                     Ok(line) => {
@@ -349,8 +381,7 @@ impl Dispatcher {
         if let Some(agent_id) = self.find_agent_waiting_tool_input() {
             let agent = self.agents.get(&agent_id).unwrap();
             if let crate::agent::AgentState::WaitingToolInput { ref arguments, .. } = agent.state {
-                render_question(arguments);
-                self.signal_ready_for_input(PROMPT_ANSWER);
+                signal_question(&self.input_signal, arguments);
             }
         }
     }
@@ -721,15 +752,14 @@ impl Dispatcher {
         agent_id: AgentId,
         tc: quine_core::conversation::ToolCall,
     ) -> Result<()> {
-        // Only print the question and prompt if no other agent is already waiting
+        // Only show prompt if no other agent is already waiting
         let already_waiting = self.find_agent_waiting_tool_input().is_some();
 
         let agent = self.agents.get_mut(&agent_id).unwrap();
         agent.enter_waiting_tool_input(tc.clone())?;
 
         if !already_waiting {
-            render_question(&tc.arguments);
-            self.signal_ready_for_input(PROMPT_ANSWER);
+            signal_question(&self.input_signal, &tc.arguments);
         }
 
         Ok(())
@@ -859,23 +889,114 @@ impl Dispatcher {
     }
 }
 
-/// Summarize tool arguments for permission prompt context.
-/// Print a question with optional numbered options.
-fn render_question(args: &serde_json::Value) {
-    let question = args["question"].as_str().unwrap_or("?");
-    println!("\n  \x1b[1;33m? {}\x1b[0m", question);
+/// Signal the input reader with either a selector or a freeform prompt,
+/// depending on whether the tool arguments include options.
+fn signal_question(
+    input_signal: &Arc<(Mutex<InputPromptState>, Condvar)>,
+    args: &serde_json::Value,
+) {
+    if let Some(sel) = selection_from_args(args) {
+        let (lock, cvar) = &**input_signal;
+        let mut state = lock.lock().unwrap();
+        state.ready = true;
+        state.prompt = PROMPT_ANSWER.to_string();
+        state.selection = Some(sel);
+        cvar.notify_one();
+    } else {
+        let question = args["question"].as_str().unwrap_or("?");
+        println!("\n  \x1b[1;33m? {}\x1b[0m", question);
+        let (lock, cvar) = &**input_signal;
+        let mut state = lock.lock().unwrap();
+        state.ready = true;
+        state.prompt = PROMPT_ANSWER.to_string();
+        state.selection = None;
+        cvar.notify_one();
+    }
+}
 
-    if let Some(options) = args["options"].as_array() {
-        for (i, opt) in options.iter().enumerate() {
-            let label = opt.as_str().unwrap_or("?");
-            println!("  \x1b[36m  {})\x1b[0m {}", i + 1, label);
+/// Build a SelectionPrompt from tool arguments, if options are present.
+fn selection_from_args(args: &serde_json::Value) -> Option<SelectionPrompt> {
+    let options = args["options"].as_array()?;
+    if options.is_empty() {
+        return None;
+    }
+    let question = args["question"].as_str().unwrap_or("?").to_string();
+    let allow_text = args["allow_text"].as_bool().unwrap_or(false);
+    let items: Vec<String> = options
+        .iter()
+        .map(|v| v.as_str().unwrap_or("?").to_string())
+        .collect();
+    Some(SelectionPrompt {
+        question,
+        options: items,
+        multi: true,
+        allow_text,
+    })
+}
+
+/// Run an interactive arrow-key selector. Returns the selected text,
+/// or None if the user cancelled.
+fn run_selector(sel: &SelectionPrompt) -> Option<String> {
+    use dialoguer::{theme::ColorfulTheme, MultiSelect, Select};
+
+    let theme = ColorfulTheme::default();
+
+    if sel.multi {
+        // Build items with an optional "Other..." entry for freeform
+        let mut items = sel.options.clone();
+        if sel.allow_text {
+            items.push("Other (type your own)...".to_string());
         }
-        let allow_text = args["allow_text"].as_bool().unwrap_or(false);
-        if allow_text {
-            println!("  \x1b[90m  (enter number(s) or type your own response)\x1b[0m");
-        } else {
-            println!("  \x1b[90m  (enter number(s), comma-separated for multiple)\x1b[0m");
+
+        let chosen = MultiSelect::with_theme(&theme)
+            .with_prompt(&sel.question)
+            .items(&items)
+            .interact_opt()
+            .ok()?;
+
+        let indices = chosen?;
+        if indices.is_empty() {
+            return Some(String::new());
         }
+
+        // Check if the "Other..." option was selected
+        if sel.allow_text && indices.contains(&(items.len() - 1)) {
+            // Fall back to freeform input
+            let input = dialoguer::Input::<String>::with_theme(&theme)
+                .with_prompt("Your response")
+                .interact_text()
+                .ok()?;
+            return Some(input);
+        }
+
+        let selected: Vec<String> = indices
+            .iter()
+            .map(|&i| sel.options[i].clone())
+            .collect();
+        Some(selected.join(", "))
+    } else {
+        let mut items = sel.options.clone();
+        if sel.allow_text {
+            items.push("Other (type your own)...".to_string());
+        }
+
+        let chosen = Select::with_theme(&theme)
+            .with_prompt(&sel.question)
+            .items(&items)
+            .interact_opt()
+            .ok()?;
+
+        let idx = chosen?;
+
+        if sel.allow_text && idx == items.len() - 1 {
+            let input = dialoguer::Input::<String>::with_theme(&theme)
+                .with_prompt("Your response")
+                .interact_text()
+                .ok()?;
+            return Some(input);
+        }
+
+        Some(sel.options[idx].clone())
     }
 }
 
