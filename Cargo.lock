@@ -1455,6 +1455,7 @@ dependencies = [
  "chrono",
  "glob",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",

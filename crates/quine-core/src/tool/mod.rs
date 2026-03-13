@@ -8,6 +8,8 @@ pub mod read;
 pub mod skill;
 pub mod subagent;
 pub mod todo;
+pub mod web_fetch;
+pub mod web_search;
 pub mod write;
 
 use anyhow::Result;
@@ -98,6 +100,8 @@ impl ToolRegistry {
         // Register the shared Arc — all registries built from the same context
         // point at the same TodoTool instance.
         registry.register(Box::new(Arc::clone(&ctx.todo)));
+        registry.register(Box::new(web_fetch::WebFetchTool::new()));
+        registry.register(Box::new(web_search::WebSearchTool::new()));
         registry
     }
 }

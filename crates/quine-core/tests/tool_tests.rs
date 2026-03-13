@@ -778,6 +778,8 @@ fn tool_registry_register_defaults_has_all_tools() {
     assert!(registry.get("ListDirectory").is_some(), "should have ListDirectory tool");
     assert!(registry.get("Skill").is_some(), "should have Skill tool");
     assert!(registry.get("Todo").is_some(), "should have Todo tool");
+    assert!(registry.get("WebFetch").is_some(), "should have WebFetch tool");
+    assert!(registry.get("WebSearch").is_some(), "should have WebSearch tool");
 }
 
 #[test]
@@ -793,7 +795,7 @@ fn tool_registry_all_schemas_returns_correct_count() {
     let registry = ToolRegistry::register_defaults(tmp.path());
     let schemas = registry.all_schemas();
 
-    assert_eq!(schemas.len(), 9, "should have exactly 9 tool schemas (Bash, Read, Write, Edit, Glob, Grep, ListDirectory, Skill, Todo)");
+    assert_eq!(schemas.len(), 11, "should have exactly 11 tool schemas (Bash, Read, Write, Edit, Glob, Grep, ListDirectory, Skill, Todo, WebFetch, WebSearch)");
 
     for schema in &schemas {
         assert!(schema["name"].is_string(), "each schema should have a name");
