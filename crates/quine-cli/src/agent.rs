@@ -28,6 +28,16 @@ pub enum AgentState {
         pending: VecDeque<ToolCall>,
         results: Vec<ToolResultEntry>,
     },
+    /// Paused during tool execution, waiting for user input to complete a tool
+    /// (e.g. AskUserQuestion). The current tool call info is stored here so the
+    /// dispatcher knows which tool to resume when input arrives.
+    WaitingToolInput {
+        pending: VecDeque<ToolCall>,
+        results: Vec<ToolResultEntry>,
+        tool_call_id: String,
+        tool_name: String,
+        arguments: Value,
+    },
     /// Agent has finished (subagents reach this state).
     Done {
         final_text: String,
@@ -291,6 +301,70 @@ impl Agent {
         }
     }
 
+    /// Transition from ExecutingTools → WaitingToolInput.
+    /// Called when a tool (e.g. AskUserQuestion) needs user input to complete.
+    /// The popped tool call info is stored in the state so the dispatcher can
+    /// resume the right tool when user input arrives.
+    pub fn enter_waiting_tool_input(&mut self, tc: ToolCall) -> anyhow::Result<()> {
+        let (pending, results) =
+            if let AgentState::ExecutingTools { pending, results } = &mut self.state {
+                (std::mem::take(pending), std::mem::take(results))
+            } else {
+                anyhow::bail!("enter_waiting_tool_input called in invalid state");
+            };
+
+        self.state = AgentState::WaitingToolInput {
+            pending,
+            results,
+            tool_call_id: tc.id,
+            tool_name: tc.name,
+            arguments: tc.arguments,
+        };
+        Ok(())
+    }
+
+    /// Transition from WaitingToolInput → ExecutingTools by providing the user's
+    /// response as the tool result. Returns true if all tools are now done.
+    pub fn resolve_tool_input(&mut self, user_response: ToolOutput) -> anyhow::Result<bool> {
+        let (pending, mut results, tool_call_id, tool_name, arguments) =
+            if let AgentState::WaitingToolInput {
+                pending,
+                results,
+                tool_call_id,
+                tool_name,
+                arguments,
+            } = &mut self.state
+            {
+                (
+                    std::mem::take(pending),
+                    std::mem::take(results),
+                    std::mem::take(tool_call_id),
+                    std::mem::take(tool_name),
+                    std::mem::take(arguments),
+                )
+            } else {
+                anyhow::bail!("resolve_tool_input called in invalid state");
+            };
+
+        // Log tool execution
+        if let Some(log) = &mut self.conv_log {
+            log.push(Entry::ToolExecution {
+                tool_call_id: tool_call_id.clone(),
+                tool_name: tool_name.clone(),
+                arguments: arguments.clone(),
+                result: user_response.clone(),
+            });
+        }
+        results.push(ToolResultEntry {
+            tool_call_id,
+            result: user_response,
+        });
+
+        let all_done = pending.is_empty();
+        self.state = AgentState::ExecutingTools { pending, results };
+        Ok(all_done)
+    }
+
     /// Record a tool result. Returns true if all tools are done.
     pub fn record_tool_result(
         &mut self,
@@ -345,6 +419,11 @@ impl Agent {
 
         self.state = AgentState::WaitingLlmResponse;
         Ok(())
+    }
+
+    /// Check if this agent is currently waiting for tool input from the user.
+    pub fn is_waiting_tool_input(&self) -> bool {
+        matches!(self.state, AgentState::WaitingToolInput { .. })
     }
 
     /// Apply a streaming event. Returns `Some(response)` when stream is done.
@@ -659,5 +738,169 @@ mod tests {
         let response = agent.apply_stream_event(StreamEvent::Done(StopReason::EndTurn));
         assert!(response.is_some(), "should return response on Done");
         assert!(agent.stream_acc.is_none(), "accumulator should be cleared after Done");
+    }
+
+    #[test]
+    fn enter_waiting_tool_input_transitions_from_executing() {
+        let mut agent = Agent::new_root(
+            make_config(),
+            make_conv_log(),
+            vec![],
+        );
+        agent.state = AgentState::ExecutingTools {
+            pending: VecDeque::from(vec![ToolCall {
+                id: "tc2".to_string(),
+                name: "Glob".to_string(),
+                arguments: serde_json::json!({}),
+            }]),
+            results: vec![ToolResultEntry {
+                tool_call_id: "tc0".to_string(),
+                result: ToolOutput { success: true, output: "done".to_string() },
+            }],
+        };
+
+        let ask_tc = ToolCall {
+            id: "tc1".to_string(),
+            name: "AskUserQuestion".to_string(),
+            arguments: serde_json::json!({"question": "What file?"}),
+        };
+        agent.enter_waiting_tool_input(ask_tc).unwrap();
+
+        assert!(
+            agent.is_waiting_tool_input(),
+            "agent should be in WaitingToolInput state"
+        );
+        if let AgentState::WaitingToolInput {
+            ref pending,
+            ref results,
+            ref tool_call_id,
+            ref tool_name,
+            ..
+        } = agent.state
+        {
+            assert_eq!(pending.len(), 1, "pending should carry over the remaining tool call");
+            assert_eq!(results.len(), 1, "results should carry over previous results");
+            assert_eq!(tool_call_id, "tc1", "tool_call_id should be the ask tool");
+            assert_eq!(tool_name, "AskUserQuestion", "tool_name should be AskUserQuestion");
+        } else {
+            panic!("expected WaitingToolInput state");
+        }
+    }
+
+    #[test]
+    fn enter_waiting_tool_input_invalid_state_returns_error() {
+        let mut agent = Agent::new_root(
+            make_config(),
+            make_conv_log(),
+            vec![],
+        );
+        // WaitingUserInput is not a valid state for this transition
+        let tc = ToolCall {
+            id: "tc1".to_string(),
+            name: "AskUserQuestion".to_string(),
+            arguments: serde_json::json!({}),
+        };
+        let result = agent.enter_waiting_tool_input(tc);
+        assert!(result.is_err(), "should error when called in WaitingUserInput state");
+    }
+
+    #[test]
+    fn resolve_tool_input_transitions_back_to_executing() {
+        let mut agent = Agent::new_root(
+            make_config(),
+            make_conv_log(),
+            vec![],
+        );
+        agent.state = AgentState::WaitingToolInput {
+            pending: VecDeque::from(vec![ToolCall {
+                id: "tc2".to_string(),
+                name: "Glob".to_string(),
+                arguments: serde_json::json!({}),
+            }]),
+            results: vec![],
+            tool_call_id: "tc1".to_string(),
+            tool_name: "AskUserQuestion".to_string(),
+            arguments: serde_json::json!({"question": "What file?"}),
+        };
+
+        let user_response = ToolOutput {
+            success: true,
+            output: "test.rs".to_string(),
+        };
+        let all_done = agent.resolve_tool_input(user_response).unwrap();
+        assert!(!all_done, "should not be all done when pending tools remain");
+        assert!(
+            matches!(agent.state, AgentState::ExecutingTools { ref pending, ref results, .. }
+                if pending.len() == 1 && results.len() == 1),
+            "should transition back to ExecutingTools with 1 pending and 1 result"
+        );
+    }
+
+    #[test]
+    fn resolve_tool_input_all_done_when_no_pending() {
+        let mut agent = Agent::new_root(
+            make_config(),
+            make_conv_log(),
+            vec![],
+        );
+        agent.state = AgentState::WaitingToolInput {
+            pending: VecDeque::new(),
+            results: vec![],
+            tool_call_id: "tc1".to_string(),
+            tool_name: "AskUserQuestion".to_string(),
+            arguments: serde_json::json!({"question": "What file?"}),
+        };
+
+        let user_response = ToolOutput {
+            success: true,
+            output: "test.rs".to_string(),
+        };
+        let all_done = agent.resolve_tool_input(user_response).unwrap();
+        assert!(all_done, "should be all done when no pending tools remain");
+    }
+
+    #[test]
+    fn resolve_tool_input_invalid_state_returns_error() {
+        let mut agent = Agent::new_root(
+            make_config(),
+            make_conv_log(),
+            vec![],
+        );
+        // WaitingUserInput is not a valid state
+        let result = agent.resolve_tool_input(ToolOutput {
+            success: true,
+            output: "test".to_string(),
+        });
+        assert!(result.is_err(), "should error when called in WaitingUserInput state");
+    }
+
+    #[test]
+    fn resolve_tool_input_logs_tool_execution() {
+        let mut agent = Agent::new_root(
+            make_config(),
+            make_conv_log(),
+            vec![],
+        );
+        agent.state = AgentState::WaitingToolInput {
+            pending: VecDeque::new(),
+            results: vec![],
+            tool_call_id: "tc1".to_string(),
+            tool_name: "AskUserQuestion".to_string(),
+            arguments: serde_json::json!({"question": "What file?"}),
+        };
+
+        agent.resolve_tool_input(ToolOutput {
+            success: true,
+            output: "test.rs".to_string(),
+        }).unwrap();
+
+        let log = agent.conv_log.as_ref().unwrap();
+        assert_eq!(log.entries.len(), 1, "should have logged one tool execution entry");
+        if let Entry::ToolExecution { ref tool_name, ref result, .. } = log.entries[0] {
+            assert_eq!(tool_name, "AskUserQuestion", "logged tool name should be AskUserQuestion");
+            assert_eq!(result.output, "test.rs", "logged output should be 'test.rs'");
+        } else {
+            panic!("expected ToolExecution entry");
+        }
     }
 }

@@ -26,19 +26,10 @@ struct SubagentInfo {
     _worktree: Option<Worktree>,
 }
 
-/// When an AskUserQuestion tool is pending, the next user input is routed here.
-struct PendingAskUser {
-    agent_id: AgentId,
-    tool_call_id: String,
-    tool_name: String,
-    arguments: serde_json::Value,
-}
-
 pub struct Dispatcher {
     agents: HashMap<AgentId, Agent>,
     registries: HashMap<AgentId, ToolRegistry>,
     subagent_info: HashMap<AgentId, SubagentInfo>,
-    pending_ask_user: Option<PendingAskUser>,
     event_tx: mpsc::Sender<Event>,
     event_rx: mpsc::Receiver<Event>,
     provider: Arc<dyn LlmProvider>,
@@ -89,7 +80,6 @@ impl Dispatcher {
             agents,
             registries,
             subagent_info: HashMap::new(),
-            pending_ask_user: None,
             event_tx,
             event_rx,
             provider,
@@ -279,22 +269,33 @@ impl Dispatcher {
         });
     }
 
+    /// Find an agent that is in WaitingToolInput state (e.g. AskUserQuestion).
+    fn find_agent_waiting_tool_input(&self) -> Option<AgentId> {
+        self.agents
+            .iter()
+            .find(|(_, agent)| agent.is_waiting_tool_input())
+            .map(|(&id, _)| id)
+    }
+
     /// Handle user input. Returns true if the loop should exit.
     async fn handle_user_input(&mut self, text: String) -> Result<bool> {
-        // If there's a pending AskUserQuestion, route the input there
-        if let Some(pending) = self.pending_ask_user.take() {
+        // First priority: route to any agent waiting for tool input (AskUserQuestion)
+        if let Some(agent_id) = self.find_agent_waiting_tool_input() {
             let result = ToolOutput {
                 success: true,
                 output: text,
             };
-            self.handle_tool_result(
-                pending.agent_id,
-                pending.tool_call_id,
-                pending.tool_name,
-                pending.arguments,
-                result,
-            )
-            .await?;
+
+            let agent = self.agents.get_mut(&agent_id).unwrap();
+            let all_done = agent.resolve_tool_input(result)?;
+            self.renderer.print_tool_result(true, "(user responded)");
+
+            if all_done {
+                agent.finalize_tool_results()?;
+                self.spawn_llm_call(agent_id);
+            } else {
+                self.dispatch_next_tool(agent_id).await?;
+            }
             return Ok(false);
         }
 
@@ -302,8 +303,15 @@ impl Dispatcher {
             return Ok(false);
         }
 
-        // Handle slash commands
+        // Only accept new turns when the root agent is idle (WaitingUserInput)
         let root_id = self.root_id();
+        let agent = self.agents.get(&root_id).unwrap();
+        if !matches!(agent.state, AgentState::WaitingUserInput) {
+            // Agent is busy (LLM thinking, executing tools, etc.) — ignore input
+            return Ok(false);
+        }
+
+        // Handle slash commands
         let agent = self.agents.get_mut(&root_id).unwrap();
         if let Some(ref mut log) = agent.conv_log {
             if let Some(result) = commands::handle_command(
@@ -591,12 +599,8 @@ impl Dispatcher {
             .unwrap_or("?");
         println!("\n\x1b[1;33m? {}\x1b[0m", question);
 
-        self.pending_ask_user = Some(PendingAskUser {
-            agent_id,
-            tool_call_id: tc.id,
-            tool_name: tc.name,
-            arguments: tc.arguments,
-        });
+        let agent = self.agents.get_mut(&agent_id).unwrap();
+        agent.enter_waiting_tool_input(tc)?;
 
         Ok(())
     }
