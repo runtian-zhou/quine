@@ -14,7 +14,7 @@ pub struct TestCase {
     pub id: String,
     /// Human-readable description
     pub description: String,
-    /// The prompt to send to both CLIs
+    /// The prompt to send to the CLI
     pub prompt: String,
     /// Files to pre-create in the working directory before running
     #[serde(default)]
@@ -45,9 +45,7 @@ pub struct ExpectedFile {
 pub struct RunResult {
     pub suite_name: String,
     pub timestamp: DateTime<Utc>,
-    pub quine_model: String,
-    pub claude_model: String,
-    pub judge_model: String,
+    pub model: String,
     pub test_results: Vec<TestResult>,
     pub summary: Summary,
 }
@@ -56,10 +54,7 @@ pub struct RunResult {
 pub struct TestResult {
     pub test_id: String,
     pub description: String,
-    pub quine: ExecutionResult,
-    pub claude: ExecutionResult,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub judge: Option<JudgeVerdict>,
+    pub result: ExecutionResult,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,45 +76,17 @@ pub struct OutputFile {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JudgeVerdict {
-    /// Overall winner: "quine", "claude", or "tie"
-    pub winner: String,
-    /// Score for Quine (0-10)
-    pub quine_score: u32,
-    /// Score for Claude Code (0-10)
-    pub claude_score: u32,
-    /// Detailed reasoning
-    pub reasoning: String,
-    /// Per-criterion scores if eval_criteria were specified
-    #[serde(default)]
-    pub criteria_scores: Vec<CriterionScore>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CriterionScore {
-    pub criterion: String,
-    pub quine_score: u32,
-    pub claude_score: u32,
-    pub note: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Summary {
     pub total_tests: usize,
-    pub quine_wins: usize,
-    pub claude_wins: usize,
-    pub ties: usize,
-    pub quine_avg_score: f64,
-    pub claude_avg_score: f64,
-    pub quine_file_checks_passed: usize,
-    pub claude_file_checks_passed: usize,
+    pub passed: usize,
+    pub failed: usize,
 }
 
 impl TestSuite {
     pub fn example() -> Self {
         TestSuite {
             name: "Example Test Suite".to_string(),
-            description: "Sample tests to compare Claude Code vs Quine".to_string(),
+            description: "Sample tests for Quine CLI".to_string(),
             tests: vec![
                 TestCase {
                     id: "hello-world".to_string(),
