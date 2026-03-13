@@ -1,4 +1,5 @@
 use crate::interactive::entries_to_messages;
+use crate::permissions::PermissionManager;
 use quine_core::conversation::Entry;
 use quine_core::log::ConversationLog;
 use quine_llm::types::ChatMessage;
@@ -39,6 +40,7 @@ pub fn handle_command(
     conv_log: &mut ConversationLog,
     messages: &mut Vec<ChatMessage>,
     session_usage: &SessionUsage,
+    permissions: &PermissionManager,
 ) -> Option<CommandResult> {
     let input = input.trim();
     if !input.starts_with('/') {
@@ -57,6 +59,7 @@ pub fn handle_command(
             println!("  \x1b[1m/rewind N\x1b[0m       Go back N user turns");
             println!("  \x1b[1m/clear\x1b[0m          Reset conversation to empty");
             println!("  \x1b[1m/tokens\x1b[0m         Show session token usage");
+            println!("  \x1b[1m/permissions\x1b[0m    Show tool permission status");
             println!("  \x1b[1m/quit\x1b[0m, \x1b[1m/exit\x1b[0m   Exit the session");
             Some(CommandResult::Continue)
         }
@@ -82,6 +85,10 @@ pub fn handle_command(
         }
         "/tokens" => {
             print_token_usage(session_usage);
+            Some(CommandResult::Continue)
+        }
+        "/permissions" => {
+            permissions.print_status();
             Some(CommandResult::Continue)
         }
         _ => Some(CommandResult::Unknown(cmd.to_string())),

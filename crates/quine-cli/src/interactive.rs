@@ -18,6 +18,7 @@ use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
 use crate::commands::{self, CommandResult, SessionUsage};
+use crate::permissions::PermissionManager;
 use crate::render::Renderer;
 
 /// Convert conversation log entries into ChatMessage list for the LLM.
@@ -116,6 +117,7 @@ pub async fn run_chat(
     let tool_schemas = registry.all_schemas();
     let renderer = Renderer::new();
     let mut session_usage = SessionUsage::default();
+    let mut permissions = PermissionManager::new();
 
     let mut conv_log = if let Some(log_path) = &continue_from {
         println!("Continuing from: {}", log_path.display());
@@ -156,6 +158,7 @@ pub async fn run_chat(
             &mut conv_log,
             &mut messages,
             &session_usage,
+            &permissions,
         ) {
             match result {
                 CommandResult::Continue | CommandResult::Rewound => continue,
@@ -255,6 +258,27 @@ pub async fn run_chat(
             let mut tool_result_blocks = Vec::new();
             for tc in &response.tool_calls {
                 renderer.print_tool_call(&tc.name, &tc.arguments);
+
+                // Permission check
+                let context = format!("({})", summarize_tool_args(&tc.name, &tc.arguments));
+                if !permissions.check(&tc.name, &context) {
+                    let result = ToolOutput {
+                        success: false,
+                        output: "Permission denied by user.".to_string(),
+                    };
+                    renderer.print_tool_result(result.success, &result.output);
+                    conv_log.push(Entry::ToolExecution {
+                        tool_call_id: tc.id.clone(),
+                        tool_name: tc.name.clone(),
+                        arguments: tc.arguments.clone(),
+                        result: result.clone(),
+                    });
+                    tool_result_blocks.push(ContentBlock::ToolResult {
+                        tool_use_id: tc.id.clone(),
+                        content: result.output,
+                    });
+                    continue;
+                }
 
                 let result = match registry.get(&tc.name) {
                     Some(tool) => match tool.execute(tc.arguments.clone()).await {
@@ -732,4 +756,23 @@ fn create_provider(
     }
 }
 
-
+/// Summarize tool arguments for permission prompt context.
+fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
+    match tool_name {
+        "Bash" => args["command"]
+            .as_str()
+            .map(|s| {
+                if s.len() > 60 {
+                    format!("{}...", &s[..60])
+                } else {
+                    s.to_string()
+                }
+            })
+            .unwrap_or_default(),
+        "Write" | "Edit" => args["file_path"]
+            .as_str()
+            .unwrap_or("")
+            .to_string(),
+        _ => String::new(),
+    }
+}
