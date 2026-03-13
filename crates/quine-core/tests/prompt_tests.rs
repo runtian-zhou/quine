@@ -27,8 +27,8 @@ fn discover_claude_md_returns_empty_when_no_file() {
     let results = discover_claude_md(&sub);
     // The sub directory itself has no CLAUDE.md
     let has_sub_claude = results.iter().any(|p| p.starts_with(&sub));
-    assert_eq!(
-        has_sub_claude, false,
+    assert!(
+        !has_sub_claude,
         "should not find CLAUDE.md in the subdirectory"
     );
 }
@@ -49,7 +49,11 @@ fn discover_claude_md_returns_root_first_order() {
         .filter(|p| p.starts_with(tmp.path()))
         .collect();
 
-    assert_eq!(within_tmp.len(), 2, "should find exactly 2 CLAUDE.md files within tmpdir");
+    assert_eq!(
+        within_tmp.len(),
+        2,
+        "should find exactly 2 CLAUDE.md files within tmpdir"
+    );
     // Root should come before child (root-first order)
     assert!(
         within_tmp[0].ends_with("CLAUDE.md") && !within_tmp[0].starts_with(&child),

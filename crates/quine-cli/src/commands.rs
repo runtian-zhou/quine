@@ -148,11 +148,7 @@ fn print_token_usage(usage: &SessionUsage) {
 }
 
 /// Print a one-line usage summary after each turn.
-pub fn print_turn_usage(
-    input: u64,
-    output: u64,
-    session: &SessionUsage,
-) {
+pub fn print_turn_usage(input: u64, output: u64, session: &SessionUsage) {
     println!(
         "\x1b[90m[{} in \u{2192} {} out | session: {} in \u{2192} {} out]\x1b[0m",
         format_tokens(input),
@@ -181,21 +177,41 @@ mod tests {
     fn format_tokens_small_numbers() {
         assert_eq!(format_tokens(0), "0", "zero should format as '0'");
         assert_eq!(format_tokens(1), "1", "single digit should format as-is");
-        assert_eq!(format_tokens(999), "999", "just under 1K should format as-is");
+        assert_eq!(
+            format_tokens(999),
+            "999",
+            "just under 1K should format as-is"
+        );
     }
 
     #[test]
     fn format_tokens_thousands() {
         assert_eq!(format_tokens(1_000), "1.0K", "1000 should format as '1.0K'");
         assert_eq!(format_tokens(1_500), "1.5K", "1500 should format as '1.5K'");
-        assert_eq!(format_tokens(12_345), "12.3K", "12345 should format as '12.3K'");
-        assert_eq!(format_tokens(999_999), "1.0M", "999999 should round up to 1.0M");
+        assert_eq!(
+            format_tokens(12_345),
+            "12.3K",
+            "12345 should format as '12.3K'"
+        );
+        assert_eq!(
+            format_tokens(999_999),
+            "1.0M",
+            "999999 should round up to 1.0M"
+        );
     }
 
     #[test]
     fn format_tokens_millions() {
-        assert_eq!(format_tokens(1_000_000), "1.0M", "1M should format as '1.0M'");
-        assert_eq!(format_tokens(2_500_000), "2.5M", "2.5M should format as '2.5M'");
+        assert_eq!(
+            format_tokens(1_000_000),
+            "1.0M",
+            "1M should format as '1.0M'"
+        );
+        assert_eq!(
+            format_tokens(2_500_000),
+            "2.5M",
+            "2.5M should format as '2.5M'"
+        );
     }
 
     // --- SessionUsage ---
@@ -205,7 +221,10 @@ mod tests {
         let usage = SessionUsage::default();
         assert_eq!(usage.total_input, 0, "default input should be 0");
         assert_eq!(usage.total_output, 0, "default output should be 0");
-        assert_eq!(usage.total_cache_creation, 0, "default cache creation should be 0");
+        assert_eq!(
+            usage.total_cache_creation, 0,
+            "default cache creation should be 0"
+        );
         assert_eq!(usage.total_cache_read, 0, "default cache read should be 0");
     }
 
@@ -219,7 +238,10 @@ mod tests {
         usage.add(200, 100, 5, 15);
         assert_eq!(usage.total_input, 300, "second add: input should be 300");
         assert_eq!(usage.total_output, 150, "second add: output should be 150");
-        assert_eq!(usage.total_cache_creation, 15, "cache creation should be 15");
+        assert_eq!(
+            usage.total_cache_creation, 15,
+            "cache creation should be 15"
+        );
         assert_eq!(usage.total_cache_read, 35, "cache read should be 35");
     }
 
@@ -361,7 +383,8 @@ mod tests {
             "/undo should return Rewound"
         );
         assert_eq!(
-            log.entries.len(), 2,
+            log.entries.len(),
+            2,
             "should have 2 entries after undo (first turn remains)"
         );
         // Verify the remaining entries are the first turn
@@ -395,7 +418,8 @@ mod tests {
             "/rewind should return Rewound"
         );
         assert_eq!(
-            log.entries.len(), 2,
+            log.entries.len(),
+            2,
             "should have 2 entries after rewinding 2 turns (first turn remains)"
         );
     }
@@ -415,7 +439,11 @@ mod tests {
             matches!(result, Some(CommandResult::Continue)),
             "/rewind 0 should return Continue"
         );
-        assert_eq!(log.entries.len(), 1, "entries should be unchanged after /rewind 0");
+        assert_eq!(
+            log.entries.len(),
+            1,
+            "entries should be unchanged after /rewind 0"
+        );
     }
 
     #[test]
@@ -438,7 +466,11 @@ mod tests {
     #[test]
     fn entries_to_messages_empty() {
         let messages = crate::interactive::entries_to_messages(&[]);
-        assert_eq!(messages.len(), 0, "empty entries should produce empty messages");
+        assert_eq!(
+            messages.len(),
+            0,
+            "empty entries should produce empty messages"
+        );
     }
 
     #[test]
@@ -455,9 +487,20 @@ mod tests {
         let messages = crate::interactive::entries_to_messages(&entries);
         assert_eq!(messages.len(), 2, "should produce 2 messages");
         assert_eq!(messages[0].role, "user", "first message should be user");
-        assert_eq!(messages[1].role, "assistant", "second message should be assistant");
-        assert_eq!(messages[0].content.as_text(), "hello", "user content should be 'hello'");
-        assert_eq!(messages[1].content.as_text(), "world", "assistant content should be 'world'");
+        assert_eq!(
+            messages[1].role, "assistant",
+            "second message should be assistant"
+        );
+        assert_eq!(
+            messages[0].content.as_text(),
+            "hello",
+            "user content should be 'hello'"
+        );
+        assert_eq!(
+            messages[1].content.as_text(),
+            "world",
+            "assistant content should be 'world'"
+        );
     }
 
     #[test]
@@ -502,10 +545,17 @@ mod tests {
         ];
         let messages = crate::interactive::entries_to_messages(&entries);
         // user message, assistant message with tool_use blocks, user message with tool_result blocks
-        assert_eq!(messages.len(), 3, "should produce 3 messages: user, assistant, tool_results");
+        assert_eq!(
+            messages.len(),
+            3,
+            "should produce 3 messages: user, assistant, tool_results"
+        );
         assert_eq!(messages[0].role, "user", "first should be user");
         assert_eq!(messages[1].role, "assistant", "second should be assistant");
-        assert_eq!(messages[2].role, "user", "third should be user (tool results)");
+        assert_eq!(
+            messages[2].role, "user",
+            "third should be user (tool results)"
+        );
     }
 
     // --- Permission tests ---
@@ -567,9 +617,8 @@ mod tests {
     #[test]
     fn permission_manager_low_risk_auto_approves() {
         let mut pm = PermissionManager::new();
-        assert_eq!(
+        assert!(
             pm.check("Read", "test.txt"),
-            true,
             "Low risk tools should be auto-approved without prompting"
         );
     }
@@ -577,10 +626,13 @@ mod tests {
     #[test]
     fn permission_manager_low_risk_auto_approves_multiple_tools() {
         let mut pm = PermissionManager::new();
-        assert_eq!(pm.check("Read", "a.txt"), true, "Read should auto-approve");
-        assert_eq!(pm.check("Glob", "*.rs"), true, "Glob should auto-approve");
-        assert_eq!(pm.check("Grep", "pattern"), true, "Grep should auto-approve");
-        assert_eq!(pm.check("ListDirectory", "."), true, "ListDirectory should auto-approve");
-        assert_eq!(pm.check("Todo", "list"), true, "Todo should auto-approve");
+        assert!(pm.check("Read", "a.txt"), "Read should auto-approve");
+        assert!(pm.check("Glob", "*.rs"), "Glob should auto-approve");
+        assert!(pm.check("Grep", "pattern"), "Grep should auto-approve");
+        assert!(
+            pm.check("ListDirectory", "."),
+            "ListDirectory should auto-approve"
+        );
+        assert!(pm.check("Todo", "list"), "Todo should auto-approve");
     }
 }

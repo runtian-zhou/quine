@@ -38,6 +38,12 @@ pub struct Conversation {
     pub entries: Vec<Entry>,
 }
 
+impl Default for Conversation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Conversation {
     pub fn new() -> Self {
         Self {

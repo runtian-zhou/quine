@@ -69,7 +69,11 @@ fn conversation_log_save_and_load_roundtrip() {
     assert_eq!(loaded.model, "claude-sonnet");
     assert_eq!(loaded.provider, "anthropic");
     assert_eq!(loaded.system_prompt, "You are helpful.");
-    assert_eq!(loaded.entries.len(), 3, "should have exactly 3 entries after roundtrip");
+    assert_eq!(
+        loaded.entries.len(),
+        3,
+        "should have exactly 3 entries after roundtrip"
+    );
 
     // Verify entry types survived
     match &loaded.entries[0] {
@@ -77,7 +81,10 @@ fn conversation_log_save_and_load_roundtrip() {
         _ => panic!("entry 0 should be UserMessage"),
     }
     match &loaded.entries[1] {
-        Entry::AssistantMessage { content, tool_calls } => {
+        Entry::AssistantMessage {
+            content,
+            tool_calls,
+        } => {
             assert_eq!(content, "Rust is a systems programming language.");
             assert_eq!(tool_calls.len(), 0, "should have 0 tool calls");
         }
@@ -92,7 +99,7 @@ fn conversation_log_save_and_load_roundtrip() {
         } => {
             assert_eq!(tool_call_id, "tc_1");
             assert_eq!(tool_name, "Read");
-            assert_eq!(result.success, true);
+            assert!(result.success);
         }
         _ => panic!("entry 2 should be ToolExecution"),
     }
@@ -103,11 +110,7 @@ fn conversation_log_save_creates_parent_dirs() {
     let tmp = TempDir::new().unwrap();
     let nested_path = tmp.path().join("a").join("b").join("c").join("log.json");
 
-    let log = ConversationLog::new(
-        "m".to_string(),
-        "p".to_string(),
-        "s".to_string(),
-    );
+    let log = ConversationLog::new("m".to_string(), "p".to_string(), "s".to_string());
     log.save(&nested_path).unwrap();
 
     assert!(nested_path.exists(), "log file should exist at nested path");
@@ -116,7 +119,10 @@ fn conversation_log_save_creates_parent_dirs() {
 #[test]
 fn conversation_log_load_nonexistent_file_errors() {
     let result = ConversationLog::load(Path::new("/nonexistent/path/log.json"));
-    assert!(result.is_err(), "loading nonexistent file should return error");
+    assert!(
+        result.is_err(),
+        "loading nonexistent file should return error"
+    );
 }
 
 #[test]
@@ -131,6 +137,12 @@ fn conversation_log_json_format_matches_spec() {
     assert_eq!(json_value["model"], "test-model");
     assert_eq!(json_value["provider"], "test-provider");
     assert_eq!(json_value["system_prompt"], "prompt");
-    assert!(json_value["created_at"].is_string(), "created_at should be a string timestamp");
-    assert!(json_value["entries"].is_array(), "entries should be an array");
+    assert!(
+        json_value["created_at"].is_string(),
+        "created_at should be a string timestamp"
+    );
+    assert!(
+        json_value["entries"].is_array(),
+        "entries should be an array"
+    );
 }

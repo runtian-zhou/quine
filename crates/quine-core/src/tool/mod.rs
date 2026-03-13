@@ -35,6 +35,12 @@ pub struct GlobalContext {
     pub todo: Arc<todo::TodoTool>,
 }
 
+impl Default for GlobalContext {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GlobalContext {
     pub fn new() -> Self {
         Self {
@@ -45,6 +51,12 @@ impl GlobalContext {
 
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ToolRegistry {
@@ -95,7 +107,9 @@ impl ToolRegistry {
         registry.register(Box::new(edit::EditTool::new(working_dir)));
         registry.register(Box::new(glob::GlobTool::new(working_dir)));
         registry.register(Box::new(grep::GrepTool::new(working_dir)));
-        registry.register(Box::new(list_directory::ListDirectoryTool::new(working_dir)));
+        registry.register(Box::new(list_directory::ListDirectoryTool::new(
+            working_dir,
+        )));
         registry.register(Box::new(skill::SkillTool::new(working_dir)));
         // Register the shared Arc — all registries built from the same context
         // point at the same TodoTool instance.

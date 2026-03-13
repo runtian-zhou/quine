@@ -2,19 +2,10 @@ use crate::conversation::Entry;
 use crate::log::ConversationLog;
 use crate::tool::ToolRegistry;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct ReplayOptions {
     pub strict: bool,
     pub dry_run: bool,
-}
-
-impl Default for ReplayOptions {
-    fn default() -> Self {
-        Self {
-            strict: false,
-            dry_run: false,
-        }
-    }
 }
 
 pub struct ReplayEngine {
@@ -99,14 +90,8 @@ impl ReplayEngine {
                                 println!(
                                     "  \x1b[1;31m[DRIFT]\x1b[0m Output differs from recorded log"
                                 );
-                                println!(
-                                    "  Expected: {}",
-                                    truncate(&expected_result.output, 100)
-                                );
-                                println!(
-                                    "  Actual:   {}",
-                                    truncate(&actual_result.output, 100)
-                                );
+                                println!("  Expected: {}", truncate(&expected_result.output, 100));
+                                println!("  Actual:   {}", truncate(&actual_result.output, 100));
 
                                 if self.options.strict {
                                     anyhow::bail!(
@@ -124,7 +109,11 @@ impl ReplayEngine {
                         None => {
                             println!("  \x1b[1;31m[ERROR]\x1b[0m Unknown tool: {}", tool_name);
                             if self.options.strict {
-                                anyhow::bail!("Unknown tool '{}' at entry {} (strict mode)", tool_name, i);
+                                anyhow::bail!(
+                                    "Unknown tool '{}' at entry {} (strict mode)",
+                                    tool_name,
+                                    i
+                                );
                             }
                         }
                     }

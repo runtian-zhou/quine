@@ -18,15 +18,9 @@ pub fn print_summary(result: &RunResult) {
     println!("Time:     {}", result.timestamp);
     println!();
     println!("Total:    {}", s.total_tests);
-    println!(
-        "Passed:   \x1b[32m{}\x1b[0m / {}",
-        s.passed, s.total_tests
-    );
+    println!("Passed:   \x1b[32m{}\x1b[0m / {}", s.passed, s.total_tests);
     if s.failed > 0 {
-        println!(
-            "Failed:   \x1b[31m{}\x1b[0m / {}",
-            s.failed, s.total_tests
-        );
+        println!("Failed:   \x1b[31m{}\x1b[0m / {}", s.failed, s.total_tests);
     }
 
     // Progress bar

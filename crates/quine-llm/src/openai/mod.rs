@@ -1,13 +1,13 @@
 pub mod api_types;
 pub mod stream;
 
+use self::api_types::*;
+use crate::provider::LlmProvider;
+use crate::types::*;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use quine_core::conversation::ToolCall;
 use reqwest::Client;
-use self::api_types::*;
-use crate::provider::LlmProvider;
-use crate::types::*;
 
 pub struct OpenAiProvider {
     client: Client,
@@ -61,8 +61,7 @@ impl OpenAiProvider {
                                     call_type: "function".to_string(),
                                     function: OpenAiFunctionCall {
                                         name: name.clone(),
-                                        arguments: serde_json::to_string(input)
-                                            .unwrap_or_default(),
+                                        arguments: serde_json::to_string(input).unwrap_or_default(),
                                     },
                                 });
                             }

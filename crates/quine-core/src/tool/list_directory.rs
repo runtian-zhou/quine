@@ -51,9 +51,7 @@ impl Tool for ListDirectoryTool {
     }
 
     async fn execute(&self, arguments: Value) -> Result<ToolOutput> {
-        let dir_path = arguments["path"]
-            .as_str()
-            .unwrap_or(".");
+        let dir_path = arguments["path"].as_str().unwrap_or(".");
         let path = self.resolve_path(dir_path);
 
         if !path.is_dir() {

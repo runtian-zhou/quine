@@ -60,23 +60,12 @@ pub enum ContentBlock {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_creation_input_tokens: u64,
     pub cache_read_input_tokens: u64,
-}
-
-impl Default for Usage {
-    fn default() -> Self {
-        Self {
-            input_tokens: 0,
-            output_tokens: 0,
-            cache_creation_input_tokens: 0,
-            cache_read_input_tokens: 0,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -98,10 +87,7 @@ pub enum StopReason {
 #[derive(Debug, Clone)]
 pub enum StreamEvent {
     ContentDelta(String),
-    ToolCallStart {
-        id: String,
-        name: String,
-    },
+    ToolCallStart { id: String, name: String },
     ToolCallDelta(String),
     ToolCallEnd,
     Usage(Usage),

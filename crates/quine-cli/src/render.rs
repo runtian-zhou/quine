@@ -1,4 +1,4 @@
-use crossterm::style::{Color, SetForegroundColor, ResetColor};
+use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -115,10 +115,10 @@ impl Renderer {
         } else if line.starts_with("### ") {
             println!("\x1b[1;32m{}\x1b[0m", line);
         } else if line.starts_with("- ") || line.starts_with("* ") {
-            println!("  {}{}{}", SetForegroundColor(Color::Cyan), "•", ResetColor);
-            print!(" {}\n", &line[2..]);
-        } else if line.starts_with("> ") {
-            println!("\x1b[3;37m  │ {}\x1b[0m", &line[2..]);
+            println!("  {}•{}", SetForegroundColor(Color::Cyan), ResetColor);
+            println!(" {}", &line[2..]);
+        } else if let Some(quoted) = line.strip_prefix("> ") {
+            println!("\x1b[3;37m  │ {}\x1b[0m", quoted);
         } else {
             println!("{}", line);
         }
@@ -135,7 +135,10 @@ impl Renderer {
         let theme = &self.theme_set.themes["base16-ocean.dark"];
         let mut highlighter = HighlightLines::new(syntax, theme);
 
-        println!("\x1b[90m┌─ {} ─┐\x1b[0m", if lang.is_empty() { "code" } else { lang });
+        println!(
+            "\x1b[90m┌─ {} ─┐\x1b[0m",
+            if lang.is_empty() { "code" } else { lang }
+        );
         for line in code.lines() {
             if let Ok(ranges) = highlighter.highlight_line(line, &self.syntax_set) {
                 let escaped = as_24_bit_terminal_escaped(&ranges, false);
@@ -148,10 +151,7 @@ impl Renderer {
     }
 
     pub fn print_tool_call(&self, name: &str, args: &serde_json::Value) {
-        println!(
-            "\n\x1b[1;33m⚙ Tool: {}\x1b[0m",
-            name
-        );
+        println!("\n\x1b[1;33m⚙ Tool: {}\x1b[0m", name);
         if let Some(obj) = args.as_object() {
             for (key, value) in obj {
                 let display = match value {

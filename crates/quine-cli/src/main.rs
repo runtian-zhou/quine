@@ -93,7 +93,14 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
             } else {
-                interactive::run_chat(&provider, &model, base_url.as_deref(), r#continue, !no_stream).await?;
+                interactive::run_chat(
+                    &provider,
+                    &model,
+                    base_url.as_deref(),
+                    r#continue,
+                    !no_stream,
+                )
+                .await?;
             }
         }
         Commands::Replay {

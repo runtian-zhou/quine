@@ -62,7 +62,8 @@ impl Tool for SkillTool {
                 if skills.is_empty() {
                     return Ok(ToolOutput {
                         success: true,
-                        output: "No skills found. Create skills in `skills/<name>/SKILL.md`.".to_string(),
+                        output: "No skills found. Create skills in `skills/<name>/SKILL.md`."
+                            .to_string(),
                     });
                 }
                 let mut lines = vec!["Available skills:".to_string()];
