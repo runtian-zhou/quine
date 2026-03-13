@@ -5,3 +5,4 @@ pub mod prompt;
 pub mod replay;
 pub mod skill;
 pub mod tool;
+pub mod worktree;

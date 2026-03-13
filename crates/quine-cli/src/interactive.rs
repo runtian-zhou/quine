@@ -9,6 +9,7 @@ use quine_core::prompt::build_system_prompt;
 use quine_core::tool::ask_user::AskUserTool;
 use quine_core::tool::subagent::SubagentTool;
 use quine_core::tool::{GlobalContext, ToolRegistry};
+use quine_core::worktree::Worktree;
 use quine_llm::anthropic::AnthropicProvider;
 use quine_llm::openai::OpenAiProvider;
 use quine_llm::provider::LlmProvider;
@@ -649,17 +650,39 @@ fn build_registry_with_subagent(
 
     let inner_working_dir = working_dir.to_path_buf();
     let completion_fn: quine_core::tool::subagent::CompletionFn =
-        Arc::new(move |prompt: String| {
+        Arc::new(move |prompt: String, use_worktree: bool| {
             let provider = Arc::clone(&provider);
             let model = model.clone();
             let system_prompt = system_prompt.clone();
             let working_dir = inner_working_dir.clone();
             let ctx = ctx.clone();
             Box::pin(async move {
+                // Optionally create a worktree for isolation
+                let worktree = if use_worktree {
+                    Some(Worktree::create(&working_dir)?)
+                } else {
+                    None
+                };
+                let effective_dir = worktree
+                    .as_ref()
+                    .map(|w| w.path.as_path())
+                    .unwrap_or(&working_dir);
+
                 let inner_registry =
-                    ToolRegistry::register_defaults_with_context(&working_dir, &ctx);
-                run_subagent_loop(&*provider, &model, &system_prompt, &inner_registry, &prompt)
-                    .await
+                    ToolRegistry::register_defaults_with_context(effective_dir, &ctx);
+                let result = run_subagent_loop(
+                    &*provider,
+                    &model,
+                    &system_prompt,
+                    &inner_registry,
+                    &prompt,
+                )
+                .await;
+
+                // worktree is dropped here, cleaning up automatically
+                drop(worktree);
+
+                result
             })
         });
 
