@@ -13,6 +13,8 @@ use quine_llm::anthropic::AnthropicProvider;
 use quine_llm::openai::OpenAiProvider;
 use quine_llm::provider::LlmProvider;
 use quine_llm::types::*;
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 
 use crate::render::Renderer;
 
@@ -119,10 +121,21 @@ pub async fn run_chat(
     println!("\x1b[90mProvider: {} | Model: {}\x1b[0m", provider_name, model);
     println!("\x1b[90mType your message (Ctrl+D to exit)\x1b[0m\n");
 
-    loop {
-        renderer.print_user_prompt();
+    let mut rl = DefaultEditor::new()?;
 
-        let user_input = read_user_input()?;
+    loop {
+        let user_input = match rl.readline("\x1b[1;32m❯\x1b[0m ") {
+            Ok(line) => {
+                let trimmed = line.trim_end().to_string();
+                if !trimmed.is_empty() {
+                    let _ = rl.add_history_entry(&trimmed);
+                }
+                trimmed
+            }
+            Err(ReadlineError::Interrupted) | Err(ReadlineError::Eof) => break,
+            Err(e) => return Err(e.into()),
+        };
+
         if user_input.is_empty() {
             continue;
         }
@@ -646,22 +659,4 @@ fn create_provider(
     }
 }
 
-fn read_user_input() -> anyhow::Result<String> {
-    let mut lines = Vec::new();
-    let mut line = String::new();
 
-    match std::io::stdin().read_line(&mut line) {
-        Ok(0) => {
-            // EOF
-            if lines.is_empty() {
-                return Ok("/quit".to_string());
-            }
-        }
-        Ok(_) => {
-            lines.push(line.trim_end().to_string());
-        }
-        Err(e) => return Err(e.into()),
-    }
-
-    Ok(lines.join("\n"))
-}

@@ -192,9 +192,4 @@ impl Renderer {
             println!("  \x1b[90m... ({} more lines)\x1b[0m", total_lines - 5);
         }
     }
-
-    pub fn print_user_prompt(&self) {
-        print!("\n\x1b[1;34m> \x1b[0m");
-        std::io::stdout().flush().ok();
-    }
 }
