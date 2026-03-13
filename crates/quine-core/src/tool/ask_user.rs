@@ -28,7 +28,7 @@ impl Tool for AskUserTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the user a question and wait for their response. Supports three modes: (1) freeform text input when only 'question' is provided, (2) single/multiple selection when 'options' is provided — the user picks by number, (3) selection with freeform fallback when both 'options' and 'allow_text' are true."
+        "Ask the user a question and wait for their response. Supports three modes: (1) freeform text input when only 'question' is provided, (2) single selection (default) or multiple selection (multi_select: true) when 'options' is provided — shown as an interactive arrow-key selector, (3) selection with freeform fallback when 'allow_text' is true."
     }
 
     fn parameters_schema(&self) -> Value {
@@ -42,11 +42,15 @@ impl Tool for AskUserTool {
                 "options": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional list of choices. The user selects by entering one or more numbers (comma-separated for multiple). Omit for freeform text input."
+                    "description": "Optional list of choices presented as an interactive selector. Omit for freeform text input."
+                },
+                "multi_select": {
+                    "type": "boolean",
+                    "description": "When true and options are provided, the user can select multiple options. When false (default), only a single option can be selected."
                 },
                 "allow_text": {
                     "type": "boolean",
-                    "description": "When true and options are provided, the user may also type freeform text instead of picking a number. Default: false."
+                    "description": "When true and options are provided, the user may also type freeform text instead of picking from the list. Default: false."
                 }
             },
             "required": ["question"]

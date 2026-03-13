@@ -926,10 +926,11 @@ fn selection_from_args(args: &serde_json::Value) -> Option<SelectionPrompt> {
         .iter()
         .map(|v| v.as_str().unwrap_or("?").to_string())
         .collect();
+    let multi = args["multi_select"].as_bool().unwrap_or(false);
     Some(SelectionPrompt {
         question,
         options: items,
-        multi: true,
+        multi,
         allow_text,
     })
 }
@@ -937,12 +938,21 @@ fn selection_from_args(args: &serde_json::Value) -> Option<SelectionPrompt> {
 /// Run an interactive arrow-key selector. Returns the selected text,
 /// or None if the user cancelled.
 fn run_selector(sel: &SelectionPrompt) -> Option<String> {
-    use dialoguer::{theme::ColorfulTheme, MultiSelect, Select};
+    use dialoguer::{theme::ColorfulTheme, Input, MultiSelect, Select};
 
     let theme = ColorfulTheme::default();
 
+    // If allow_text with no options, just show freeform input directly
+    if sel.options.is_empty() {
+        println!("\n  \x1b[1;33m? {}\x1b[0m", sel.question);
+        let input = Input::<String>::with_theme(&theme)
+            .with_prompt("Your response")
+            .interact_text()
+            .ok()?;
+        return Some(input);
+    }
+
     if sel.multi {
-        // Build items with an optional "Other..." entry for freeform
         let mut items = sel.options.clone();
         if sel.allow_text {
             items.push("Other (type your own)...".to_string());
@@ -959,11 +969,9 @@ fn run_selector(sel: &SelectionPrompt) -> Option<String> {
             return Some(String::new());
         }
 
-        // Check if the "Other..." option was selected
         if sel.allow_text && indices.contains(&(items.len() - 1)) {
-            // Fall back to freeform input
-            let input = dialoguer::Input::<String>::with_theme(&theme)
-                .with_prompt("Your response")
+            let input = Input::<String>::with_theme(&theme)
+                .with_prompt("Type your response")
                 .interact_text()
                 .ok()?;
             return Some(input);
@@ -982,6 +990,7 @@ fn run_selector(sel: &SelectionPrompt) -> Option<String> {
 
         let chosen = Select::with_theme(&theme)
             .with_prompt(&sel.question)
+            .default(0)
             .items(&items)
             .interact_opt()
             .ok()?;
@@ -989,8 +998,8 @@ fn run_selector(sel: &SelectionPrompt) -> Option<String> {
         let idx = chosen?;
 
         if sel.allow_text && idx == items.len() - 1 {
-            let input = dialoguer::Input::<String>::with_theme(&theme)
-                .with_prompt("Your response")
+            let input = Input::<String>::with_theme(&theme)
+                .with_prompt("Type your response")
                 .interact_text()
                 .ok()?;
             return Some(input);
