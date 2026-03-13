@@ -16,43 +16,15 @@ use quine_llm::types::*;
 use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
 
+use crate::commands::{self, CommandResult, SessionUsage};
 use crate::render::Renderer;
 
-pub async fn run_chat(
-    provider_name: &str,
-    model: &str,
-    base_url: Option<&str>,
-    continue_from: Option<PathBuf>,
-    stream: bool,
-) -> anyhow::Result<()> {
-    let config = Config::new(provider_name, model);
-    let provider = create_provider(provider_name, base_url)?;
-
-    let system_prompt = build_system_prompt(&config.working_dir);
-    let ctx = GlobalContext::new();
-    let registry = build_registry_with_subagent(
-        &config.working_dir,
-        Arc::clone(&provider),
-        model.to_string(),
-        system_prompt.clone(),
-        ctx,
-    );
-    let tool_schemas = registry.all_schemas();
-    let renderer = Renderer::new();
-
-    let mut conv_log = if let Some(log_path) = &continue_from {
-        println!("Continuing from: {}", log_path.display());
-        ConversationLog::load(log_path)?
-    } else {
-        ConversationLog::new(model.to_string(), provider_name.to_string(), system_prompt.clone())
-    };
-
-    // Build messages from existing log entries for continuation.
-    // Group consecutive ToolExecution entries into a single user message.
+/// Convert conversation log entries into ChatMessage list for the LLM.
+pub fn entries_to_messages(entries: &[Entry]) -> Vec<ChatMessage> {
     let mut messages: Vec<ChatMessage> = Vec::new();
     let mut pending_tool_results: Vec<ContentBlock> = Vec::new();
 
-    for entry in &conv_log.entries {
+    for entry in entries {
         match entry {
             Entry::ToolExecution {
                 tool_call_id,
@@ -118,10 +90,45 @@ pub async fn run_chat(
             content: ChatContent::Blocks(pending_tool_results),
         });
     }
+    messages
+}
+
+pub async fn run_chat(
+    provider_name: &str,
+    model: &str,
+    base_url: Option<&str>,
+    continue_from: Option<PathBuf>,
+    stream: bool,
+) -> anyhow::Result<()> {
+    let config = Config::new(provider_name, model);
+    let provider = create_provider(provider_name, base_url)?;
+
+    let system_prompt = build_system_prompt(&config.working_dir);
+    let ctx = GlobalContext::new();
+    let registry = build_registry_with_subagent(
+        &config.working_dir,
+        Arc::clone(&provider),
+        model.to_string(),
+        system_prompt.clone(),
+        ctx,
+    );
+    let tool_schemas = registry.all_schemas();
+    let renderer = Renderer::new();
+    let mut session_usage = SessionUsage::default();
+
+    let mut conv_log = if let Some(log_path) = &continue_from {
+        println!("Continuing from: {}", log_path.display());
+        ConversationLog::load(log_path)?
+    } else {
+        ConversationLog::new(model.to_string(), provider_name.to_string(), system_prompt.clone())
+    };
+
+    // Build messages from existing log entries for continuation.
+    let mut messages = entries_to_messages(&conv_log.entries);
 
     println!("\x1b[1;36mQuine\x1b[0m - Self-bootstrapping CLI assistant");
     println!("\x1b[90mProvider: {} | Model: {}\x1b[0m", provider_name, model);
-    println!("\x1b[90mType your message (Ctrl+D to exit)\x1b[0m\n");
+    println!("\x1b[90mType your message, /help for commands, Ctrl+D to exit\x1b[0m\n");
 
     let mut rl = DefaultEditor::new()?;
 
@@ -141,8 +148,22 @@ pub async fn run_chat(
         if user_input.is_empty() {
             continue;
         }
-        if user_input == "/quit" || user_input == "/exit" {
-            break;
+
+        // Handle slash commands
+        if let Some(result) = commands::handle_command(
+            &user_input,
+            &mut conv_log,
+            &mut messages,
+            &session_usage,
+        ) {
+            match result {
+                CommandResult::Continue | CommandResult::Rewound => continue,
+                CommandResult::Exit => break,
+                CommandResult::Unknown(cmd) => {
+                    println!("\x1b[33mUnknown command: {}. Type /help for available commands.\x1b[0m", cmd);
+                    continue;
+                }
+            }
         }
 
         messages.push(ChatMessage {
@@ -152,6 +173,10 @@ pub async fn run_chat(
         conv_log.push(Entry::UserMessage {
             content: user_input,
         });
+
+        // Track per-turn usage
+        let mut turn_input = 0u64;
+        let mut turn_output = 0u64;
 
         // Conversation loop: keep going while LLM wants to call tools
         loop {
@@ -174,6 +199,10 @@ pub async fn run_chat(
                 }
                 resp
             };
+
+            // Accumulate usage
+            turn_input += response.usage.input_tokens;
+            turn_output += response.usage.output_tokens;
 
             // Record assistant message
             let tool_calls_for_log: Vec<ToolCall> = response
@@ -261,6 +290,12 @@ pub async fn run_chat(
                 role: "user".to_string(),
                 content: ChatContent::Blocks(tool_result_blocks),
             });
+        }
+
+        // Update session usage and print summary
+        session_usage.add(turn_input, turn_output, 0, 0);
+        if turn_input > 0 || turn_output > 0 {
+            commands::print_turn_usage(turn_input, turn_output, &session_usage);
         }
 
         // Save log after each turn

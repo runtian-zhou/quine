@@ -1,3 +1,4 @@
+mod commands;
 mod interactive;
 mod render;
 mod replay_cmd;
