@@ -11,11 +11,12 @@ use quine_core::log::ConversationLog;
 use quine_core::tool::{GlobalContext, ToolRegistry};
 use quine_core::worktree::Worktree;
 use quine_llm::provider::LlmProvider;
-use quine_llm::types::*;
+use quine_core::llm_types::*;
 
-use crate::agent::{Agent, AgentConfig, AgentId, AgentState};
+use quine_core::agent::{Agent, AgentConfig, AgentId, AgentState};
+use quine_core::event::Event;
+
 use crate::commands::{self, CommandResult, SessionUsage};
-use crate::event::Event;
 use crate::permissions::PermissionManager;
 use crate::render::Renderer;
 
@@ -383,7 +384,7 @@ impl Dispatcher {
     fn prompt_next_waiting_question(&self) {
         if let Some(agent_id) = self.find_agent_waiting_tool_input() {
             let agent = self.agents.get(&agent_id).unwrap();
-            if let crate::agent::AgentState::WaitingToolInput { ref arguments, .. } = agent.state {
+            if let AgentState::WaitingToolInput { ref arguments, .. } = agent.state {
                 signal_question(&self.input_signal, arguments);
             }
         }
@@ -396,7 +397,7 @@ impl Dispatcher {
             // Resolve numbered selections against options if present
             let resolved = {
                 let agent = self.agents.get(&agent_id).unwrap();
-                if let crate::agent::AgentState::WaitingToolInput { ref arguments, .. } =
+                if let AgentState::WaitingToolInput { ref arguments, .. } =
                     agent.state
                 {
                     resolve_answer(arguments, &text)

@@ -1,7 +1,5 @@
-mod agent;
 mod commands;
 mod dispatcher;
-mod event;
 mod interactive;
 mod permissions;
 mod render;

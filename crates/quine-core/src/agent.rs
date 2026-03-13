@@ -1,10 +1,10 @@
 use std::collections::VecDeque;
 
-use quine_llm::types::*;
+use crate::llm_types::*;
 use serde_json::Value;
 
-use quine_core::conversation::{Entry, ToolCall, ToolOutput};
-use quine_core::log::ConversationLog;
+use crate::conversation::{Entry, ToolCall, ToolOutput};
+use crate::log::ConversationLog;
 
 /// Unique identifier for an agent instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
