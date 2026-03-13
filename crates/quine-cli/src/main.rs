@@ -1,11 +1,19 @@
+mod agent;
 mod commands;
+mod dispatcher;
+mod event;
 mod interactive;
 mod permissions;
 mod render;
 mod replay_cmd;
 
-use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+
+use clap::{Parser, Subcommand};
+
+use quine_core::config::Config;
+use quine_core::log::ConversationLog;
+use quine_core::prompt::build_system_prompt;
 
 #[derive(Parser)]
 #[command(name = "quine", about = "A self-bootstrapping CLI assistant")]
@@ -73,7 +81,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Chat {
-            provider,
+            provider: provider_name,
             model,
             base_url,
             r#continue,
@@ -82,25 +90,45 @@ async fn main() -> anyhow::Result<()> {
             working_dir,
             output_format,
         } => {
-            if let Some(prompt) = print {
-                interactive::run_print(
-                    &provider,
-                    &model,
-                    base_url.as_deref(),
-                    &prompt,
-                    working_dir,
-                    &output_format,
-                )
-                .await?;
+            let config = if let Some(ref wd) = working_dir {
+                let mut c = Config::new(&provider_name, &model);
+                c.working_dir = wd.clone();
+                c.log_dir = wd.join(".quine").join("logs");
+                c
             } else {
-                interactive::run_chat(
-                    &provider,
-                    &model,
-                    base_url.as_deref(),
-                    r#continue,
-                    !no_stream,
-                )
-                .await?;
+                Config::new(&provider_name, &model)
+            };
+            let llm_provider = interactive::create_provider(&provider_name, base_url.as_deref())?;
+            let system_prompt = build_system_prompt(&config.working_dir);
+
+            let (conv_log, messages) = if let Some(ref log_path) = r#continue {
+                println!("Continuing from: {}", log_path.display());
+                let log = ConversationLog::load(log_path)?;
+                let msgs = interactive::entries_to_messages(&log.entries);
+                (log, msgs)
+            } else {
+                let log = ConversationLog::new(
+                    model.clone(),
+                    provider_name.clone(),
+                    system_prompt.clone(),
+                );
+                (log, vec![])
+            };
+
+            let mut disp = dispatcher::Dispatcher::new(
+                llm_provider,
+                config,
+                model,
+                system_prompt,
+                conv_log,
+                messages,
+                !no_stream,
+            );
+
+            if let Some(prompt) = print {
+                disp.run_oneshot(&prompt, &output_format).await?;
+            } else {
+                disp.run().await?;
             }
         }
         Commands::Replay {
