@@ -1,0 +1,8 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/quine-core",
+    "crates/quine-llm",
+    "crates/quine-cli",
+    "crates/quine-eval",
+]

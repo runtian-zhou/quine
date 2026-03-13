@@ -1,0 +1,567 @@
+{
+  "name": "Tool Coverage Suite",
+  "description": "Tests exercising each of Quine's tools: Read, Write, Edit, Glob, Grep, Bash, ListDirectory, Skill",
+  "tests": [
+    {
+      "id": "write-single-file",
+      "description": "Write: create a single file from scratch",
+      "prompt": "Create a file called greeting.txt containing exactly: Hello from Quine!",
+      "setup_files": [],
+      "expected_files": [
+        { "path": "greeting.txt", "contains": "Hello from Quine!" }
+      ],
+      "eval_criteria": [
+        "File greeting.txt exists with the exact content requested",
+        "No extra files were created"
+      ]
+    },
+    {
+      "id": "write-nested-dirs",
+      "description": "Write: create a file in nested directories that don't exist yet",
+      "prompt": "Create the file src/utils/helpers.py with a function called 'add' that returns the sum of two arguments a and b.",
+      "setup_files": [],
+      "expected_files": [
+        { "path": "src/utils/helpers.py", "contains": "def add" }
+      ],
+      "eval_criteria": [
+        "The file is at the correct nested path",
+        "The function signature accepts two parameters",
+        "The function returns their sum"
+      ]
+    },
+    {
+      "id": "read-and-answer",
+      "description": "Read: read a file and answer a question about its content",
+      "prompt": "Read the file data.json and tell me the exact value of the 'version' field.",
+      "setup_files": [
+        {
+          "path": "data.json",
+          "content": "{\n  \"name\": \"quine\",\n  \"version\": \"3.7.2\",\n  \"license\": \"MIT\"\n}\n"
+        }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The answer includes the exact version string '3.7.2'",
+        "The Read tool was used to access the file rather than guessing"
+      ]
+    },
+    {
+      "id": "read-line-count",
+      "description": "Read: read a file and report structural information",
+      "prompt": "Read the file poem.txt and tell me how many lines it has and what the last line says.",
+      "setup_files": [
+        {
+          "path": "poem.txt",
+          "content": "Roses are red,\nViolets are blue,\nSugar is sweet,\nAnd so are you."
+        }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "Correctly states the file has 4 lines",
+        "Correctly identifies the last line as 'And so are you.'"
+      ]
+    },
+    {
+      "id": "edit-single-replacement",
+      "description": "Edit: replace one string in a file",
+      "prompt": "In config.yaml, change the port from 8080 to 9090.",
+      "setup_files": [
+        {
+          "path": "config.yaml",
+          "content": "server:\n  host: localhost\n  port: 8080\n  debug: false\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "config.yaml", "contains": "port: 9090" }
+      ],
+      "eval_criteria": [
+        "The port value was changed to 9090",
+        "All other fields (host, debug) remain unchanged",
+        "The YAML structure is preserved"
+      ]
+    },
+    {
+      "id": "edit-add-function",
+      "description": "Edit: add new content to an existing file",
+      "prompt": "In math_utils.py, add a function called 'multiply' that takes two arguments and returns their product. Place it after the existing 'add' function.",
+      "setup_files": [
+        {
+          "path": "math_utils.py",
+          "content": "def add(a, b):\n    return a + b\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "math_utils.py", "contains": "def multiply" },
+        { "path": "math_utils.py", "contains": "def add" }
+      ],
+      "eval_criteria": [
+        "The multiply function is present and correct",
+        "The original add function is preserved unchanged",
+        "multiply appears after add in the file"
+      ]
+    },
+    {
+      "id": "edit-rename-variable",
+      "description": "Edit: rename a variable throughout a file using replace_all",
+      "prompt": "In app.js, rename all occurrences of the variable 'tmp' to 'result'.",
+      "setup_files": [
+        {
+          "path": "app.js",
+          "content": "function process(data) {\n  let tmp = data.filter(x => x > 0);\n  tmp = tmp.map(x => x * 2);\n  console.log(tmp);\n  return tmp;\n}\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "app.js", "contains": "result" }
+      ],
+      "eval_criteria": [
+        "All 4 occurrences of 'tmp' are replaced with 'result'",
+        "No occurrences of 'tmp' remain",
+        "The logic and structure of the code is unchanged"
+      ]
+    },
+    {
+      "id": "glob-find-files",
+      "description": "Glob: find files matching a pattern and report them",
+      "prompt": "Find all .rs files in this project and list their paths.",
+      "setup_files": [
+        { "path": "src/main.rs", "content": "fn main() {}\n" },
+        { "path": "src/lib.rs", "content": "pub mod utils;\n" },
+        { "path": "src/utils/mod.rs", "content": "pub fn helper() {}\n" },
+        { "path": "tests/test_basic.rs", "content": "#[test]\nfn it_works() {}\n" },
+        { "path": "README.md", "content": "# Project\n" },
+        { "path": "Cargo.toml", "content": "[package]\nname = \"demo\"\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "Lists all 4 .rs files: main.rs, lib.rs, mod.rs, test_basic.rs",
+        "Does not include README.md or Cargo.toml in the list",
+        "The Glob tool was used"
+      ]
+    },
+    {
+      "id": "grep-find-pattern",
+      "description": "Grep: search for a pattern across multiple files",
+      "prompt": "Search all .py files for the word 'TODO' and tell me which files and line numbers contain it.",
+      "setup_files": [
+        { "path": "app.py", "content": "# Main app\ndef run():\n    pass  # TODO: implement\n" },
+        { "path": "utils.py", "content": "def helper():\n    return 42\n" },
+        { "path": "tests.py", "content": "# TODO: add more tests\ndef test_one():\n    assert True\n    # TODO: check edge cases\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "Identifies app.py line 3 as containing TODO",
+        "Identifies tests.py lines 1 and 4 as containing TODO",
+        "Does not falsely report utils.py as containing TODO",
+        "Reports exactly 3 total matches"
+      ]
+    },
+    {
+      "id": "grep-no-matches",
+      "description": "Grep: search for a pattern that doesn't exist",
+      "prompt": "Search all files for the string 'FIXME' and report what you find.",
+      "setup_files": [
+        { "path": "clean.py", "content": "def clean():\n    return True\n" },
+        { "path": "tidy.rs", "content": "fn tidy() -> bool { true }\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "Correctly reports that no matches were found",
+        "Does not fabricate any results"
+      ]
+    },
+    {
+      "id": "read-then-write",
+      "description": "Multi-tool: read a file, transform its content, write the result",
+      "prompt": "Read the file names.txt, sort the names alphabetically, and write the sorted list to sorted_names.txt (one name per line).",
+      "setup_files": [
+        { "path": "names.txt", "content": "Charlie\nAlice\nDave\nBob\n" }
+      ],
+      "expected_files": [
+        { "path": "sorted_names.txt", "contains": "Alice" },
+        { "path": "sorted_names.txt", "contains": "Bob" }
+      ],
+      "eval_criteria": [
+        "The sorted file contains all 4 names",
+        "The names appear in alphabetical order: Alice, Bob, Charlie, Dave",
+        "The original names.txt is not modified"
+      ]
+    },
+    {
+      "id": "glob-then-grep",
+      "description": "Multi-tool: find files by pattern, then search their content",
+      "prompt": "Find all .toml files, then check which ones contain a 'version' key. List the file paths and their version values.",
+      "setup_files": [
+        { "path": "Cargo.toml", "content": "[package]\nname = \"myapp\"\nversion = \"0.2.0\"\n" },
+        { "path": "config.toml", "content": "[database]\nhost = \"localhost\"\nport = 5432\n" },
+        { "path": "pyproject.toml", "content": "[project]\nname = \"mypkg\"\nversion = \"1.5.3\"\n" },
+        { "path": "data.json", "content": "{\"version\": \"ignored\"}\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "Identifies Cargo.toml with version 0.2.0",
+        "Identifies pyproject.toml with version 1.5.3",
+        "Reports that config.toml has no version key",
+        "Does not include data.json (not a .toml file)"
+      ]
+    },
+    {
+      "id": "read-edit-verify",
+      "description": "Multi-tool: read, edit, then read again to verify",
+      "prompt": "Read the file settings.ini, change the 'theme' value from 'dark' to 'light', then read the file again and confirm the change was applied.",
+      "setup_files": [
+        {
+          "path": "settings.ini",
+          "content": "[ui]\ntheme = dark\nfont_size = 14\nlanguage = en\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "settings.ini", "contains": "theme = light" }
+      ],
+      "eval_criteria": [
+        "The theme value was changed from 'dark' to 'light'",
+        "font_size and language remain unchanged",
+        "The assistant verified the edit by reading the file afterward"
+      ]
+    },
+    {
+      "id": "write-multiple-files",
+      "description": "Write: create multiple related files",
+      "prompt": "Create a simple Python package: __init__.py (empty), models.py with a class 'User' that has 'name' and 'email' attributes, and views.py with a function 'get_user' that returns a User instance. All files should go in the 'myapp' directory.",
+      "setup_files": [],
+      "expected_files": [
+        { "path": "myapp/__init__.py" },
+        { "path": "myapp/models.py", "contains": "class User" },
+        { "path": "myapp/views.py", "contains": "def get_user" }
+      ],
+      "eval_criteria": [
+        "All three files are created in the myapp/ directory",
+        "User class has name and email attributes",
+        "get_user function returns a User instance",
+        "views.py imports from models.py correctly"
+      ]
+    },
+    {
+      "id": "bash-run-command",
+      "description": "Bash: run a shell command and report its output",
+      "prompt": "Use a shell command to count the number of lines in data.csv and tell me the exact count.",
+      "setup_files": [
+        {
+          "path": "data.csv",
+          "content": "name,age\nAlice,30\nBob,25\nCharlie,35\nDiana,28\n"
+        }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The Bash tool was used to run a command like 'wc -l'",
+        "Correctly reports the file has 5 lines (including the header)",
+        "Does not fabricate the count"
+      ]
+    },
+    {
+      "id": "bash-create-directory-structure",
+      "description": "Bash: use shell commands to create a directory tree",
+      "prompt": "Use mkdir to create the directory structure: project/src, project/tests, project/docs. Then create an empty .gitkeep file in each directory.",
+      "setup_files": [],
+      "expected_files": [
+        { "path": "project/src/.gitkeep" },
+        { "path": "project/tests/.gitkeep" },
+        { "path": "project/docs/.gitkeep" }
+      ],
+      "eval_criteria": [
+        "The Bash tool was used for directory creation",
+        "All three directories exist with .gitkeep files",
+        "The directory structure matches exactly what was requested"
+      ]
+    },
+    {
+      "id": "bash-pipeline",
+      "description": "Bash: run a multi-step shell pipeline",
+      "prompt": "Use a shell command to find all unique extensions in this directory (ignoring files without extensions) and write them to extensions.txt, one per line, sorted alphabetically.",
+      "setup_files": [
+        { "path": "main.py", "content": "print('hello')\n" },
+        { "path": "utils.py", "content": "pass\n" },
+        { "path": "app.js", "content": "console.log('hi');\n" },
+        { "path": "style.css", "content": "body {}\n" },
+        { "path": "README.md", "content": "# Readme\n" },
+        { "path": "data.json", "content": "{}\n" }
+      ],
+      "expected_files": [
+        { "path": "extensions.txt", "contains": ".css" },
+        { "path": "extensions.txt", "contains": ".js" },
+        { "path": "extensions.txt", "contains": ".json" },
+        { "path": "extensions.txt", "contains": ".md" },
+        { "path": "extensions.txt", "contains": ".py" }
+      ],
+      "eval_criteria": [
+        "The Bash tool was used with a pipeline (e.g. ls, find, sort, uniq)",
+        "extensions.txt contains exactly 5 unique extensions",
+        "Extensions are sorted alphabetically",
+        "Each extension appears only once"
+      ]
+    },
+    {
+      "id": "bash-error-handling",
+      "description": "Bash: handle a failing command gracefully",
+      "prompt": "Try to compile the file broken.c with gcc and report what errors you find. Then fix the errors and compile again.",
+      "setup_files": [
+        {
+          "path": "broken.c",
+          "content": "#include <stdio.h>\nint main() {\n    printf(\"Hello, World!\")\n    return 0;\n}\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "broken.c", "contains": "printf(\"Hello, World!\");" }
+      ],
+      "eval_criteria": [
+        "The Bash tool was used to run gcc",
+        "The missing semicolon error was identified",
+        "The file was fixed (semicolon added after printf)",
+        "A second compilation attempt succeeded or the fix is clearly correct"
+      ]
+    },
+    {
+      "id": "listdir-explore-project",
+      "description": "ListDirectory: explore a project structure and describe it",
+      "prompt": "List the contents of the project root and the src/ directory. Describe the project structure.",
+      "setup_files": [
+        { "path": "Cargo.toml", "content": "[package]\nname = \"demo\"\nversion = \"0.1.0\"\n" },
+        { "path": "README.md", "content": "# Demo Project\n" },
+        { "path": "src/main.rs", "content": "fn main() { println!(\"hi\"); }\n" },
+        { "path": "src/lib.rs", "content": "pub mod utils;\n" },
+        { "path": "src/utils.rs", "content": "pub fn helper() -> i32 { 42 }\n" },
+        { "path": "tests/integration.rs", "content": "#[test]\nfn it_works() {}\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The ListDirectory tool was used to list directory contents",
+        "Correctly identifies it as a Rust/Cargo project",
+        "Mentions key files: Cargo.toml, README.md, src/ directory",
+        "Mentions the source files: main.rs, lib.rs, utils.rs"
+      ]
+    },
+    {
+      "id": "listdir-find-hidden-files",
+      "description": "ListDirectory: list directory contents including hidden indicators",
+      "prompt": "List the contents of the config/ directory and tell me how many files and how many subdirectories it contains.",
+      "setup_files": [
+        { "path": "config/settings.yaml", "content": "debug: true\n" },
+        { "path": "config/routes.json", "content": "[]\n" },
+        { "path": "config/certs/ca.pem", "content": "CERT\n" },
+        { "path": "config/certs/key.pem", "content": "KEY\n" },
+        { "path": "config/templates/base.html", "content": "<html></html>\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The ListDirectory tool was used",
+        "Correctly reports 2 files (settings.yaml, routes.json) in config/",
+        "Correctly reports 2 subdirectories (certs/, templates/) in config/",
+        "Distinguishes files from directories in the listing"
+      ]
+    },
+    {
+      "id": "skill-list-empty",
+      "description": "Skill: list skills when none are defined",
+      "prompt": "List all available skills.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "The Skill tool was used with the 'list' action",
+        "Reports that no skills are available",
+        "Does not fabricate skill names"
+      ]
+    },
+    {
+      "id": "skill-list-and-execute",
+      "description": "Skill: discover and load a skill",
+      "prompt": "List the available skills, then execute the 'code-review' skill with input 'Review the main.py file for bugs'.",
+      "setup_files": [
+        {
+          "path": "skills/code-review/SKILL.md",
+          "content": "---\nname: code-review\ndescription: Review code for bugs, style issues, and improvements.\n---\n\n# Code Review Skill\n\n1. Read the specified file.\n2. Check for common bugs (off-by-one, null checks, resource leaks).\n3. Check for style issues.\n4. Suggest improvements.\n5. Summarize findings."
+        },
+        {
+          "path": "main.py",
+          "content": "def divide(a, b):\n    return a / b\n\ndef read_file(path):\n    f = open(path)\n    data = f.read()\n    return data\n"
+        }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The Skill tool was used with 'list' action first",
+        "The code-review skill was found and listed",
+        "The Skill tool was used with 'execute' action to load the skill",
+        "The loaded skill prompt was used to guide a code review of main.py",
+        "Identified the division-by-zero risk in divide()",
+        "Identified the unclosed file handle in read_file()"
+      ]
+    },
+    {
+      "id": "skill-with-references",
+      "description": "Skill: load a skill that has reference files",
+      "prompt": "Execute the 'setup-project' skill to set up a new Python project called 'mylib'.",
+      "setup_files": [
+        {
+          "path": "skills/setup-project/SKILL.md",
+          "content": "---\nname: setup-project\ndescription: Set up a new Python project with standard structure.\n---\n\n# Project Setup\n\nFollow the reference files in order to set up the project."
+        },
+        {
+          "path": "skills/setup-project/references/01-structure.md",
+          "content": "# Directory Structure\n\nCreate the following:\n- <name>/\n- <name>/__init__.py\n- tests/\n- tests/__init__.py\n- setup.py\n- README.md"
+        },
+        {
+          "path": "skills/setup-project/references/02-setup-py.md",
+          "content": "# setup.py Template\n\nCreate setup.py with:\n```python\nfrom setuptools import setup, find_packages\nsetup(name='<name>', version='0.1.0', packages=find_packages())\n```"
+        }
+      ],
+      "expected_files": [
+        { "path": "mylib/__init__.py" },
+        { "path": "tests/__init__.py" },
+        { "path": "setup.py", "contains": "mylib" },
+        { "path": "README.md" }
+      ],
+      "eval_criteria": [
+        "The Skill tool loaded the setup-project skill with references",
+        "The directory structure from 01-structure.md was followed",
+        "setup.py follows the template from 02-setup-py.md",
+        "The project name 'mylib' was substituted correctly",
+        "All expected files were created"
+      ]
+    },
+    {
+      "id": "bash-then-edit",
+      "description": "Multi-tool: use Bash to inspect, then Edit to fix",
+      "prompt": "Run the Python script test_math.py and fix any failing tests, then run it again to confirm all tests pass.",
+      "setup_files": [
+        {
+          "path": "math_ops.py",
+          "content": "def square(x):\n    return x * x\n\ndef cube(x):\n    return x * x  # bug: should be x * x * x\n"
+        },
+        {
+          "path": "test_math.py",
+          "content": "from math_ops import square, cube\n\ndef test_square():\n    assert square(3) == 9, f\"Expected 9, got {square(3)}\"\n    assert square(0) == 0, f\"Expected 0, got {square(0)}\"\n    print('test_square passed')\n\ndef test_cube():\n    assert cube(2) == 8, f\"Expected 8, got {cube(2)}\"\n    assert cube(3) == 27, f\"Expected 27, got {cube(3)}\"\n    print('test_cube passed')\n\nif __name__ == '__main__':\n    test_square()\n    test_cube()\n    print('All tests passed!')\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "math_ops.py", "contains": "x * x * x" }
+      ],
+      "eval_criteria": [
+        "The Bash tool was used to run the test script initially",
+        "The test_cube failure was identified from the output",
+        "The bug in cube() was fixed (x * x changed to x * x * x)",
+        "The Bash tool was used again to verify the fix",
+        "All tests pass after the fix"
+      ]
+    },
+    {
+      "id": "listdir-then-read",
+      "description": "Multi-tool: use ListDirectory to explore, then Read to inspect",
+      "prompt": "List the contents of the configs/ directory, find which file defines the database settings, and tell me the database host and port.",
+      "setup_files": [
+        { "path": "configs/app.yaml", "content": "app:\n  name: myapp\n  version: 2.1\n  log_level: info\n" },
+        { "path": "configs/database.yaml", "content": "database:\n  host: db.internal.example.com\n  port: 5432\n  name: production\n  pool_size: 10\n" },
+        { "path": "configs/cache.yaml", "content": "cache:\n  backend: redis\n  host: cache.internal\n  ttl: 3600\n" }
+      ],
+      "expected_files": [],
+      "eval_criteria": [
+        "The ListDirectory tool was used to list configs/",
+        "Identified database.yaml as the file with database settings",
+        "The Read tool was used to read database.yaml",
+        "Correctly reports host as 'db.internal.example.com'",
+        "Correctly reports port as 5432"
+      ]
+    },
+    {
+      "id": "bash-grep-edit-workflow",
+      "description": "Multi-tool: use Bash + Grep + Edit in a debugging workflow",
+      "prompt": "There's a bug in the app. Run 'python app.py' to see the error, find the problematic function using Grep, fix the bug, and run the app again to verify.",
+      "setup_files": [
+        {
+          "path": "app.py",
+          "content": "from utils import format_name, calculate_total\n\ndef main():\n    name = format_name('john', 'doe')\n    print(f'Name: {name}')\n    \n    items = [10.0, 20.0, 30.0]\n    total = calculate_total(items)\n    print(f'Total: ${total:.2f}')\n\nif __name__ == '__main__':\n    main()\n"
+        },
+        {
+          "path": "utils.py",
+          "content": "def format_name(first, last):\n    return f'{first.capitalize()} {last.capitalize()}'\n\ndef calculate_total(items):\n    total = 0\n    for item in items:\n        total += item\n    return total / 0  # bug: division by zero\n"
+        }
+      ],
+      "expected_files": [
+        { "path": "utils.py", "contains": "return total" }
+      ],
+      "eval_criteria": [
+        "Bash was used to run app.py and see the ZeroDivisionError",
+        "Grep or Read was used to locate the division by zero in utils.py",
+        "The bug was fixed (removed '/ 0' so it returns 'total' directly)",
+        "Bash was used to run app.py again to confirm it works",
+        "The output shows Name: John Doe and Total: $60.00"
+      ]
+    },
+    {
+      "id": "todo-basic-dag",
+      "description": "Todo: create tasks with dependency relationships and track them",
+      "prompt": "I have a release process with these steps: (1) Write tests, (2) Fix bugs (depends on Write tests), (3) Code review (depends on Fix bugs), (4) Deploy (depends on Code review). Use the Todo tool to model this as a DAG. Add all four tasks with their dependencies, then list them to show the dependency graph.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "The Todo tool was used with 'add' action for all four tasks",
+        "Fix bugs declares a dependency on Write tests",
+        "Code review declares a dependency on Fix bugs",
+        "Deploy declares a dependency on Code review",
+        "The 'list' action was called and shows the dependency chain",
+        "Unfinished dependencies are marked with ✗ in the listing"
+      ]
+    },
+    {
+      "id": "todo-blocked-enforcement",
+      "description": "Todo: verify that a blocked task cannot be started until its dependency is done",
+      "prompt": "Use the Todo tool to: (1) Add task 'Setup database' and task 'Run migrations' that depends on 'Setup database'. (2) Try to mark 'Run migrations' as in_progress — it should be blocked. (3) Mark 'Setup database' as done. (4) Now mark 'Run migrations' as in_progress — it should succeed. Show the final list.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "Both tasks were added with the correct dependency",
+        "The first attempt to start 'Run migrations' was rejected with a blocked message",
+        "After marking 'Setup database' as done, 'Run migrations' was successfully started",
+        "The final list shows 'Setup database' as done and 'Run migrations' as in_progress",
+        "The dependency on 'Setup database' shows ✓ in the final listing"
+      ]
+    },
+    {
+      "id": "todo-cycle-rejection",
+      "description": "Todo: verify that circular dependencies are rejected",
+      "prompt": "Use the Todo tool to add three tasks: 'A', 'B' (depends on A), and 'C' (depends on B). Then try to add a dependency from A to C (which would create a cycle A→B→C→A). The tool should reject it. Report what happened.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "Tasks A, B, C were added with the linear dependency chain A←B←C",
+        "The attempt to make A depend on C was rejected",
+        "The rejection message mentions 'cycle'",
+        "The existing tasks and their valid dependencies remain intact after the rejection"
+      ]
+    },
+    {
+      "id": "todo-add-remove-dep",
+      "description": "Todo: dynamically add and remove dependencies between existing tasks",
+      "prompt": "Use the Todo tool to: (1) Add tasks 'Build frontend', 'Build backend', and 'Integration test'. (2) Use add_dep to make 'Integration test' depend on both 'Build frontend' and 'Build backend'. (3) List to confirm. (4) Use remove_dep to remove the dependency on 'Build frontend'. (5) List again to confirm it's gone.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "All three tasks were added",
+        "add_dep was used to add both dependencies to 'Integration test'",
+        "The list after step 3 shows both deps on 'Integration test'",
+        "remove_dep was used to remove the 'Build frontend' dependency",
+        "The final list shows 'Integration test' depending only on 'Build backend'"
+      ]
+    },
+    {
+      "id": "todo-remove-cascades",
+      "description": "Todo: removing a task cleans up its references in other tasks' dependency lists",
+      "prompt": "Use the Todo tool to: (1) Add 'Task A' and 'Task B' where B depends on A. (2) Remove 'Task A'. (3) List the remaining tasks and confirm that 'Task B' no longer shows any dependencies.",
+      "setup_files": [],
+      "expected_files": [],
+      "eval_criteria": [
+        "Both tasks were added with B depending on A",
+        "Task A was removed",
+        "The list shows only Task B with no dependency entries",
+        "Task B can now be started without being blocked"
+      ]
+    }
+  ]
+}
