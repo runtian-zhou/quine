@@ -122,7 +122,7 @@ fn rewind(conv_log: &mut ConversationLog, messages: &mut Vec<ChatMessage>, n: us
 }
 
 pub(crate) fn format_tokens(n: u64) -> String {
-    if n >= 1_000_000 {
+    if n >= 999_950 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
         format!("{:.1}K", n as f64 / 1_000.0)
@@ -189,7 +189,7 @@ mod tests {
         assert_eq!(format_tokens(1_000), "1.0K", "1000 should format as '1.0K'");
         assert_eq!(format_tokens(1_500), "1.5K", "1500 should format as '1.5K'");
         assert_eq!(format_tokens(12_345), "12.3K", "12345 should format as '12.3K'");
-        assert_eq!(format_tokens(999_999), "1000.0K", "999999 should stay in K range");
+        assert_eq!(format_tokens(999_999), "1.0M", "999999 should round up to 1.0M");
     }
 
     #[test]

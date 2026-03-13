@@ -181,6 +181,8 @@ pub async fn run_chat(
         // Track per-turn usage
         let mut turn_input = 0u64;
         let mut turn_output = 0u64;
+        let mut turn_cache_creation = 0u64;
+        let mut turn_cache_read = 0u64;
 
         // Conversation loop: keep going while LLM wants to call tools
         loop {
@@ -207,6 +209,8 @@ pub async fn run_chat(
             // Accumulate usage
             turn_input += response.usage.input_tokens;
             turn_output += response.usage.output_tokens;
+            turn_cache_creation += response.usage.cache_creation_input_tokens;
+            turn_cache_read += response.usage.cache_read_input_tokens;
 
             // Record assistant message
             let tool_calls_for_log: Vec<ToolCall> = response
@@ -318,7 +322,7 @@ pub async fn run_chat(
         }
 
         // Update session usage and print summary
-        session_usage.add(turn_input, turn_output, 0, 0);
+        session_usage.add(turn_input, turn_output, turn_cache_creation, turn_cache_read);
         if turn_input > 0 || turn_output > 0 {
             commands::print_turn_usage(turn_input, turn_output, &session_usage);
         }

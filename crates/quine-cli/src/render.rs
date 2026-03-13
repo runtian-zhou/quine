@@ -157,7 +157,11 @@ impl Renderer {
                 let display = match value {
                     serde_json::Value::String(s) => {
                         if s.len() > 80 {
-                            format!("{}...", &s[..80])
+                            let mut end = 80;
+                            while end > 0 && !s.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!("{}...", &s[..end])
                         } else {
                             s.clone()
                         }
@@ -165,7 +169,11 @@ impl Renderer {
                     other => {
                         let s = other.to_string();
                         if s.len() > 80 {
-                            format!("{}...", &s[..80])
+                            let mut end = 80;
+                            while end > 0 && !s.is_char_boundary(end) {
+                                end -= 1;
+                            }
+                            format!("{}...", &s[..end])
                         } else {
                             s
                         }

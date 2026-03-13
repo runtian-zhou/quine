@@ -1078,6 +1078,24 @@ async fn web_fetch_tool_invalid_url_returns_failure() {
     );
 }
 
+#[tokio::test]
+async fn web_fetch_tool_rejects_file_scheme() {
+    let tool = WebFetchTool::new();
+    let result = tool
+        .execute(json!({"url": "file:///etc/passwd"}))
+        .await
+        .unwrap();
+    assert_eq!(
+        result.success, false,
+        "file:// URLs should be rejected to prevent SSRF"
+    );
+    assert!(
+        result.output.contains("http://") || result.output.contains("https://"),
+        "error message should mention allowed schemes, got: {}",
+        result.output
+    );
+}
+
 #[test]
 fn strip_html_tags_removes_tags() {
     let input = "<p>Hello <b>World</b></p>";

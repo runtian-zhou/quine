@@ -122,7 +122,7 @@ impl TodoTool {
         false
     }
 
-    fn add(&self, content: &str, priority: &str, depends_on: Vec<usize>) -> String {
+    fn add(&self, content: &str, priority: &str, depends_on: Vec<usize>) -> (bool, String) {
         let mut items = self.items.lock().unwrap();
         let mut next_id = self.next_id.lock().unwrap();
         let id = *next_id;
@@ -130,12 +130,12 @@ impl TodoTool {
         // Validate all dep IDs exist.
         for &dep in &depends_on {
             if !items.iter().any(|i| i.id == dep) {
-                return format!("Dependency #{} not found", dep);
+                return (false, format!("Dependency #{} not found", dep));
             }
         }
 
         if Self::would_create_cycle(&items, id, &depends_on) {
-            return "Cannot add: self-dependency detected".to_string();
+            return (false, "Cannot add: self-dependency detected".to_string());
         }
 
         *next_id += 1;
@@ -146,20 +146,20 @@ impl TodoTool {
             priority: Priority::from_str(priority),
             depends_on,
         });
-        format!("Added todo #{}: {}", id, content)
+        (true, format!("Added todo #{}: {}", id, content))
     }
 
-    fn update(&self, id: usize, status: &str) -> String {
+    fn update(&self, id: usize, status: &str) -> (bool, String) {
         let mut items = self.items.lock().unwrap();
         let Some(status_enum) = TodoStatus::from_str(status) else {
-            return format!("Invalid status '{}'. Use: pending, in_progress, done", status);
+            return (false, format!("Invalid status '{}'. Use: pending, in_progress, done", status));
         };
 
         // If moving to in_progress, check all deps are done.
         if status_enum == TodoStatus::InProgress {
             let item = match items.iter().find(|i| i.id == id) {
                 Some(i) => i.clone(),
-                None => return format!("Todo #{} not found", id),
+                None => return (false, format!("Todo #{} not found", id)),
             };
             let map: HashMap<usize, &TodoItem> =
                 items.iter().map(|i| (i.id, i)).collect();
@@ -175,60 +175,60 @@ impl TodoTool {
                 .collect();
             if !blocking.is_empty() {
                 let ids: Vec<String> = blocking.iter().map(|i| format!("#{}", i)).collect();
-                return format!(
+                return (false, format!(
                     "Cannot start #{}: blocked by {}",
                     id,
                     ids.join(", ")
-                );
+                ));
             }
         }
 
         if let Some(item) = items.iter_mut().find(|i| i.id == id) {
             item.status = status_enum;
-            format!("Updated todo #{} to {}", id, status)
+            (true, format!("Updated todo #{} to {}", id, status))
         } else {
-            format!("Todo #{} not found", id)
+            (false, format!("Todo #{} not found", id))
         }
     }
 
-    fn add_dep(&self, id: usize, dep_id: usize) -> String {
+    fn add_dep(&self, id: usize, dep_id: usize) -> (bool, String) {
         let mut items = self.items.lock().unwrap();
         if !items.iter().any(|i| i.id == dep_id) {
-            return format!("Dependency #{} not found", dep_id);
+            return (false, format!("Dependency #{} not found", dep_id));
         }
         if !items.iter().any(|i| i.id == id) {
-            return format!("Todo #{} not found", id);
+            return (false, format!("Todo #{} not found", id));
         }
         if id == dep_id {
-            return "Cannot depend on itself".to_string();
+            return (false, "Cannot depend on itself".to_string());
         }
         if Self::edge_creates_cycle(&items, id, dep_id) {
-            return format!("Cannot add dependency: would create a cycle between #{} and #{}", id, dep_id);
+            return (false, format!("Cannot add dependency: would create a cycle between #{} and #{}", id, dep_id));
         }
         let item = items.iter_mut().find(|i| i.id == id).unwrap();
         if item.depends_on.contains(&dep_id) {
-            return format!("#{} already depends on #{}", id, dep_id);
+            return (false, format!("#{} already depends on #{}", id, dep_id));
         }
         item.depends_on.push(dep_id);
-        format!("#{} now depends on #{}", id, dep_id)
+        (true, format!("#{} now depends on #{}", id, dep_id))
     }
 
-    fn remove_dep(&self, id: usize, dep_id: usize) -> String {
+    fn remove_dep(&self, id: usize, dep_id: usize) -> (bool, String) {
         let mut items = self.items.lock().unwrap();
         if let Some(item) = items.iter_mut().find(|i| i.id == id) {
             let before = item.depends_on.len();
             item.depends_on.retain(|&d| d != dep_id);
             if item.depends_on.len() < before {
-                format!("Removed dependency #{} -> #{}", id, dep_id)
+                (true, format!("Removed dependency #{} -> #{}", id, dep_id))
             } else {
-                format!("#{} does not depend on #{}", id, dep_id)
+                (false, format!("#{} does not depend on #{}", id, dep_id))
             }
         } else {
-            format!("Todo #{} not found", id)
+            (false, format!("Todo #{} not found", id))
         }
     }
 
-    fn remove(&self, id: usize) -> String {
+    fn remove(&self, id: usize) -> (bool, String) {
         let mut items = self.items.lock().unwrap();
         // Also strip this id from other items' depends_on.
         for item in items.iter_mut() {
@@ -237,16 +237,16 @@ impl TodoTool {
         let len_before = items.len();
         items.retain(|i| i.id != id);
         if items.len() < len_before {
-            format!("Removed todo #{}", id)
+            (true, format!("Removed todo #{}", id))
         } else {
-            format!("Todo #{} not found", id)
+            (false, format!("Todo #{} not found", id))
         }
     }
 
-    fn list(&self) -> String {
+    fn list(&self) -> (bool, String) {
         let items = self.items.lock().unwrap();
         if items.is_empty() {
-            return "No todos.".to_string();
+            return (true, "No todos.".to_string());
         }
         let map: HashMap<usize, &TodoItem> = items.iter().map(|i| (i.id, i)).collect();
         let mut lines = Vec::new();
@@ -281,7 +281,7 @@ impl TodoTool {
                 marker, item.id, item.status, item.priority, deps_str, item.content
             ));
         }
-        lines.join("\n")
+        (true, lines.join("\n"))
     }
 }
 
@@ -342,7 +342,7 @@ impl Tool for Arc<TodoTool> {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("action is required"))?;
 
-        let output = match action {
+        let (success, output) = match action {
             "add" => {
                 let content = arguments["content"]
                     .as_str()
@@ -392,14 +392,14 @@ impl Tool for Arc<TodoTool> {
                     .ok_or_else(|| anyhow::anyhow!("dep_id is required for 'remove_dep'"))? as usize;
                 self.remove_dep(id, dep_id)
             }
-            _ => format!(
+            _ => (false, format!(
                 "Unknown action '{}'. Use: add, update, remove, list, add_dep, remove_dep",
                 action
-            ),
+            )),
         };
 
         Ok(ToolOutput {
-            success: true,
+            success,
             output,
         })
     }

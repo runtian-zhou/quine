@@ -37,7 +37,7 @@ impl PermissionManager {
     pub fn risk_level(tool_name: &str) -> RiskLevel {
         match tool_name {
             "Bash" => RiskLevel::High,
-            "Write" | "Edit" => RiskLevel::Medium,
+            "Write" | "Edit" | "WebFetch" | "WebSearch" | "Subagent" => RiskLevel::Medium,
             _ => RiskLevel::Low,
         }
     }
@@ -106,6 +106,9 @@ impl PermissionManager {
             ("ListDirectory", RiskLevel::Low),
             ("Write", RiskLevel::Medium),
             ("Edit", RiskLevel::Medium),
+            ("WebFetch", RiskLevel::Medium),
+            ("WebSearch", RiskLevel::Medium),
+            ("Subagent", RiskLevel::Medium),
             ("Bash", RiskLevel::High),
         ];
         for (name, risk) in &tools {

@@ -48,6 +48,14 @@ impl Tool for WebFetchTool {
             .as_str()
             .ok_or_else(|| anyhow::anyhow!("url is required"))?;
 
+        // Only allow http:// and https:// schemes to prevent SSRF via file://, etc.
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return Ok(ToolOutput {
+                success: false,
+                output: "Only http:// and https:// URLs are supported.".to_string(),
+            });
+        }
+
         let response = match self.client.get(url).send().await {
             Ok(r) => r,
             Err(e) => {
@@ -83,7 +91,13 @@ impl Tool for WebFetchTool {
         let text = if text.len() > max_len {
             format!(
                 "{}\n\n... truncated ({} chars total)",
-                &text[..max_len],
+                {
+                    let mut end = max_len;
+                    while end > 0 && !text.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    &text[..end]
+                },
                 text.len()
             )
         } else {

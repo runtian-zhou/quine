@@ -82,7 +82,11 @@ impl Tool for BashTool {
                 // Truncate very long output
                 let max_len = 100_000;
                 if result.len() > max_len {
-                    let truncated = &result[..max_len];
+                    let mut end = max_len;
+                    while end > 0 && !result.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    let truncated = &result[..end];
                     result = format!(
                         "{}\n\n... output truncated ({} bytes total)",
                         truncated,
