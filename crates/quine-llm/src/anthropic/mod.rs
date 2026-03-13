@@ -172,10 +172,21 @@ impl LlmProvider for AnthropicProvider {
             _ => StopReason::Unknown("none".to_string()),
         };
 
+        let usage = match api_response.usage {
+            Some(u) => Usage {
+                input_tokens: u.input_tokens,
+                output_tokens: u.output_tokens,
+                cache_creation_input_tokens: u.cache_creation_input_tokens.unwrap_or(0),
+                cache_read_input_tokens: u.cache_read_input_tokens.unwrap_or(0),
+            },
+            None => Usage::default(),
+        };
+
         Ok(CompletionResponse {
             content,
             tool_calls,
             stop_reason,
+            usage,
         })
     }
 

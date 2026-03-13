@@ -198,10 +198,21 @@ impl LlmProvider for OpenAiProvider {
             None => StopReason::Unknown("none".to_string()),
         };
 
+        let usage = match api_response.usage {
+            Some(u) => Usage {
+                input_tokens: u.prompt_tokens,
+                output_tokens: u.completion_tokens,
+                cache_creation_input_tokens: 0,
+                cache_read_input_tokens: 0,
+            },
+            None => Usage::default(),
+        };
+
         Ok(CompletionResponse {
             content,
             tool_calls,
             stop_reason,
+            usage,
         })
     }
 

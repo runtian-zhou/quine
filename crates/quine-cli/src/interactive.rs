@@ -288,6 +288,7 @@ async fn complete_with_streaming(
     let mut current_tool_name = String::new();
     let mut current_tool_args = String::new();
     let mut stop_reason = StopReason::EndTurn;
+    let mut usage = Usage::default();
 
     let mut spinner = Some(crate::render::Spinner::start("Thinking..."));
 
@@ -322,6 +323,12 @@ async fn complete_with_streaming(
                     current_tool_args.clear();
                 }
             }
+            StreamEvent::Usage(u) => {
+                usage.input_tokens += u.input_tokens;
+                usage.output_tokens += u.output_tokens;
+                usage.cache_creation_input_tokens += u.cache_creation_input_tokens;
+                usage.cache_read_input_tokens += u.cache_read_input_tokens;
+            }
             StreamEvent::Done(reason) => {
                 stop_reason = reason;
             }
@@ -344,6 +351,7 @@ async fn complete_with_streaming(
         content,
         tool_calls,
         stop_reason,
+        usage,
     })
 }
 

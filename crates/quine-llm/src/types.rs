@@ -61,10 +61,30 @@ pub enum ContentBlock {
 }
 
 #[derive(Debug, Clone)]
+pub struct Usage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: u64,
+    pub cache_read_input_tokens: u64,
+}
+
+impl Default for Usage {
+    fn default() -> Self {
+        Self {
+            input_tokens: 0,
+            output_tokens: 0,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct CompletionResponse {
     pub content: String,
     pub tool_calls: Vec<ToolCall>,
     pub stop_reason: StopReason,
+    pub usage: Usage,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -84,5 +104,6 @@ pub enum StreamEvent {
     },
     ToolCallDelta(String),
     ToolCallEnd,
+    Usage(Usage),
     Done(StopReason),
 }

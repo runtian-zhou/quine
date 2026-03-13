@@ -82,10 +82,19 @@ pub enum AnthropicBlock {
     },
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnthropicUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_creation_input_tokens: Option<u64>,
+    pub cache_read_input_tokens: Option<u64>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct AnthropicResponse {
     pub content: Vec<AnthropicBlock>,
     pub stop_reason: Option<String>,
+    pub usage: Option<AnthropicUsage>,
 }
 
 // SSE streaming types
@@ -116,6 +125,7 @@ pub enum AnthropicStreamEvent {
 #[derive(Debug, Deserialize)]
 pub struct MessageStartData {
     pub id: String,
+    pub usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -130,6 +140,7 @@ pub enum DeltaBlock {
 #[derive(Debug, Deserialize)]
 pub struct MessageDeltaData {
     pub stop_reason: Option<String>,
+    pub usage: Option<AnthropicUsage>,
 }
 
 #[derive(Debug, Deserialize)]

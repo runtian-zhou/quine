@@ -53,8 +53,15 @@ pub struct OpenAiFunctionCall {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct OpenAiUsage {
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct OpenAiResponse {
     pub choices: Vec<OpenAiChoice>,
+    pub usage: Option<OpenAiUsage>,
 }
 
 #[derive(Debug, Deserialize)]
