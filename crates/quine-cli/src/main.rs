@@ -32,9 +32,9 @@ enum Commands {
         #[arg(long, value_name = "LOG_FILE")]
         r#continue: Option<PathBuf>,
 
-        /// Use streaming responses
-        #[arg(long, default_value_t = true)]
-        stream: bool,
+        /// Disable streaming responses
+        #[arg(long)]
+        no_stream: bool,
 
         /// Non-interactive: run a single prompt and print the result
         #[arg(short, long)]
@@ -75,7 +75,7 @@ async fn main() -> anyhow::Result<()> {
             model,
             base_url,
             r#continue,
-            stream,
+            no_stream,
             print,
             working_dir,
             output_format,
@@ -91,7 +91,7 @@ async fn main() -> anyhow::Result<()> {
                 )
                 .await?;
             } else {
-                interactive::run_chat(&provider, &model, base_url.as_deref(), r#continue, stream).await?;
+                interactive::run_chat(&provider, &model, base_url.as_deref(), r#continue, !no_stream).await?;
             }
         }
         Commands::Replay {
