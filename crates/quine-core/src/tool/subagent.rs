@@ -10,9 +10,8 @@ use crate::tool::Tool;
 
 /// An async function that takes a prompt and worktree flag, returns the final assistant response text.
 /// The implementation is responsible for running the full agent loop (LLM calls + tool execution).
-pub type CompletionFn = Arc<
-    dyn Fn(String, bool) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync,
->;
+pub type CompletionFn =
+    Arc<dyn Fn(String, bool) -> Pin<Box<dyn Future<Output = Result<String>> + Send>> + Send + Sync>;
 
 pub struct SubagentTool {
     completion_fn: CompletionFn,

@@ -127,7 +127,10 @@ impl PermissionManager {
                 RiskLevel::Medium => "\x1b[33mmedium\x1b[0m",
                 RiskLevel::High => "\x1b[31mhigh\x1b[0m",
             };
-            println!("  \x1b[1m{:<15}\x1b[0m risk: {}  status: {}", name, risk_label, status);
+            println!(
+                "  \x1b[1m{:<15}\x1b[0m risk: {}  status: {}",
+                name, risk_label, status
+            );
         }
     }
 }

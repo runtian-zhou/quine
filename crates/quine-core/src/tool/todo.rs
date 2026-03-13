@@ -77,6 +77,12 @@ pub struct TodoTool {
     next_id: Mutex<usize>,
 }
 
+impl Default for TodoTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TodoTool {
     pub fn new() -> Self {
         Self {
@@ -152,7 +158,13 @@ impl TodoTool {
     fn update(&self, id: usize, status: &str) -> (bool, String) {
         let mut items = self.items.lock().unwrap();
         let Some(status_enum) = TodoStatus::from_str(status) else {
-            return (false, format!("Invalid status '{}'. Use: pending, in_progress, done", status));
+            return (
+                false,
+                format!(
+                    "Invalid status '{}'. Use: pending, in_progress, done",
+                    status
+                ),
+            );
         };
 
         // If moving to in_progress, check all deps are done.
@@ -161,8 +173,7 @@ impl TodoTool {
                 Some(i) => i.clone(),
                 None => return (false, format!("Todo #{} not found", id)),
             };
-            let map: HashMap<usize, &TodoItem> =
-                items.iter().map(|i| (i.id, i)).collect();
+            let map: HashMap<usize, &TodoItem> = items.iter().map(|i| (i.id, i)).collect();
             let blocking: Vec<usize> = item
                 .depends_on
                 .iter()
@@ -175,11 +186,10 @@ impl TodoTool {
                 .collect();
             if !blocking.is_empty() {
                 let ids: Vec<String> = blocking.iter().map(|i| format!("#{}", i)).collect();
-                return (false, format!(
-                    "Cannot start #{}: blocked by {}",
-                    id,
-                    ids.join(", ")
-                ));
+                return (
+                    false,
+                    format!("Cannot start #{}: blocked by {}", id, ids.join(", ")),
+                );
             }
         }
 
@@ -203,7 +213,13 @@ impl TodoTool {
             return (false, "Cannot depend on itself".to_string());
         }
         if Self::edge_creates_cycle(&items, id, dep_id) {
-            return (false, format!("Cannot add dependency: would create a cycle between #{} and #{}", id, dep_id));
+            return (
+                false,
+                format!(
+                    "Cannot add dependency: would create a cycle between #{} and #{}",
+                    id, dep_id
+                ),
+            );
         }
         let item = items.iter_mut().find(|i| i.id == id).unwrap();
         if item.depends_on.contains(&dep_id) {
@@ -361,7 +377,8 @@ impl Tool for Arc<TodoTool> {
             "update" => {
                 let id = arguments["id"]
                     .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("id is required for 'update'"))? as usize;
+                    .ok_or_else(|| anyhow::anyhow!("id is required for 'update'"))?
+                    as usize;
                 let status = arguments["status"]
                     .as_str()
                     .ok_or_else(|| anyhow::anyhow!("status is required for 'update'"))?;
@@ -370,37 +387,42 @@ impl Tool for Arc<TodoTool> {
             "remove" => {
                 let id = arguments["id"]
                     .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("id is required for 'remove'"))? as usize;
+                    .ok_or_else(|| anyhow::anyhow!("id is required for 'remove'"))?
+                    as usize;
                 self.remove(id)
             }
             "list" => self.list(),
             "add_dep" => {
                 let id = arguments["id"]
                     .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("id is required for 'add_dep'"))? as usize;
+                    .ok_or_else(|| anyhow::anyhow!("id is required for 'add_dep'"))?
+                    as usize;
                 let dep_id = arguments["dep_id"]
                     .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("dep_id is required for 'add_dep'"))? as usize;
+                    .ok_or_else(|| anyhow::anyhow!("dep_id is required for 'add_dep'"))?
+                    as usize;
                 self.add_dep(id, dep_id)
             }
             "remove_dep" => {
                 let id = arguments["id"]
                     .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("id is required for 'remove_dep'"))? as usize;
+                    .ok_or_else(|| anyhow::anyhow!("id is required for 'remove_dep'"))?
+                    as usize;
                 let dep_id = arguments["dep_id"]
                     .as_u64()
-                    .ok_or_else(|| anyhow::anyhow!("dep_id is required for 'remove_dep'"))? as usize;
+                    .ok_or_else(|| anyhow::anyhow!("dep_id is required for 'remove_dep'"))?
+                    as usize;
                 self.remove_dep(id, dep_id)
             }
-            _ => (false, format!(
-                "Unknown action '{}'. Use: add, update, remove, list, add_dep, remove_dep",
-                action
-            )),
+            _ => (
+                false,
+                format!(
+                    "Unknown action '{}'. Use: add, update, remove, list, add_dep, remove_dep",
+                    action
+                ),
+            ),
         };
 
-        Ok(ToolOutput {
-            success,
-            output,
-        })
+        Ok(ToolOutput { success, output })
     }
 }

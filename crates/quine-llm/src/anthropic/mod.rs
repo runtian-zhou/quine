@@ -1,13 +1,13 @@
 pub mod api_types;
 pub mod stream;
 
+use self::api_types::*;
+use crate::provider::LlmProvider;
+use crate::types::*;
 use async_trait::async_trait;
 use futures::stream::BoxStream;
 use quine_core::conversation::ToolCall;
 use reqwest::Client;
-use self::api_types::*;
-use crate::provider::LlmProvider;
-use crate::types::*;
 
 pub struct AnthropicProvider {
     client: Client,
@@ -68,13 +68,14 @@ impl AnthropicProvider {
                                         input: input.clone(),
                                     }
                                 }
-                                ContentBlock::ToolResult { tool_use_id, content } => {
-                                    AnthropicBlock::ToolResult {
-                                        tool_use_id: tool_use_id.clone(),
-                                        content: content.clone(),
-                                        cache_control: None,
-                                    }
-                                }
+                                ContentBlock::ToolResult {
+                                    tool_use_id,
+                                    content,
+                                } => AnthropicBlock::ToolResult {
+                                    tool_use_id: tool_use_id.clone(),
+                                    content: content.clone(),
+                                    cache_control: None,
+                                },
                             })
                             .collect();
                         AnthropicContent::Blocks(ab)
@@ -100,7 +101,11 @@ impl AnthropicProvider {
 
         AnthropicRequest {
             model: request.model.clone(),
-            max_tokens: if request.max_tokens > 0 { request.max_tokens } else { 8192 },
+            max_tokens: if request.max_tokens > 0 {
+                request.max_tokens
+            } else {
+                8192
+            },
             system,
             messages,
             tools,

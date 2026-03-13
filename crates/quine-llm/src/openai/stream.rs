@@ -6,9 +6,8 @@ use super::api_types::OpenAiStreamChunk;
 use crate::types::{StopReason, StreamEvent};
 
 pub fn parse_openai_sse(response: reqwest::Response) -> BoxStream<'static, Result<StreamEvent>> {
-    let stream = futures::stream::unfold(
-        response.bytes_stream().eventsource(),
-        |mut es| async move {
+    let stream =
+        futures::stream::unfold(response.bytes_stream().eventsource(), |mut es| async move {
             loop {
                 let event = es.next().await?;
                 match event {
@@ -38,8 +37,7 @@ pub fn parse_openai_sse(response: reqwest::Response) -> BoxStream<'static, Resul
                     }
                 }
             }
-        },
-    );
+        });
 
     Box::pin(stream)
 }

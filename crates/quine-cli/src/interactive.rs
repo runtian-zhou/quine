@@ -14,8 +14,8 @@ use quine_llm::anthropic::AnthropicProvider;
 use quine_llm::openai::OpenAiProvider;
 use quine_llm::provider::LlmProvider;
 use quine_llm::types::*;
-use rustyline::DefaultEditor;
 use rustyline::error::ReadlineError;
+use rustyline::DefaultEditor;
 
 use crate::commands::{self, CommandResult, SessionUsage};
 use crate::permissions::PermissionManager;
@@ -42,7 +42,7 @@ pub fn entries_to_messages(entries: &[Entry]) -> Vec<ChatMessage> {
                 if !pending_tool_results.is_empty() {
                     messages.push(ChatMessage {
                         role: "user".to_string(),
-                        content: ChatContent::Blocks(pending_tool_results.drain(..).collect()),
+                        content: ChatContent::Blocks(std::mem::take(&mut pending_tool_results)),
                     });
                 }
                 match other {
@@ -123,14 +123,21 @@ pub async fn run_chat(
         println!("Continuing from: {}", log_path.display());
         ConversationLog::load(log_path)?
     } else {
-        ConversationLog::new(model.to_string(), provider_name.to_string(), system_prompt.clone())
+        ConversationLog::new(
+            model.to_string(),
+            provider_name.to_string(),
+            system_prompt.clone(),
+        )
     };
 
     // Build messages from existing log entries for continuation.
     let mut messages = entries_to_messages(&conv_log.entries);
 
     println!("\x1b[1;36mQuine\x1b[0m - Self-bootstrapping CLI assistant");
-    println!("\x1b[90mProvider: {} | Model: {}\x1b[0m", provider_name, model);
+    println!(
+        "\x1b[90mProvider: {} | Model: {}\x1b[0m",
+        provider_name, model
+    );
     println!("\x1b[90mType your message, /help for commands, Ctrl+D to exit\x1b[0m\n");
 
     let mut rl = DefaultEditor::new()?;
@@ -164,7 +171,10 @@ pub async fn run_chat(
                 CommandResult::Continue | CommandResult::Rewound => continue,
                 CommandResult::Exit => break,
                 CommandResult::Unknown(cmd) => {
-                    println!("\x1b[33mUnknown command: {}. Type /help for available commands.\x1b[0m", cmd);
+                    println!(
+                        "\x1b[33mUnknown command: {}. Type /help for available commands.\x1b[0m",
+                        cmd
+                    );
                     continue;
                 }
             }
@@ -322,7 +332,12 @@ pub async fn run_chat(
         }
 
         // Update session usage and print summary
-        session_usage.add(turn_input, turn_output, turn_cache_creation, turn_cache_read);
+        session_usage.add(
+            turn_input,
+            turn_output,
+            turn_cache_creation,
+            turn_cache_read,
+        );
         if turn_input > 0 || turn_output > 0 {
             commands::print_turn_usage(turn_input, turn_output, &session_usage);
         }
@@ -428,7 +443,8 @@ pub async fn run_print(
     working_dir: Option<PathBuf>,
     output_format: &str,
 ) -> anyhow::Result<()> {
-    let wd = working_dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let wd = working_dir
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let config = Config::new(provider_name, model);
     let provider = create_provider(provider_name, base_url)?;
 
@@ -698,14 +714,9 @@ fn build_registry_with_subagent(
 
                 let inner_registry =
                     ToolRegistry::register_defaults_with_context(effective_dir, &ctx);
-                let result = run_subagent_loop(
-                    &*provider,
-                    &model,
-                    &system_prompt,
-                    &inner_registry,
-                    &prompt,
-                )
-                .await;
+                let result =
+                    run_subagent_loop(&*provider, &model, &system_prompt, &inner_registry, &prompt)
+                        .await;
 
                 // worktree is dropped here, cleaning up automatically
                 drop(worktree);
@@ -756,7 +767,10 @@ fn create_provider(
             }
             Ok(Arc::new(provider))
         }
-        _ => anyhow::bail!("Unknown provider: {}. Use 'anthropic' or 'openai'.", provider_name),
+        _ => anyhow::bail!(
+            "Unknown provider: {}. Use 'anthropic' or 'openai'.",
+            provider_name
+        ),
     }
 }
 
@@ -773,10 +787,7 @@ fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
                 }
             })
             .unwrap_or_default(),
-        "Write" | "Edit" => args["file_path"]
-            .as_str()
-            .unwrap_or("")
-            .to_string(),
+        "Write" | "Edit" => args["file_path"].as_str().unwrap_or("").to_string(),
         _ => String::new(),
     }
 }

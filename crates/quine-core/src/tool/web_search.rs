@@ -10,6 +10,12 @@ pub struct WebSearchTool {
     client: reqwest::Client,
 }
 
+impl Default for WebSearchTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl WebSearchTool {
     pub fn new() -> Self {
         Self {
@@ -103,10 +109,7 @@ impl Tool for WebSearchTool {
             }
         };
 
-        let results = body
-            .web
-            .map(|w| w.results)
-            .unwrap_or_default();
+        let results = body.web.map(|w| w.results).unwrap_or_default();
 
         if results.is_empty() {
             return Ok(ToolOutput {

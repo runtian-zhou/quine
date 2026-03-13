@@ -20,7 +20,13 @@ impl Worktree {
         std::fs::create_dir_all(worktree_dir.parent().unwrap())?;
 
         let output = Command::new("git")
-            .args(["worktree", "add", &worktree_dir.to_string_lossy(), "-b", &branch])
+            .args([
+                "worktree",
+                "add",
+                &worktree_dir.to_string_lossy(),
+                "-b",
+                &branch,
+            ])
             .current_dir(repo_dir)
             .output()?;
 
@@ -41,7 +47,12 @@ impl Drop for Worktree {
     fn drop(&mut self) {
         // Remove the worktree
         let _ = Command::new("git")
-            .args(["worktree", "remove", "--force", &self.path.to_string_lossy()])
+            .args([
+                "worktree",
+                "remove",
+                "--force",
+                &self.path.to_string_lossy(),
+            ])
             .current_dir(&self.repo_dir)
             .output();
 

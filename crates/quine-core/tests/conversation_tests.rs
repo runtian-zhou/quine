@@ -4,7 +4,11 @@ use serde_json::json;
 #[test]
 fn conversation_starts_empty() {
     let conv = Conversation::new();
-    assert_eq!(conv.entries.len(), 0, "new conversation should have 0 entries");
+    assert_eq!(
+        conv.entries.len(),
+        0,
+        "new conversation should have 0 entries"
+    );
 }
 
 #[test]
@@ -17,7 +21,11 @@ fn conversation_push_entries() {
         content: "hi there".to_string(),
         tool_calls: vec![],
     });
-    assert_eq!(conv.entries.len(), 2, "should have exactly 2 entries after two pushes");
+    assert_eq!(
+        conv.entries.len(),
+        2,
+        "should have exactly 2 entries after two pushes"
+    );
 }
 
 #[test]
@@ -85,7 +93,7 @@ fn entry_tool_execution_serialization_roundtrip() {
             assert_eq!(tool_call_id, "call_1");
             assert_eq!(tool_name, "Write");
             assert_eq!(arguments["file_path"], "out.txt");
-            assert_eq!(result.success, true);
+            assert!(result.success);
             assert_eq!(result.output, "File written successfully: out.txt");
         }
         _ => panic!("expected ToolExecution variant"),

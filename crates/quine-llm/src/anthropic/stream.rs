@@ -7,7 +7,10 @@ use crate::types::{StopReason, StreamEvent, Usage};
 
 pub fn parse_anthropic_sse(response: reqwest::Response) -> BoxStream<'static, Result<StreamEvent>> {
     let stream = futures::stream::unfold(
-        (response.bytes_stream().eventsource(), std::collections::VecDeque::<Result<StreamEvent>>::new()),
+        (
+            response.bytes_stream().eventsource(),
+            std::collections::VecDeque::<Result<StreamEvent>>::new(),
+        ),
         |(mut es, mut pending)| async move {
             loop {
                 // Drain any pending events from a previous multi-event SSE message.
@@ -77,12 +80,10 @@ fn convert_stream_event(event: AnthropicStreamEvent) -> Vec<Result<StreamEvent>>
             }
         },
         AnthropicStreamEvent::ContentBlockStop { .. } => vec![Ok(StreamEvent::ToolCallEnd)],
-        AnthropicStreamEvent::MessageStart { message } => {
-            match message.usage {
-                Some(u) => vec![Ok(StreamEvent::Usage(convert_anthropic_usage(&u)))],
-                None => vec![],
-            }
-        }
+        AnthropicStreamEvent::MessageStart { message } => match message.usage {
+            Some(u) => vec![Ok(StreamEvent::Usage(convert_anthropic_usage(&u)))],
+            None => vec![],
+        },
         AnthropicStreamEvent::MessageDelta { delta } => {
             let mut events = Vec::new();
             if let Some(u) = &delta.usage {

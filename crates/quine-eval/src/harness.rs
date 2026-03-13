@@ -4,11 +4,7 @@ use std::time::Instant;
 use crate::report;
 use crate::types::*;
 
-pub async fn run_suite(
-    suite_path: &Path,
-    model: &str,
-    output_dir: &Path,
-) -> anyhow::Result<()> {
+pub async fn run_suite(suite_path: &Path, model: &str, output_dir: &Path) -> anyhow::Result<()> {
     let suite_json = std::fs::read_to_string(suite_path)?;
     let suite: TestSuite = serde_json::from_str(&suite_json)?;
 
@@ -94,9 +90,7 @@ fn find_quine_binary() -> anyhow::Result<PathBuf> {
             }
         }
     }
-    anyhow::bail!(
-        "Could not find 'quine' binary. Run 'cargo build' first or install it on PATH."
-    )
+    anyhow::bail!("Could not find 'quine' binary. Run 'cargo build' first or install it on PATH.")
 }
 
 async fn run_quine(
@@ -185,10 +179,7 @@ fn collect_files_recursive(
             // Only read text files (skip large/binary)
             if let Ok(content) = std::fs::read_to_string(&path) {
                 if content.len() <= 50_000 {
-                    files.push(OutputFile {
-                        path: rel,
-                        content,
-                    });
+                    files.push(OutputFile { path: rel, content });
                 }
             }
         } else if path.is_dir() {
@@ -220,7 +211,10 @@ fn check_expected_files(dir: &Path, expected: &[ExpectedFile]) -> bool {
 
 fn compute_summary(results: &[TestResult]) -> Summary {
     let total = results.len();
-    let passed = results.iter().filter(|r| r.result.files_check_passed).count();
+    let passed = results
+        .iter()
+        .filter(|r| r.result.files_check_passed)
+        .count();
 
     Summary {
         total_tests: total,

@@ -6,11 +6,8 @@ use serde_json::json;
 use tempfile::TempDir;
 
 fn make_log_with_write(tmp: &TempDir, file_name: &str, content: &str) -> ConversationLog {
-    let mut log = ConversationLog::new(
-        "test".to_string(),
-        "test".to_string(),
-        "system".to_string(),
-    );
+    let mut log =
+        ConversationLog::new("test".to_string(), "test".to_string(), "system".to_string());
     log.push(Entry::UserMessage {
         content: format!("Create {}", file_name),
     });
@@ -49,10 +46,17 @@ async fn replay_executes_tools_and_creates_files() {
 
     assert_eq!(result.entries_processed, 3, "should process all 3 entries");
     assert_eq!(result.tools_executed, 1, "should execute exactly 1 tool");
-    assert_eq!(result.drift_warnings.len(), 0, "should have 0 drift warnings");
+    assert_eq!(
+        result.drift_warnings.len(),
+        0,
+        "should have 0 drift warnings"
+    );
 
     let content = std::fs::read_to_string(tmp.path().join("replay_test.txt")).unwrap();
-    assert_eq!(content, "replay content", "file should be created by replay");
+    assert_eq!(
+        content, "replay content",
+        "file should be created by replay"
+    );
 }
 
 #[tokio::test]
@@ -62,11 +66,8 @@ async fn replay_detects_drift_when_output_differs() {
     // Pre-create the file with different content so Write succeeds but Read output differs
     std::fs::write(tmp.path().join("drifted.txt"), "actual content").unwrap();
 
-    let mut log = ConversationLog::new(
-        "test".to_string(),
-        "test".to_string(),
-        "system".to_string(),
-    );
+    let mut log =
+        ConversationLog::new("test".to_string(), "test".to_string(), "system".to_string());
     log.push(Entry::ToolExecution {
         tool_call_id: "tc_1".to_string(),
         tool_name: "Read".to_string(),
@@ -87,7 +88,11 @@ async fn replay_detects_drift_when_output_differs() {
     let result = engine.run().await.unwrap();
 
     assert_eq!(result.tools_executed, 1, "should execute exactly 1 tool");
-    assert_eq!(result.drift_warnings.len(), 1, "should detect exactly 1 drift");
+    assert_eq!(
+        result.drift_warnings.len(),
+        1,
+        "should detect exactly 1 drift"
+    );
     assert_eq!(result.drift_warnings[0].tool_name, "Read");
 }
 
@@ -96,11 +101,8 @@ async fn replay_strict_mode_aborts_on_drift() {
     let tmp = TempDir::new().unwrap();
     std::fs::write(tmp.path().join("strict.txt"), "actual").unwrap();
 
-    let mut log = ConversationLog::new(
-        "test".to_string(),
-        "test".to_string(),
-        "system".to_string(),
-    );
+    let mut log =
+        ConversationLog::new("test".to_string(), "test".to_string(), "system".to_string());
     log.push(Entry::ToolExecution {
         tool_call_id: "tc_1".to_string(),
         tool_name: "Read".to_string(),
@@ -142,8 +144,15 @@ async fn replay_dry_run_does_not_execute_tools() {
     let engine = ReplayEngine::new(log, registry, options);
     let result = engine.run().await.unwrap();
 
-    assert_eq!(result.tools_executed, 1, "dry-run should still count the tool");
-    assert_eq!(result.drift_warnings.len(), 0, "dry-run produces 0 drift warnings");
+    assert_eq!(
+        result.tools_executed, 1,
+        "dry-run should still count the tool"
+    );
+    assert_eq!(
+        result.drift_warnings.len(),
+        0,
+        "dry-run produces 0 drift warnings"
+    );
     assert!(
         !tmp.path().join("should_not_exist.txt").exists(),
         "file should not be created in dry-run mode"
@@ -160,17 +169,18 @@ async fn replay_no_drift_when_output_matches() {
     let engine = ReplayEngine::new(log, registry, options);
     let result = engine.run().await.unwrap();
 
-    assert_eq!(result.drift_warnings.len(), 0, "no drift when output matches");
+    assert_eq!(
+        result.drift_warnings.len(),
+        0,
+        "no drift when output matches"
+    );
 }
 
 #[tokio::test]
 async fn replay_unknown_tool_in_non_strict_mode() {
     let tmp = TempDir::new().unwrap();
-    let mut log = ConversationLog::new(
-        "test".to_string(),
-        "test".to_string(),
-        "system".to_string(),
-    );
+    let mut log =
+        ConversationLog::new("test".to_string(), "test".to_string(), "system".to_string());
     log.push(Entry::ToolExecution {
         tool_call_id: "tc_1".to_string(),
         tool_name: "FakeTool".to_string(),
@@ -188,17 +198,17 @@ async fn replay_unknown_tool_in_non_strict_mode() {
     let result = engine.run().await.unwrap();
 
     // Unknown tool is skipped in non-strict mode (not counted as executed)
-    assert_eq!(result.tools_executed, 0, "unknown tool should not be counted as executed");
+    assert_eq!(
+        result.tools_executed, 0,
+        "unknown tool should not be counted as executed"
+    );
 }
 
 #[tokio::test]
 async fn replay_unknown_tool_in_strict_mode_errors() {
     let tmp = TempDir::new().unwrap();
-    let mut log = ConversationLog::new(
-        "test".to_string(),
-        "test".to_string(),
-        "system".to_string(),
-    );
+    let mut log =
+        ConversationLog::new("test".to_string(), "test".to_string(), "system".to_string());
     log.push(Entry::ToolExecution {
         tool_call_id: "tc_1".to_string(),
         tool_name: "FakeTool".to_string(),
@@ -224,11 +234,8 @@ async fn replay_unknown_tool_in_strict_mode_errors() {
 #[tokio::test]
 async fn replay_multiple_tool_executions() {
     let tmp = TempDir::new().unwrap();
-    let mut log = ConversationLog::new(
-        "test".to_string(),
-        "test".to_string(),
-        "system".to_string(),
-    );
+    let mut log =
+        ConversationLog::new("test".to_string(), "test".to_string(), "system".to_string());
 
     // Write two files
     for i in 1..=3 {
@@ -257,6 +264,11 @@ async fn replay_multiple_tool_executions() {
 
     for i in 1..=3 {
         let content = std::fs::read_to_string(tmp.path().join(format!("file{}.txt", i))).unwrap();
-        assert_eq!(content, format!("content {}", i), "file{}.txt should have correct content", i);
+        assert_eq!(
+            content,
+            format!("content {}", i),
+            "file{}.txt should have correct content",
+            i
+        );
     }
 }

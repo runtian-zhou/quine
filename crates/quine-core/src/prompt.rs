@@ -21,7 +21,8 @@ pub fn discover_claude_md(start_dir: &Path) -> Vec<PathBuf> {
 pub fn build_system_prompt(working_dir: &Path) -> String {
     let claude_files = discover_claude_md(working_dir);
     let mut parts = vec![
-        "You are Quine, an interactive CLI assistant that helps with software engineering tasks.".to_string(),
+        "You are Quine, an interactive CLI assistant that helps with software engineering tasks."
+            .to_string(),
         "You have access to file tools: Read, Write, Edit, Glob, Grep.".to_string(),
         "Use these tools to explore and modify the codebase as needed.".to_string(),
     ];

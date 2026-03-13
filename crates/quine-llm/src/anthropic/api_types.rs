@@ -9,7 +9,9 @@ pub struct CacheControl {
 
 impl CacheControl {
     pub fn ephemeral() -> Self {
-        Self { kind: "ephemeral".to_string() }
+        Self {
+            kind: "ephemeral".to_string(),
+        }
     }
 }
 
@@ -25,11 +27,19 @@ pub struct SystemBlock {
 
 impl SystemBlock {
     pub fn text(text: String) -> Self {
-        Self { kind: "text".to_string(), text, cache_control: None }
+        Self {
+            kind: "text".to_string(),
+            text,
+            cache_control: None,
+        }
     }
 
     pub fn text_cached(text: String) -> Self {
-        Self { kind: "text".to_string(), text, cache_control: Some(CacheControl::ephemeral()) }
+        Self {
+            kind: "text".to_string(),
+            text,
+            cache_control: Some(CacheControl::ephemeral()),
+        }
     }
 }
 

@@ -32,7 +32,8 @@ fn worktree_create_and_drop_cleans_up() {
     let branch_name: String;
 
     {
-        let wt = Worktree::create(repo).expect("Worktree::create should succeed on a valid git repo");
+        let wt =
+            Worktree::create(repo).expect("Worktree::create should succeed on a valid git repo");
 
         worktree_path = wt.path.clone();
         branch_name = wt.branch.clone();

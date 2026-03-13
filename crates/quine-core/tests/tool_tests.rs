@@ -1,4 +1,3 @@
-use quine_core::tool::todo::TodoTool;
 use quine_core::tool::ask_user::AskUserTool;
 use quine_core::tool::bash::BashTool;
 use quine_core::tool::edit::EditTool;
@@ -7,6 +6,7 @@ use quine_core::tool::grep::GrepTool;
 use quine_core::tool::list_directory::ListDirectoryTool;
 use quine_core::tool::read::ReadTool;
 use quine_core::tool::skill::SkillTool;
+use quine_core::tool::todo::TodoTool;
 use quine_core::tool::web_fetch::{strip_html_tags, WebFetchTool};
 use quine_core::tool::web_search::WebSearchTool;
 use quine_core::tool::write::WriteTool;
@@ -20,12 +20,19 @@ use tempfile::TempDir;
 #[tokio::test]
 async fn read_tool_reads_file_with_line_numbers() {
     let tmp = TempDir::new().unwrap();
-    std::fs::write(tmp.path().join("hello.txt"), "line one\nline two\nline three").unwrap();
+    std::fs::write(
+        tmp.path().join("hello.txt"),
+        "line one\nline two\nline three",
+    )
+    .unwrap();
 
     let tool = ReadTool::new(tmp.path());
-    let result = tool.execute(json!({"file_path": "hello.txt"})).await.unwrap();
+    let result = tool
+        .execute(json!({"file_path": "hello.txt"}))
+        .await
+        .unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert!(
         result.output.contains("line one"),
         "output should contain file content"
@@ -35,8 +42,14 @@ async fn read_tool_reads_file_with_line_numbers() {
         "output should contain all lines"
     );
     // Verify line numbers are present
-    assert!(result.output.contains("1\t"), "output should contain line number 1");
-    assert!(result.output.contains("3\t"), "output should contain line number 3");
+    assert!(
+        result.output.contains("1\t"),
+        "output should contain line number 1"
+    );
+    assert!(
+        result.output.contains("3\t"),
+        "output should contain line number 3"
+    );
 }
 
 #[tokio::test]
@@ -54,11 +67,23 @@ async fn read_tool_with_offset_and_limit() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
-    assert!(result.output.contains("beta"), "should include line at offset 2");
-    assert!(result.output.contains("gamma"), "should include line at offset 3");
-    assert!(!result.output.contains("alpha"), "should not include line before offset");
-    assert!(!result.output.contains("delta"), "should not include line beyond limit");
+    assert!(result.success);
+    assert!(
+        result.output.contains("beta"),
+        "should include line at offset 2"
+    );
+    assert!(
+        result.output.contains("gamma"),
+        "should include line at offset 3"
+    );
+    assert!(
+        !result.output.contains("alpha"),
+        "should not include line before offset"
+    );
+    assert!(
+        !result.output.contains("delta"),
+        "should not include line beyond limit"
+    );
 }
 
 #[tokio::test]
@@ -70,7 +95,7 @@ async fn read_tool_nonexistent_file_returns_failure() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, false, "reading nonexistent file should fail");
+    assert!(!result.success, "reading nonexistent file should fail");
     assert!(
         result.output.contains("Error reading"),
         "error message should describe the failure"
@@ -89,7 +114,7 @@ async fn read_tool_absolute_path() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert!(result.output.contains("absolute content"));
 }
 
@@ -105,7 +130,7 @@ async fn write_tool_creates_file() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     let content = std::fs::read_to_string(tmp.path().join("new_file.txt")).unwrap();
     assert_eq!(content, "hello world", "file content should match exactly");
 }
@@ -120,9 +145,12 @@ async fn write_tool_creates_parent_directories() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     let content = std::fs::read_to_string(tmp.path().join("sub/dir/file.txt")).unwrap();
-    assert_eq!(content, "nested", "nested file content should match exactly");
+    assert_eq!(
+        content, "nested",
+        "nested file content should match exactly"
+    );
 }
 
 #[tokio::test]
@@ -136,9 +164,12 @@ async fn write_tool_overwrites_existing_file() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     let content = std::fs::read_to_string(tmp.path().join("existing.txt")).unwrap();
-    assert_eq!(content, "new content", "file should be overwritten with new content");
+    assert_eq!(
+        content, "new content",
+        "file should be overwritten with new content"
+    );
 }
 
 // --- EditTool ---
@@ -158,7 +189,7 @@ async fn edit_tool_replaces_unique_string() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     let content = std::fs::read_to_string(tmp.path().join("edit_me.txt")).unwrap();
     assert_eq!(content, "foo qux baz", "should replace 'bar' with 'qux'");
 }
@@ -178,7 +209,10 @@ async fn edit_tool_rejects_ambiguous_match() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, false, "should fail when old_string matches multiple times");
+    assert!(
+        !result.success,
+        "should fail when old_string matches multiple times"
+    );
     assert!(
         result.output.contains("2 times"),
         "error should mention the match count"
@@ -201,9 +235,12 @@ async fn edit_tool_replace_all_replaces_all_occurrences() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     let content = std::fs::read_to_string(tmp.path().join("multi.txt")).unwrap();
-    assert_eq!(content, "ccc bbb ccc", "all occurrences of 'aaa' should be replaced");
+    assert_eq!(
+        content, "ccc bbb ccc",
+        "all occurrences of 'aaa' should be replaced"
+    );
 }
 
 #[tokio::test]
@@ -221,7 +258,7 @@ async fn edit_tool_old_string_not_found() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, false, "should fail when old_string is not found");
+    assert!(!result.success, "should fail when old_string is not found");
     assert!(result.output.contains("not found"));
 }
 
@@ -238,7 +275,7 @@ async fn edit_tool_nonexistent_file() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, false, "editing nonexistent file should fail");
+    assert!(!result.success, "editing nonexistent file should fail");
 }
 
 // --- GlobTool ---
@@ -253,7 +290,7 @@ async fn glob_tool_finds_matching_files() {
     let tool = GlobTool::new(tmp.path());
     let result = tool.execute(json!({"pattern": "*.rs"})).await.unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert!(result.output.contains("a.rs"), "should find a.rs");
     assert!(result.output.contains("b.rs"), "should find b.rs");
     assert!(!result.output.contains("c.txt"), "should not match c.txt");
@@ -265,7 +302,7 @@ async fn glob_tool_no_matches() {
     let tool = GlobTool::new(tmp.path());
     let result = tool.execute(json!({"pattern": "*.xyz"})).await.unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert_eq!(
         result.output, "No files matched the pattern.",
         "should return exact no-match message"
@@ -282,8 +319,11 @@ async fn glob_tool_recursive_pattern() {
     let tool = GlobTool::new(tmp.path());
     let result = tool.execute(json!({"pattern": "**/*.rs"})).await.unwrap();
 
-    assert_eq!(result.success, true);
-    assert!(result.output.contains("nested.rs"), "should find nested files");
+    assert!(result.success);
+    assert!(
+        result.output.contains("nested.rs"),
+        "should find nested files"
+    );
 }
 
 // --- GrepTool ---
@@ -303,12 +343,12 @@ async fn grep_tool_finds_matching_lines() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
-    assert!(result.output.contains("println"), "should find the matching line");
+    assert!(result.success);
     assert!(
-        result.output.contains(":2:"),
-        "should report line number 2"
+        result.output.contains("println"),
+        "should find the matching line"
     );
+    assert!(result.output.contains(":2:"), "should report line number 2");
 }
 
 #[tokio::test]
@@ -322,7 +362,7 @@ async fn grep_tool_no_matches() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert_eq!(
         result.output, "No matches found.",
         "should return exact no-match message"
@@ -335,7 +375,7 @@ async fn grep_tool_invalid_regex() {
     let tool = GrepTool::new(tmp.path());
     let result = tool.execute(json!({"pattern": "[invalid"})).await.unwrap();
 
-    assert_eq!(result.success, false, "invalid regex should fail");
+    assert!(!result.success, "invalid regex should fail");
     assert!(result.output.contains("Invalid regex"));
 }
 
@@ -345,10 +385,16 @@ async fn grep_tool_invalid_regex() {
 async fn bash_tool_runs_simple_command() {
     let tmp = TempDir::new().unwrap();
     let tool = BashTool::new(tmp.path());
-    let result = tool.execute(json!({"command": "echo hello"})).await.unwrap();
+    let result = tool
+        .execute(json!({"command": "echo hello"}))
+        .await
+        .unwrap();
 
-    assert_eq!(result.success, true, "echo should succeed");
-    assert_eq!(result.output, "hello\n", "should capture exact stdout of echo");
+    assert!(result.success, "echo should succeed");
+    assert_eq!(
+        result.output, "hello\n",
+        "should capture exact stdout of echo"
+    );
 }
 
 #[tokio::test]
@@ -357,10 +403,16 @@ async fn bash_tool_runs_in_working_directory() {
     std::fs::write(tmp.path().join("marker.txt"), "found_it").unwrap();
 
     let tool = BashTool::new(tmp.path());
-    let result = tool.execute(json!({"command": "cat marker.txt"})).await.unwrap();
+    let result = tool
+        .execute(json!({"command": "cat marker.txt"}))
+        .await
+        .unwrap();
 
-    assert_eq!(result.success, true, "cat should find the file in working dir");
-    assert_eq!(result.output, "found_it", "should read the file content from working dir");
+    assert!(result.success, "cat should find the file in working dir");
+    assert_eq!(
+        result.output, "found_it",
+        "should read the file content from working dir"
+    );
 }
 
 #[tokio::test]
@@ -372,7 +424,10 @@ async fn bash_tool_captures_stderr() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true, "writing to stderr with exit 0 is still success");
+    assert!(
+        result.success,
+        "writing to stderr with exit 0 is still success"
+    );
     assert!(
         result.output.contains("STDERR:"),
         "output should contain STDERR label, got: {}",
@@ -390,7 +445,7 @@ async fn bash_tool_reports_failure_on_nonzero_exit() {
     let tool = BashTool::new(tmp.path());
     let result = tool.execute(json!({"command": "exit 42"})).await.unwrap();
 
-    assert_eq!(result.success, false, "nonzero exit code should report failure");
+    assert!(!result.success, "nonzero exit code should report failure");
     assert!(
         result.output.contains("Exit code 42"),
         "output should contain the exact exit code 42, got: {}",
@@ -404,7 +459,7 @@ async fn bash_tool_no_output_shows_exit_code() {
     let tool = BashTool::new(tmp.path());
     let result = tool.execute(json!({"command": "true"})).await.unwrap();
 
-    assert_eq!(result.success, true, "true command should succeed");
+    assert!(result.success, "true command should succeed");
     assert_eq!(
         result.output, "(no output, exit code 0)",
         "should show exact no-output message with exit code 0"
@@ -420,7 +475,7 @@ async fn bash_tool_pipes_work() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true, "piped command should succeed");
+    assert!(result.success, "piped command should succeed");
     assert!(
         result.output.trim().contains("3"),
         "wc -l should count 3 lines, got: {}",
@@ -440,11 +495,17 @@ async fn list_directory_lists_files_and_dirs() {
     let tool = ListDirectoryTool::new(tmp.path());
     let result = tool.execute(json!({})).await.unwrap();
 
-    assert_eq!(result.success, true, "listing existing directory should succeed");
+    assert!(result.success, "listing existing directory should succeed");
     let lines: Vec<&str> = result.output.lines().collect();
     assert_eq!(lines.len(), 3, "should list exactly 3 entries");
-    assert_eq!(lines[0], "file_a.txt", "first entry should be file_a.txt (sorted)");
-    assert_eq!(lines[1], "file_b.rs", "second entry should be file_b.rs (sorted)");
+    assert_eq!(
+        lines[0], "file_a.txt",
+        "first entry should be file_a.txt (sorted)"
+    );
+    assert_eq!(
+        lines[1], "file_b.rs",
+        "second entry should be file_b.rs (sorted)"
+    );
     assert_eq!(lines[2], "subdir/", "directories should have trailing /");
 }
 
@@ -458,8 +519,11 @@ async fn list_directory_with_explicit_path() {
     let tool = ListDirectoryTool::new(tmp.path());
     let result = tool.execute(json!({"path": "inner"})).await.unwrap();
 
-    assert_eq!(result.success, true);
-    assert_eq!(result.output, "nested.txt", "should list the single file in the subdirectory");
+    assert!(result.success);
+    assert_eq!(
+        result.output, "nested.txt",
+        "should list the single file in the subdirectory"
+    );
 }
 
 #[tokio::test]
@@ -470,7 +534,10 @@ async fn list_directory_not_a_directory() {
     let tool = ListDirectoryTool::new(tmp.path());
     let result = tool.execute(json!({"path": "afile.txt"})).await.unwrap();
 
-    assert_eq!(result.success, false, "listing a file (not directory) should fail");
+    assert!(
+        !result.success,
+        "listing a file (not directory) should fail"
+    );
     assert!(
         result.output.contains("is not a directory"),
         "error should say 'is not a directory', got: {}",
@@ -486,8 +553,11 @@ async fn list_directory_empty_dir() {
     let tool = ListDirectoryTool::new(tmp.path());
     let result = tool.execute(json!({"path": "empty"})).await.unwrap();
 
-    assert_eq!(result.success, true);
-    assert_eq!(result.output, "", "empty directory should produce empty output");
+    assert!(result.success);
+    assert_eq!(
+        result.output, "",
+        "empty directory should produce empty output"
+    );
 }
 
 #[tokio::test]
@@ -500,7 +570,7 @@ async fn list_directory_sorted_output() {
     let tool = ListDirectoryTool::new(tmp.path());
     let result = tool.execute(json!({})).await.unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     let lines: Vec<&str> = result.output.lines().collect();
     assert_eq!(
         lines,
@@ -513,17 +583,19 @@ async fn list_directory_sorted_output() {
 
 #[tokio::test]
 async fn ask_user_returns_user_response() {
-    let ask_fn: quine_core::tool::ask_user::AskUserFn = Arc::new(|_question: String| {
-        Box::pin(async { Ok("yes, proceed".to_string()) })
-    });
+    let ask_fn: quine_core::tool::ask_user::AskUserFn =
+        Arc::new(|_question: String| Box::pin(async { Ok("yes, proceed".to_string()) }));
     let tool = AskUserTool::new(ask_fn);
     let result = tool
         .execute(json!({"question": "Continue?"}))
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
-    assert_eq!(result.output, "yes, proceed", "should return the exact user response");
+    assert!(result.success);
+    assert_eq!(
+        result.output, "yes, proceed",
+        "should return the exact user response"
+    );
 }
 
 #[tokio::test]
@@ -553,17 +625,13 @@ async fn ask_user_passes_question_to_callback() {
 
 #[tokio::test]
 async fn ask_user_handles_callback_error() {
-    let ask_fn: quine_core::tool::ask_user::AskUserFn = Arc::new(|_question: String| {
-        Box::pin(async { Err(anyhow::anyhow!("connection lost")) })
-    });
+    let ask_fn: quine_core::tool::ask_user::AskUserFn =
+        Arc::new(|_question: String| Box::pin(async { Err(anyhow::anyhow!("connection lost")) }));
 
     let tool = AskUserTool::new(ask_fn);
-    let result = tool
-        .execute(json!({"question": "Hello?"}))
-        .await
-        .unwrap();
+    let result = tool.execute(json!({"question": "Hello?"})).await.unwrap();
 
-    assert_eq!(result.success, false, "callback error should report failure");
+    assert!(!result.success, "callback error should report failure");
     assert!(
         result.output.contains("Failed to get user response"),
         "error should contain failure prefix, got: {}",
@@ -583,10 +651,9 @@ async fn skill_tool_list_no_skills() {
     let tool = SkillTool::new(tmp.path());
     let result = tool.execute(json!({"action": "list"})).await.unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert_eq!(
-        result.output,
-        "No skills found. Create skills in `skills/<name>/SKILL.md`.",
+        result.output, "No skills found. Create skills in `skills/<name>/SKILL.md`.",
         "should return exact no-skills message"
     );
 }
@@ -605,7 +672,7 @@ async fn skill_tool_list_discovers_skills() {
     let tool = SkillTool::new(tmp.path());
     let result = tool.execute(json!({"action": "list"})).await.unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert!(
         result.output.contains("Available skills:"),
         "should start with header, got: {}",
@@ -638,7 +705,7 @@ async fn skill_tool_execute_loads_skill_into_context() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert!(
         result.output.contains("# Skill: deploy"),
         "output should contain skill header"
@@ -681,7 +748,7 @@ async fn skill_tool_execute_includes_references() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, true);
+    assert!(result.success);
     assert!(
         result.output.contains("## Reference: 01-setup.md"),
         "output should contain first reference header"
@@ -709,7 +776,7 @@ async fn skill_tool_execute_not_found() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, false, "executing unknown skill should fail");
+    assert!(!result.success, "executing unknown skill should fail");
     assert!(
         result.output.contains("Skill 'nonexistent' not found"),
         "error should name the missing skill, got: {}",
@@ -739,7 +806,7 @@ async fn skill_tool_execute_not_found_lists_available() {
         .await
         .unwrap();
 
-    assert_eq!(result.success, false);
+    assert!(!result.success);
     assert!(
         result.output.contains("Available: existing"),
         "should list available skills in error, got: {}",
@@ -751,15 +818,11 @@ async fn skill_tool_execute_not_found_lists_available() {
 async fn skill_tool_unknown_action() {
     let tmp = TempDir::new().unwrap();
     let tool = SkillTool::new(tmp.path());
-    let result = tool
-        .execute(json!({"action": "delete"}))
-        .await
-        .unwrap();
+    let result = tool.execute(json!({"action": "delete"})).await.unwrap();
 
-    assert_eq!(result.success, false, "unknown action should fail");
+    assert!(!result.success, "unknown action should fail");
     assert_eq!(
-        result.output,
-        "Unknown action 'delete'. Use: list, execute",
+        result.output, "Unknown action 'delete'. Use: list, execute",
         "should return exact error message for unknown action"
     );
 }
@@ -777,18 +840,30 @@ fn tool_registry_register_defaults_has_all_tools() {
     assert!(registry.get("Edit").is_some(), "should have Edit tool");
     assert!(registry.get("Glob").is_some(), "should have Glob tool");
     assert!(registry.get("Grep").is_some(), "should have Grep tool");
-    assert!(registry.get("ListDirectory").is_some(), "should have ListDirectory tool");
+    assert!(
+        registry.get("ListDirectory").is_some(),
+        "should have ListDirectory tool"
+    );
     assert!(registry.get("Skill").is_some(), "should have Skill tool");
     assert!(registry.get("Todo").is_some(), "should have Todo tool");
-    assert!(registry.get("WebFetch").is_some(), "should have WebFetch tool");
-    assert!(registry.get("WebSearch").is_some(), "should have WebSearch tool");
+    assert!(
+        registry.get("WebFetch").is_some(),
+        "should have WebFetch tool"
+    );
+    assert!(
+        registry.get("WebSearch").is_some(),
+        "should have WebSearch tool"
+    );
 }
 
 #[test]
 fn tool_registry_get_unknown_returns_none() {
     let tmp = TempDir::new().unwrap();
     let registry = ToolRegistry::register_defaults(tmp.path());
-    assert!(registry.get("NonExistent").is_none(), "unknown tool should return None");
+    assert!(
+        registry.get("NonExistent").is_none(),
+        "unknown tool should return None"
+    );
 }
 
 #[test]
@@ -801,8 +876,14 @@ fn tool_registry_all_schemas_returns_correct_count() {
 
     for schema in &schemas {
         assert!(schema["name"].is_string(), "each schema should have a name");
-        assert!(schema["description"].is_string(), "each schema should have a description");
-        assert!(schema["input_schema"].is_object(), "each schema should have an input_schema");
+        assert!(
+            schema["description"].is_string(),
+            "each schema should have a description"
+        );
+        assert!(
+            schema["input_schema"].is_object(),
+            "each schema should have an input_schema"
+        );
     }
 }
 
@@ -826,7 +907,10 @@ fn tool_schema_has_required_fields() {
 #[tokio::test]
 async fn todo_add_and_list() {
     let tool = Arc::new(TodoTool::new());
-    let r = tool.execute(json!({"action": "add", "content": "Write tests", "priority": "high"})).await.unwrap();
+    let r = tool
+        .execute(json!({"action": "add", "content": "Write tests", "priority": "high"}))
+        .await
+        .unwrap();
     assert!(r.success);
     assert!(r.output.contains("#1"), "should assign id 1");
 
@@ -846,8 +930,13 @@ async fn todo_list_empty() {
 #[tokio::test]
 async fn todo_update_status() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "Task A"})).await.unwrap();
-    let r = tool.execute(json!({"action": "update", "id": 1, "status": "done"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Task A"}))
+        .await
+        .unwrap();
+    let r = tool
+        .execute(json!({"action": "update", "id": 1, "status": "done"}))
+        .await
+        .unwrap();
     assert!(r.success);
     assert!(r.output.contains("done"));
 
@@ -858,8 +947,12 @@ async fn todo_update_status() {
 #[tokio::test]
 async fn todo_update_in_progress_marker() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "Task B"})).await.unwrap();
-    tool.execute(json!({"action": "update", "id": 1, "status": "in_progress"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Task B"}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action": "update", "id": 1, "status": "in_progress"}))
+        .await
+        .unwrap();
 
     let r = tool.execute(json!({"action": "list"})).await.unwrap();
     assert!(r.output.contains("[~]"), "in_progress task should show [~]");
@@ -868,8 +961,13 @@ async fn todo_update_in_progress_marker() {
 #[tokio::test]
 async fn todo_remove() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "Temporary"})).await.unwrap();
-    let r = tool.execute(json!({"action": "remove", "id": 1})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Temporary"}))
+        .await
+        .unwrap();
+    let r = tool
+        .execute(json!({"action": "remove", "id": 1}))
+        .await
+        .unwrap();
     assert!(r.success);
 
     let r = tool.execute(json!({"action": "list"})).await.unwrap();
@@ -879,22 +977,33 @@ async fn todo_remove() {
 #[tokio::test]
 async fn todo_remove_nonexistent() {
     let tool = Arc::new(TodoTool::new());
-    let r = tool.execute(json!({"action": "remove", "id": 99})).await.unwrap();
+    let r = tool
+        .execute(json!({"action": "remove", "id": 99}))
+        .await
+        .unwrap();
     assert!(r.output.contains("not found"));
 }
 
 #[tokio::test]
 async fn todo_update_nonexistent() {
     let tool = Arc::new(TodoTool::new());
-    let r = tool.execute(json!({"action": "update", "id": 99, "status": "done"})).await.unwrap();
+    let r = tool
+        .execute(json!({"action": "update", "id": 99, "status": "done"}))
+        .await
+        .unwrap();
     assert!(r.output.contains("not found"));
 }
 
 #[tokio::test]
 async fn todo_add_with_depends_on() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "Step 1"})).await.unwrap();
-    let r = tool.execute(json!({"action": "add", "content": "Step 2", "depends_on": [1]})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Step 1"}))
+        .await
+        .unwrap();
+    let r = tool
+        .execute(json!({"action": "add", "content": "Step 2", "depends_on": [1]}))
+        .await
+        .unwrap();
     assert!(r.success);
     assert!(r.output.contains("#2"));
 
@@ -906,9 +1015,15 @@ async fn todo_add_with_depends_on() {
 #[tokio::test]
 async fn todo_dep_shows_done_checkmark() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "Step 1"})).await.unwrap();
-    tool.execute(json!({"action": "add", "content": "Step 2", "depends_on": [1]})).await.unwrap();
-    tool.execute(json!({"action": "update", "id": 1, "status": "done"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Step 1"}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action": "add", "content": "Step 2", "depends_on": [1]}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action": "update", "id": 1, "status": "done"}))
+        .await
+        .unwrap();
 
     let r = tool.execute(json!({"action": "list"})).await.unwrap();
     assert!(r.output.contains("#1 ✓"), "finished dep should show ✓");
@@ -917,11 +1032,18 @@ async fn todo_dep_shows_done_checkmark() {
 #[tokio::test]
 async fn todo_blocked_task_cannot_start() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "Prereq"})).await.unwrap();
-    tool.execute(json!({"action": "add", "content": "Dependent", "depends_on": [1]})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Prereq"}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action": "add", "content": "Dependent", "depends_on": [1]}))
+        .await
+        .unwrap();
 
     // Try to start task 2 while task 1 is still pending
-    let r = tool.execute(json!({"action": "update", "id": 2, "status": "in_progress"})).await.unwrap();
+    let r = tool
+        .execute(json!({"action": "update", "id": 2, "status": "in_progress"}))
+        .await
+        .unwrap();
     assert!(r.output.contains("blocked"), "should report blocked");
     assert!(r.output.contains("#1"), "should name the blocking task");
 }
@@ -929,21 +1051,40 @@ async fn todo_blocked_task_cannot_start() {
 #[tokio::test]
 async fn todo_unblocked_after_dep_done() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "Prereq"})).await.unwrap();
-    tool.execute(json!({"action": "add", "content": "Dependent", "depends_on": [1]})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Prereq"}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action": "add", "content": "Dependent", "depends_on": [1]}))
+        .await
+        .unwrap();
 
-    tool.execute(json!({"action": "update", "id": 1, "status": "done"})).await.unwrap();
-    let r = tool.execute(json!({"action": "update", "id": 2, "status": "in_progress"})).await.unwrap();
-    assert!(r.output.contains("in_progress"), "should succeed once dep is done");
+    tool.execute(json!({"action": "update", "id": 1, "status": "done"}))
+        .await
+        .unwrap();
+    let r = tool
+        .execute(json!({"action": "update", "id": 2, "status": "in_progress"}))
+        .await
+        .unwrap();
+    assert!(
+        r.output.contains("in_progress"),
+        "should succeed once dep is done"
+    );
 }
 
 #[tokio::test]
 async fn todo_add_dep_action() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "A"})).await.unwrap();
-    tool.execute(json!({"action": "add", "content": "B"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "A"}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action": "add", "content": "B"}))
+        .await
+        .unwrap();
 
-    let r = tool.execute(json!({"action": "add_dep", "id": 2, "dep_id": 1})).await.unwrap();
+    let r = tool
+        .execute(json!({"action": "add_dep", "id": 2, "dep_id": 1}))
+        .await
+        .unwrap();
     assert!(r.success);
     assert!(r.output.contains("#2") && r.output.contains("#1"));
 
@@ -954,10 +1095,17 @@ async fn todo_add_dep_action() {
 #[tokio::test]
 async fn todo_remove_dep_action() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "A"})).await.unwrap();
-    tool.execute(json!({"action": "add", "content": "B", "depends_on": [1]})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "A"}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action": "add", "content": "B", "depends_on": [1]}))
+        .await
+        .unwrap();
 
-    let r = tool.execute(json!({"action": "remove_dep", "id": 2, "dep_id": 1})).await.unwrap();
+    let r = tool
+        .execute(json!({"action": "remove_dep", "id": 2, "dep_id": 1}))
+        .await
+        .unwrap();
     assert!(r.success);
 
     let r = tool.execute(json!({"action": "list"})).await.unwrap();
@@ -967,58 +1115,107 @@ async fn todo_remove_dep_action() {
 #[tokio::test]
 async fn todo_cycle_detection_self_dep() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "Solo"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Solo"}))
+        .await
+        .unwrap();
 
-    let r = tool.execute(json!({"action": "add_dep", "id": 1, "dep_id": 1})).await.unwrap();
-    assert!(r.output.contains("itself") || r.output.contains("cycle") || r.output.contains("self"),
-        "self-dep should be rejected, got: {}", r.output);
+    let r = tool
+        .execute(json!({"action": "add_dep", "id": 1, "dep_id": 1}))
+        .await
+        .unwrap();
+    assert!(
+        r.output.contains("itself") || r.output.contains("cycle") || r.output.contains("self"),
+        "self-dep should be rejected, got: {}",
+        r.output
+    );
 }
 
 #[tokio::test]
 async fn todo_cycle_detection_indirect() {
     let tool = Arc::new(TodoTool::new());
     // A -> B -> C, then try C -> A (would create cycle)
-    tool.execute(json!({"action": "add", "content": "A"})).await.unwrap();
-    tool.execute(json!({"action": "add", "content": "B", "depends_on": [1]})).await.unwrap();
-    tool.execute(json!({"action": "add", "content": "C", "depends_on": [2]})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "A"}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action": "add", "content": "B", "depends_on": [1]}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action": "add", "content": "C", "depends_on": [2]}))
+        .await
+        .unwrap();
 
-    let r = tool.execute(json!({"action": "add_dep", "id": 1, "dep_id": 3})).await.unwrap();
-    assert!(r.output.contains("cycle"), "indirect cycle should be rejected, got: {}", r.output);
+    let r = tool
+        .execute(json!({"action": "add_dep", "id": 1, "dep_id": 3}))
+        .await
+        .unwrap();
+    assert!(
+        r.output.contains("cycle"),
+        "indirect cycle should be rejected, got: {}",
+        r.output
+    );
 }
 
 #[tokio::test]
 async fn todo_remove_cleans_up_deps() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "A"})).await.unwrap();
-    tool.execute(json!({"action": "add", "content": "B", "depends_on": [1]})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "A"}))
+        .await
+        .unwrap();
+    tool.execute(json!({"action": "add", "content": "B", "depends_on": [1]}))
+        .await
+        .unwrap();
 
     // Remove A; B should no longer list it as a dep
-    tool.execute(json!({"action": "remove", "id": 1})).await.unwrap();
+    tool.execute(json!({"action": "remove", "id": 1}))
+        .await
+        .unwrap();
     let r = tool.execute(json!({"action": "list"})).await.unwrap();
-    assert!(!r.output.contains("deps:"), "removed task's dep entry should be cleaned up");
+    assert!(
+        !r.output.contains("deps:"),
+        "removed task's dep entry should be cleaned up"
+    );
 }
 
 #[tokio::test]
 async fn todo_add_dep_nonexistent_dep() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "A"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "A"}))
+        .await
+        .unwrap();
 
-    let r = tool.execute(json!({"action": "add_dep", "id": 1, "dep_id": 99})).await.unwrap();
-    assert!(r.output.contains("not found"), "should reject dep on nonexistent task");
+    let r = tool
+        .execute(json!({"action": "add_dep", "id": 1, "dep_id": 99}))
+        .await
+        .unwrap();
+    assert!(
+        r.output.contains("not found"),
+        "should reject dep on nonexistent task"
+    );
 }
 
 #[tokio::test]
 async fn todo_add_with_nonexistent_dep_in_depends_on() {
     let tool = Arc::new(TodoTool::new());
-    let r = tool.execute(json!({"action": "add", "content": "X", "depends_on": [42]})).await.unwrap();
-    assert!(r.output.contains("not found"), "should reject add with nonexistent dep");
+    let r = tool
+        .execute(json!({"action": "add", "content": "X", "depends_on": [42]}))
+        .await
+        .unwrap();
+    assert!(
+        r.output.contains("not found"),
+        "should reject add with nonexistent dep"
+    );
 }
 
 #[tokio::test]
 async fn todo_invalid_status() {
     let tool = Arc::new(TodoTool::new());
-    tool.execute(json!({"action": "add", "content": "Task"})).await.unwrap();
-    let r = tool.execute(json!({"action": "update", "id": 1, "status": "flying"})).await.unwrap();
+    tool.execute(json!({"action": "add", "content": "Task"}))
+        .await
+        .unwrap();
+    let r = tool
+        .execute(json!({"action": "update", "id": 1, "status": "flying"}))
+        .await
+        .unwrap();
     assert!(r.output.contains("Invalid status"));
 }
 
@@ -1027,12 +1224,21 @@ async fn todo_schema_includes_dag_fields() {
     let tool = Arc::new(TodoTool::new());
     let schema = tool.parameters_schema();
     let props = &schema["properties"];
-    assert!(props["depends_on"].is_object(), "schema should include depends_on");
+    assert!(
+        props["depends_on"].is_object(),
+        "schema should include depends_on"
+    );
     assert!(props["dep_id"].is_object(), "schema should include dep_id");
     let actions = schema["properties"]["action"]["enum"].as_array().unwrap();
     let action_strs: Vec<&str> = actions.iter().filter_map(|v| v.as_str()).collect();
-    assert!(action_strs.contains(&"add_dep"), "schema should list add_dep action");
-    assert!(action_strs.contains(&"remove_dep"), "schema should list remove_dep action");
+    assert!(
+        action_strs.contains(&"add_dep"),
+        "schema should list add_dep action"
+    );
+    assert!(
+        action_strs.contains(&"remove_dep"),
+        "schema should list remove_dep action"
+    );
 }
 
 // --- WebFetchTool ---
@@ -1040,7 +1246,11 @@ async fn todo_schema_includes_dag_fields() {
 #[test]
 fn web_fetch_tool_has_correct_name() {
     let tool = WebFetchTool::new();
-    assert_eq!(tool.name(), "WebFetch", "WebFetchTool name should be exactly 'WebFetch'");
+    assert_eq!(
+        tool.name(),
+        "WebFetch",
+        "WebFetchTool name should be exactly 'WebFetch'"
+    );
 }
 
 #[test]
@@ -1072,8 +1282,8 @@ async fn web_fetch_tool_invalid_url_returns_failure() {
         .execute(json!({"url": "http://localhost:1"}))
         .await
         .unwrap();
-    assert_eq!(
-        result.success, false,
+    assert!(
+        !result.success,
         "fetching an unreachable URL should return success=false"
     );
 }
@@ -1085,8 +1295,8 @@ async fn web_fetch_tool_rejects_file_scheme() {
         .execute(json!({"url": "file:///etc/passwd"}))
         .await
         .unwrap();
-    assert_eq!(
-        result.success, false,
+    assert!(
+        !result.success,
         "file:// URLs should be rejected to prevent SSRF"
     );
     assert!(
@@ -1100,28 +1310,40 @@ async fn web_fetch_tool_rejects_file_scheme() {
 fn strip_html_tags_removes_tags() {
     let input = "<p>Hello <b>World</b></p>";
     let output = strip_html_tags(input);
-    assert_eq!(output, "Hello World", "HTML tags should be stripped, leaving only text content");
+    assert_eq!(
+        output, "Hello World",
+        "HTML tags should be stripped, leaving only text content"
+    );
 }
 
 #[test]
 fn strip_html_tags_removes_script_blocks() {
     let input = "<script>alert(1)</script>visible";
     let output = strip_html_tags(input);
-    assert_eq!(output, "visible", "script blocks and their content should be completely removed");
+    assert_eq!(
+        output, "visible",
+        "script blocks and their content should be completely removed"
+    );
 }
 
 #[test]
 fn strip_html_tags_removes_style_blocks() {
     let input = "<style>body{}</style>visible";
     let output = strip_html_tags(input);
-    assert_eq!(output, "visible", "style blocks and their content should be completely removed");
+    assert_eq!(
+        output, "visible",
+        "style blocks and their content should be completely removed"
+    );
 }
 
 #[test]
 fn strip_html_tags_decodes_entities() {
     let input = "&amp; &lt; &gt; &quot; &#39;";
     let output = strip_html_tags(input);
-    assert_eq!(output, "& < > \" '", "common HTML entities should be decoded to their character equivalents");
+    assert_eq!(
+        output, "& < > \" '",
+        "common HTML entities should be decoded to their character equivalents"
+    );
 }
 
 // --- WebSearchTool ---
@@ -1129,7 +1351,11 @@ fn strip_html_tags_decodes_entities() {
 #[test]
 fn web_search_tool_has_correct_name() {
     let tool = WebSearchTool::new();
-    assert_eq!(tool.name(), "WebSearch", "WebSearchTool name should be exactly 'WebSearch'");
+    assert_eq!(
+        tool.name(),
+        "WebSearch",
+        "WebSearchTool name should be exactly 'WebSearch'"
+    );
 }
 
 #[test]
@@ -1161,18 +1387,15 @@ async fn web_search_tool_missing_api_key_returns_failure() {
     std::env::remove_var("BRAVE_SEARCH_API_KEY");
 
     let tool = WebSearchTool::new();
-    let result = tool
-        .execute(json!({"query": "test search"}))
-        .await
-        .unwrap();
+    let result = tool.execute(json!({"query": "test search"})).await.unwrap();
 
     // Restore the env var if it was previously set
     if let Some(val) = prev {
         std::env::set_var("BRAVE_SEARCH_API_KEY", val);
     }
 
-    assert_eq!(
-        result.success, false,
+    assert!(
+        !result.success,
         "missing BRAVE_SEARCH_API_KEY should return success=false"
     );
     assert!(
