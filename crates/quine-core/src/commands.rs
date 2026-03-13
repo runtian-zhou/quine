@@ -1,8 +1,7 @@
-use crate::interactive::entries_to_messages;
+use crate::conversation::{entries_to_messages, Entry};
+use crate::log::ConversationLog;
+use crate::llm_types::ChatMessage;
 use crate::permissions::PermissionManager;
-use quine_core::conversation::Entry;
-use quine_core::log::ConversationLog;
-use quine_core::llm_types::ChatMessage;
 
 /// Result of executing a slash command.
 pub enum CommandResult {
@@ -121,7 +120,7 @@ fn rewind(conv_log: &mut ConversationLog, messages: &mut Vec<ChatMessage>, n: us
     );
 }
 
-pub(crate) fn format_tokens(n: u64) -> String {
+pub fn format_tokens(n: u64) -> String {
     if n >= 999_950 {
         format!("{:.1}M", n as f64 / 1_000_000.0)
     } else if n >= 1_000 {
@@ -161,7 +160,7 @@ pub fn print_turn_usage(input: u64, output: u64, session: &SessionUsage) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quine_core::conversation::{Entry, ToolCall, ToolOutput};
+    use crate::conversation::{entries_to_messages, Entry, ToolCall, ToolOutput};
 
     fn make_conv_log() -> ConversationLog {
         ConversationLog::new(
@@ -338,7 +337,7 @@ mod tests {
             content: "hi".to_string(),
             tool_calls: vec![],
         });
-        let mut messages = crate::interactive::entries_to_messages(&log.entries);
+        let mut messages = entries_to_messages(&log.entries);
         let usage = SessionUsage::default();
         let perms = PermissionManager::new();
 
@@ -371,7 +370,7 @@ mod tests {
             content: "response2".to_string(),
             tool_calls: vec![],
         });
-        let mut messages = crate::interactive::entries_to_messages(&log.entries);
+        let mut messages = entries_to_messages(&log.entries);
         let usage = SessionUsage::default();
         let perms = PermissionManager::new();
 
@@ -406,7 +405,7 @@ mod tests {
                 tool_calls: vec![],
             });
         }
-        let mut messages = crate::interactive::entries_to_messages(&log.entries);
+        let mut messages = entries_to_messages(&log.entries);
         let usage = SessionUsage::default();
         let perms = PermissionManager::new();
 
@@ -430,7 +429,7 @@ mod tests {
         log.push(Entry::UserMessage {
             content: "test".to_string(),
         });
-        let mut messages = crate::interactive::entries_to_messages(&log.entries);
+        let mut messages = entries_to_messages(&log.entries);
         let usage = SessionUsage::default();
         let perms = PermissionManager::new();
 
@@ -465,7 +464,7 @@ mod tests {
 
     #[test]
     fn entries_to_messages_empty() {
-        let messages = crate::interactive::entries_to_messages(&[]);
+        let messages = entries_to_messages(&[]);
         assert_eq!(
             messages.len(),
             0,
@@ -484,7 +483,7 @@ mod tests {
                 tool_calls: vec![],
             },
         ];
-        let messages = crate::interactive::entries_to_messages(&entries);
+        let messages = entries_to_messages(&entries);
         assert_eq!(messages.len(), 2, "should produce 2 messages");
         assert_eq!(messages[0].role, "user", "first message should be user");
         assert_eq!(
@@ -543,7 +542,7 @@ mod tests {
                 },
             },
         ];
-        let messages = crate::interactive::entries_to_messages(&entries);
+        let messages = entries_to_messages(&entries);
         // user message, assistant message with tool_use blocks, user message with tool_result blocks
         assert_eq!(
             messages.len(),
@@ -564,7 +563,7 @@ mod tests {
     fn risk_level_bash_is_high() {
         assert_eq!(
             PermissionManager::risk_level("Bash"),
-            super::super::permissions::RiskLevel::High,
+            crate::permissions::RiskLevel::High,
             "Bash should have High risk level"
         );
     }
@@ -573,7 +572,7 @@ mod tests {
     fn risk_level_write_is_medium() {
         assert_eq!(
             PermissionManager::risk_level("Write"),
-            super::super::permissions::RiskLevel::Medium,
+            crate::permissions::RiskLevel::Medium,
             "Write should have Medium risk level"
         );
     }
@@ -582,7 +581,7 @@ mod tests {
     fn risk_level_edit_is_medium() {
         assert_eq!(
             PermissionManager::risk_level("Edit"),
-            super::super::permissions::RiskLevel::Medium,
+            crate::permissions::RiskLevel::Medium,
             "Edit should have Medium risk level"
         );
     }
@@ -591,7 +590,7 @@ mod tests {
     fn risk_level_read_is_low() {
         assert_eq!(
             PermissionManager::risk_level("Read"),
-            super::super::permissions::RiskLevel::Low,
+            crate::permissions::RiskLevel::Low,
             "Read should have Low risk level"
         );
     }
@@ -600,7 +599,7 @@ mod tests {
     fn risk_level_glob_is_low() {
         assert_eq!(
             PermissionManager::risk_level("Glob"),
-            super::super::permissions::RiskLevel::Low,
+            crate::permissions::RiskLevel::Low,
             "Glob should have Low risk level"
         );
     }
@@ -609,7 +608,7 @@ mod tests {
     fn risk_level_unknown_tool_is_low() {
         assert_eq!(
             PermissionManager::risk_level("SomeUnknownTool"),
-            super::super::permissions::RiskLevel::Low,
+            crate::permissions::RiskLevel::Low,
             "Unknown tools should default to Low risk level"
         );
     }

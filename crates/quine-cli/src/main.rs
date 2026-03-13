@@ -1,12 +1,8 @@
-mod commands;
-mod dispatcher;
 mod interactive;
-mod permissions;
 mod render;
 mod replay_cmd;
 
 use std::path::PathBuf;
-
 use clap::{Parser, Subcommand};
 
 use quine_core::config::Config;
@@ -102,7 +98,7 @@ async fn main() -> anyhow::Result<()> {
             let (conv_log, messages) = if let Some(ref log_path) = r#continue {
                 println!("Continuing from: {}", log_path.display());
                 let log = ConversationLog::load(log_path)?;
-                let msgs = interactive::entries_to_messages(&log.entries);
+                let msgs = quine_core::conversation::entries_to_messages(&log.entries);
                 (log, msgs)
             } else {
                 let log = ConversationLog::new(
@@ -113,7 +109,9 @@ async fn main() -> anyhow::Result<()> {
                 (log, vec![])
             };
 
-            let mut disp = dispatcher::Dispatcher::new(
+            let ui = Box::new(render::CliUI::new());
+
+            let mut disp = quine_core::dispatcher::Dispatcher::new(
                 llm_provider,
                 config,
                 model,
@@ -121,11 +119,16 @@ async fn main() -> anyhow::Result<()> {
                 conv_log,
                 messages,
                 !no_stream,
+                ui,
             );
 
             if let Some(prompt) = print {
                 disp.run_oneshot(&prompt, &output_format).await?;
             } else {
+                render::spawn_input_reader(
+                    disp.event_sender(),
+                    disp.input_signal(),
+                );
                 disp.run().await?;
             }
         }

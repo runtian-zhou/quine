@@ -5,23 +5,61 @@ use anyhow::Result;
 use futures::StreamExt;
 use tokio::sync::mpsc;
 
-use quine_core::config::Config;
-use quine_core::conversation::ToolOutput;
-use quine_core::log::ConversationLog;
-use quine_core::tool::{GlobalContext, ToolRegistry};
-use quine_core::worktree::Worktree;
-use quine_llm::provider::LlmProvider;
-use quine_core::llm_types::*;
-
-use quine_core::agent::{Agent, AgentConfig, AgentId, AgentState};
-use quine_core::event::Event;
-
+use crate::agent::{Agent, AgentConfig, AgentId, AgentState};
 use crate::commands::{self, CommandResult, SessionUsage};
+use crate::config::Config;
+use crate::conversation::ToolOutput;
+use crate::event::Event;
+use crate::llm_types::*;
+use crate::log::ConversationLog;
 use crate::permissions::PermissionManager;
-use crate::render::Renderer;
+use crate::provider::LlmProvider;
+use crate::tool::{GlobalContext, ToolRegistry};
+use crate::worktree::Worktree;
 
-const PROMPT_NORMAL: &str = "\x1b[1;32m❯\x1b[0m ";
-const PROMPT_ANSWER: &str = "\x1b[1;33m>\x1b[0m ";
+pub const PROMPT_NORMAL: &str = "\x1b[1;32m❯\x1b[0m ";
+pub const PROMPT_ANSWER: &str = "\x1b[1;33m>\x1b[0m ";
+
+// ─── UI trait ────────────────────────────────────────────────────────────────
+
+/// Abstraction for terminal rendering — implemented by the CLI crate.
+pub trait DispatcherUI: Send {
+    fn print_assistant_message(&self, content: &str);
+    fn print_delta(&self, text: &str);
+    fn print_stream_start(&self);
+    fn print_tool_call(&self, name: &str, args: &serde_json::Value);
+    fn print_tool_result(&self, success: bool, output: &str);
+    fn start_spinner(&self, label: &str) -> Box<dyn SpinnerHandle>;
+}
+
+/// Handle returned by `DispatcherUI::start_spinner`. Call `stop()` to clear it.
+pub trait SpinnerHandle: Send {
+    fn stop(&mut self);
+}
+
+// ─── Input reader types ──────────────────────────────────────────────────────
+
+/// Shared state between the dispatcher and the input reader thread.
+pub struct InputPromptState {
+    /// When true, the reader should call readline or show a selector.
+    pub ready: bool,
+    /// The prompt string to display (normal turn vs answering a question).
+    pub prompt: String,
+    /// When set, show an interactive selector instead of readline.
+    pub selection: Option<SelectionPrompt>,
+}
+
+/// Configuration for an interactive arrow-key selector.
+pub struct SelectionPrompt {
+    pub question: String,
+    pub options: Vec<String>,
+    /// If true, allow multiple selections.
+    pub multi: bool,
+    /// If true, allow freeform text as a fallback (adds a "Other..." option).
+    pub allow_text: bool,
+}
+
+// ─── Subagent tracking ───────────────────────────────────────────────────────
 
 /// Tracks a subagent's relationship to its parent.
 struct SubagentInfo {
@@ -29,6 +67,8 @@ struct SubagentInfo {
     tool_call_id: String,
     _worktree: Option<Worktree>,
 }
+
+// ─── Dispatcher ──────────────────────────────────────────────────────────────
 
 pub struct Dispatcher {
     agents: HashMap<AgentId, Agent>,
@@ -43,36 +83,17 @@ pub struct Dispatcher {
     global_ctx: GlobalContext,
     permissions: PermissionManager,
     session_usage: SessionUsage,
-    renderer: Renderer,
+    ui: Box<dyn DispatcherUI>,
     stream: bool,
     next_id: u64,
-    spinner: Option<crate::render::Spinner>,
+    spinner: Option<Box<dyn SpinnerHandle>>,
     /// Shared state for the input reader thread. The reader waits on the condvar
     /// until the dispatcher sets `ready = true`, then shows the stored prompt.
     input_signal: Arc<(Mutex<InputPromptState>, Condvar)>,
 }
 
-/// Shared state between the dispatcher and the input reader thread.
-struct InputPromptState {
-    /// When true, the reader should call readline or show a selector.
-    ready: bool,
-    /// The prompt string to display (normal turn vs answering a question).
-    prompt: String,
-    /// When set, show an interactive selector instead of readline.
-    selection: Option<SelectionPrompt>,
-}
-
-/// Configuration for an interactive arrow-key selector.
-struct SelectionPrompt {
-    question: String,
-    options: Vec<String>,
-    /// If true, allow multiple selections.
-    multi: bool,
-    /// If true, allow freeform text as a fallback (adds a "Other..." option).
-    allow_text: bool,
-}
-
 impl Dispatcher {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         provider: Arc<dyn LlmProvider>,
         config: Config,
@@ -81,6 +102,7 @@ impl Dispatcher {
         conv_log: ConversationLog,
         initial_messages: Vec<ChatMessage>,
         stream: bool,
+        ui: Box<dyn DispatcherUI>,
     ) -> Self {
         let (event_tx, event_rx) = mpsc::channel(256);
         let global_ctx = GlobalContext::new();
@@ -117,7 +139,7 @@ impl Dispatcher {
             global_ctx,
             permissions: PermissionManager::new(),
             session_usage: SessionUsage::default(),
-            renderer: Renderer::new(),
+            ui,
             stream,
             next_id: 1,
             spinner: None,
@@ -130,6 +152,16 @@ impl Dispatcher {
                 Condvar::new(),
             )),
         }
+    }
+
+    /// Get the event sender so the CLI can set up an input reader.
+    pub fn event_sender(&self) -> mpsc::Sender<Event> {
+        self.event_tx.clone()
+    }
+
+    /// Get the input signal so the CLI can coordinate with the reader thread.
+    pub fn input_signal(&self) -> Arc<(Mutex<InputPromptState>, Condvar)> {
+        Arc::clone(&self.input_signal)
     }
 
     /// Signal the input reader thread to show a prompt and accept input.
@@ -163,13 +195,13 @@ impl Dispatcher {
     /// Start a spinner if one isn't already running.
     fn start_spinner(&mut self, label: &str) {
         if self.spinner.is_none() {
-            self.spinner = Some(crate::render::Spinner::start(label));
+            self.spinner = Some(self.ui.start_spinner(label));
         }
     }
 
     /// Stop the spinner if running.
     fn stop_spinner(&mut self) {
-        if let Some(spinner) = self.spinner.take() {
+        if let Some(mut spinner) = self.spinner.take() {
             spinner.stop();
         }
     }
@@ -182,7 +214,6 @@ impl Dispatcher {
         );
         println!("\x1b[90mType your message, /help for commands, Ctrl+D to exit\x1b[0m\n");
 
-        self.spawn_input_reader();
         self.signal_ready_for_input(PROMPT_NORMAL);
 
         while let Some(event) = self.event_rx.recv().await {
@@ -229,7 +260,7 @@ impl Dispatcher {
                 let registry = self.registries.get(&root_id).unwrap();
                 let tool_schemas = registry.all_schemas();
                 let request = agent.build_request(&tool_schemas);
-                let spinner = crate::render::Spinner::start("Thinking...");
+                let mut spinner = self.ui.start_spinner("Thinking...");
                 let resp = self.provider.complete(request).await?;
                 spinner.stop();
                 resp
@@ -296,7 +327,7 @@ impl Dispatcher {
                 }
                 _ => {
                     for entry in log.entries.iter().rev() {
-                        if let quine_core::conversation::Entry::AssistantMessage {
+                        if let crate::conversation::Entry::AssistantMessage {
                             content, ..
                         } = entry
                         {
@@ -311,65 +342,6 @@ impl Dispatcher {
         }
 
         Ok(())
-    }
-
-    fn spawn_input_reader(&self) {
-        let tx = self.event_tx.clone();
-        let signal = Arc::clone(&self.input_signal);
-        tokio::task::spawn_blocking(move || {
-            let mut rl = rustyline::DefaultEditor::new().unwrap();
-            loop {
-                // Wait until the dispatcher signals we should prompt for input.
-                let (prompt, selection) = {
-                    let (lock, cvar) = &*signal;
-                    let mut state = lock.lock().unwrap();
-                    while !state.ready {
-                        state = cvar.wait(state).unwrap();
-                    }
-                    state.ready = false;
-                    (state.prompt.clone(), state.selection.take())
-                };
-
-                // If we have a selection prompt, use dialoguer instead of readline.
-                if let Some(sel) = selection {
-                    let result = run_selector(&sel);
-                    match result {
-                        Some(text) => {
-                            if tx.blocking_send(Event::UserInput(text)).is_err() {
-                                break;
-                            }
-                        }
-                        None => {
-                            // User cancelled (Esc / Ctrl+C)
-                            let _ = tx.blocking_send(Event::Shutdown);
-                            break;
-                        }
-                    }
-                    continue;
-                }
-
-                match rl.readline(&prompt) {
-                    Ok(line) => {
-                        let trimmed = line.trim_end().to_string();
-                        if !trimmed.is_empty() {
-                            let _ = rl.add_history_entry(&trimmed);
-                        }
-                        if tx.blocking_send(Event::UserInput(trimmed)).is_err() {
-                            break;
-                        }
-                    }
-                    Err(rustyline::error::ReadlineError::Interrupted)
-                    | Err(rustyline::error::ReadlineError::Eof) => {
-                        let _ = tx.blocking_send(Event::Shutdown);
-                        break;
-                    }
-                    Err(_) => {
-                        let _ = tx.blocking_send(Event::Shutdown);
-                        break;
-                    }
-                }
-            }
-        });
     }
 
     /// Find an agent that is in WaitingToolInput state (e.g. AskUserQuestion).
@@ -491,7 +463,7 @@ impl Dispatcher {
 
         // Print content for root agent (non-streaming mode)
         if is_root && !response.content.is_empty() {
-            self.renderer.print_assistant_message(&response.content);
+            self.ui.print_assistant_message(&response.content);
         }
 
         {
@@ -521,12 +493,12 @@ impl Dispatcher {
         {
             self.stop_spinner();
             // Print the indent prefix at the start of streaming output
-            self.renderer.print_stream_start();
+            self.ui.print_stream_start();
         }
 
         // Print content deltas immediately
         if let StreamEvent::ContentDelta(ref text) = event {
-            self.renderer.print_delta(text);
+            self.ui.print_delta(text);
         }
 
         let agent = self.agents.get_mut(&agent_id).unwrap();
@@ -571,7 +543,7 @@ impl Dispatcher {
             }
             if let Some(log) = &mut agent.conv_log {
                 // Remove the last log entry if it was the user message for this failed turn
-                if let Some(quine_core::conversation::Entry::UserMessage { .. }) =
+                if let Some(crate::conversation::Entry::UserMessage { .. }) =
                     log.entries.last()
                 {
                     log.entries.pop();
@@ -605,7 +577,7 @@ impl Dispatcher {
         arguments: serde_json::Value,
         result: ToolOutput,
     ) -> Result<bool> {
-        self.renderer.print_tool_result(result.success, &result.output);
+        self.ui.print_tool_result(result.success, &result.output);
 
         let pending_empty = {
             let agent = self.agents.get_mut(&agent_id).unwrap();
@@ -693,7 +665,7 @@ impl Dispatcher {
                 return self.dispatch_ask_user(agent_id, tc);
             }
 
-            self.renderer.print_tool_call(&tc.name, &tc.arguments);
+            self.ui.print_tool_call(&tc.name, &tc.arguments);
 
             // Subagent: spawn concurrently and continue dispatching remaining tools
             if tc.name == "Subagent" {
@@ -754,7 +726,7 @@ impl Dispatcher {
     async fn dispatch_subagent(
         &mut self,
         parent_id: AgentId,
-        tc: quine_core::conversation::ToolCall,
+        tc: crate::conversation::ToolCall,
     ) -> Result<()> {
         let prompt = tc.arguments["prompt"]
             .as_str()
@@ -804,7 +776,7 @@ impl Dispatcher {
     fn dispatch_ask_user(
         &mut self,
         agent_id: AgentId,
-        tc: quine_core::conversation::ToolCall,
+        tc: crate::conversation::ToolCall,
     ) -> Result<()> {
         // Only show prompt if no other agent is already waiting
         let already_waiting = self.find_agent_waiting_tool_input().is_some();
@@ -958,6 +930,8 @@ impl Dispatcher {
     }
 }
 
+// ─── Free functions ──────────────────────────────────────────────────────────
+
 /// Signal the input reader with either a selector or a freeform prompt,
 /// depending on whether the tool arguments include options.
 fn signal_question(
@@ -984,7 +958,7 @@ fn signal_question(
 }
 
 /// Build a SelectionPrompt from tool arguments, if options are present.
-fn selection_from_args(args: &serde_json::Value) -> Option<SelectionPrompt> {
+pub fn selection_from_args(args: &serde_json::Value) -> Option<SelectionPrompt> {
     let options = args["options"].as_array()?;
     if options.is_empty() {
         return None;
@@ -1004,86 +978,10 @@ fn selection_from_args(args: &serde_json::Value) -> Option<SelectionPrompt> {
     })
 }
 
-const OTHER_OPTION: &str = "Other (type your own)...";
-const FREEFORM_PROMPT: &str = "Type your response";
-
-/// Run an interactive arrow-key selector. Returns the selected text,
-/// or None if the user cancelled.
-fn run_selector(sel: &SelectionPrompt) -> Option<String> {
-    use dialoguer::{theme::ColorfulTheme, Input, MultiSelect, Select};
-
-    let theme = ColorfulTheme::default();
-
-    if sel.multi {
-        let mut items = sel.options.clone();
-        if sel.allow_text {
-            items.push(OTHER_OPTION.to_string());
-        }
-
-        let chosen = MultiSelect::with_theme(&theme)
-            .with_prompt(&sel.question)
-            .items(&items)
-            .interact_opt()
-            .ok()?;
-
-        let indices = chosen?;
-        if indices.is_empty() {
-            return Some("(no selection)".to_string());
-        }
-
-        let other_idx = items.len() - 1;
-        let has_other = sel.allow_text && indices.contains(&other_idx);
-
-        // Collect the real (non-"Other") selections
-        let mut selected: Vec<String> = indices
-            .iter()
-            .filter(|&&i| !(sel.allow_text && i == other_idx))
-            .map(|&i| sel.options[i].clone())
-            .collect();
-
-        // If "Other..." was checked, prompt for freeform and append it
-        if has_other {
-            let input = Input::<String>::with_theme(&theme)
-                .with_prompt(FREEFORM_PROMPT)
-                .interact_text()
-                .ok()?;
-            if !input.is_empty() {
-                selected.push(input);
-            }
-        }
-
-        Some(selected.join(", "))
-    } else {
-        let mut items = sel.options.clone();
-        if sel.allow_text {
-            items.push(OTHER_OPTION.to_string());
-        }
-
-        let chosen = Select::with_theme(&theme)
-            .with_prompt(&sel.question)
-            .default(0)
-            .items(&items)
-            .interact_opt()
-            .ok()?;
-
-        let idx = chosen?;
-
-        if sel.allow_text && idx == items.len() - 1 {
-            let input = Input::<String>::with_theme(&theme)
-                .with_prompt(FREEFORM_PROMPT)
-                .interact_text()
-                .ok()?;
-            return Some(input);
-        }
-
-        Some(sel.options[idx].clone())
-    }
-}
-
 /// Parse user input against the options in the tool arguments.
 /// If options are present, try to interpret the input as comma-separated numbers.
 /// Returns the resolved text to send back as the tool result.
-fn resolve_answer(args: &serde_json::Value, input: &str) -> String {
+pub fn resolve_answer(args: &serde_json::Value, input: &str) -> String {
     let options = match args["options"].as_array() {
         Some(opts) if !opts.is_empty() => opts,
         _ => return input.to_string(), // freeform mode
@@ -1120,7 +1018,7 @@ fn resolve_answer(args: &serde_json::Value, input: &str) -> String {
     }
 }
 
-fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
+pub fn summarize_tool_args(tool_name: &str, args: &serde_json::Value) -> String {
     match tool_name {
         "Bash" => args["command"]
             .as_str()

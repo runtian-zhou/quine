@@ -4,11 +4,18 @@ const INDENT: &str = "  ";
 use crossterm::style::{Color, ResetColor, SetForegroundColor};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Condvar, Mutex};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::ThemeSet;
 use syntect::parsing::SyntaxSet;
 use syntect::util::as_24_bit_terminal_escaped;
+
+use quine_core::dispatcher::{
+    DispatcherUI, InputPromptState, SelectionPrompt, SpinnerHandle,
+};
+use quine_core::event::Event;
+
+// ─── Spinner ─────────────────────────────────────────────────────────────────
 
 pub struct Spinner {
     running: Arc<AtomicBool>,
@@ -43,8 +50,10 @@ impl Spinner {
             handle: Some(handle),
         }
     }
+}
 
-    pub fn stop(mut self) {
+impl SpinnerHandle for Spinner {
+    fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {
             h.join().ok();
@@ -61,13 +70,15 @@ impl Drop for Spinner {
     }
 }
 
-pub struct Renderer {
+// ─── Renderer ────────────────────────────────────────────────────────────────
+
+struct Renderer {
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
 }
 
 impl Renderer {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
@@ -75,7 +86,7 @@ impl Renderer {
     }
 
     /// Print a streamed content delta (no newline, flush immediately)
-    pub fn print_delta(&self, text: &str) {
+    fn print_delta(&self, text: &str) {
         // Indent each new line in the delta
         let mut first = true;
         for part in text.split('\n') {
@@ -89,13 +100,13 @@ impl Renderer {
     }
 
     /// Print the indent prefix at the start of a streaming response.
-    pub fn print_stream_start(&self) {
+    fn print_stream_start(&self) {
         print!("{}", INDENT);
         std::io::stdout().flush().ok();
     }
 
     /// Print a complete assistant message with markdown/syntax highlighting
-    pub fn print_assistant_message(&self, content: &str) {
+    fn print_assistant_message(&self, content: &str) {
         // Simple markdown rendering: detect code blocks and highlight them
         let mut in_code_block = false;
         let mut code_lang = String::new();
@@ -178,7 +189,7 @@ impl Renderer {
         println!("{}\x1b[90m└──────┘\x1b[0m", INDENT);
     }
 
-    pub fn print_tool_call(&self, name: &str, args: &serde_json::Value) {
+    fn print_tool_call(&self, name: &str, args: &serde_json::Value) {
         println!("\n{}\x1b[1;33m⚙ Tool: {}\x1b[0m", INDENT, name);
         if let Some(obj) = args.as_object() {
             for (key, value) in obj {
@@ -212,7 +223,7 @@ impl Renderer {
         }
     }
 
-    pub fn print_tool_result(&self, success: bool, output: &str) {
+    fn print_tool_result(&self, success: bool, output: &str) {
         if success {
             println!("{}\x1b[32m  ✓ Success\x1b[0m", INDENT);
         } else {
@@ -231,5 +242,186 @@ impl Renderer {
                 total_lines - 5
             );
         }
+    }
+}
+
+// ─── CliUI: DispatcherUI implementation ──────────────────────────────────────
+
+/// CLI implementation of the DispatcherUI trait using syntect, crossterm, etc.
+pub struct CliUI {
+    renderer: Renderer,
+}
+
+impl CliUI {
+    pub fn new() -> Self {
+        Self {
+            renderer: Renderer::new(),
+        }
+    }
+}
+
+impl DispatcherUI for CliUI {
+    fn print_assistant_message(&self, content: &str) {
+        self.renderer.print_assistant_message(content);
+    }
+
+    fn print_delta(&self, text: &str) {
+        self.renderer.print_delta(text);
+    }
+
+    fn print_stream_start(&self) {
+        self.renderer.print_stream_start();
+    }
+
+    fn print_tool_call(&self, name: &str, args: &serde_json::Value) {
+        self.renderer.print_tool_call(name, args);
+    }
+
+    fn print_tool_result(&self, success: bool, output: &str) {
+        self.renderer.print_tool_result(success, output);
+    }
+
+    fn start_spinner(&self, label: &str) -> Box<dyn SpinnerHandle> {
+        Box::new(Spinner::start(label))
+    }
+}
+
+// ─── Input reader ────────────────────────────────────────────────────────────
+
+const OTHER_OPTION: &str = "Other (type your own)...";
+const FREEFORM_PROMPT: &str = "Type your response";
+
+/// Spawn a background thread that reads user input and sends it as events.
+/// Uses rustyline for readline and dialoguer for interactive selectors.
+pub fn spawn_input_reader(
+    tx: tokio::sync::mpsc::Sender<Event>,
+    signal: Arc<(Mutex<InputPromptState>, Condvar)>,
+) {
+    tokio::task::spawn_blocking(move || {
+        let mut rl = rustyline::DefaultEditor::new().unwrap();
+        loop {
+            // Wait until the dispatcher signals we should prompt for input.
+            let (prompt, selection) = {
+                let (lock, cvar) = &*signal;
+                let mut state = lock.lock().unwrap();
+                while !state.ready {
+                    state = cvar.wait(state).unwrap();
+                }
+                state.ready = false;
+                (state.prompt.clone(), state.selection.take())
+            };
+
+            // If we have a selection prompt, use dialoguer instead of readline.
+            if let Some(sel) = selection {
+                let result = run_selector(&sel);
+                match result {
+                    Some(text) => {
+                        if tx.blocking_send(Event::UserInput(text)).is_err() {
+                            break;
+                        }
+                    }
+                    None => {
+                        // User cancelled (Esc / Ctrl+C)
+                        let _ = tx.blocking_send(Event::Shutdown);
+                        break;
+                    }
+                }
+                continue;
+            }
+
+            match rl.readline(&prompt) {
+                Ok(line) => {
+                    let trimmed = line.trim_end().to_string();
+                    if !trimmed.is_empty() {
+                        let _ = rl.add_history_entry(&trimmed);
+                    }
+                    if tx.blocking_send(Event::UserInput(trimmed)).is_err() {
+                        break;
+                    }
+                }
+                Err(rustyline::error::ReadlineError::Interrupted)
+                | Err(rustyline::error::ReadlineError::Eof) => {
+                    let _ = tx.blocking_send(Event::Shutdown);
+                    break;
+                }
+                Err(_) => {
+                    let _ = tx.blocking_send(Event::Shutdown);
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// Run an interactive arrow-key selector. Returns the selected text,
+/// or None if the user cancelled.
+fn run_selector(sel: &SelectionPrompt) -> Option<String> {
+    use dialoguer::{theme::ColorfulTheme, Input, MultiSelect, Select};
+
+    let theme = ColorfulTheme::default();
+
+    if sel.multi {
+        let mut items = sel.options.clone();
+        if sel.allow_text {
+            items.push(OTHER_OPTION.to_string());
+        }
+
+        let chosen = MultiSelect::with_theme(&theme)
+            .with_prompt(&sel.question)
+            .items(&items)
+            .interact_opt()
+            .ok()?;
+
+        let indices = chosen?;
+        if indices.is_empty() {
+            return Some("(no selection)".to_string());
+        }
+
+        let other_idx = items.len() - 1;
+        let has_other = sel.allow_text && indices.contains(&other_idx);
+
+        // Collect the real (non-"Other") selections
+        let mut selected: Vec<String> = indices
+            .iter()
+            .filter(|&&i| !(sel.allow_text && i == other_idx))
+            .map(|&i| sel.options[i].clone())
+            .collect();
+
+        // If "Other..." was checked, prompt for freeform and append it
+        if has_other {
+            let input = Input::<String>::with_theme(&theme)
+                .with_prompt(FREEFORM_PROMPT)
+                .interact_text()
+                .ok()?;
+            if !input.is_empty() {
+                selected.push(input);
+            }
+        }
+
+        Some(selected.join(", "))
+    } else {
+        let mut items = sel.options.clone();
+        if sel.allow_text {
+            items.push(OTHER_OPTION.to_string());
+        }
+
+        let chosen = Select::with_theme(&theme)
+            .with_prompt(&sel.question)
+            .default(0)
+            .items(&items)
+            .interact_opt()
+            .ok()?;
+
+        let idx = chosen?;
+
+        if sel.allow_text && idx == items.len() - 1 {
+            let input = Input::<String>::with_theme(&theme)
+                .with_prompt(FREEFORM_PROMPT)
+                .interact_text()
+                .ok()?;
+            return Some(input);
+        }
+
+        Some(sel.options[idx].clone())
     }
 }
