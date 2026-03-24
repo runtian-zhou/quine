@@ -113,6 +113,7 @@ pub mod methods {
     pub const SUBSCRIBE: &str = "subscribe";
     pub const LIST_SESSIONS: &str = "list_sessions";
     pub const GET_SESSION_LOG: &str = "get_session_log";
+    pub const SUBMIT_INTERACTION_RESPONSE: &str = "submit_interaction_response";
 }
 
 /// Notification method names.

@@ -36,7 +36,7 @@ pub async fn run_oneshot(
     session_id: Option<&str>,
     json_output: bool,
 ) -> anyhow::Result<()> {
-    let mut client = IpcClient::connect(socket_path).await?;
+    let mut client = IpcClient::connect_or_launch(socket_path).await?;
 
     // Create or reuse session.
     let session_id = match session_id {
@@ -106,6 +106,20 @@ pub async fn run_oneshot(
                             tool_use_id,
                         });
                     }
+                }
+                notifications::INTERACTION_NEEDED => {
+                    // One-shot mode cannot prompt the user interactively.
+                    // Send back a response explaining this so the tool doesn't hang.
+                    eprintln!(
+                        "warning: interactive tool requested in one-shot mode, auto-responding"
+                    );
+                    let params = serde_json::json!({
+                        "session_id": session_id,
+                        "response": "User is not available (one-shot mode). Please proceed without user input.",
+                    });
+                    let _ = client
+                        .call(methods::SUBMIT_INTERACTION_RESPONSE, Some(params))
+                        .await;
                 }
                 notifications::SESSION_ERROR => {
                     if let Some(params) = &notif.params {

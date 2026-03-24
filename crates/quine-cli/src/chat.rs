@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::IpcClient;
 use crate::render::{Renderer, TerminalRenderer};
@@ -11,7 +11,7 @@ use quine_harness::protocol::{methods, notifications};
 /// Connects to the harness daemon, creates a session, then loops:
 /// read user input -> send message -> print streamed response.
 pub async fn run_chat(socket_path: &Path) -> anyhow::Result<()> {
-    let mut client = IpcClient::connect(socket_path).await?;
+    let mut client = IpcClient::connect_or_launch(socket_path).await?;
     let mut renderer = TerminalRenderer::new();
 
     // Create a session.
@@ -59,6 +59,10 @@ pub async fn run_chat(socket_path: &Path) -> anyhow::Result<()> {
                 loop {
                     match client.recv_notification().await {
                         Some(notif) => {
+                            if notif.method == notifications::INTERACTION_NEEDED {
+                                handle_interaction(&notif, &mut client, &session_id).await?;
+                                continue;
+                            }
                             let handled = handle_notification(&notif, &mut renderer).await?;
                             if handled {
                                 break;
@@ -81,6 +85,51 @@ pub async fn run_chat(socket_path: &Path) -> anyhow::Result<()> {
 
     // Shutdown.
     let _ = client.call(methods::SHUTDOWN, None).await;
+    Ok(())
+}
+
+/// Handle an `interaction_needed` notification by prompting the user for input
+/// and sending the response back to the daemon.
+async fn handle_interaction(
+    notif: &quine_harness::protocol::JsonRpcNotification,
+    client: &mut IpcClient,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let prompt = notif
+        .params
+        .as_ref()
+        .and_then(|p| p.get("prompt"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("(tool is asking for input)");
+
+    // Display the prompt to the user.
+    let mut stderr = tokio::io::stderr();
+    stderr
+        .write_all(format!("\n[ask_user] {prompt}\n> ").as_bytes())
+        .await?;
+    stderr.flush().await?;
+
+    // Read the user's response from stdin.
+    let mut line = String::new();
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    stdin.read_line(&mut line).await?;
+    let response = line.trim().to_string();
+
+    // Send the response back to the daemon.
+    let params = serde_json::json!({
+        "session_id": session_id,
+        "response": response,
+    });
+    let result = client
+        .call(
+            quine_harness::protocol::methods::SUBMIT_INTERACTION_RESPONSE,
+            Some(params),
+        )
+        .await?;
+    if let Err(e) = result {
+        eprintln!("warning: failed to submit interaction response: {e}");
+    }
+
     Ok(())
 }
 

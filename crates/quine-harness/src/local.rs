@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use quine_core::{create_channels, ChannelConfig, CoreInput, CoreOutput, HarnessHandle, SessionId};
+use quine_core::{
+    create_channels, ChannelConfig, CoreInput, CoreOutput, HarnessHandle, InteractionResponse,
+    SessionId,
+};
 use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, oneshot, Mutex};
 
@@ -129,6 +132,20 @@ impl HarnessService for LocalHarness {
                 session_id,
                 tool_use_id,
                 result,
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)
+    }
+
+    async fn submit_interaction_response(
+        &self,
+        session_id: SessionId,
+        response: InteractionResponse,
+    ) -> Result<(), HarnessError> {
+        self.harness_input
+            .send(CoreInput::InteractionResponse {
+                session_id,
+                response,
             })
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)
