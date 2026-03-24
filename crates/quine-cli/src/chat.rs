@@ -83,8 +83,10 @@ pub async fn run_chat(socket_path: &Path) -> anyhow::Result<()> {
         }
     }
 
-    // Shutdown.
-    let _ = client.call(methods::SHUTDOWN, None).await;
+    // Just disconnect — don't shut down the daemon. Other sessions or
+    // future CLI invocations may still need it. Use `quine daemon stop`
+    // to shut down the daemon explicitly.
+    drop(client);
     Ok(())
 }
 
