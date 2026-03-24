@@ -111,6 +111,8 @@ pub mod methods {
     pub const CANCEL: &str = "cancel";
     pub const SHUTDOWN: &str = "shutdown";
     pub const SUBSCRIBE: &str = "subscribe";
+    pub const LIST_SESSIONS: &str = "list_sessions";
+    pub const GET_SESSION_LOG: &str = "get_session_log";
 }
 
 /// Notification method names.

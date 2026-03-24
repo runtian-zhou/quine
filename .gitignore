@@ -3,3 +3,5 @@
 .claude/settings.local.json
 target/
 .quine/
+qa/reports/
+!qa/reports/.gitkeep
