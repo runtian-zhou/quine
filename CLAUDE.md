@@ -27,6 +27,7 @@ crates/
   quine-core/       # agent harness library
   quine-harness/    # local daemon service
   quine-llm/        # LLM provider adapter
+features/           # feature request markdown files
 ```
 
 ### Crate Responsibilities
@@ -76,6 +77,49 @@ Rules:
 5. Keep PRs focused — one logical change per PR.
 6. Design docs go in `docs/design/` with conversation transcripts attached.
 7. At the end of each implementation, use the built-in `/review` skill to review the code, then create a PR and merge once all code is reviewed and CI passes.
+
+### Parallel Agent Work
+
+Multiple agents can work independently on the same crate, **as long as the trait interfaces between crates are not changed.** Inter-crate trait definitions (e.g., `Tool`, `LlmProvider`, `HarnessService`) are shared contracts — modifying them requires coordination and should be done in a dedicated PR before parallel work begins. Internal implementation changes within a crate are safe for parallel work.
+
+### Feature Requests
+
+Feature requests live in `features/` as Markdown files. Each file describes one feature:
+
+```
+features/
+  add-streaming-support.md
+  tool-permission-system.md
+  ...
+```
+
+**Format** for a feature request file:
+
+```markdown
+---
+status: pending | in-progress | done
+---
+
+# Feature Title
+
+Description of the feature, requirements, and acceptance criteria.
+```
+
+The `status` field tracks progress:
+- `pending` — not yet started
+- `in-progress` — an agent is actively working on it
+- `done` — implemented and merged
+
+**Agent workflow for feature requests:**
+
+1. Scan `features/` for files with `status: pending`.
+2. Pick a feature, update its status to `in-progress`.
+3. Create a git worktree (`git worktree add`) for an isolated workspace.
+4. Implement the feature in the worktree on a feature branch.
+5. Run all checks (`cargo build`, `cargo test`, `cargo clippy`, `cargo fmt`).
+6. Use `/review` to review the code, create a PR, and merge when CI passes.
+7. Update the feature file status to `done`.
+8. Clean up the worktree (`git worktree remove`).
 
 ## The Bootstrapping Contract
 
