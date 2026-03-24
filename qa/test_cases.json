@@ -1,0 +1,37 @@
+[
+  {
+    "name": "simple_greeting",
+    "description": "Basic single-turn greeting to verify the agent responds",
+    "turns": [
+      {
+        "message": "Hello, please respond with exactly: PONG",
+        "expect_contains": "PONG"
+      }
+    ]
+  },
+  {
+    "name": "session_resume",
+    "description": "Two-turn conversation verifying session persistence",
+    "turns": [
+      {
+        "message": "Remember this number: 42. Reply with OK.",
+        "expect_contains": "OK"
+      },
+      {
+        "message": "What number did I ask you to remember?",
+        "expect_contains": "42"
+      }
+    ]
+  },
+  {
+    "name": "json_output_mode",
+    "description": "Verify --json flag produces valid structured output",
+    "json_mode": true,
+    "turns": [
+      {
+        "message": "Say hello",
+        "expect_json_fields": ["session_id", "response", "tool_calls"]
+      }
+    ]
+  }
+]

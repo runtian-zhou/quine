@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 
@@ -9,6 +10,7 @@ use crate::protocol::{
     JsonRpcResponse,
 };
 use crate::service::HarnessService;
+use crate::session_log::{self, EventDirection, SessionLogEntry};
 
 /// Run the IPC server on a Unix domain socket.
 ///
@@ -57,6 +59,9 @@ async fn handle_connection(
 
     tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
+            // Log the event asynchronously.
+            log_core_output(&event).await;
+
             let notification = core_output_to_notification(&event);
             if let Ok(json) = serde_json::to_string(&notification) {
                 if notify_tx.send(format!("{json}\n")).await.is_err() {
@@ -92,6 +97,98 @@ async fn handle_connection(
     Ok(())
 }
 
+/// Log a CoreOutput event to the session's JSONL log file.
+async fn log_core_output(event: &quine_core::CoreOutput) {
+    let (session_id_str, event_type, payload) = match event {
+        quine_core::CoreOutput::StreamDelta { session_id, delta } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "stream_delta",
+            serde_json::json!({"delta": delta}),
+        ),
+        quine_core::CoreOutput::TextComplete {
+            session_id,
+            full_text,
+        } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "text_complete",
+            serde_json::json!({"full_text": full_text}),
+        ),
+        quine_core::CoreOutput::ToolRequest {
+            session_id,
+            tool_use_id,
+            tool_name,
+            arguments,
+        } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "tool_request",
+            serde_json::json!({
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "arguments": arguments,
+            }),
+        ),
+        quine_core::CoreOutput::SessionStateChanged { session_id, state } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "session_state_changed",
+            serde_json::json!({"state": state}),
+        ),
+        quine_core::CoreOutput::SessionError { session_id, error } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "session_error",
+            serde_json::json!({"error": error.to_string()}),
+        ),
+        quine_core::CoreOutput::InteractionNeeded {
+            session_id,
+            request,
+        } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "interaction_needed",
+            serde_json::json!({
+                "prompt": request.prompt,
+                "kind": request.kind,
+            }),
+        ),
+        quine_core::CoreOutput::TurnComplete { session_id } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "turn_complete",
+            serde_json::json!({}),
+        ),
+    };
+
+    let entry = SessionLogEntry {
+        timestamp: Utc::now(),
+        session_id: session_id_str,
+        event_type: event_type.to_string(),
+        direction: EventDirection::Outbound,
+        payload,
+    };
+
+    if let Err(e) = session_log::append_log_entry(&entry).await {
+        tracing::warn!("failed to write session log: {e}");
+    }
+}
+
 /// Parse and dispatch a JSON-RPC request, returning the serialized response.
 async fn handle_request(line: &str, service: &dyn HarnessService) -> Option<String> {
     let request: JsonRpcRequest = match serde_json::from_str(line) {
@@ -124,6 +221,20 @@ async fn handle_request(line: &str, service: &dyn HarnessService) -> Option<Stri
 
             match service.create_session(config).await {
                 Ok(session_id) => {
+                    // Log session creation.
+                    let sid_str = serde_json::to_value(session_id)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .unwrap_or_default();
+                    let entry = SessionLogEntry {
+                        timestamp: Utc::now(),
+                        session_id: sid_str,
+                        event_type: "session_created".to_string(),
+                        direction: EventDirection::Inbound,
+                        payload: serde_json::json!({}),
+                    };
+                    let _ = session_log::append_log_entry(&entry).await;
+
                     let resp = JsonRpcResponse::success(id, session_id);
                     Some(serde_json::to_string(&resp).unwrap_or_default())
                 }
@@ -158,6 +269,16 @@ async fn handle_request(line: &str, service: &dyn HarnessService) -> Option<Stri
                                 return Some(serde_json::to_string(&resp).unwrap_or_default());
                             }
                         };
+
+                    // Log user message.
+                    let entry = SessionLogEntry {
+                        timestamp: Utc::now(),
+                        session_id: sid.to_string(),
+                        event_type: "user_message".to_string(),
+                        direction: EventDirection::Inbound,
+                        payload: serde_json::json!({"content": content}),
+                    };
+                    let _ = session_log::append_log_entry(&entry).await;
 
                     match service.send_message(session_id, content.to_string()).await {
                         Ok(()) => {
@@ -233,6 +354,57 @@ async fn handle_request(line: &str, service: &dyn HarnessService) -> Option<Stri
                         }
                     }
                 }
+                None => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing session_id",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::LIST_SESSIONS => match session_log::list_sessions().await {
+            Ok(summaries) => {
+                let resp = JsonRpcResponse::success(
+                    id,
+                    serde_json::to_value(&summaries).unwrap_or_default(),
+                );
+                Some(serde_json::to_string(&resp).unwrap_or_default())
+            }
+            Err(e) => {
+                let resp =
+                    JsonRpcErrorResponse::new(id, error_codes::INTERNAL_ERROR, e.to_string());
+                Some(serde_json::to_string(&resp).unwrap_or_default())
+            }
+        },
+
+        methods::GET_SESSION_LOG => {
+            let session_id_str = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str());
+
+            match session_id_str {
+                Some(sid) => match session_log::read_session_log(sid).await {
+                    Ok(entries) => {
+                        let resp = JsonRpcResponse::success(
+                            id,
+                            serde_json::to_value(&entries).unwrap_or_default(),
+                        );
+                        Some(serde_json::to_string(&resp).unwrap_or_default())
+                    }
+                    Err(e) => {
+                        let resp = JsonRpcErrorResponse::new(
+                            id,
+                            error_codes::INTERNAL_ERROR,
+                            e.to_string(),
+                        );
+                        Some(serde_json::to_string(&resp).unwrap_or_default())
+                    }
+                },
                 None => {
                     let resp = JsonRpcErrorResponse::new(
                         id,
