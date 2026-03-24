@@ -34,6 +34,10 @@ pub async fn run_core_loop(mut handle: CoreHandle) {
                 system_prompt,
                 reply,
             } => {
+                if sessions.contains_key(&session_id) {
+                    let _ = reply.send(Err("session already exists".into()));
+                    continue;
+                }
                 let ctx = SessionContext::new(system_prompt);
                 sessions.insert(session_id, ctx);
                 let _ = handle
@@ -88,7 +92,7 @@ pub async fn run_core_loop(mut handle: CoreHandle) {
 
             CoreInput::ToolResult {
                 session_id,
-                tool_use_id,
+                tool_use_id: _tool_use_id,
                 result: _,
             } => {
                 if let Some(session) = sessions.get_mut(&session_id) {
@@ -105,7 +109,6 @@ pub async fn run_core_loop(mut handle: CoreHandle) {
                             .await;
                     } else {
                         // TODO: feed tool result back into conversation
-                        let _ = tool_use_id;
                         session.state = SessionState::Idle;
                     }
                 } else {
@@ -249,6 +252,44 @@ mod tests {
 
         let event = output.recv().await.unwrap();
         assert!(matches!(event, CoreOutput::TurnComplete { .. }));
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_session_id_returns_error() {
+        let (harness, core) = create_channels(ChannelConfig::default());
+
+        let loop_handle = tokio::spawn(run_core_loop(core));
+
+        let session_id = SessionId::new();
+
+        // First creation succeeds
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(reply_rx.await.unwrap().is_ok());
+
+        // Second creation with same ID fails
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(reply_rx.await.unwrap().is_err());
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();
