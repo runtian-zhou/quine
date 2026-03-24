@@ -1,5 +1,9 @@
 use std::path::PathBuf;
 
+use quine_core::permission::composite::CompositeChecker;
+use quine_core::permission::llm_checker::LlmChecker;
+use quine_core::permission::rule_checker::RuleBasedChecker;
+use quine_core::PermissionChecker;
 use quine_llm::config::ProviderConfig;
 use quine_llm::openai_compat::OpenAiCompatConfig;
 use serde::{Deserialize, Serialize};
@@ -62,6 +66,24 @@ fn config_from_env() -> ProviderConfig {
 /// `quine_llm::config::create_provider`.
 pub fn create_provider_from_env() -> Box<dyn quine_llm::LlmProvider> {
     quine_llm::config::create_provider(config_from_env())
+}
+
+/// Create the default permission checker from environment configuration.
+///
+/// Always includes `RuleBasedChecker`. Optionally includes `LlmChecker` when
+/// `PERMISSION_LLM_ENABLED=true` is set in the environment.
+pub fn create_default_permission_checker() -> Box<dyn PermissionChecker> {
+    let mut checkers: Vec<Box<dyn PermissionChecker>> = vec![Box::new(RuleBasedChecker::new())];
+
+    if std::env::var("PERMISSION_LLM_ENABLED")
+        .map(|v| v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+    {
+        let provider = create_provider_from_env();
+        checkers.push(Box::new(LlmChecker::new(provider)));
+    }
+
+    Box::new(CompositeChecker::new(checkers))
 }
 
 #[cfg(test)]

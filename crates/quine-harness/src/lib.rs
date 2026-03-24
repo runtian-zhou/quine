@@ -6,7 +6,10 @@ pub mod server;
 pub mod service;
 pub mod session_log;
 
-pub use config::{create_provider_from_env, default_socket_path, HarnessConfig, SessionConfig};
+pub use config::{
+    create_default_permission_checker, create_provider_from_env, default_socket_path,
+    HarnessConfig, SessionConfig,
+};
 pub use error::HarnessError;
 pub use local::LocalHarness;
 pub use protocol::{

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: in-progress
 ---
 
 # Permission Checker Agent for Tool Execution
