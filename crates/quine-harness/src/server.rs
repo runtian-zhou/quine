@@ -117,7 +117,10 @@ async fn handle_request(line: &str, service: &dyn HarnessService) -> Option<Stri
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
-            let config = crate::config::SessionConfig { system_prompt };
+            let config = crate::config::SessionConfig {
+                system_prompt,
+                working_directory: None,
+            };
 
             match service.create_session(config).await {
                 Ok(session_id) => {
@@ -300,6 +303,17 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
             Some(serde_json::json!({
                 "session_id": session_id,
                 "error": error.to_string(),
+            })),
+        ),
+        quine_core::CoreOutput::InteractionNeeded {
+            session_id,
+            request,
+        } => JsonRpcNotification::new(
+            notifications::INTERACTION_NEEDED,
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "prompt": request.prompt,
+                "kind": request.kind,
             })),
         ),
         quine_core::CoreOutput::TurnComplete { session_id } => JsonRpcNotification::new(

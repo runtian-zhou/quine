@@ -120,6 +120,7 @@ pub mod notifications {
     pub const TOOL_REQUEST: &str = "tool_request";
     pub const SESSION_STATE_CHANGED: &str = "session_state_changed";
     pub const SESSION_ERROR: &str = "session_error";
+    pub const INTERACTION_NEEDED: &str = "interaction_needed";
     pub const TURN_COMPLETE: &str = "turn_complete";
 }
 
