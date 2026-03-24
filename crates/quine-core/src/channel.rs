@@ -1,0 +1,214 @@
+use serde::{Deserialize, Serialize};
+use tokio::sync::{mpsc, oneshot};
+
+use crate::error::CoreError;
+use crate::session::{SessionId, SessionState};
+
+/// Operations the harness sends into the core event loop.
+#[derive(Debug)]
+pub enum CoreInput {
+    /// Start a new agent session.
+    CreateSession {
+        session_id: SessionId,
+        /// Optional system prompt override.
+        system_prompt: Option<String>,
+        /// Acknowledges session creation.
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+
+    /// Send a user message into an existing session.
+    UserMessage {
+        session_id: SessionId,
+        content: String,
+    },
+
+    /// Return the result of a tool invocation the core previously requested.
+    ToolResult {
+        session_id: SessionId,
+        /// Correlates to the `tool_use_id` from the corresponding `ToolRequest`.
+        tool_use_id: String,
+        result: ToolOutcome,
+    },
+
+    /// Cancel any in-flight work for a session.
+    Cancel { session_id: SessionId },
+
+    /// Graceful shutdown of the entire core event loop.
+    Shutdown,
+}
+
+/// The outcome of a tool execution performed by the harness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ToolOutcome {
+    /// Tool succeeded with this output.
+    Success { output: String },
+    /// Tool failed with this error description.
+    Error { message: String },
+    /// Tool execution was cancelled (e.g., user denied permission).
+    Cancelled,
+}
+
+/// Events the core sends out to the harness.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum CoreOutput {
+    /// A partial text token from the LLM stream.
+    StreamDelta {
+        session_id: SessionId,
+        delta: String,
+    },
+
+    /// The LLM has finished generating text for this turn.
+    TextComplete {
+        session_id: SessionId,
+        full_text: String,
+    },
+
+    /// The LLM is requesting a tool invocation.
+    ToolRequest {
+        session_id: SessionId,
+        tool_use_id: String,
+        tool_name: String,
+        arguments: serde_json::Value,
+    },
+
+    /// A session's state changed.
+    SessionStateChanged {
+        session_id: SessionId,
+        state: SessionState,
+    },
+
+    /// An error occurred within a session.
+    SessionError {
+        session_id: SessionId,
+        error: CoreError,
+    },
+
+    /// The agent turn is fully complete.
+    TurnComplete { session_id: SessionId },
+}
+
+/// Configuration for channel buffer sizes.
+pub struct ChannelConfig {
+    /// Buffer size for the input channel (harness -> core).
+    pub input_buffer: usize,
+    /// Buffer size for the output channel (core -> harness).
+    pub output_buffer: usize,
+}
+
+impl Default for ChannelConfig {
+    fn default() -> Self {
+        Self {
+            input_buffer: 64,
+            output_buffer: 256,
+        }
+    }
+}
+
+/// The channel endpoints the harness holds.
+pub struct HarnessHandle {
+    /// Send operations into the core.
+    pub input: mpsc::Sender<CoreInput>,
+    /// Receive events from the core.
+    pub output: mpsc::Receiver<CoreOutput>,
+}
+
+/// The channel endpoints the core event loop holds.
+pub struct CoreHandle {
+    /// Receive operations from the harness.
+    pub input: mpsc::Receiver<CoreInput>,
+    /// Send events to the harness.
+    pub output: mpsc::Sender<CoreOutput>,
+}
+
+/// Create a paired set of channels connecting harness and core.
+pub fn create_channels(config: ChannelConfig) -> (HarnessHandle, CoreHandle) {
+    let (input_tx, input_rx) = mpsc::channel(config.input_buffer);
+    let (output_tx, output_rx) = mpsc::channel(config.output_buffer);
+
+    let harness = HarnessHandle {
+        input: input_tx,
+        output: output_rx,
+    };
+
+    let core = CoreHandle {
+        input: input_rx,
+        output: output_tx,
+    };
+
+    (harness, core)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn channels_send_and_receive() {
+        let (mut harness, mut core) = create_channels(ChannelConfig::default());
+
+        let session_id = SessionId::new();
+
+        // Harness sends a user message
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "hello".into(),
+            })
+            .await
+            .unwrap();
+
+        // Core receives it
+        let msg = core.input.recv().await.unwrap();
+        match msg {
+            CoreInput::UserMessage { content, .. } => assert_eq!(content, "hello"),
+            _ => panic!("expected UserMessage"),
+        }
+
+        // Core sends a stream delta back
+        core.output
+            .send(CoreOutput::StreamDelta {
+                session_id,
+                delta: "hi".into(),
+            })
+            .await
+            .unwrap();
+
+        // Harness receives it
+        let event = harness.output.recv().await.unwrap();
+        match event {
+            CoreOutput::StreamDelta { delta, .. } => assert_eq!(delta, "hi"),
+            _ => panic!("expected StreamDelta"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_with_oneshot_reply() {
+        let (harness, mut core) = create_channels(ChannelConfig::default());
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        // Core receives and acknowledges
+        let msg = core.input.recv().await.unwrap();
+        match msg {
+            CoreInput::CreateSession { reply, .. } => {
+                reply.send(Ok(())).unwrap();
+            }
+            _ => panic!("expected CreateSession"),
+        }
+
+        // Harness gets the ack
+        assert!(reply_rx.await.unwrap().is_ok());
+    }
+}

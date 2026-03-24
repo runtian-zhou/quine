@@ -75,6 +75,7 @@ Rules:
 4. Commits co-authored: `Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>`
 5. Keep PRs focused — one logical change per PR.
 6. Design docs go in `docs/design/` with conversation transcripts attached.
+7. At the end of each implementation, use the built-in `/review` skill to review the code, then create a PR and merge once all code is reviewed and CI passes.
 
 ## The Bootstrapping Contract
 
