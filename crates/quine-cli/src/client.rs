@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -95,6 +96,65 @@ impl IpcClient {
     /// Receive the next notification from the server.
     pub async fn recv_notification(&mut self) -> Option<JsonRpcNotification> {
         self.notification_rx.recv().await
+    }
+
+    /// Connect to the daemon, launching it automatically if it is not running.
+    ///
+    /// Attempts to connect to the socket. If the connection fails, spawns the
+    /// daemon as a detached background process (using the same `quine` binary
+    /// with `daemon start`) and polls until the socket accepts connections.
+    pub async fn connect_or_launch(socket_path: &Path) -> anyhow::Result<Self> {
+        // Fast path: daemon is already running.
+        if let Ok(client) = Self::connect(socket_path).await {
+            return Ok(client);
+        }
+
+        // Remove stale socket file if present.
+        if socket_path.exists() {
+            let _ = tokio::fs::remove_file(socket_path).await;
+        }
+
+        eprintln!("Starting daemon...");
+
+        // Resolve the path to the current executable so that `quine daemon start`
+        // works regardless of how the binary was invoked.
+        let exe = std::env::current_exe()?;
+
+        // Build socket arg.
+        let socket_str = socket_path.to_string_lossy();
+
+        // Spawn the daemon as a detached background process.
+        let _child = tokio::process::Command::new(&exe)
+            .args(["daemon", "start", "--socket", &socket_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // On Unix, start a new process group so the daemon outlives the CLI.
+            .process_group(0)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn daemon: {e}"))?;
+
+        // Poll until the socket is ready (max ~5 seconds).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut interval = std::time::Duration::from_millis(50);
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            if let Ok(client) = Self::connect(socket_path).await {
+                return Ok(client);
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for daemon to start at {}",
+                    socket_path.display()
+                );
+            }
+
+            // Exponential backoff: 50ms, 100ms, 200ms, 400ms, …
+            interval = (interval * 2).min(std::time::Duration::from_millis(500));
+        }
     }
 }
 
