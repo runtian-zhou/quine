@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 ---
 
 # Implement quine-llm Adapter and Integrate with quine-core
