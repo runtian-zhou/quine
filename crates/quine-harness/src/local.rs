@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use quine_core::{create_channels, ChannelConfig, CoreInput, CoreOutput, HarnessHandle, SessionId};
+use quine_core::{
+    create_channels, ChannelConfig, CoreInput, CoreOutput, HarnessHandle, PermissionChecker,
+    SessionId,
+};
 use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, oneshot, Mutex};
 
@@ -23,8 +26,11 @@ pub struct LocalHarness {
 
 impl LocalHarness {
     /// Create a new `LocalHarness` that spawns the core event loop with the
-    /// given LLM provider.
-    pub fn new(provider: Box<dyn LlmProvider>) -> Self {
+    /// given LLM provider and optional permission checker.
+    pub fn new(
+        provider: Box<dyn LlmProvider>,
+        permission_checker: Option<Box<dyn PermissionChecker>>,
+    ) -> Self {
         let (harness_handle, core_handle) = create_channels(ChannelConfig::default());
 
         let HarnessHandle { input, output } = harness_handle;
@@ -35,7 +41,11 @@ impl LocalHarness {
         let event_tx_clone = event_tx.clone();
 
         // Spawn the core event loop.
-        let core_task = tokio::spawn(quine_core::run_core_loop(core_handle, provider));
+        let core_task = tokio::spawn(quine_core::run_core_loop(
+            core_handle,
+            provider,
+            permission_checker,
+        ));
 
         // Spawn a fan-out task that reads from the core output channel and
         // broadcasts events. The core now handles tool execution directly,
@@ -183,7 +193,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_harness_create_session_and_message() {
-        let harness = LocalHarness::new(Box::new(MockProvider));
+        let harness = LocalHarness::new(Box::new(MockProvider), None);
         let mut rx = harness.subscribe();
 
         let session_id = harness

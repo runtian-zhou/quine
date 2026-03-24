@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use quine_harness::{create_provider_from_env, HarnessConfig, LocalHarness};
+use quine_harness::{
+    create_default_permission_checker, create_provider_from_env, HarnessConfig, LocalHarness,
+};
 
 #[derive(Parser)]
 #[command(name = "quine-harness", about = "Quine harness daemon")]
@@ -33,7 +35,8 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let provider = create_provider_from_env();
-            let harness = Arc::new(LocalHarness::new(provider));
+            let checker = create_default_permission_checker();
+            let harness = Arc::new(LocalHarness::new(provider, Some(checker)));
 
             quine_harness::server::run_ipc_server(&config.socket_path, harness).await?;
         }

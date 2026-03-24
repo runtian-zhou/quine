@@ -115,7 +115,9 @@ async fn main() -> anyhow::Result<()> {
 
                 // Start the daemon in-process.
                 let provider = quine_harness::create_provider_from_env();
-                let harness = std::sync::Arc::new(quine_harness::LocalHarness::new(provider));
+                let checker = quine_harness::create_default_permission_checker();
+                let harness =
+                    std::sync::Arc::new(quine_harness::LocalHarness::new(provider, Some(checker)));
                 quine_harness::server::run_ipc_server(&socket_path, harness).await?;
             }
             DaemonCommands::Stop { socket } => {

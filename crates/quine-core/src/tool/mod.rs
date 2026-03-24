@@ -33,6 +33,10 @@ pub enum ToolError {
     #[error("tool execution cancelled")]
     Cancelled,
 
+    /// The tool execution was denied by the permission checker.
+    #[error("permission denied: {reason}")]
+    PermissionDenied { reason: String },
+
     /// An internal error occurred.
     #[error("internal error: {message}")]
     Internal { message: String },

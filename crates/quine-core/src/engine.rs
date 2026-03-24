@@ -9,10 +9,11 @@ use tokio::sync::{mpsc, oneshot};
 use crate::channel::{CoreHandle, CoreInput, CoreOutput, ToolOutcome};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
+use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision};
 use crate::session::{SessionId, SessionState};
 use crate::tool::{
     ask_user::AskUserTool, bash::BashTool, read::ReadTool, write::WriteTool, ExecutionContext,
-    InteractionChannel, InteractionRequest, InteractionResponse, ToolRegistry,
+    InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse, ToolRegistry,
 };
 
 /// Per-session context held by the core event loop.
@@ -155,6 +156,95 @@ enum LlmTurnResult {
     },
 }
 
+/// Check permissions for a tool call, optionally requesting user confirmation.
+///
+/// Returns `Ok(())` if the tool is allowed to proceed, or `Err(ToolOutcome)` with
+/// the denial/cancellation outcome.
+async fn check_permission(
+    checker: &dyn PermissionChecker,
+    call: &PendingToolCall,
+    session: &SessionContext,
+    session_id: SessionId,
+    output: &mpsc::Sender<CoreOutput>,
+    input: &mut mpsc::Receiver<CoreInput>,
+) -> Result<(), ToolOutcome> {
+    let context = PermissionContext {
+        session_id,
+        working_directory: session.working_directory.clone(),
+    };
+
+    let decision = match checker
+        .check(&call.tool_name, &call.arguments, &context)
+        .await
+    {
+        Ok(d) => d,
+        Err(e) => {
+            // On checker error, default to requiring confirmation
+            PermissionDecision::RequiresConfirmation {
+                risk_score: 0.5,
+                reason: format!("permission checker error: {e}"),
+            }
+        }
+    };
+
+    match decision {
+        PermissionDecision::Allow => Ok(()),
+        PermissionDecision::Deny { reason } => Err(ToolOutcome::Error {
+            message: format!("permission denied: {reason}"),
+        }),
+        PermissionDecision::RequiresConfirmation { risk_score, reason } => {
+            let prompt = format!(
+                "Tool `{}` with args `{}` scored {:.1} risk: {}. Allow? [y/N]",
+                call.tool_name,
+                serde_json::to_string(&call.arguments).unwrap_or_default(),
+                risk_score,
+                reason
+            );
+
+            let request = InteractionRequest {
+                prompt,
+                kind: InteractionKind::Confirmation,
+            };
+
+            let _ = output
+                .send(CoreOutput::InteractionNeeded {
+                    session_id,
+                    request,
+                })
+                .await;
+
+            // Wait for user response
+            loop {
+                match input.recv().await {
+                    Some(CoreInput::InteractionResponse {
+                        session_id: resp_sid,
+                        response,
+                    }) if resp_sid == session_id => {
+                        let answer = response.response.trim().to_lowercase();
+                        if answer == "y" || answer == "yes" {
+                            return Ok(());
+                        }
+                        return Err(ToolOutcome::Error {
+                            message: format!("permission denied by user: {reason}"),
+                        });
+                    }
+                    Some(CoreInput::Cancel {
+                        session_id: cancel_sid,
+                    }) if cancel_sid == session_id => {
+                        return Err(ToolOutcome::Cancelled);
+                    }
+                    Some(_) => continue,
+                    None => {
+                        return Err(ToolOutcome::Error {
+                            message: "input channel closed during permission check".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Execute a tool call directly within the core.
 ///
 /// For interactive tools, sets up a channel and emits `InteractionNeeded`.
@@ -165,7 +255,17 @@ async fn execute_tool_call(
     session_id: SessionId,
     output: &mpsc::Sender<CoreOutput>,
     input: &mut mpsc::Receiver<CoreInput>,
+    permission_checker: Option<&dyn PermissionChecker>,
 ) -> ToolOutcome {
+    // Check permissions before execution
+    if let Some(checker) = permission_checker {
+        if let Err(outcome) =
+            check_permission(checker, call, session, session_id, output, input).await
+        {
+            return outcome;
+        }
+    }
+
     let tool = match session.tool_registry.get(&call.tool_name) {
         Some(t) => Arc::clone(t),
         None => {
@@ -292,6 +392,7 @@ async fn handle_llm_turn(
     session_id: SessionId,
     output: &mpsc::Sender<CoreOutput>,
     input: &mut mpsc::Receiver<CoreInput>,
+    permission_checker: Option<&dyn PermissionChecker>,
 ) {
     loop {
         match call_llm(provider, session, session_id, output).await {
@@ -326,7 +427,15 @@ async fn handle_llm_turn(
                         })
                         .await;
 
-                    let result = execute_tool_call(call, session, session_id, output, input).await;
+                    let result = execute_tool_call(
+                        call,
+                        session,
+                        session_id,
+                        output,
+                        input,
+                        permission_checker,
+                    )
+                    .await;
 
                     // Append tool result to history
                     let (tool_output, is_error) = match &result {
@@ -361,7 +470,11 @@ async fn handle_llm_turn(
 ///
 /// The `provider` is used to send conversation history to the LLM and
 /// stream back responses. Tools are executed directly within the core.
-pub async fn run_core_loop(mut handle: CoreHandle, provider: Box<dyn LlmProvider>) {
+pub async fn run_core_loop(
+    mut handle: CoreHandle,
+    provider: Box<dyn LlmProvider>,
+    permission_checker: Option<Box<dyn PermissionChecker>>,
+) {
     let mut sessions: HashMap<SessionId, SessionContext> = HashMap::new();
 
     while let Some(input) = handle.input.recv().await {
@@ -420,6 +533,7 @@ pub async fn run_core_loop(mut handle: CoreHandle, provider: Box<dyn LlmProvider
                         session_id,
                         &handle.output,
                         &mut handle.input,
+                        permission_checker.as_deref(),
                     )
                     .await;
                 } else {
@@ -482,6 +596,7 @@ pub async fn run_core_loop(mut handle: CoreHandle, provider: Box<dyn LlmProvider
                             session_id,
                             &handle.output,
                             &mut handle.input,
+                            permission_checker.as_deref(),
                         )
                         .await;
                     }
@@ -567,7 +682,7 @@ mod tests {
     async fn create_session_and_shutdown() {
         let (harness, core) = create_channels(ChannelConfig::default());
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty())));
+        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -593,7 +708,7 @@ mod tests {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty())));
+        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
         harness
@@ -623,7 +738,7 @@ mod tests {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty())));
+        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -675,7 +790,7 @@ mod tests {
     async fn duplicate_session_id_returns_error() {
         let (harness, core) = create_channels(ChannelConfig::default());
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty())));
+        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
 
@@ -715,7 +830,7 @@ mod tests {
         let mut output = harness.output;
 
         let provider = MockProvider::new("Hello from the LLM!");
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(provider)));
+        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(provider), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -820,7 +935,7 @@ mod tests {
         let provider = ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
         };
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(provider)));
+        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(provider), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
