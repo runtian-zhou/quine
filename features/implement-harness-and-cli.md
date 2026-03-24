@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 ---
 
 # Implement quine-harness and quine-cli Crates
