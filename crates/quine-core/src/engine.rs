@@ -1,42 +1,83 @@
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use futures::StreamExt;
 use quine_llm::{LlmEvent, LlmProvider, Message, ToolDefinition};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::channel::{CoreHandle, CoreInput, CoreOutput, ToolOutcome};
 use crate::error::CoreError;
+use crate::filesystem::OverlayFilesystem;
 use crate::session::{SessionId, SessionState};
+use crate::tool::{
+    ask_user::AskUserTool, bash::BashTool, read::ReadTool, write::WriteTool, ExecutionContext,
+    InteractionChannel, InteractionRequest, InteractionResponse, ToolRegistry,
+};
 
 /// Per-session context held by the core event loop.
 struct SessionContext {
     state: SessionState,
-    #[allow(dead_code)] // May be used for session management features later.
+    #[allow(dead_code)]
     system_prompt: Option<String>,
     /// Conversation history for this session.
     history: Vec<Message>,
     /// Tool definitions available to the LLM.
     tools: Vec<ToolDefinition>,
+    /// Registry of tool implementations.
+    tool_registry: ToolRegistry,
+    /// Session filesystem.
+    filesystem: Arc<dyn crate::filesystem::SessionFilesystem>,
+    /// Working directory for this session.
+    working_directory: PathBuf,
+    /// Sender for pending interaction responses (tool_use_id -> sender).
+    pending_interaction: Option<oneshot::Sender<InteractionResponse>>,
 }
 
 impl SessionContext {
-    fn new(system_prompt: Option<String>) -> Self {
+    async fn new(
+        system_prompt: Option<String>,
+        working_directory: PathBuf,
+    ) -> Result<Self, CoreError> {
+        let session_dir = std::env::temp_dir()
+            .join("quine-sessions")
+            .join(uuid::Uuid::new_v4().to_string());
+
+        let filesystem = Arc::new(
+            OverlayFilesystem::new(working_directory.clone(), session_dir)
+                .await
+                .map_err(|e| CoreError::Internal {
+                    message: format!("failed to create overlay filesystem: {e}"),
+                })?,
+        );
+
+        let mut tool_registry = ToolRegistry::new();
+        tool_registry.register(Arc::new(ReadTool));
+        tool_registry.register(Arc::new(WriteTool));
+        tool_registry.register(Arc::new(BashTool));
+        tool_registry.register(Arc::new(AskUserTool));
+
+        let tools = tool_registry.tool_definitions();
+
         let mut history = Vec::new();
         if let Some(prompt) = &system_prompt {
             history.push(Message::system(prompt.clone()));
         }
-        Self {
+
+        Ok(Self {
             state: SessionState::Idle,
             system_prompt,
             history,
-            tools: Vec::new(),
-        }
+            tools,
+            tool_registry,
+            filesystem,
+            working_directory,
+            pending_interaction: None,
+        })
     }
 }
 
 /// Send the current conversation to the LLM and stream the response.
-///
-/// Returns the accumulated assistant text if the LLM responded with text,
-/// or a list of tool calls if it requested tools.
 async fn call_llm(
     provider: &dyn LlmProvider,
     session: &SessionContext,
@@ -114,10 +155,212 @@ enum LlmTurnResult {
     },
 }
 
+/// Execute a tool call directly within the core.
+///
+/// For interactive tools, sets up a channel and emits `InteractionNeeded`.
+/// Returns the tool result as a `ToolOutcome`.
+async fn execute_tool_call(
+    call: &PendingToolCall,
+    session: &mut SessionContext,
+    session_id: SessionId,
+    output: &mpsc::Sender<CoreOutput>,
+    input: &mut mpsc::Receiver<CoreInput>,
+) -> ToolOutcome {
+    let tool = match session.tool_registry.get(&call.tool_name) {
+        Some(t) => Arc::clone(t),
+        None => {
+            return ToolOutcome::Error {
+                message: format!("unknown tool: {}", call.tool_name),
+            };
+        }
+    };
+
+    if tool.is_interactive() {
+        // Create an interaction channel for this tool.
+        // The tool is spawned in a separate task so we can simultaneously
+        // poll for interaction requests and tool completion.
+        let (req_tx, mut req_rx) =
+            mpsc::channel::<(InteractionRequest, oneshot::Sender<InteractionResponse>)>(1);
+
+        let channel = InteractionChannel { request_tx: req_tx };
+
+        let ctx = ExecutionContext {
+            session_id,
+            filesystem: Arc::clone(&session.filesystem),
+            working_directory: session.working_directory.clone(),
+            interaction_channel: Some(channel),
+        };
+
+        let args = call.arguments.clone();
+        let mut tool_handle = tokio::spawn(async move { tool.execute(args, &ctx).await });
+
+        let output_clone = output.clone();
+        let sid = session_id;
+
+        // Poll: either the tool finishes or it needs interaction
+        loop {
+            tokio::select! {
+                result = &mut tool_handle => {
+                    return match result {
+                        Ok(Ok(tool_output)) => {
+                            if tool_output.is_error {
+                                ToolOutcome::Error { message: tool_output.content }
+                            } else {
+                                ToolOutcome::Success { output: tool_output.content }
+                            }
+                        }
+                        Ok(Err(tool_err)) => {
+                            ToolOutcome::Error { message: tool_err.to_string() }
+                        }
+                        Err(join_err) => {
+                            ToolOutcome::Error {
+                                message: format!("tool task panicked: {join_err}"),
+                            }
+                        }
+                    };
+                }
+                interaction = req_rx.recv() => {
+                    if let Some((request, reply_tx)) = interaction {
+                        // Emit InteractionNeeded
+                        let _ = output_clone.send(CoreOutput::InteractionNeeded {
+                            session_id: sid,
+                            request,
+                        }).await;
+
+                        // Wait for CoreInput::InteractionResponse from the harness
+                        loop {
+                            match input.recv().await {
+                                Some(CoreInput::InteractionResponse { session_id: resp_sid, response }) if resp_sid == sid => {
+                                    let _ = reply_tx.send(response);
+                                    break;
+                                }
+                                Some(CoreInput::Cancel { session_id: cancel_sid }) if cancel_sid == sid => {
+                                    // Drop the reply sender to cancel the tool
+                                    drop(reply_tx);
+                                    return ToolOutcome::Cancelled;
+                                }
+                                Some(_) => {
+                                    // Ignore other messages while waiting for interaction response
+                                    continue;
+                                }
+                                None => {
+                                    return ToolOutcome::Error {
+                                        message: "input channel closed".into(),
+                                    };
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // Non-interactive tool: execute directly
+        let ctx = ExecutionContext {
+            session_id,
+            filesystem: Arc::clone(&session.filesystem),
+            working_directory: session.working_directory.clone(),
+            interaction_channel: None,
+        };
+
+        match tool.execute(call.arguments.clone(), &ctx).await {
+            Ok(tool_output) => {
+                if tool_output.is_error {
+                    ToolOutcome::Error {
+                        message: tool_output.content,
+                    }
+                } else {
+                    ToolOutcome::Success {
+                        output: tool_output.content,
+                    }
+                }
+            }
+            Err(tool_err) => ToolOutcome::Error {
+                message: tool_err.to_string(),
+            },
+        }
+    }
+}
+
+/// Handle the result of an LLM turn: either complete with text or process tool calls.
+///
+/// This function handles the tool execution loop: when the LLM requests tools,
+/// it executes them and calls the LLM again until the LLM produces text.
+async fn handle_llm_turn(
+    provider: &dyn LlmProvider,
+    session: &mut SessionContext,
+    session_id: SessionId,
+    output: &mpsc::Sender<CoreOutput>,
+    input: &mut mpsc::Receiver<CoreInput>,
+) {
+    loop {
+        match call_llm(provider, session, session_id, output).await {
+            Ok(LlmTurnResult::Text(full_text)) => {
+                session.history.push(Message::assistant(&full_text));
+
+                let _ = output
+                    .send(CoreOutput::TextComplete {
+                        session_id,
+                        full_text,
+                    })
+                    .await;
+
+                session.state = SessionState::Idle;
+                let _ = output.send(CoreOutput::TurnComplete { session_id }).await;
+                break;
+            }
+            Ok(LlmTurnResult::ToolCalls { text_before, calls }) => {
+                if let Some(text) = &text_before {
+                    session.history.push(Message::assistant(text));
+                }
+
+                // Execute each tool call directly
+                for call in &calls {
+                    // Emit ToolRequest for informational purposes
+                    let _ = output
+                        .send(CoreOutput::ToolRequest {
+                            session_id,
+                            tool_use_id: call.tool_use_id.clone(),
+                            tool_name: call.tool_name.clone(),
+                            arguments: call.arguments.clone(),
+                        })
+                        .await;
+
+                    let result = execute_tool_call(call, session, session_id, output, input).await;
+
+                    // Append tool result to history
+                    let (tool_output, is_error) = match &result {
+                        ToolOutcome::Success { output } => (output.clone(), false),
+                        ToolOutcome::Error { message } => (message.clone(), true),
+                        ToolOutcome::Cancelled => {
+                            ("Tool execution was cancelled".to_string(), true)
+                        }
+                    };
+                    session.history.push(Message::tool_result(
+                        &call.tool_use_id,
+                        &tool_output,
+                        is_error,
+                    ));
+                }
+
+                // Call LLM again with tool results
+                continue;
+            }
+            Err(error) => {
+                session.state = SessionState::Idle;
+                let _ = output
+                    .send(CoreOutput::SessionError { session_id, error })
+                    .await;
+                break;
+            }
+        }
+    }
+}
+
 /// Run the core event loop, processing inputs and emitting outputs.
 ///
 /// The `provider` is used to send conversation history to the LLM and
-/// stream back responses.
+/// stream back responses. Tools are executed directly within the core.
 pub async fn run_core_loop(mut handle: CoreHandle, provider: Box<dyn LlmProvider>) {
     let mut sessions: HashMap<SessionId, SessionContext> = HashMap::new();
 
@@ -126,22 +369,33 @@ pub async fn run_core_loop(mut handle: CoreHandle, provider: Box<dyn LlmProvider
             CoreInput::CreateSession {
                 session_id,
                 system_prompt,
+                working_directory,
                 reply,
             } => {
                 if sessions.contains_key(&session_id) {
                     let _ = reply.send(Err("session already exists".into()));
                     continue;
                 }
-                let ctx = SessionContext::new(system_prompt);
-                sessions.insert(session_id, ctx);
-                let _ = handle
-                    .output
-                    .send(CoreOutput::SessionStateChanged {
-                        session_id,
-                        state: SessionState::Idle,
-                    })
-                    .await;
-                let _ = reply.send(Ok(()));
+
+                let work_dir = working_directory
+                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
+                match SessionContext::new(system_prompt, work_dir).await {
+                    Ok(ctx) => {
+                        sessions.insert(session_id, ctx);
+                        let _ = handle
+                            .output
+                            .send(CoreOutput::SessionStateChanged {
+                                session_id,
+                                state: SessionState::Idle,
+                            })
+                            .await;
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(format!("failed to create session: {e}")));
+                    }
+                }
             }
 
             CoreInput::UserMessage {
@@ -158,65 +412,16 @@ pub async fn run_core_loop(mut handle: CoreHandle, provider: Box<dyn LlmProvider
                         })
                         .await;
 
-                    // Append user message to history
                     session.history.push(Message::user(&content));
 
-                    // Call LLM and process the response
-                    match call_llm(&*provider, session, session_id, &handle.output).await {
-                        Ok(LlmTurnResult::Text(full_text)) => {
-                            // Append assistant response to history
-                            session.history.push(Message::assistant(&full_text));
-
-                            let _ = handle
-                                .output
-                                .send(CoreOutput::TextComplete {
-                                    session_id,
-                                    full_text,
-                                })
-                                .await;
-
-                            session.state = SessionState::Idle;
-                            let _ = handle
-                                .output
-                                .send(CoreOutput::TurnComplete { session_id })
-                                .await;
-                        }
-                        Ok(LlmTurnResult::ToolCalls { text_before, calls }) => {
-                            // If there was text before tool calls, add it to history
-                            if let Some(text) = &text_before {
-                                session.history.push(Message::assistant(text));
-                            }
-
-                            // Emit tool requests and transition to awaiting
-                            for call in &calls {
-                                let _ = handle
-                                    .output
-                                    .send(CoreOutput::ToolRequest {
-                                        session_id,
-                                        tool_use_id: call.tool_use_id.clone(),
-                                        tool_name: call.tool_name.clone(),
-                                        arguments: call.arguments.clone(),
-                                    })
-                                    .await;
-                            }
-
-                            session.state = SessionState::AwaitingToolResult;
-                            let _ = handle
-                                .output
-                                .send(CoreOutput::SessionStateChanged {
-                                    session_id,
-                                    state: SessionState::AwaitingToolResult,
-                                })
-                                .await;
-                        }
-                        Err(error) => {
-                            session.state = SessionState::Idle;
-                            let _ = handle
-                                .output
-                                .send(CoreOutput::SessionError { session_id, error })
-                                .await;
-                        }
-                    }
+                    handle_llm_turn(
+                        &*provider,
+                        session,
+                        session_id,
+                        &handle.output,
+                        &mut handle.input,
+                    )
+                    .await;
                 } else {
                     let _ = handle
                         .output
@@ -233,6 +438,9 @@ pub async fn run_core_loop(mut handle: CoreHandle, provider: Box<dyn LlmProvider
                 tool_use_id,
                 result,
             } => {
+                // Legacy path: the harness sent a tool result.
+                // With the new architecture, tools are executed in-core,
+                // but we still accept external tool results for backward compat.
                 if let Some(session) = sessions.get_mut(&session_id) {
                     if session.state != SessionState::AwaitingToolResult {
                         let _ = handle
@@ -246,19 +454,19 @@ pub async fn run_core_loop(mut handle: CoreHandle, provider: Box<dyn LlmProvider
                             })
                             .await;
                     } else {
-                        // Append tool result to history
-                        let (output, is_error) = match &result {
+                        let (output_text, is_error) = match &result {
                             ToolOutcome::Success { output } => (output.clone(), false),
                             ToolOutcome::Error { message } => (message.clone(), true),
                             ToolOutcome::Cancelled => {
                                 ("Tool execution was cancelled".to_string(), true)
                             }
                         };
-                        session
-                            .history
-                            .push(Message::tool_result(&tool_use_id, &output, is_error));
+                        session.history.push(Message::tool_result(
+                            &tool_use_id,
+                            &output_text,
+                            is_error,
+                        ));
 
-                        // Transition back to streaming and call LLM again
                         session.state = SessionState::Streaming;
                         let _ = handle
                             .output
@@ -268,58 +476,14 @@ pub async fn run_core_loop(mut handle: CoreHandle, provider: Box<dyn LlmProvider
                             })
                             .await;
 
-                        match call_llm(&*provider, session, session_id, &handle.output).await {
-                            Ok(LlmTurnResult::Text(full_text)) => {
-                                session.history.push(Message::assistant(&full_text));
-
-                                let _ = handle
-                                    .output
-                                    .send(CoreOutput::TextComplete {
-                                        session_id,
-                                        full_text,
-                                    })
-                                    .await;
-
-                                session.state = SessionState::Idle;
-                                let _ = handle
-                                    .output
-                                    .send(CoreOutput::TurnComplete { session_id })
-                                    .await;
-                            }
-                            Ok(LlmTurnResult::ToolCalls { text_before, calls }) => {
-                                if let Some(text) = &text_before {
-                                    session.history.push(Message::assistant(text));
-                                }
-
-                                for call in &calls {
-                                    let _ = handle
-                                        .output
-                                        .send(CoreOutput::ToolRequest {
-                                            session_id,
-                                            tool_use_id: call.tool_use_id.clone(),
-                                            tool_name: call.tool_name.clone(),
-                                            arguments: call.arguments.clone(),
-                                        })
-                                        .await;
-                                }
-
-                                session.state = SessionState::AwaitingToolResult;
-                                let _ = handle
-                                    .output
-                                    .send(CoreOutput::SessionStateChanged {
-                                        session_id,
-                                        state: SessionState::AwaitingToolResult,
-                                    })
-                                    .await;
-                            }
-                            Err(error) => {
-                                session.state = SessionState::Idle;
-                                let _ = handle
-                                    .output
-                                    .send(CoreOutput::SessionError { session_id, error })
-                                    .await;
-                            }
-                        }
+                        handle_llm_turn(
+                            &*provider,
+                            session,
+                            session_id,
+                            &handle.output,
+                            &mut handle.input,
+                        )
+                        .await;
                     }
                 } else {
                     let _ = handle
@@ -332,9 +496,16 @@ pub async fn run_core_loop(mut handle: CoreHandle, provider: Box<dyn LlmProvider
                 }
             }
 
+            CoreInput::InteractionResponse { .. } => {
+                // Interaction responses are handled within execute_tool_call.
+                // If we get one here, it means no tool is waiting for it.
+            }
+
             CoreInput::Cancel { session_id } => {
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.state = SessionState::Idle;
+                    // Drop any pending interaction
+                    session.pending_interaction.take();
                     let _ = handle
                         .output
                         .send(CoreOutput::SessionStateChanged {
@@ -398,7 +569,6 @@ mod tests {
 
         let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty())));
 
-        // Create a session
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
         harness
@@ -406,6 +576,7 @@ mod tests {
             .send(CoreInput::CreateSession {
                 session_id,
                 system_prompt: None,
+                working_directory: None,
                 reply: reply_tx,
             })
             .await
@@ -413,7 +584,6 @@ mod tests {
 
         assert!(reply_rx.await.unwrap().is_ok());
 
-        // Shutdown
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();
     }
@@ -435,7 +605,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Should receive a SessionError with SessionNotFound
         let event = output.recv().await.unwrap();
         match event {
             CoreOutput::SessionError { error, .. } => match error {
@@ -456,7 +625,6 @@ mod tests {
 
         let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty())));
 
-        // Create session
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
         harness
@@ -464,6 +632,7 @@ mod tests {
             .send(CoreInput::CreateSession {
                 session_id,
                 system_prompt: None,
+                working_directory: None,
                 reply: reply_tx,
             })
             .await
@@ -473,7 +642,6 @@ mod tests {
         // Drain the SessionStateChanged from creation
         let _ = output.recv().await.unwrap();
 
-        // Send a user message
         harness
             .input
             .send(CoreInput::UserMessage {
@@ -511,26 +679,26 @@ mod tests {
 
         let session_id = SessionId::new();
 
-        // First creation succeeds
         let (reply_tx, reply_rx) = oneshot::channel();
         harness
             .input
             .send(CoreInput::CreateSession {
                 session_id,
                 system_prompt: None,
+                working_directory: None,
                 reply: reply_tx,
             })
             .await
             .unwrap();
         assert!(reply_rx.await.unwrap().is_ok());
 
-        // Second creation with same ID fails
         let (reply_tx, reply_rx) = oneshot::channel();
         harness
             .input
             .send(CoreInput::CreateSession {
                 session_id,
                 system_prompt: None,
+                working_directory: None,
                 reply: reply_tx,
             })
             .await
@@ -549,7 +717,6 @@ mod tests {
         let provider = MockProvider::new("Hello from the LLM!");
         let loop_handle = tokio::spawn(run_core_loop(core, Box::new(provider)));
 
-        // Create session
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
         harness
@@ -557,16 +724,15 @@ mod tests {
             .send(CoreInput::CreateSession {
                 session_id,
                 system_prompt: None,
+                working_directory: None,
                 reply: reply_tx,
             })
             .await
             .unwrap();
         reply_rx.await.unwrap().unwrap();
 
-        // Drain the SessionStateChanged from creation
         let _ = output.recv().await.unwrap();
 
-        // Send a user message
         harness
             .input
             .send(CoreInput::UserMessage {
@@ -576,7 +742,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Expect: SessionStateChanged(Streaming), StreamDelta, TextComplete, TurnComplete
         let event = output.recv().await.unwrap();
         assert!(matches!(
             event,
@@ -610,8 +775,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tool_call_and_result_flow() {
-        // Provider that returns a tool call on first send, then text on second
+    async fn tool_call_executed_in_core() {
+        // Provider that returns a tool call for read_file on first send, then text on second
         struct ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32,
         }
@@ -628,18 +793,19 @@ mod tests {
                     .call_count
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let events = if count == 0 {
+                    // Ask to read a file that we'll create in the test
                     vec![
                         Ok(LlmEvent::ToolCall {
                             tool_use_id: "tc_1".into(),
-                            tool_name: "read_file".into(),
-                            arguments: serde_json::json!({"path": "/tmp/test"}),
+                            tool_name: "bash".into(),
+                            arguments: serde_json::json!({"command": "echo hello_world"}),
                         }),
                         Ok(LlmEvent::Done),
                     ]
                 } else {
                     vec![
                         Ok(LlmEvent::TextDelta {
-                            text: "File contents are: hello".into(),
+                            text: "Done!".into(),
                         }),
                         Ok(LlmEvent::Done),
                     ]
@@ -656,7 +822,6 @@ mod tests {
         };
         let loop_handle = tokio::spawn(run_core_loop(core, Box::new(provider)));
 
-        // Create session
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
         harness
@@ -664,91 +829,54 @@ mod tests {
             .send(CoreInput::CreateSession {
                 session_id,
                 system_prompt: None,
+                working_directory: None,
                 reply: reply_tx,
             })
             .await
             .unwrap();
         reply_rx.await.unwrap().unwrap();
-        let _ = output.recv().await.unwrap(); // Drain SessionStateChanged
+        let _ = output.recv().await.unwrap(); // SessionStateChanged(Idle)
 
         // Send user message
         harness
             .input
             .send(CoreInput::UserMessage {
                 session_id,
-                content: "read /tmp/test".into(),
+                content: "run echo".into(),
             })
             .await
             .unwrap();
 
-        // Expect: Streaming state, ToolRequest, AwaitingToolResult state
-        let event = output.recv().await.unwrap();
-        assert!(matches!(
-            event,
-            CoreOutput::SessionStateChanged {
-                state: SessionState::Streaming,
-                ..
-            }
-        ));
+        // Collect events until TurnComplete
+        let mut got_tool_request = false;
+        let mut got_text_complete = false;
+        let mut got_turn_complete = false;
 
-        let event = output.recv().await.unwrap();
-        match &event {
-            CoreOutput::ToolRequest {
-                tool_use_id,
-                tool_name,
-                ..
-            } => {
-                assert_eq!(tool_use_id, "tc_1");
-                assert_eq!(tool_name, "read_file");
-            }
-            other => panic!("expected ToolRequest, got {other:?}"),
-        }
-
-        let event = output.recv().await.unwrap();
-        assert!(matches!(
-            event,
-            CoreOutput::SessionStateChanged {
-                state: SessionState::AwaitingToolResult,
-                ..
-            }
-        ));
-
-        // Send tool result
-        harness
-            .input
-            .send(CoreInput::ToolResult {
-                session_id,
-                tool_use_id: "tc_1".into(),
-                result: ToolOutcome::Success {
-                    output: "hello".into(),
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
+                Ok(Some(event)) => match event {
+                    CoreOutput::ToolRequest { tool_name, .. } => {
+                        assert_eq!(tool_name, "bash");
+                        got_tool_request = true;
+                    }
+                    CoreOutput::TextComplete { full_text, .. } => {
+                        assert_eq!(full_text, "Done!");
+                        got_text_complete = true;
+                    }
+                    CoreOutput::TurnComplete { .. } => {
+                        got_turn_complete = true;
+                        break;
+                    }
+                    _ => {} // SessionStateChanged, StreamDelta, etc.
                 },
-            })
-            .await
-            .unwrap();
-
-        // Expect: Streaming state, StreamDelta, TextComplete, TurnComplete
-        let event = output.recv().await.unwrap();
-        assert!(matches!(
-            event,
-            CoreOutput::SessionStateChanged {
-                state: SessionState::Streaming,
-                ..
+                Ok(None) => break,
+                Err(_) => panic!("timeout waiting for events"),
             }
-        ));
-
-        let event = output.recv().await.unwrap();
-        assert!(matches!(event, CoreOutput::StreamDelta { .. }));
-
-        let event = output.recv().await.unwrap();
-        match &event {
-            CoreOutput::TextComplete { full_text, .. } => {
-                assert_eq!(full_text, "File contents are: hello");
-            }
-            other => panic!("expected TextComplete, got {other:?}"),
         }
 
-        let event = output.recv().await.unwrap();
-        assert!(matches!(event, CoreOutput::TurnComplete { .. }));
+        assert!(got_tool_request, "should have received ToolRequest");
+        assert!(got_text_complete, "should have received TextComplete");
+        assert!(got_turn_complete, "should have received TurnComplete");
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();

@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 pub struct SessionConfig {
     /// Optional system prompt override.
     pub system_prompt: Option<String>,
+    /// Optional working directory for the session filesystem.
+    pub working_directory: Option<std::path::PathBuf>,
 }
 
 /// Configuration for the harness daemon.
@@ -82,6 +84,7 @@ mod tests {
     fn session_config_serialization() {
         let config = SessionConfig {
             system_prompt: Some("You are helpful.".into()),
+            working_directory: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: SessionConfig = serde_json::from_str(&json).unwrap();

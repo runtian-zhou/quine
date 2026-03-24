@@ -1,8 +1,11 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::CoreError;
 use crate::session::{SessionId, SessionState};
+use crate::tool;
 
 /// Operations the harness sends into the core event loop.
 #[derive(Debug)]
@@ -12,6 +15,8 @@ pub enum CoreInput {
         session_id: SessionId,
         /// Optional system prompt override.
         system_prompt: Option<String>,
+        /// The working directory for this session's filesystem.
+        working_directory: Option<PathBuf>,
         /// Acknowledges session creation.
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -28,6 +33,12 @@ pub enum CoreInput {
         /// Correlates to the `tool_use_id` from the corresponding `ToolRequest`.
         tool_use_id: String,
         result: ToolOutcome,
+    },
+
+    /// Provide the user's response to an interaction request.
+    InteractionResponse {
+        session_id: SessionId,
+        response: tool::InteractionResponse,
     },
 
     /// Cancel any in-flight work for a session.
@@ -81,6 +92,12 @@ pub enum CoreOutput {
     SessionError {
         session_id: SessionId,
         error: CoreError,
+    },
+
+    /// A tool needs user interaction before it can proceed.
+    InteractionNeeded {
+        session_id: SessionId,
+        request: tool::InteractionRequest,
     },
 
     /// The agent turn is fully complete.
@@ -194,6 +211,7 @@ mod tests {
             .send(CoreInput::CreateSession {
                 session_id,
                 system_prompt: None,
+                working_directory: None,
                 reply: reply_tx,
             })
             .await

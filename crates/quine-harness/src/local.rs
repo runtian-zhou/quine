@@ -1,7 +1,5 @@
 use async_trait::async_trait;
-use quine_core::{
-    create_channels, ChannelConfig, CoreInput, CoreOutput, HarnessHandle, SessionId, ToolOutcome,
-};
+use quine_core::{create_channels, ChannelConfig, CoreInput, CoreOutput, HarnessHandle, SessionId};
 use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, oneshot, Mutex};
 
@@ -12,7 +10,8 @@ use crate::service::HarnessService;
 /// Local in-process harness implementation.
 ///
 /// Spawns the core event loop in a background task and fans out events to
-/// subscribers via a broadcast channel.
+/// subscribers via a broadcast channel. Tools are now executed directly
+/// within the core, so this harness simply forwards events.
 pub struct LocalHarness {
     harness_input: tokio::sync::mpsc::Sender<CoreInput>,
     event_tx: broadcast::Sender<CoreOutput>,
@@ -39,7 +38,8 @@ impl LocalHarness {
         let core_task = tokio::spawn(quine_core::run_core_loop(core_handle, provider));
 
         // Spawn a fan-out task that reads from the core output channel and
-        // broadcasts events. Also handles automatic tool result stubs.
+        // broadcasts events. The core now handles tool execution directly,
+        // so no stub tool results are needed.
         let fanout_input = input;
         let fanout_task = tokio::spawn(Self::fanout_loop(
             Mutex::new(output),
@@ -56,32 +56,17 @@ impl LocalHarness {
     }
 
     /// Fan-out loop: reads events from the core and broadcasts them.
-    /// When a ToolRequest arrives, automatically replies with a stub error.
+    ///
+    /// InteractionNeeded events are broadcast to subscribers (e.g., the CLI)
+    /// which are responsible for collecting the user's response and sending
+    /// it back via `submit_interaction_response`.
     async fn fanout_loop(
         output: Mutex<tokio::sync::mpsc::Receiver<CoreOutput>>,
         event_tx: broadcast::Sender<CoreOutput>,
-        input: tokio::sync::mpsc::Sender<CoreInput>,
+        _input: tokio::sync::mpsc::Sender<CoreInput>,
     ) {
         let mut output = output.into_inner();
         while let Some(event) = output.recv().await {
-            // If this is a tool request, automatically reply with a stub error.
-            if let CoreOutput::ToolRequest {
-                session_id,
-                ref tool_use_id,
-                ..
-            } = event
-            {
-                let _ = input
-                    .send(CoreInput::ToolResult {
-                        session_id,
-                        tool_use_id: tool_use_id.clone(),
-                        result: ToolOutcome::Error {
-                            message: "tool execution not yet implemented".into(),
-                        },
-                    })
-                    .await;
-            }
-
             // Broadcast to all subscribers (ignore errors if no receivers).
             let _ = event_tx.send(event);
         }
@@ -98,6 +83,7 @@ impl HarnessService for LocalHarness {
             .send(CoreInput::CreateSession {
                 session_id,
                 system_prompt: config.system_prompt,
+                working_directory: config.working_directory,
                 reply: reply_tx,
             })
             .await
@@ -133,9 +119,9 @@ impl HarnessService for LocalHarness {
         is_error: bool,
     ) -> Result<(), HarnessError> {
         let result = if is_error {
-            ToolOutcome::Error { message: output }
+            quine_core::ToolOutcome::Error { message: output }
         } else {
-            ToolOutcome::Success { output }
+            quine_core::ToolOutcome::Success { output }
         };
 
         self.harness_input
