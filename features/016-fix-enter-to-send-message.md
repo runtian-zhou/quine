@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Fix Enter Key to Send Message in Interactive CLI

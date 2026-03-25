@@ -173,17 +173,17 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 return app.submit_input();
             }
 
+            // Shift+Enter or Alt+Enter inserts a newline.
+            if code == KeyCode::Enter
+                && (modifiers.contains(KeyModifiers::SHIFT)
+                    || modifiers.contains(KeyModifiers::ALT))
+            {
+                app.input.insert_newline();
+                return None;
+            }
+
             match code {
-                KeyCode::Enter => {
-                    if app.has_pending_interaction() {
-                        // Single-line mode for interactions: Enter submits.
-                        app.submit_input()
-                    } else {
-                        // Normal mode: Enter inserts a newline.
-                        app.input.insert_newline();
-                        None
-                    }
-                }
+                KeyCode::Enter => app.submit_input(),
                 KeyCode::Backspace => {
                     app.input.delete_char_before();
                     None
