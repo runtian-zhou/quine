@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Simple Subagent Tool

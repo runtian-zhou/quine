@@ -2,6 +2,7 @@ pub mod ask_user;
 pub mod bash;
 pub mod plan;
 pub mod read;
+pub mod subagent;
 pub mod write;
 
 use std::collections::HashMap;

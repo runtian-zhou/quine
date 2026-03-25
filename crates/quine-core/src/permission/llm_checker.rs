@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use futures::StreamExt;
 use quine_llm::{LlmEvent, LlmProvider, Message};
@@ -29,12 +31,12 @@ Be conservative: when in doubt, recommend "confirm"."#;
 /// asking for risk evaluation. The LLM response is parsed as JSON and mapped to
 /// a `PermissionDecision`.
 pub struct LlmChecker {
-    provider: Box<dyn LlmProvider>,
+    provider: Arc<dyn LlmProvider>,
 }
 
 impl LlmChecker {
     /// Create a new `LlmChecker` with the given LLM provider.
-    pub fn new(provider: Box<dyn LlmProvider>) -> Self {
+    pub fn new(provider: Arc<dyn LlmProvider>) -> Self {
         Self { provider }
     }
 
@@ -209,7 +211,7 @@ mod tests {
         let provider = MockPermissionProvider::new(
             r#"{"score": 0.1, "reason": "read-only operation", "decision": "allow"}"#,
         );
-        let checker = LlmChecker::new(Box::new(provider));
+        let checker = LlmChecker::new(Arc::new(provider));
         let ctx = test_context();
 
         let decision = checker
@@ -224,7 +226,7 @@ mod tests {
         let provider = MockPermissionProvider::new(
             r#"{"score": 0.9, "reason": "destructive operation", "decision": "deny"}"#,
         );
-        let checker = LlmChecker::new(Box::new(provider));
+        let checker = LlmChecker::new(Arc::new(provider));
         let ctx = test_context();
 
         let decision = checker
@@ -239,7 +241,7 @@ mod tests {
         let provider = MockPermissionProvider::new(
             r#"{"score": 0.5, "reason": "network access", "decision": "confirm"}"#,
         );
-        let checker = LlmChecker::new(Box::new(provider));
+        let checker = LlmChecker::new(Arc::new(provider));
         let ctx = test_context();
 
         let decision = checker
@@ -259,7 +261,7 @@ mod tests {
     #[tokio::test]
     async fn llm_checker_unparseable_falls_back_to_confirm() {
         let provider = MockPermissionProvider::new("I don't understand the request.");
-        let checker = LlmChecker::new(Box::new(provider));
+        let checker = LlmChecker::new(Arc::new(provider));
         let ctx = test_context();
 
         let decision = checker
@@ -274,7 +276,7 @@ mod tests {
 
     #[tokio::test]
     async fn llm_checker_provider_error() {
-        let checker = LlmChecker::new(Box::new(ErrorProvider));
+        let checker = LlmChecker::new(Arc::new(ErrorProvider));
         let ctx = test_context();
 
         let result = checker
