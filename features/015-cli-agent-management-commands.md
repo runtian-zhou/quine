@@ -6,7 +6,7 @@ status: pending
 
 ## Overview
 
-Expose the agent process control syscalls defined in `features/013-agent-process-control-and-ipc.md` as top-level CLI commands, analogous to how Linux exposes syscalls via commands like `kill`, `ps`, and `wait`. This gives users (and scripts) direct control over agent sessions from the shell without entering an interactive chat session.
+Expose the agent process control syscalls defined in `features/013-agent-process-control-and-ipc.md` as top-level CLI commands, analogous to how Linux exposes syscalls via commands like `kill` and `ps`. This gives users (and scripts) direct control over agent sessions from the shell without entering an interactive chat session.
 
 Additionally, add a `ps` command that lists all current agent sessions with their status, parent-child relationships, and uptime — similar to `ps aux` on Linux.
 
@@ -43,21 +43,6 @@ Spawn {
     /// Inherit conversation history from parent
     #[arg(long, default_value_t = false)]
     inherit_history: bool,
-    /// Output as JSON
-    #[arg(long)]
-    json: bool,
-},
-
-/// Wait for a session to complete (like `wait`/`waitpid`)
-Wait {
-    /// Session ID to wait for
-    session_id: String,
-    /// Non-blocking check (like WNOHANG)
-    #[arg(short, long)]
-    non_blocking: bool,
-    /// Timeout in seconds (0 = no timeout)
-    #[arg(short, long, default_value_t = 0)]
-    timeout: u64,
     /// Output as JSON
     #[arg(long)]
     json: bool,
@@ -107,7 +92,6 @@ Add new RPC method constants to the `methods` module:
 ```rust
 pub const LIST_SESSIONS: &str = "list_sessions";   // already exists
 pub const SPAWN_SESSION: &str = "spawn_session";
-pub const WAIT_SESSION: &str = "wait_session";
 pub const SIGNAL_SESSION: &str = "signal_session";
 pub const SEND_IPC_MESSAGE: &str = "send_ipc_message";
 pub const RECV_IPC_MESSAGE: &str = "recv_ipc_message";
@@ -125,12 +109,6 @@ async fn spawn_session(
     system_prompt: Option<String>,
     inheritance: InheritanceFlags,
 ) -> Result<SessionId>;
-
-async fn wait_session(
-    &self,
-    session_id: SessionId,
-    non_blocking: bool,
-) -> Result<Option<ExitStatus>>;
 
 async fn signal_session(
     &self,
@@ -200,8 +178,6 @@ With `--all` flag, include sessions in `Destroyed` state.
 
 **`handle_spawn`**: Calls `spawn_session`, prints the new session ID. With `--json`, outputs `{"session_id": "..."}`.
 
-**`handle_wait`**: Calls `wait_session`. If blocking, streams until result. If non-blocking, prints result or "running". With `--json`, outputs the `ExitStatus` as JSON.
-
 **`handle_signal`**: Calls `signal_session`. Parses signal string to `SessionSignal` enum (term/kill/stop/continue). Prints confirmation.
 
 **`handle_send`**: Calls `send_ipc_message`. If `--message` is omitted, reads content from stdin (enables piping: `echo "do X" | quine send <id>`).
@@ -221,12 +197,10 @@ Add `mod agent_ctl;` and route the new command variants to handler functions in 
   - `format_ps_table` — verify table formatting with sample `SessionInfo` data
   - `format_ps_tree` — verify tree rendering with nested parent-child relationships
   - `spawn_json_output` — verify JSON output format for spawn command
-  - `wait_nonblocking_null` — verify non-blocking wait returns appropriate output when session is still running
   - `send_reads_stdin` — verify message is read from stdin when `--message` is omitted
 - Integration tests:
   - `cli_ps_lists_sessions` — start daemon, create sessions, run `quine ps`, verify output contains session IDs
-  - `cli_spawn_and_wait` — run `quine spawn "say hello"`, capture session ID, run `quine wait <id>`, verify exit status
-  - `cli_signal_term` — spawn a session, send `quine signal <id> -s term`, wait and verify stopped
+  - `cli_signal_term` — spawn a session, send `quine signal <id> -s term`, verify with `quine ps` that it stopped
   - `cli_send_recv_roundtrip` — spawn session, send message via `quine send`, receive via `quine recv`
 
 ## QA Test Cases (add to `qa/test_cases.json`)
@@ -254,13 +228,13 @@ Add `mod agent_ctl;` and route the new command variants to handler functions in 
     ]
   },
   {
-    "name": "cli_spawn_and_wait",
-    "description": "Spawn a child agent from CLI and wait for its result",
+    "name": "cli_spawn_and_check",
+    "description": "Spawn a child agent from CLI and check its status",
     "steps": [
       "Run `quine spawn 'Say exactly: CLI_SPAWN_TEST_123' --json`",
       "Capture session_id from JSON output",
-      "Run `quine wait <session_id>`",
-      "Verify output contains CLI_SPAWN_TEST_123"
+      "Run `quine ps --json`",
+      "Verify the session appears in the output with its state"
     ]
   },
   {
@@ -270,8 +244,7 @@ Add `mod agent_ctl;` and route the new command variants to handler functions in 
       "Run `quine spawn 'Count from 1 to 1000000 slowly'`",
       "Capture the session ID",
       "Run `quine signal <session_id> -s term`",
-      "Run `quine wait <session_id>`",
-      "Verify exit status indicates termination"
+      "Run `quine ps` and verify session state reflects termination"
     ]
   },
   {
@@ -280,17 +253,7 @@ Add `mod agent_ctl;` and route the new command variants to handler functions in 
     "steps": [
       "Spawn a session: `quine spawn 'Use recv_message to read from any source, then repeat the message'`",
       "Run `echo 'PIPE_MSG_456' | quine send <session_id>`",
-      "Run `quine wait <session_id>`",
-      "Verify output contains PIPE_MSG_456"
-    ]
-  },
-  {
-    "name": "cli_wait_nonblocking",
-    "description": "Non-blocking wait returns immediately when session is still running",
-    "steps": [
-      "Run `quine spawn 'Think about the meaning of life for a long time'`",
-      "Immediately run `quine wait <session_id> --non-blocking`",
-      "Verify output indicates session is still running (not blocked)"
+      "Run `quine recv <session_id>` to read the response"
     ]
   }
 ]
