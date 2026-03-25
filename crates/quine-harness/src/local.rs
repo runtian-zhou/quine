@@ -264,7 +264,7 @@ mod tests {
                 Ok(LlmEvent::TextDelta {
                     text: "Hello!".into(),
                 }),
-                Ok(LlmEvent::Done),
+                Ok(LlmEvent::Done { usage: None }),
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }

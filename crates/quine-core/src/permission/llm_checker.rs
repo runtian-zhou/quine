@@ -127,7 +127,7 @@ impl PermissionChecker for LlmChecker {
                 Ok(LlmEvent::TextDelta { text }) => {
                     full_text.push_str(&text);
                 }
-                Ok(LlmEvent::Done) => break,
+                Ok(LlmEvent::Done { .. }) => break,
                 Err(e) => {
                     return Err(PermissionError::LlmUnavailable {
                         message: e.to_string(),
@@ -186,7 +186,10 @@ mod tests {
         ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
         {
             let text = self.response.clone();
-            let events = vec![Ok(LlmEvent::TextDelta { text }), Ok(LlmEvent::Done)];
+            let events = vec![
+                Ok(LlmEvent::TextDelta { text }),
+                Ok(LlmEvent::Done { usage: None }),
+            ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
     }

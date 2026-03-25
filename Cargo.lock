@@ -1153,6 +1153,7 @@ dependencies = [
  "crossterm",
  "futures",
  "quine-harness",
+ "quine-llm",
  "ratatui",
  "serde",
  "serde_json",

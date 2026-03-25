@@ -18,6 +18,14 @@ pub enum DiffLine {
     Header(String),
 }
 
+/// Status of a tool call execution.
+#[derive(Debug, Clone)]
+pub enum ToolStatus {
+    Running,
+    Success { duration_ms: u64 },
+    Error { duration_ms: u64 },
+}
+
 /// A single entry in the conversation view.
 #[derive(Debug, Clone)]
 pub enum ConversationEntry {
@@ -25,7 +33,9 @@ pub enum ConversationEntry {
     AssistantText(String),
     ToolCall {
         tool_name: String,
+        tool_use_id: String,
         summary: String,
+        status: ToolStatus,
     },
     /// Write tool diff preview.
     WriteDiff {
@@ -35,6 +45,11 @@ pub enum ConversationEntry {
     },
     Error(String),
     InteractionPrompt(String),
+    /// Turn summary with timing and token usage.
+    TurnInfo {
+        duration_ms: u64,
+        usage: Option<quine_llm::TokenUsage>,
+    },
 }
 
 /// Current phase of the agent turn.
@@ -535,6 +550,11 @@ impl App {
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string();
+                    let tool_use_id = params
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
                     let summary = params
                         .get("arguments")
                         .and_then(|v| {
@@ -573,14 +593,56 @@ impl App {
                                 diff_lines,
                             });
                         } else {
-                            self.messages
-                                .push(ConversationEntry::ToolCall { tool_name, summary });
+                            self.messages.push(ConversationEntry::ToolCall {
+                                tool_name,
+                                tool_use_id,
+                                summary,
+                                status: ToolStatus::Running,
+                            });
                         }
                     } else {
-                        self.messages
-                            .push(ConversationEntry::ToolCall { tool_name, summary });
+                        self.messages.push(ConversationEntry::ToolCall {
+                            tool_name,
+                            tool_use_id,
+                            summary,
+                            status: ToolStatus::Running,
+                        });
                     }
                     self.auto_scroll();
+                }
+            }
+            notifications::TOOL_RESULT => {
+                if let Some(params) = &notif.params {
+                    let tool_use_id = params
+                        .get("tool_use_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    let is_error = params
+                        .get("is_error")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let duration_ms = params
+                        .get("duration_ms")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    // Find matching ToolCall entry (search from end).
+                    for entry in self.messages.iter_mut().rev() {
+                        if let ConversationEntry::ToolCall {
+                            tool_use_id: id,
+                            status,
+                            ..
+                        } = entry
+                        {
+                            if id.as_str() == tool_use_id {
+                                *status = if is_error {
+                                    ToolStatus::Error { duration_ms }
+                                } else {
+                                    ToolStatus::Success { duration_ms }
+                                };
+                                break;
+                            }
+                        }
+                    }
                 }
             }
             notifications::TURN_COMPLETE => {
@@ -588,6 +650,26 @@ impl App {
                 if !self.streaming_buffer.is_empty() {
                     let text = std::mem::take(&mut self.streaming_buffer);
                     self.messages.push(ConversationEntry::AssistantText(text));
+                }
+                let duration_ms = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("duration_ms"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let usage = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("usage"))
+                    .and_then(|v| {
+                        Some(quine_llm::TokenUsage {
+                            input_tokens: v.get("input_tokens")?.as_u64()?,
+                            output_tokens: v.get("output_tokens")?.as_u64()?,
+                        })
+                    });
+                if duration_ms > 0 {
+                    self.messages
+                        .push(ConversationEntry::TurnInfo { duration_ms, usage });
                 }
                 self.phase = AgentPhase::Idle;
                 self.auto_scroll();
@@ -984,6 +1066,108 @@ mod tests {
         app.input.set_from_string("n");
         let action = app.submit_input();
         assert!(matches!(action, Some(AppAction::SubmitInteraction(r)) if r == "denied"));
+    }
+
+    #[test]
+    fn tool_status_transitions() {
+        let mut app = App::new("s".into());
+        // Apply TOOL_REQUEST notification.
+        let notif = make_notif(
+            notifications::TOOL_REQUEST,
+            Some(serde_json::json!({
+                "tool_name": "bash",
+                "tool_use_id": "tc_42",
+                "arguments": {"command": "echo hello"}
+            })),
+        );
+        app.apply_notification(&notif);
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(
+            &app.messages[0],
+            ConversationEntry::ToolCall {
+                status: ToolStatus::Running,
+                ..
+            }
+        ));
+
+        // Apply TOOL_RESULT notification (success).
+        let notif = make_notif(
+            notifications::TOOL_RESULT,
+            Some(serde_json::json!({
+                "tool_use_id": "tc_42",
+                "tool_name": "bash",
+                "is_error": false,
+                "duration_ms": 150
+            })),
+        );
+        app.apply_notification(&notif);
+        assert!(matches!(
+            &app.messages[0],
+            ConversationEntry::ToolCall {
+                status: ToolStatus::Success { duration_ms: 150 },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn tool_result_error_status() {
+        let mut app = App::new("s".into());
+        let notif = make_notif(
+            notifications::TOOL_REQUEST,
+            Some(serde_json::json!({
+                "tool_name": "bash",
+                "tool_use_id": "tc_err",
+                "arguments": {"command": "exit 1"}
+            })),
+        );
+        app.apply_notification(&notif);
+
+        let notif = make_notif(
+            notifications::TOOL_RESULT,
+            Some(serde_json::json!({
+                "tool_use_id": "tc_err",
+                "tool_name": "bash",
+                "is_error": true,
+                "duration_ms": 200
+            })),
+        );
+        app.apply_notification(&notif);
+        assert!(matches!(
+            &app.messages[0],
+            ConversationEntry::ToolCall {
+                status: ToolStatus::Error { duration_ms: 200 },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn turn_info_created_on_complete() {
+        let mut app = App::new("s".into());
+        app.phase = AgentPhase::Streaming;
+        let notif = make_notif(
+            notifications::TURN_COMPLETE,
+            Some(serde_json::json!({
+                "duration_ms": 4500,
+                "usage": {
+                    "input_tokens": 1200,
+                    "output_tokens": 350
+                }
+            })),
+        );
+        app.apply_notification(&notif);
+        assert_eq!(app.phase, AgentPhase::Idle);
+        assert_eq!(app.messages.len(), 1);
+        match &app.messages[0] {
+            ConversationEntry::TurnInfo { duration_ms, usage } => {
+                assert_eq!(*duration_ms, 4500);
+                let u = usage.as_ref().expect("usage should be present");
+                assert_eq!(u.input_tokens, 1200);
+                assert_eq!(u.output_tokens, 350);
+            }
+            other => panic!("expected TurnInfo, got {:?}", other),
+        }
     }
 
     // --- New InputBuffer tests ---

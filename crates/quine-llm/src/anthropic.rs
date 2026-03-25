@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::LlmError;
 use crate::provider::LlmProvider;
-use crate::types::{LlmEvent, Message, MessageContent, Role, ToolDefinition};
+use crate::types::{LlmEvent, Message, MessageContent, Role, TokenUsage, ToolDefinition};
 
 /// Configuration for the Anthropic Messages API.
 #[derive(Debug, Clone)]
@@ -138,6 +138,19 @@ enum DeltaPayload {
     TextDelta { text: String },
     #[serde(rename = "input_json_delta")]
     InputJsonDelta { partial_json: String },
+}
+
+/// Parsed from the Anthropic `message_delta` SSE event which carries usage info.
+#[derive(Deserialize)]
+struct MessageDeltaEvent {
+    #[serde(default)]
+    usage: Option<MessageDeltaUsage>,
+}
+
+#[derive(Deserialize)]
+struct MessageDeltaUsage {
+    #[serde(default)]
+    output_tokens: u64,
 }
 
 /// Tracks in-flight tool calls as their arguments stream in.
@@ -343,8 +356,14 @@ impl LlmProvider for AnthropicProvider {
         let byte_stream = response.bytes_stream();
 
         let event_stream = stream::unfold(
-            (byte_stream, String::new(), ToolCallTracker::new(), false),
-            |(mut byte_stream, mut buffer, mut tool_tracker, mut done)| async move {
+            (
+                byte_stream,
+                String::new(),
+                ToolCallTracker::new(),
+                false,
+                None::<TokenUsage>,
+            ),
+            |(mut byte_stream, mut buffer, mut tool_tracker, mut done, mut usage)| async move {
                 if done {
                     return None;
                 }
@@ -392,7 +411,13 @@ impl LlmProvider for AnthropicProvider {
                                                     stream::iter(vec![Ok(LlmEvent::TextDelta {
                                                         text,
                                                     })]),
-                                                    (byte_stream, buffer, tool_tracker, done),
+                                                    (
+                                                        byte_stream,
+                                                        buffer,
+                                                        tool_tracker,
+                                                        done,
+                                                        usage,
+                                                    ),
                                                 ));
                                             }
                                         }
@@ -407,14 +432,26 @@ impl LlmProvider for AnthropicProvider {
                                 }
                                 continue;
                             }
+                            "message_delta" => {
+                                // Parse usage from the message_delta event.
+                                if let Ok(evt) = serde_json::from_str::<MessageDeltaEvent>(&data) {
+                                    if let Some(msg_usage) = evt.usage {
+                                        let u = usage.get_or_insert(TokenUsage::default());
+                                        u.output_tokens = msg_usage.output_tokens;
+                                    }
+                                }
+                                continue;
+                            }
                             "message_stop" => {
                                 let mut events: Vec<anyhow::Result<LlmEvent>> =
                                     tool_tracker.take_completed().into_iter().map(Ok).collect();
-                                events.push(Ok(LlmEvent::Done));
+                                events.push(Ok(LlmEvent::Done {
+                                    usage: usage.take(),
+                                }));
                                 done = true;
                                 return Some((
                                     stream::iter(events),
-                                    (byte_stream, buffer, ToolCallTracker::new(), done),
+                                    (byte_stream, buffer, ToolCallTracker::new(), done, None),
                                 ));
                             }
                             _ => continue,
@@ -430,17 +467,19 @@ impl LlmProvider for AnthropicProvider {
                         Some(Err(e)) => {
                             return Some((
                                 stream::iter(vec![Err(e.into())]),
-                                (byte_stream, buffer, tool_tracker, done),
+                                (byte_stream, buffer, tool_tracker, done, usage),
                             ));
                         }
                         None => {
                             let mut events: Vec<anyhow::Result<LlmEvent>> =
                                 tool_tracker.take_completed().into_iter().map(Ok).collect();
-                            events.push(Ok(LlmEvent::Done));
+                            events.push(Ok(LlmEvent::Done {
+                                usage: usage.take(),
+                            }));
                             done = true;
                             return Some((
                                 stream::iter(events),
-                                (byte_stream, buffer, ToolCallTracker::new(), done),
+                                (byte_stream, buffer, ToolCallTracker::new(), done, None),
                             ));
                         }
                     }

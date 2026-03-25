@@ -125,6 +125,7 @@ pub mod notifications {
     pub const STREAM_DELTA: &str = "stream_delta";
     pub const TEXT_COMPLETE: &str = "text_complete";
     pub const TOOL_REQUEST: &str = "tool_request";
+    pub const TOOL_RESULT: &str = "tool_result";
     pub const SESSION_STATE_CHANGED: &str = "session_state_changed";
     pub const SESSION_ERROR: &str = "session_error";
     pub const INTERACTION_NEEDED: &str = "interaction_needed";

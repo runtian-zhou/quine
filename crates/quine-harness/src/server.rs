@@ -204,14 +204,48 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
                 "total": total,
             }),
         ),
-        quine_core::CoreOutput::TurnComplete { session_id } => (
+        quine_core::CoreOutput::ToolResult {
+            session_id,
+            tool_use_id,
+            tool_name,
+            is_error,
+            duration_ms,
+        } => (
             serde_json::to_value(session_id)
                 .ok()
                 .and_then(|v| v.as_str().map(String::from))
                 .unwrap_or_default(),
-            "turn_complete",
-            serde_json::json!({}),
+            "tool_result",
+            serde_json::json!({
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "is_error": is_error,
+                "duration_ms": duration_ms,
+            }),
         ),
+        quine_core::CoreOutput::TurnComplete {
+            session_id,
+            duration_ms,
+            usage,
+        } => {
+            let mut payload = serde_json::json!({
+                "duration_ms": duration_ms,
+            });
+            if let Some(u) = usage {
+                payload["usage"] = serde_json::json!({
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                });
+            }
+            (
+                serde_json::to_value(session_id)
+                    .ok()
+                    .and_then(|v| v.as_str().map(String::from))
+                    .unwrap_or_default(),
+                "turn_complete",
+                payload,
+            )
+        }
         quine_core::CoreOutput::ChildSpawned {
             parent_id,
             child_id,
@@ -834,12 +868,39 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
                 "total": total,
             })),
         ),
-        quine_core::CoreOutput::TurnComplete { session_id } => JsonRpcNotification::new(
-            notifications::TURN_COMPLETE,
+        quine_core::CoreOutput::ToolResult {
+            session_id,
+            tool_use_id,
+            tool_name,
+            is_error,
+            duration_ms,
+        } => JsonRpcNotification::new(
+            notifications::TOOL_RESULT,
             Some(serde_json::json!({
                 "session_id": session_id,
+                "tool_use_id": tool_use_id,
+                "tool_name": tool_name,
+                "is_error": is_error,
+                "duration_ms": duration_ms,
             })),
         ),
+        quine_core::CoreOutput::TurnComplete {
+            session_id,
+            duration_ms,
+            usage,
+        } => {
+            let mut params = serde_json::json!({
+                "session_id": session_id,
+                "duration_ms": duration_ms,
+            });
+            if let Some(u) = usage {
+                params["usage"] = serde_json::json!({
+                    "input_tokens": u.input_tokens,
+                    "output_tokens": u.output_tokens,
+                });
+            }
+            JsonRpcNotification::new(notifications::TURN_COMPLETE, Some(params))
+        }
         quine_core::CoreOutput::ChildSpawned {
             parent_id,
             child_id,
