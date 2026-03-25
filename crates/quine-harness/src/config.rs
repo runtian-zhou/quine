@@ -53,7 +53,7 @@ pub fn default_socket_path() -> PathBuf {
 /// default `"openai"`), plus `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL`.
 fn config_from_env() -> ProviderConfig {
     let provider = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "openai".into());
-    if provider.eq_ignore_ascii_case("anthropic") {
+    let config = if provider.eq_ignore_ascii_case("anthropic") {
         let api_key = std::env::var("LLM_API_KEY")
             .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
             .expect("LLM_API_KEY or ANTHROPIC_API_KEY must be set for Anthropic provider");
@@ -72,7 +72,16 @@ fn config_from_env() -> ProviderConfig {
             model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "qwen-3.5".into()),
             max_tokens: Some(4096),
         })
+    };
+    match &config {
+        ProviderConfig::Anthropic(c) => {
+            eprintln!("[daemon] LLM provider: Anthropic, model={}, base_url={}", c.model, c.base_url);
+        }
+        ProviderConfig::OpenAiCompat(c) => {
+            eprintln!("[daemon] LLM provider: OpenAI-compat, model={}, base_url={}", c.model, c.base_url);
+        }
     }
+    config
 }
 
 /// Create an LLM provider from environment variables.
