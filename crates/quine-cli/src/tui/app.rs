@@ -453,6 +453,7 @@ impl App {
     }
 
     /// Check if there is a pending interaction in the queue.
+    #[allow(dead_code)]
     pub fn has_pending_interaction(&self) -> bool {
         !self.interaction_queue.is_empty()
     }
