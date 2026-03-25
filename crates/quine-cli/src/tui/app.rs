@@ -36,6 +36,8 @@ pub enum InteractionKind {
 /// A queued interaction request from the daemon.
 #[derive(Debug, Clone)]
 pub struct PendingInteraction {
+    /// The prompt text (shown in conversation view, kept here for reference).
+    #[allow(dead_code)]
     pub prompt: String,
     pub kind: InteractionKind,
 }
@@ -103,6 +105,9 @@ impl App {
     }
 
     /// Get the label for the input box.
+    ///
+    /// Permission prompts show a short label here — the full prompt is
+    /// rendered in the conversation view instead.
     pub fn input_label(&self) -> String {
         if let Some(interaction) = self.interaction_queue.front() {
             let pending = self.interaction_queue.len();
@@ -113,10 +118,10 @@ impl App {
             };
             match interaction.kind {
                 InteractionKind::Permission => {
-                    format!("[permission]{badge} {} (y/n) > ", interaction.prompt)
+                    format!("[permission]{badge} (y/n) > ")
                 }
                 InteractionKind::AskUser => {
-                    format!("[ask_user]{badge} {} > ", interaction.prompt)
+                    format!("[ask_user]{badge} > ")
                 }
             }
         } else {
@@ -303,13 +308,14 @@ impl App {
                 } else {
                     InteractionKind::AskUser
                 };
-                // Show permission prompts as a highlighted entry in conversation.
-                if kind == InteractionKind::Permission {
-                    self.messages.push(ConversationEntry::Error(format!(
-                        "⚠ Permission requested: {prompt}"
-                    )));
-                    self.auto_scroll();
-                }
+                // Show the prompt in the conversation view so the user can see it
+                // without it cluttering the input box.
+                let label = match kind {
+                    InteractionKind::Permission => format!("⚠ Permission: {prompt}"),
+                    InteractionKind::AskUser => format!("❓ {prompt}"),
+                };
+                self.messages.push(ConversationEntry::Error(label));
+                self.auto_scroll();
                 self.interaction_queue
                     .push_back(PendingInteraction { prompt, kind });
             }
@@ -512,7 +518,7 @@ mod tests {
             prompt: "Name?".into(),
             kind: InteractionKind::AskUser,
         });
-        assert_eq!(app.input_label(), "[ask_user] Name? > ");
+        assert_eq!(app.input_label(), "[ask_user] > ");
     }
 
     #[test]
