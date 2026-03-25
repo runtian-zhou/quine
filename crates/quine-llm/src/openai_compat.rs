@@ -157,6 +157,25 @@ fn convert_message(msg: &Message) -> ChatMessage {
             tool_call_id: Some(tool_use_id.clone()),
             tool_calls: None,
         },
+        MessageContent::ToolUse { text, tool_calls } => ChatMessage {
+            role: "assistant".into(),
+            content: text.clone(),
+            tool_call_id: None,
+            tool_calls: Some(
+                tool_calls
+                    .iter()
+                    .map(|tc| OpenAiToolCall {
+                        id: tc.tool_use_id.clone(),
+                        r#type: "function".into(),
+                        function: OpenAiToolCallFunction {
+                            name: tc.tool_name.clone(),
+                            arguments: serde_json::to_string(&tc.arguments)
+                                .unwrap_or_default(),
+                        },
+                    })
+                    .collect(),
+            ),
+        },
     }
 }
 

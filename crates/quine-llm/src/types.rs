@@ -10,7 +10,7 @@ pub enum Role {
     Tool,
 }
 
-/// Content of a message, supporting both text and tool results.
+/// Content of a message, supporting text, tool results, and tool use requests.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum MessageContent {
@@ -22,6 +22,21 @@ pub enum MessageContent {
         output: String,
         is_error: bool,
     },
+    /// Assistant requesting tool invocations (one or more).
+    ToolUse {
+        /// Optional text before tool calls.
+        text: Option<String>,
+        /// The tool calls requested by the assistant.
+        tool_calls: Vec<ToolUseRequest>,
+    },
+}
+
+/// A single tool use request from the assistant.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolUseRequest {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
 }
 
 /// A message in a conversation.
@@ -53,6 +68,17 @@ impl Message {
         Self {
             role: Role::Assistant,
             content: MessageContent::Text(text.into()),
+        }
+    }
+
+    /// Create an assistant message requesting tool use.
+    pub fn assistant_tool_use(
+        text: Option<String>,
+        tool_calls: Vec<ToolUseRequest>,
+    ) -> Self {
+        Self {
+            role: Role::Assistant,
+            content: MessageContent::ToolUse { text, tool_calls },
         }
     }
 

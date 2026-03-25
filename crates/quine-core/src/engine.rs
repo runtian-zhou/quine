@@ -515,9 +515,19 @@ async fn handle_llm_turn(
                 break;
             }
             Ok(LlmTurnResult::ToolCalls { text_before, calls }) => {
-                if let Some(text) = &text_before {
-                    session.history.push(Message::assistant(text));
-                }
+                // Record the assistant's tool_use message in history.
+                let tool_use_requests: Vec<quine_llm::ToolUseRequest> = calls
+                    .iter()
+                    .map(|c| quine_llm::ToolUseRequest {
+                        tool_use_id: c.tool_use_id.clone(),
+                        tool_name: c.tool_name.clone(),
+                        arguments: c.arguments.clone(),
+                    })
+                    .collect();
+                session.history.push(Message::assistant_tool_use(
+                    text_before.clone(),
+                    tool_use_requests,
+                ));
 
                 // Execute each tool call directly
                 for call in &calls {
