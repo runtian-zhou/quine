@@ -1,5 +1,6 @@
 pub mod ask_user;
 pub mod bash;
+pub mod plan;
 pub mod read;
 pub mod write;
 
@@ -126,6 +127,8 @@ pub struct ExecutionContext {
     pub working_directory: PathBuf,
     /// Channel for requesting user interaction (available for interactive tools).
     pub interaction_channel: Option<InteractionChannel>,
+    /// Shared plan store for this session.
+    pub plan_store: crate::tool::plan::PlanStore,
 }
 
 /// Trait for a tool that the agent can invoke.

@@ -95,6 +95,7 @@ mod tests {
             filesystem: Arc::new(fs),
             working_directory: base.path().to_path_buf(),
             interaction_channel: Some(channel),
+            plan_store: crate::tool::plan::new_plan_store(),
         };
 
         let tool = AskUserTool;
@@ -133,6 +134,7 @@ mod tests {
             filesystem: Arc::new(fs),
             working_directory: base.path().to_path_buf(),
             interaction_channel: None,
+            plan_store: crate::tool::plan::new_plan_store(),
         };
 
         let tool = AskUserTool;

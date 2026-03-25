@@ -124,6 +124,7 @@ pub mod notifications {
     pub const SESSION_STATE_CHANGED: &str = "session_state_changed";
     pub const SESSION_ERROR: &str = "session_error";
     pub const INTERACTION_NEEDED: &str = "interaction_needed";
+    pub const PLAN_PROGRESS: &str = "plan_progress";
     pub const TURN_COMPLETE: &str = "turn_complete";
 }
 

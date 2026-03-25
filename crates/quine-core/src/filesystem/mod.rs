@@ -91,6 +91,50 @@ pub trait SessionFilesystem: Send + Sync {
     fn root(&self) -> &Path;
 }
 
+/// A no-op filesystem for testing. All operations return errors.
+pub struct NullFilesystem;
+
+#[async_trait]
+impl SessionFilesystem for NullFilesystem {
+    async fn read_file(&self, path: &Path) -> Result<String, FsError> {
+        Err(FsError::NotFound {
+            path: path.display().to_string(),
+        })
+    }
+    async fn write_file(&self, path: &Path, _contents: &str) -> Result<(), FsError> {
+        Err(FsError::NotFound {
+            path: path.display().to_string(),
+        })
+    }
+    async fn exists(&self, _path: &Path) -> Result<bool, FsError> {
+        Ok(false)
+    }
+    async fn list_dir(&self, path: &Path) -> Result<Vec<DirEntry>, FsError> {
+        Err(FsError::NotFound {
+            path: path.display().to_string(),
+        })
+    }
+    async fn create_dir_all(&self, _path: &Path) -> Result<(), FsError> {
+        Ok(())
+    }
+    async fn remove_file(&self, path: &Path) -> Result<(), FsError> {
+        Err(FsError::NotFound {
+            path: path.display().to_string(),
+        })
+    }
+    async fn remove_dir_all(&self, path: &Path) -> Result<(), FsError> {
+        Err(FsError::NotFound {
+            path: path.display().to_string(),
+        })
+    }
+    fn resolve_path(&self, path: &Path) -> Result<PathBuf, FsError> {
+        Ok(path.to_path_buf())
+    }
+    fn root(&self) -> &Path {
+        Path::new("/")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
