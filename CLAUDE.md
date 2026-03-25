@@ -118,8 +118,9 @@ The `status` field tracks progress:
 4. Implement the feature in the worktree on a feature branch.
 5. Run all checks (`cargo build`, `cargo test`, `cargo clippy`, `cargo fmt`).
 6. Use `/review` to review the code, create a PR, and merge when CI passes.
-7. Update the feature file status to `done`.
-8. Clean up the worktree (`git worktree remove`).
+7. Add QA test cases for the new feature to `qa/test_cases.json` (multi-turn conversations that exercise the feature and verify expected behavior).
+8. Update the feature file status to `done`.
+9. Clean up the worktree (`git worktree remove`).
 
 ## The Bootstrapping Contract
 
