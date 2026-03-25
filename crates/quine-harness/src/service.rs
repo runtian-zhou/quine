@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use quine_core::{CoreOutput, SessionId};
+use quine_core::{CoreOutput, InteractionResponse, SessionId};
 use tokio::sync::broadcast;
 
 use crate::config::SessionConfig;
@@ -29,6 +29,13 @@ pub trait HarnessService: Send + Sync {
         tool_use_id: String,
         output: String,
         is_error: bool,
+    ) -> Result<(), HarnessError>;
+
+    /// Submit the user's response to an interaction request from a tool.
+    async fn submit_interaction_response(
+        &self,
+        session_id: SessionId,
+        response: InteractionResponse,
     ) -> Result<(), HarnessError>;
 
     /// Cancel any in-flight work for a session.

@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::IpcClient;
 use crate::render::{Renderer, TerminalRenderer};
@@ -71,6 +71,10 @@ pub async fn run_chat(socket_path: &Path) -> anyhow::Result<()> {
                                 notif = client.recv_notification() => {
                                     match notif {
                                         Some(notif) => {
+                                            if notif.method == notifications::INTERACTION_NEEDED {
+                                                handle_interaction(&notif, &mut client, &session_id).await?;
+                                                continue;
+                                            }
                                             let handled = handle_notification(&notif, &mut renderer).await?;
                                             if handled {
                                                 break;
@@ -107,6 +111,45 @@ pub async fn run_chat(socket_path: &Path) -> anyhow::Result<()> {
 
     shutdown_if_spawned(&mut client, daemon_spawned).await;
     drop(client);
+    Ok(())
+}
+
+/// Handle an `interaction_needed` notification by prompting the user and
+/// sending the response back to the daemon.
+async fn handle_interaction(
+    notif: &quine_harness::protocol::JsonRpcNotification,
+    client: &mut IpcClient,
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let prompt = notif
+        .params
+        .as_ref()
+        .and_then(|p| p.get("prompt"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("(tool is asking for input)");
+
+    let mut stderr = tokio::io::stderr();
+    stderr
+        .write_all(format!("\n[ask_user] {prompt}\n> ").as_bytes())
+        .await?;
+    stderr.flush().await?;
+
+    let mut line = String::new();
+    let mut stdin = BufReader::new(tokio::io::stdin());
+    stdin.read_line(&mut line).await?;
+    let response = line.trim().to_string();
+
+    let params = serde_json::json!({
+        "session_id": session_id,
+        "response": response,
+    });
+    let result = client
+        .call(methods::SUBMIT_INTERACTION_RESPONSE, Some(params))
+        .await?;
+    if let Err(e) = result {
+        eprintln!("warning: failed to submit interaction response: {e}");
+    }
+
     Ok(())
 }
 

@@ -107,6 +107,35 @@ pub async fn run_oneshot(
                         });
                     }
                 }
+                notifications::INTERACTION_NEEDED => {
+                    // Output the interaction prompt so the caller can respond
+                    // via `quine respond --session <id> "answer"`.
+                    let prompt = notif
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("prompt"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(interaction requested)");
+
+                    if json_output {
+                        let output = serde_json::json!({
+                            "session_id": session_id,
+                            "interaction_needed": true,
+                            "prompt": prompt,
+                            "response": full_response,
+                            "tool_calls": tool_calls,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else {
+                        eprintln!("interaction needed: {prompt}");
+                        // Print any partial response accumulated so far.
+                        if !full_response.is_empty() {
+                            println!("{full_response}");
+                        }
+                    }
+                    // Exit so the caller can use `quine respond` to continue.
+                    return Ok(());
+                }
                 notifications::SESSION_ERROR => {
                     if let Some(params) = &notif.params {
                         if let Some(error) = params.get("error").and_then(|v| v.as_str()) {
@@ -129,6 +158,127 @@ pub async fn run_oneshot(
     if json_output {
         let output = OneshotOutput {
             session_id,
+            response: full_response,
+            tool_calls,
+        };
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("{full_response}");
+    }
+
+    Ok(())
+}
+
+/// Submit an interaction response to a session and collect the remaining turn output.
+///
+/// Used after `quine run` exits with an `interaction_needed` status.
+/// Sends the response via `submit_interaction_response`, then waits for TurnComplete.
+pub async fn run_respond(
+    socket_path: &Path,
+    session_id: &str,
+    response: &str,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
+
+    // Submit the interaction response.
+    let params = serde_json::json!({
+        "session_id": session_id,
+        "response": response,
+    });
+    let result = client
+        .call(methods::SUBMIT_INTERACTION_RESPONSE, Some(params))
+        .await?;
+    if let Err(e) = result {
+        anyhow::bail!("failed to submit response: {e}");
+    }
+
+    // Collect remaining notifications until TurnComplete.
+    let mut full_response = String::new();
+    let mut tool_calls = Vec::new();
+
+    loop {
+        match client.recv_notification().await {
+            Some(notif) => match notif.method.as_str() {
+                notifications::STREAM_DELTA => {
+                    if let Some(params) = &notif.params {
+                        if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
+                            full_response.push_str(delta);
+                        }
+                    }
+                }
+                notifications::TEXT_COMPLETE => {
+                    if let Some(params) = &notif.params {
+                        if let Some(full_text) = params.get("full_text").and_then(|v| v.as_str()) {
+                            full_response = full_text.to_string();
+                        }
+                    }
+                }
+                notifications::TOOL_REQUEST => {
+                    if let Some(params) = &notif.params {
+                        let tool_name = params
+                            .get("tool_name")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        let tool_use_id = params
+                            .get("tool_use_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("unknown")
+                            .to_string();
+                        tool_calls.push(ToolCallRecord {
+                            tool_name,
+                            tool_use_id,
+                        });
+                    }
+                }
+                notifications::INTERACTION_NEEDED => {
+                    // Another interaction needed — output and exit for caller to respond again.
+                    let prompt = notif
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("prompt"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(interaction requested)");
+
+                    if json_output {
+                        let output = serde_json::json!({
+                            "session_id": session_id,
+                            "interaction_needed": true,
+                            "prompt": prompt,
+                            "response": full_response,
+                            "tool_calls": tool_calls,
+                        });
+                        println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else {
+                        eprintln!("interaction needed: {prompt}");
+                        if !full_response.is_empty() {
+                            println!("{full_response}");
+                        }
+                    }
+                    return Ok(());
+                }
+                notifications::SESSION_ERROR => {
+                    if let Some(params) = &notif.params {
+                        if let Some(error) = params.get("error").and_then(|v| v.as_str()) {
+                            anyhow::bail!("session error: {error}");
+                        }
+                    }
+                }
+                notifications::TURN_COMPLETE => {
+                    break;
+                }
+                _ => {}
+            },
+            None => {
+                anyhow::bail!("connection to daemon lost");
+            }
+        }
+    }
+
+    if json_output {
+        let output = OneshotOutput {
+            session_id: session_id.to_string(),
             response: full_response,
             tool_calls,
         };
