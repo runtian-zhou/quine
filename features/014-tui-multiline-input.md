@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # TUI Multi-line Input Support
