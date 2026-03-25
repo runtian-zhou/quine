@@ -17,7 +17,9 @@ Use Explore agents to search for relevant code. Read CLAUDE.md for conventions.
 
 ## Step 3: Write the Feature Request
 
-Create a feature request markdown file at `features/<kebab-case-name>.md` with this format:
+Create a feature request markdown file at `features/<NNN>-<kebab-case-name>.md` where `<NNN>` is a zero-padded three-digit sequence number. Determine the next number by finding the highest existing number in `features/` and adding 1. For example, if the highest is `014-...`, the next file is `015-<name>.md`.
+
+Use this format:
 
 ```markdown
 ---
@@ -56,7 +58,7 @@ What is explicitly out of scope.
 ## Step 4: Create a PR
 
 1. Create a feature branch: `feature-request-<name>`
-2. Stage ONLY the markdown file (`features/<name>.md`). Do NOT stage any other files.
+2. Stage ONLY the markdown file (`features/<NNN>-<name>.md`). Do NOT stage any other files.
 3. Commit with message: `Add feature request: <title>`
 4. Verify the commit only contains the .md file: `git diff --stat HEAD~1`
 5. Push and create a PR with title `Feature request: <title>` and a brief summary body.
