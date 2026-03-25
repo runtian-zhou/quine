@@ -436,6 +436,7 @@ async fn handle_request(
 
                     let interaction_response = quine_core::InteractionResponse {
                         response: response.to_string(),
+                        selected_indices: Vec::new(),
                     };
 
                     match service

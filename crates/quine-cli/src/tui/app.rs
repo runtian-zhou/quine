@@ -31,6 +31,10 @@ pub enum InteractionKind {
     AskUser,
     /// Permission confirmation request.
     Permission,
+    /// Single-select from options.
+    SingleSelect,
+    /// Multi-select from options.
+    MultiSelect,
 }
 
 /// A queued interaction request from the daemon.
@@ -40,6 +44,27 @@ pub struct PendingInteraction {
     #[allow(dead_code)]
     pub prompt: String,
     pub kind: InteractionKind,
+    /// Option labels for select interactions.
+    #[allow(dead_code)]
+    pub options: Vec<String>,
+    /// Whether free-form "Other" input is allowed.
+    #[allow(dead_code)]
+    pub allow_freeform: bool,
+}
+
+/// State for option-based selection in the TUI.
+pub struct OptionSelectState {
+    /// Option labels.
+    pub options: Vec<String>,
+    /// Currently highlighted option index.
+    pub cursor: usize,
+    /// Selected indices (for MultiSelect).
+    pub selected: HashSet<usize>,
+    /// Whether multi-select is enabled.
+    pub multi_select: bool,
+    /// Whether freeform input is allowed.
+    #[allow(dead_code)]
+    pub allow_freeform: bool,
 }
 
 /// Actions the event loop should perform after handling an event.
@@ -69,6 +94,8 @@ pub struct App {
     history_index: Option<usize>,
     /// Saved in-progress input when entering history mode.
     saved_input: String,
+    /// Active option selector state (for SingleSelect/MultiSelect interactions).
+    pub option_select: Option<OptionSelectState>,
 }
 
 impl App {
@@ -89,6 +116,7 @@ impl App {
             input_history: Vec::new(),
             history_index: None,
             saved_input: String::new(),
+            option_select: None,
         }
     }
 
@@ -123,6 +151,12 @@ impl App {
                 InteractionKind::AskUser => {
                     format!("[ask_user]{badge} > ")
                 }
+                InteractionKind::SingleSelect => {
+                    format!("[select]{badge} [↑↓] Enter > ")
+                }
+                InteractionKind::MultiSelect => {
+                    format!("[multi-select]{badge} [↑↓] Space/Enter > ")
+                }
             }
         } else {
             "> ".to_string()
@@ -131,6 +165,31 @@ impl App {
 
     /// Handle Enter key: send message or submit interaction response.
     pub fn submit_input(&mut self) -> Option<AppAction> {
+        // If in option-select mode, submit the selection.
+        if let Some(select) = self.option_select.take() {
+            let response = if select.multi_select {
+                let labels: Vec<String> = select
+                    .selected
+                    .iter()
+                    .copied()
+                    .filter(|&i| i < select.options.len())
+                    .map(|i| select.options[i].clone())
+                    .collect();
+                labels.join(", ")
+            } else {
+                select
+                    .options
+                    .get(select.cursor)
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            self.interaction_queue.pop_front();
+            self.messages
+                .push(ConversationEntry::InteractionPrompt(response.clone()));
+            self.auto_scroll();
+            return Some(AppAction::SubmitInteraction(response));
+        }
+
         let text = self.input.trim().to_string();
         if text.is_empty() {
             return None;
@@ -163,6 +222,43 @@ impl App {
             self.auto_scroll();
             Some(AppAction::SendMessage(text))
         }
+    }
+
+    /// Move option selector cursor up.
+    pub fn option_cursor_up(&mut self) {
+        if let Some(ref mut select) = self.option_select {
+            if select.cursor > 0 {
+                select.cursor -= 1;
+            }
+        }
+    }
+
+    /// Move option selector cursor down.
+    pub fn option_cursor_down(&mut self) {
+        if let Some(ref mut select) = self.option_select {
+            if select.cursor + 1 < select.options.len() {
+                select.cursor += 1;
+            }
+        }
+    }
+
+    /// Toggle selection on current option (for MultiSelect).
+    pub fn option_toggle(&mut self) {
+        if let Some(ref mut select) = self.option_select {
+            if select.multi_select {
+                let idx = select.cursor;
+                if select.selected.contains(&idx) {
+                    select.selected.remove(&idx);
+                } else {
+                    select.selected.insert(idx);
+                }
+            }
+        }
+    }
+
+    /// Check if we're in option selection mode.
+    pub fn is_selecting_options(&self) -> bool {
+        self.option_select.is_some()
     }
 
     /// Navigate to the previous input in history (Up arrow).
@@ -303,21 +399,70 @@ impl App {
                     .and_then(|p| p.get("kind"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
-                let kind = if kind_str == "Confirmation" {
-                    InteractionKind::Permission
-                } else {
-                    InteractionKind::AskUser
+                let options: Vec<String> = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("options"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| {
+                                item.get("label")
+                                    .and_then(|l| l.as_str())
+                                    .map(|s| s.to_string())
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let allow_freeform = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("allow_freeform"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let kind = match kind_str {
+                    "Confirmation" => InteractionKind::Permission,
+                    "SingleSelect" => InteractionKind::SingleSelect,
+                    "MultiSelect" => InteractionKind::MultiSelect,
+                    _ => InteractionKind::AskUser,
                 };
-                // Show the prompt in the conversation view so the user can see it
-                // without it cluttering the input box.
+                // Show the prompt in the conversation view.
                 let label = match kind {
                     InteractionKind::Permission => format!("⚠ Permission: {prompt}"),
                     InteractionKind::AskUser => format!("❓ {prompt}"),
+                    InteractionKind::SingleSelect | InteractionKind::MultiSelect => {
+                        let opt_list: Vec<String> = options
+                            .iter()
+                            .enumerate()
+                            .map(|(i, o)| format!("  {}. {o}", i + 1))
+                            .collect();
+                        format!("❓ {prompt}\n{}", opt_list.join("\n"))
+                    }
                 };
                 self.messages.push(ConversationEntry::Error(label));
                 self.auto_scroll();
-                self.interaction_queue
-                    .push_back(PendingInteraction { prompt, kind });
+
+                let is_select = matches!(
+                    kind,
+                    InteractionKind::SingleSelect | InteractionKind::MultiSelect
+                );
+                self.interaction_queue.push_back(PendingInteraction {
+                    prompt,
+                    kind: kind.clone(),
+                    options: options.clone(),
+                    allow_freeform,
+                });
+
+                // If this is the first interaction and it has options, enter select mode.
+                if is_select && self.interaction_queue.len() == 1 {
+                    self.option_select = Some(OptionSelectState {
+                        options,
+                        cursor: 0,
+                        selected: HashSet::new(),
+                        multi_select: kind == InteractionKind::MultiSelect,
+                        allow_freeform,
+                    });
+                }
             }
             _ => {}
         }
@@ -424,6 +569,8 @@ mod tests {
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "What is your name?".into(),
             kind: InteractionKind::AskUser,
+            options: Vec::new(),
+            allow_freeform: false,
         });
         app.input = "Alice".into();
         app.cursor_pos = 5;
@@ -517,6 +664,8 @@ mod tests {
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Name?".into(),
             kind: InteractionKind::AskUser,
+            options: Vec::new(),
+            allow_freeform: false,
         });
         assert_eq!(app.input_label(), "[ask_user] > ");
     }
@@ -527,10 +676,14 @@ mod tests {
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Q1?".into(),
             kind: InteractionKind::AskUser,
+            options: Vec::new(),
+            allow_freeform: false,
         });
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Q2?".into(),
             kind: InteractionKind::AskUser,
+            options: Vec::new(),
+            allow_freeform: false,
         });
         assert!(app.input_label().contains("[2 pending]"));
     }
@@ -621,6 +774,8 @@ mod tests {
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Allow bash: rm -rf /tmp/foo?".into(),
             kind: InteractionKind::Permission,
+            options: Vec::new(),
+            allow_freeform: false,
         });
         let label = app.input_label();
         assert!(label.contains("[permission]"));
@@ -633,6 +788,8 @@ mod tests {
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Allow?".into(),
             kind: InteractionKind::Permission,
+            options: Vec::new(),
+            allow_freeform: false,
         });
         app.input = "y".into();
         app.cursor_pos = 1;
@@ -646,6 +803,8 @@ mod tests {
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Allow?".into(),
             kind: InteractionKind::Permission,
+            options: Vec::new(),
+            allow_freeform: false,
         });
         app.input = "n".into();
         app.cursor_pos = 1;

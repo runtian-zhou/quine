@@ -17,5 +17,5 @@ pub use permission::{PermissionChecker, PermissionContext, PermissionDecision, P
 pub use session::{SessionId, SessionState};
 pub use tool::{
     ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse,
-    Tool, ToolError, ToolOutput, ToolRegistry,
+    SelectOption, Tool, ToolError, ToolOutput, ToolRegistry,
 };

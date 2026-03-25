@@ -218,6 +218,8 @@ async fn check_permission(
             let request = InteractionRequest {
                 prompt,
                 kind: InteractionKind::Confirmation,
+                options: Vec::new(),
+                allow_freeform: false,
             };
 
             let _ = output

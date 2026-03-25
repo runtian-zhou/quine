@@ -128,16 +128,62 @@ async fn handle_interaction(
         .and_then(|v| v.as_str())
         .unwrap_or("(tool is asking for input)");
 
+    // Extract options if present.
+    let options: Vec<String> = notif
+        .params
+        .as_ref()
+        .and_then(|p| p.get("options"))
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|item| {
+                    item.get("label")
+                        .and_then(|l| l.as_str())
+                        .map(|s| s.to_string())
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     let mut stderr = tokio::io::stderr();
     stderr
-        .write_all(format!("\n[ask_user] {prompt}\n> ").as_bytes())
+        .write_all(format!("\n[ask_user] {prompt}\n").as_bytes())
         .await?;
+
+    // Show numbered options if present.
+    if !options.is_empty() {
+        for (i, opt) in options.iter().enumerate() {
+            stderr
+                .write_all(format!("  {}. {opt}\n", i + 1).as_bytes())
+                .await?;
+        }
+        stderr
+            .write_all(b"Enter number (or text for custom answer): ")
+            .await?;
+    } else {
+        stderr.write_all(b"> ").await?;
+    }
     stderr.flush().await?;
 
     let mut line = String::new();
     let mut stdin = BufReader::new(tokio::io::stdin());
     stdin.read_line(&mut line).await?;
-    let response = line.trim().to_string();
+    let raw = line.trim().to_string();
+
+    // If options present, try to parse as number.
+    let response = if !options.is_empty() {
+        if let Ok(num) = raw.parse::<usize>() {
+            if num >= 1 && num <= options.len() {
+                options[num - 1].clone()
+            } else {
+                raw
+            }
+        } else {
+            raw
+        }
+    } else {
+        raw
+    };
 
     let params = serde_json::json!({
         "session_id": session_id,

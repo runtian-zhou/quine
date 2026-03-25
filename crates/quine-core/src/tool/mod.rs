@@ -72,12 +72,25 @@ impl ToolOutput {
 }
 
 /// The kind of interaction requested from the user.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum InteractionKind {
     /// Ask the user a free-form question.
     Question,
     /// Ask the user for confirmation (yes/no).
     Confirmation,
+    /// Select exactly one option from a list.
+    SingleSelect,
+    /// Select one or more options from a list.
+    MultiSelect,
+}
+
+/// An option in a selection list.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectOption {
+    /// Display label for the option.
+    pub label: String,
+    /// Optional description shown below the label.
+    pub description: Option<String>,
 }
 
 /// A request for user interaction, sent from a tool.
@@ -87,6 +100,12 @@ pub struct InteractionRequest {
     pub prompt: String,
     /// The kind of interaction.
     pub kind: InteractionKind,
+    /// Available options for SingleSelect/MultiSelect.
+    #[serde(default)]
+    pub options: Vec<SelectOption>,
+    /// Whether to allow free-form input in addition to options.
+    #[serde(default)]
+    pub allow_freeform: bool,
 }
 
 /// The user's response to an interaction request.
@@ -94,6 +113,9 @@ pub struct InteractionRequest {
 pub struct InteractionResponse {
     /// The user's textual response.
     pub response: String,
+    /// For MultiSelect: indices of selected options (0-based).
+    #[serde(default)]
+    pub selected_indices: Vec<usize>,
 }
 
 /// A channel for tools to request user interaction.
@@ -295,9 +317,46 @@ mod tests {
         let req = InteractionRequest {
             prompt: "Continue?".into(),
             kind: InteractionKind::Confirmation,
+            options: Vec::new(),
+            allow_freeform: false,
         };
         let json = serde_json::to_string(&req).unwrap();
         let de: InteractionRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(de.prompt, "Continue?");
+    }
+
+    #[test]
+    fn interaction_request_with_options_serialization() {
+        let req = InteractionRequest {
+            prompt: "Pick one".into(),
+            kind: InteractionKind::SingleSelect,
+            options: vec![
+                SelectOption {
+                    label: "A".into(),
+                    description: Some("Option A".into()),
+                },
+                SelectOption {
+                    label: "B".into(),
+                    description: None,
+                },
+            ],
+            allow_freeform: true,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let de: InteractionRequest = serde_json::from_str(&json).unwrap();
+        assert_eq!(de.options.len(), 2);
+        assert_eq!(de.options[0].label, "A");
+        assert_eq!(de.kind, InteractionKind::SingleSelect);
+        assert!(de.allow_freeform);
+    }
+
+    #[test]
+    fn interaction_request_backward_compatible_deserialization() {
+        // Old-style request without options field should deserialize fine
+        let json = r#"{"prompt":"hello","kind":"Question"}"#;
+        let de: InteractionRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(de.prompt, "hello");
+        assert!(de.options.is_empty());
+        assert!(!de.allow_freeform);
     }
 }
