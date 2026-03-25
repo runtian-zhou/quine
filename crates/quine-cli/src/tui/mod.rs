@@ -168,26 +168,48 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 };
             }
 
+            // Ctrl+S submits input.
+            if code == KeyCode::Char('s') && modifiers.contains(KeyModifiers::CONTROL) {
+                return app.submit_input();
+            }
+
             match code {
-                KeyCode::Enter => app.submit_input(),
+                KeyCode::Enter => {
+                    if app.has_pending_interaction() {
+                        // Single-line mode for interactions: Enter submits.
+                        app.submit_input()
+                    } else {
+                        // Normal mode: Enter inserts a newline.
+                        app.input.insert_newline();
+                        None
+                    }
+                }
                 KeyCode::Backspace => {
-                    app.delete_char_before();
+                    app.input.delete_char_before();
                     None
                 }
                 KeyCode::Left => {
-                    app.cursor_left();
+                    app.input.cursor_left();
                     None
                 }
                 KeyCode::Right => {
-                    app.cursor_right();
+                    app.input.cursor_right();
                     None
                 }
                 KeyCode::Up => {
-                    app.history_prev();
+                    if app.input.is_multiline() && app.input.row() > 0 {
+                        app.input.cursor_up();
+                    } else {
+                        app.history_prev();
+                    }
                     None
                 }
                 KeyCode::Down => {
-                    app.history_next();
+                    if app.input.is_multiline() && app.input.row() < app.input.line_count() - 1 {
+                        app.input.cursor_down();
+                    } else {
+                        app.history_next();
+                    }
                     None
                 }
                 KeyCode::PageUp => {
@@ -208,11 +230,10 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 }
                 KeyCode::Esc => {
                     app.input.clear();
-                    app.cursor_pos = 0;
                     None
                 }
                 KeyCode::Char(c) => {
-                    app.insert_char(c);
+                    app.input.insert_char(c);
                     None
                 }
                 _ => None,

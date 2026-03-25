@@ -8,13 +8,15 @@ use super::app::{AgentPhase, App, ConversationEntry, DiffLine};
 
 /// Render the entire TUI frame.
 pub fn draw(frame: &mut Frame, app: &App) {
-    // Dynamic input box height: expand for option selection.
+    // Dynamic input box height: expand for option selection or multi-line input.
+    let max_height = (frame.area().height / 2).min(12);
     let input_height = if let Some(ref select) = app.option_select {
         // 2 for borders + 1 for label + option count, capped at half terminal
         let content_rows = (select.options.len() as u16 + 1).min(frame.area().height / 2);
         content_rows + 2
     } else {
-        3
+        let content_rows = app.input.line_count().max(1) as u16;
+        (content_rows + 2).max(3).min(max_height) // +2 for borders
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -209,7 +211,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let label = app.input_label();
-    let display_text = format!("{}{}", label, app.input);
+    // Build display text: label prefixes the first line, subsequent lines have no prefix.
+    let content = app.input.content();
+    let display_text = format!("{}{}", label, content);
 
     let input_widget = Paragraph::new(display_text.as_str())
         .block(Block::default().borders(Borders::ALL))
@@ -217,11 +221,16 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     frame.render_widget(input_widget, area);
 
-    // Position cursor after the label + input text.
-    let cursor_x = (label.len() + app.cursor_pos) as u16 + 1; // +1 for border
-    let cursor_y = area.y + 1; // +1 for border
-                               // Clamp to area width.
-    let cursor_x = cursor_x.min(area.x + area.width - 2);
+    // Position cursor for multi-line input.
+    let cursor_y = area.y + 1 + app.input.row() as u16; // +1 for border
+    let cursor_x = if app.input.row() == 0 {
+        (label.len() + app.input.col()) as u16 + 1 // +1 for border
+    } else {
+        app.input.col() as u16 + 1 // +1 for border
+    };
+    // Clamp to area bounds.
+    let cursor_x = cursor_x.min(area.x + area.width.saturating_sub(2));
+    let cursor_y = cursor_y.min(area.y + area.height.saturating_sub(2));
     frame.set_cursor_position((area.x + cursor_x, cursor_y));
 }
 

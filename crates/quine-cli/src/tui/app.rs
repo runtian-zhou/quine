@@ -1,4 +1,5 @@
 use std::collections::{HashSet, VecDeque};
+use std::fmt;
 
 use quine_harness::protocol::{notifications, JsonRpcNotification};
 
@@ -95,14 +96,185 @@ pub enum AppAction {
     Quit,
 }
 
+/// Multi-line input buffer with cursor tracking.
+pub struct InputBuffer {
+    lines: Vec<String>,
+    row: usize,
+    col: usize,
+}
+
+impl InputBuffer {
+    pub fn new() -> Self {
+        Self {
+            lines: vec![String::new()],
+            row: 0,
+            col: 0,
+        }
+    }
+
+    /// Insert a character at the current cursor position (UTF-8 safe).
+    pub fn insert_char(&mut self, c: char) {
+        let line = &mut self.lines[self.row];
+        // Find the byte offset for self.col characters into the line.
+        let byte_offset = line
+            .char_indices()
+            .nth(self.col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+        line.insert(byte_offset, c);
+        self.col += 1;
+    }
+
+    /// Insert a newline, splitting the current line at the cursor column.
+    pub fn insert_newline(&mut self) {
+        let line = &self.lines[self.row];
+        let byte_offset = line
+            .char_indices()
+            .nth(self.col)
+            .map(|(i, _)| i)
+            .unwrap_or(line.len());
+        let remainder = self.lines[self.row][byte_offset..].to_string();
+        self.lines[self.row].truncate(byte_offset);
+        self.row += 1;
+        self.lines.insert(self.row, remainder);
+        self.col = 0;
+    }
+
+    /// Delete the character before the cursor (backspace).
+    /// If at column 0, join with the previous line.
+    pub fn delete_char_before(&mut self) {
+        if self.col > 0 {
+            let line = &mut self.lines[self.row];
+            // Find byte offset of the char before col.
+            let byte_start = line
+                .char_indices()
+                .nth(self.col - 1)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            let byte_end = line
+                .char_indices()
+                .nth(self.col)
+                .map(|(i, _)| i)
+                .unwrap_or(line.len());
+            line.drain(byte_start..byte_end);
+            self.col -= 1;
+        } else if self.row > 0 {
+            // Join current line with previous line.
+            let current = self.lines.remove(self.row);
+            self.row -= 1;
+            let prev_char_count = self.lines[self.row].chars().count();
+            self.lines[self.row].push_str(&current);
+            self.col = prev_char_count;
+        }
+    }
+
+    /// Move cursor left. Wraps to end of previous line.
+    pub fn cursor_left(&mut self) {
+        if self.col > 0 {
+            self.col -= 1;
+        } else if self.row > 0 {
+            self.row -= 1;
+            self.col = self.lines[self.row].chars().count();
+        }
+    }
+
+    /// Move cursor right. Wraps to start of next line.
+    pub fn cursor_right(&mut self) {
+        let line_char_count = self.lines[self.row].chars().count();
+        if self.col < line_char_count {
+            self.col += 1;
+        } else if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            self.col = 0;
+        }
+    }
+
+    /// Move cursor up one line, clamping column.
+    pub fn cursor_up(&mut self) {
+        if self.row > 0 {
+            self.row -= 1;
+            let line_char_count = self.lines[self.row].chars().count();
+            self.col = self.col.min(line_char_count);
+        }
+    }
+
+    /// Move cursor down one line, clamping column.
+    pub fn cursor_down(&mut self) {
+        if self.row + 1 < self.lines.len() {
+            self.row += 1;
+            let line_char_count = self.lines[self.row].chars().count();
+            self.col = self.col.min(line_char_count);
+        }
+    }
+
+    /// Check if the buffer is empty (single empty line).
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.lines.len() == 1 && self.lines[0].is_empty()
+    }
+
+    /// Clear the buffer to a single empty line.
+    pub fn clear(&mut self) {
+        self.lines = vec![String::new()];
+        self.row = 0;
+        self.col = 0;
+    }
+
+    /// Set buffer contents from a string (for history restore). Cursor goes to end.
+    pub fn set_from_string(&mut self, s: &str) {
+        self.lines = s.split('\n').map(|l| l.to_string()).collect();
+        if self.lines.is_empty() {
+            self.lines.push(String::new());
+        }
+        self.row = self.lines.len() - 1;
+        self.col = self.lines[self.row].chars().count();
+    }
+
+    /// Number of lines in the buffer.
+    pub fn line_count(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Whether the buffer contains multiple lines.
+    pub fn is_multiline(&self) -> bool {
+        self.lines.len() > 1
+    }
+
+    /// Current cursor row.
+    pub fn row(&self) -> usize {
+        self.row
+    }
+
+    /// Current cursor column (in characters, not bytes).
+    pub fn col(&self) -> usize {
+        self.col
+    }
+
+    /// Reference to the current line.
+    #[allow(dead_code)]
+    pub fn current_line(&self) -> &str {
+        &self.lines[self.row]
+    }
+
+    /// Get the full content as a single string (lines joined by newlines).
+    pub fn content(&self) -> String {
+        self.lines.join("\n")
+    }
+}
+
+impl fmt::Display for InputBuffer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.lines.join("\n"))
+    }
+}
+
 /// The main application state.
 pub struct App {
     pub messages: Vec<ConversationEntry>,
     pub streaming_buffer: String,
     pub scroll_offset: u16,
     pub user_scrolled: bool,
-    pub input: String,
-    pub cursor_pos: usize,
+    pub input: InputBuffer,
     pub interaction_queue: VecDeque<PendingInteraction>,
     pub phase: AgentPhase,
     pub spinner_frame: usize,
@@ -126,8 +298,7 @@ impl App {
             streaming_buffer: String::new(),
             scroll_offset: 0,
             user_scrolled: false,
-            input: String::new(),
-            cursor_pos: 0,
+            input: InputBuffer::new(),
             interaction_queue: VecDeque::new(),
             phase: AgentPhase::Idle,
             spinner_frame: 0,
@@ -184,7 +355,7 @@ impl App {
         }
     }
 
-    /// Handle Enter key: send message or submit interaction response.
+    /// Handle Enter/Ctrl+S: send message or submit interaction response.
     pub fn submit_input(&mut self) -> Option<AppAction> {
         // If in option-select mode, submit the selection.
         if let Some(select) = self.option_select.take() {
@@ -211,12 +382,11 @@ impl App {
             return Some(AppAction::SubmitInteraction(response));
         }
 
-        let text = self.input.trim().to_string();
+        let text = self.input.content().trim().to_string();
         if text.is_empty() {
             return None;
         }
         self.input.clear();
-        self.cursor_pos = 0;
         self.history_index = None;
         self.saved_input.clear();
 
@@ -282,6 +452,11 @@ impl App {
         self.option_select.is_some()
     }
 
+    /// Check if there is a pending interaction in the queue.
+    pub fn has_pending_interaction(&self) -> bool {
+        !self.interaction_queue.is_empty()
+    }
+
     /// Navigate to the previous input in history (Up arrow).
     pub fn history_prev(&mut self) {
         if self.input_history.is_empty() {
@@ -290,17 +465,15 @@ impl App {
         match self.history_index {
             None => {
                 // Enter history mode — save current input.
-                self.saved_input = self.input.clone();
+                self.saved_input = self.input.content();
                 let idx = self.input_history.len() - 1;
                 self.history_index = Some(idx);
-                self.input = self.input_history[idx].clone();
-                self.cursor_pos = self.input.len();
+                self.input.set_from_string(&self.input_history[idx].clone());
             }
             Some(idx) if idx > 0 => {
                 let idx = idx - 1;
                 self.history_index = Some(idx);
-                self.input = self.input_history[idx].clone();
-                self.cursor_pos = self.input.len();
+                self.input.set_from_string(&self.input_history[idx].clone());
             }
             _ => {} // Already at oldest entry.
         }
@@ -312,13 +485,12 @@ impl App {
             if idx + 1 < self.input_history.len() {
                 let idx = idx + 1;
                 self.history_index = Some(idx);
-                self.input = self.input_history[idx].clone();
-                self.cursor_pos = self.input.len();
+                self.input.set_from_string(&self.input_history[idx].clone());
             } else {
                 // Past the end — restore saved input.
                 self.history_index = None;
-                self.input = std::mem::take(&mut self.saved_input);
-                self.cursor_pos = self.input.len();
+                let saved = std::mem::take(&mut self.saved_input);
+                self.input.set_from_string(&saved);
             }
         }
     }
@@ -515,47 +687,6 @@ impl App {
         }
     }
 
-    /// Insert a character at the cursor position.
-    pub fn insert_char(&mut self, c: char) {
-        self.input.insert(self.cursor_pos, c);
-        self.cursor_pos += c.len_utf8();
-    }
-
-    /// Delete the character before the cursor (backspace).
-    pub fn delete_char_before(&mut self) {
-        if self.cursor_pos > 0 {
-            let prev = self.input[..self.cursor_pos]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-            self.input.drain(prev..self.cursor_pos);
-            self.cursor_pos = prev;
-        }
-    }
-
-    /// Move cursor left.
-    pub fn cursor_left(&mut self) {
-        if self.cursor_pos > 0 {
-            self.cursor_pos = self.input[..self.cursor_pos]
-                .char_indices()
-                .next_back()
-                .map(|(i, _)| i)
-                .unwrap_or(0);
-        }
-    }
-
-    /// Move cursor right.
-    pub fn cursor_right(&mut self) {
-        if self.cursor_pos < self.input.len() {
-            self.cursor_pos = self.input[self.cursor_pos..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| self.cursor_pos + i)
-                .unwrap_or(self.input.len());
-        }
-    }
-
     pub fn scroll_up(&mut self, amount: u16) {
         self.scroll_offset = self.scroll_offset.saturating_add(amount);
         self.user_scrolled = true;
@@ -599,8 +730,7 @@ mod tests {
     #[test]
     fn submit_input_sends_message_when_no_interaction() {
         let mut app = App::new("test-session".into());
-        app.input = "hello".into();
-        app.cursor_pos = 5;
+        app.input.set_from_string("hello");
 
         let action = app.submit_input();
         assert!(matches!(action, Some(AppAction::SendMessage(msg)) if msg == "hello"));
@@ -619,8 +749,7 @@ mod tests {
             options: Vec::new(),
             allow_freeform: false,
         });
-        app.input = "Alice".into();
-        app.cursor_pos = 5;
+        app.input.set_from_string("Alice");
 
         let action = app.submit_input();
         assert!(matches!(action, Some(AppAction::SubmitInteraction(r)) if r == "Alice"));
@@ -630,7 +759,7 @@ mod tests {
     #[test]
     fn submit_empty_input_does_nothing() {
         let mut app = App::new("test-session".into());
-        app.input = "   ".into();
+        app.input.set_from_string("   ");
         assert!(app.submit_input().is_none());
     }
 
@@ -762,13 +891,13 @@ mod tests {
     #[test]
     fn insert_and_delete_chars() {
         let mut app = App::new("s".into());
-        app.insert_char('h');
-        app.insert_char('i');
-        assert_eq!(app.input, "hi");
-        assert_eq!(app.cursor_pos, 2);
-        app.delete_char_before();
-        assert_eq!(app.input, "h");
-        assert_eq!(app.cursor_pos, 1);
+        app.input.insert_char('h');
+        app.input.insert_char('i');
+        assert_eq!(app.input.content(), "hi");
+        assert_eq!(app.input.col(), 2);
+        app.input.delete_char_before();
+        assert_eq!(app.input.content(), "h");
+        assert_eq!(app.input.col(), 1);
     }
 
     #[test]
@@ -776,41 +905,40 @@ mod tests {
         let mut app = App::new("s".into());
         app.input_history.push("first".into());
         app.input_history.push("second".into());
-        app.input = "current".into();
+        app.input.set_from_string("current");
 
-        // Up → most recent history entry.
+        // Up -> most recent history entry.
         app.history_prev();
-        assert_eq!(app.input, "second");
-        // Up again → older entry.
+        assert_eq!(app.input.content(), "second");
+        // Up again -> older entry.
         app.history_prev();
-        assert_eq!(app.input, "first");
-        // Up at the top → stays.
+        assert_eq!(app.input.content(), "first");
+        // Up at the top -> stays.
         app.history_prev();
-        assert_eq!(app.input, "first");
-        // Down → back to second.
+        assert_eq!(app.input.content(), "first");
+        // Down -> back to second.
         app.history_next();
-        assert_eq!(app.input, "second");
-        // Down → restores saved input.
+        assert_eq!(app.input.content(), "second");
+        // Down -> restores saved input.
         app.history_next();
-        assert_eq!(app.input, "current");
-        // Down again → no-op.
+        assert_eq!(app.input.content(), "current");
+        // Down again -> no-op.
         app.history_next();
-        assert_eq!(app.input, "current");
+        assert_eq!(app.input.content(), "current");
     }
 
     #[test]
     fn history_empty_does_nothing() {
         let mut app = App::new("s".into());
-        app.input = "hello".into();
+        app.input.set_from_string("hello");
         app.history_prev();
-        assert_eq!(app.input, "hello");
+        assert_eq!(app.input.content(), "hello");
     }
 
     #[test]
     fn submit_pushes_to_history() {
         let mut app = App::new("s".into());
-        app.input = "hello".into();
-        app.cursor_pos = 5;
+        app.input.set_from_string("hello");
         app.submit_input();
         assert_eq!(app.input_history, vec!["hello"]);
     }
@@ -838,8 +966,7 @@ mod tests {
             options: Vec::new(),
             allow_freeform: false,
         });
-        app.input = "y".into();
-        app.cursor_pos = 1;
+        app.input.set_from_string("y");
         let action = app.submit_input();
         assert!(matches!(action, Some(AppAction::SubmitInteraction(r)) if r == "approved"));
     }
@@ -853,9 +980,141 @@ mod tests {
             options: Vec::new(),
             allow_freeform: false,
         });
-        app.input = "n".into();
-        app.cursor_pos = 1;
+        app.input.set_from_string("n");
         let action = app.submit_input();
         assert!(matches!(action, Some(AppAction::SubmitInteraction(r)) if r == "denied"));
+    }
+
+    // --- New InputBuffer tests ---
+
+    #[test]
+    fn input_buffer_insert_newline() {
+        let mut buf = InputBuffer::new();
+        buf.insert_char('a');
+        buf.insert_char('b');
+        buf.insert_newline();
+        buf.insert_char('c');
+        assert_eq!(buf.content(), "ab\nc");
+        assert_eq!(buf.line_count(), 2);
+        assert_eq!(buf.row(), 1);
+        assert_eq!(buf.col(), 1);
+    }
+
+    #[test]
+    fn input_buffer_backspace_at_line_start() {
+        let mut buf = InputBuffer::new();
+        buf.insert_char('a');
+        buf.insert_newline();
+        buf.insert_char('b');
+        assert_eq!(buf.content(), "a\nb");
+        // Move to start of line 1 and backspace -> joins lines.
+        buf.cursor_left(); // col=0
+        buf.delete_char_before();
+        assert_eq!(buf.content(), "ab");
+        assert_eq!(buf.line_count(), 1);
+        assert_eq!(buf.row(), 0);
+        assert_eq!(buf.col(), 1); // cursor at end of "a"
+    }
+
+    #[test]
+    fn input_buffer_cursor_up_down() {
+        let mut buf = InputBuffer::new();
+        buf.set_from_string("hello\nworld\nfoo");
+        // Cursor at end of "foo" (row=2, col=3).
+        assert_eq!(buf.row(), 2);
+        assert_eq!(buf.col(), 3);
+
+        buf.cursor_up();
+        assert_eq!(buf.row(), 1);
+        assert_eq!(buf.col(), 3); // clamped to min(3, 5)
+
+        buf.cursor_up();
+        assert_eq!(buf.row(), 0);
+        assert_eq!(buf.col(), 3);
+
+        // Up at top -> no-op.
+        buf.cursor_up();
+        assert_eq!(buf.row(), 0);
+
+        buf.cursor_down();
+        assert_eq!(buf.row(), 1);
+        assert_eq!(buf.col(), 3);
+
+        buf.cursor_down();
+        assert_eq!(buf.row(), 2);
+        assert_eq!(buf.col(), 3);
+
+        // Down at bottom -> no-op.
+        buf.cursor_down();
+        assert_eq!(buf.row(), 2);
+    }
+
+    #[test]
+    fn input_buffer_to_string() {
+        let mut buf = InputBuffer::new();
+        buf.set_from_string("line1\nline2\nline3");
+        assert_eq!(buf.to_string(), "line1\nline2\nline3");
+        assert_eq!(buf.content(), "line1\nline2\nline3");
+        assert!(buf.is_multiline());
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn input_buffer_cursor_wrap_left_right() {
+        let mut buf = InputBuffer::new();
+        buf.set_from_string("ab\ncd");
+        // Cursor at end of "cd" (row=1, col=2).
+        // Go to start of line 1.
+        buf.cursor_left();
+        buf.cursor_left();
+        assert_eq!(buf.row(), 1);
+        assert_eq!(buf.col(), 0);
+        // Left wraps to end of prev line.
+        buf.cursor_left();
+        assert_eq!(buf.row(), 0);
+        assert_eq!(buf.col(), 2);
+        // Right wraps to start of next line.
+        buf.cursor_right();
+        assert_eq!(buf.row(), 1);
+        assert_eq!(buf.col(), 0);
+    }
+
+    #[test]
+    fn input_buffer_insert_newline_mid_line() {
+        let mut buf = InputBuffer::new();
+        buf.set_from_string("abcd");
+        // Cursor at end (col=4). Move left twice to col=2.
+        buf.cursor_left();
+        buf.cursor_left();
+        assert_eq!(buf.col(), 2);
+        buf.insert_newline();
+        assert_eq!(buf.content(), "ab\ncd");
+        assert_eq!(buf.row(), 1);
+        assert_eq!(buf.col(), 0);
+    }
+
+    #[test]
+    fn input_buffer_clear() {
+        let mut buf = InputBuffer::new();
+        buf.set_from_string("hello\nworld");
+        buf.clear();
+        assert!(buf.is_empty());
+        assert_eq!(buf.line_count(), 1);
+        assert_eq!(buf.row(), 0);
+        assert_eq!(buf.col(), 0);
+    }
+
+    #[test]
+    fn input_buffer_utf8_safe() {
+        let mut buf = InputBuffer::new();
+        buf.insert_char('é');
+        buf.insert_char('ñ');
+        assert_eq!(buf.content(), "éñ");
+        assert_eq!(buf.col(), 2);
+        buf.cursor_left();
+        assert_eq!(buf.col(), 1);
+        buf.delete_char_before();
+        assert_eq!(buf.content(), "ñ");
+        assert_eq!(buf.col(), 0);
     }
 }
