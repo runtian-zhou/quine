@@ -5,12 +5,33 @@ use quine_harness::protocol::{notifications, JsonRpcNotification};
 /// Spinner braille frames for the waiting animation.
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// A single line in a diff display.
+#[derive(Debug, Clone)]
+pub enum DiffLine {
+    /// Added line (shown in green with + prefix).
+    Add(String),
+    /// Removed line (shown in red with - prefix).
+    #[allow(dead_code)]
+    Remove(String),
+    /// Header line (shown in bold/cyan).
+    Header(String),
+}
+
 /// A single entry in the conversation view.
 #[derive(Debug, Clone)]
 pub enum ConversationEntry {
     User(String),
     AssistantText(String),
-    ToolCall { tool_name: String, summary: String },
+    ToolCall {
+        tool_name: String,
+        summary: String,
+    },
+    /// Write tool diff preview.
+    WriteDiff {
+        #[allow(dead_code)]
+        file_path: String,
+        diff_lines: Vec<DiffLine>,
+    },
     Error(String),
     InteractionPrompt(String),
 }
@@ -358,8 +379,34 @@ impl App {
                         summary
                     };
                     self.phase = AgentPhase::RunningTool(tool_name.clone());
-                    self.messages
-                        .push(ConversationEntry::ToolCall { tool_name, summary });
+
+                    // For write tool, show content preview as diff.
+                    if tool_name == "write" {
+                        if let Some(args) = params.get("arguments") {
+                            let file_path = args
+                                .get("file_path")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let content =
+                                args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            let mut diff_lines =
+                                vec![DiffLine::Header(format!("write: {file_path}"))];
+                            for line in content.lines() {
+                                diff_lines.push(DiffLine::Add(line.to_string()));
+                            }
+                            self.messages.push(ConversationEntry::WriteDiff {
+                                file_path,
+                                diff_lines,
+                            });
+                        } else {
+                            self.messages
+                                .push(ConversationEntry::ToolCall { tool_name, summary });
+                        }
+                    } else {
+                        self.messages
+                            .push(ConversationEntry::ToolCall { tool_name, summary });
+                    }
                     self.auto_scroll();
                 }
             }
