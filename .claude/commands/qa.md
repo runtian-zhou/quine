@@ -10,12 +10,14 @@ If no arguments are provided, run all default test cases (see Step 3).
 
 1. Build the project: `cargo build`
 2. Kill any existing daemon on the QA socket: `rm -f /tmp/quine-qa.sock`
-3. Start a daemon on a dedicated QA socket in the background:
+3. Start a daemon on a dedicated QA socket in the background. Source `.env` first for LLM config:
    ```
-   cargo run --bin quine -- daemon start --socket /tmp/quine-qa.sock
+   source .env && cargo run --bin quine -- daemon start --socket /tmp/quine-qa.sock
    ```
    Run this in the background. Wait 3 seconds for it to start.
 4. Verify the daemon is running by checking the socket exists: `ls -la /tmp/quine-qa.sock`
+5. Create the report directory: `mkdir -p qa/reports`
+6. Generate a timestamp for this run: `YYYY-MM-DDTHH:MM:SSZ` format (UTC)
 
 ## Step 2: Parse Test Cases
 
@@ -60,7 +62,11 @@ For each test case:
 
 ## Step 5: Report Results
 
-After all tests complete, print a summary table:
+After all tests complete:
+
+### 5a. Print summary to the user
+
+Print a summary table in the conversation:
 
 ```
 === QA Results ===
@@ -73,7 +79,52 @@ bash_tool             | FAIL   | Expected "TOOLTEST_42" not found in output
 Total: X | Passed: Y | Failed: Z
 ```
 
-If any test failed, show the relevant output snippet for debugging.
+### 5b. Write report file to `qa/reports/`
+
+Write a markdown report to `qa/reports/qa-<TIMESTAMP>.md` with the following structure:
+
+```markdown
+# QA Report — <TIMESTAMP>
+
+## Summary
+- **Total**: X
+- **Passed**: Y
+- **Failed**: Z
+- **Pass rate**: Y/X (percentage)
+
+## Environment
+- **LLM Provider**: (Anthropic / OpenAI-compat — read from daemon stderr or .env)
+- **Model**: (model name from .env)
+- **Commit**: (output of `git rev-parse --short HEAD`)
+- **Branch**: (output of `git branch --show-current`)
+
+## Results
+
+| Test | Status |
+|------|--------|
+| simple_greeting | PASS |
+| bash_tool | FAIL |
+| ... | ... |
+
+## Failures
+
+(Only include sections for FAILED tests. Omit passing tests.)
+
+### bash_tool — FAIL
+- **Message sent**: "Use the bash tool to run: echo TOOLTEST_42..."
+- **Expected**: Output contains "TOOLTEST_42"
+- **Actual output**: (full stdout, truncated to 500 chars if longer)
+- **Stderr**: (relevant error output if any)
+
+## Analysis
+
+(Write 2-5 sentences analyzing the results. For failures, identify:
+- Root cause category: LLM error, tool error, conversation history bug, timeout, etc.
+- Whether the failure is a regression or a known issue
+- Suggested next steps to fix)
+```
+
+Reports are committed to the repo so the team can track QA history over time.
 
 ## Step 6: Cleanup
 
