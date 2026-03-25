@@ -124,7 +124,14 @@ Write a markdown report to `qa/reports/qa-<TIMESTAMP>.md` with the following str
 - Suggested next steps to fix)
 ```
 
-Reports are committed to the repo so the team can track QA history over time.
+### 5c. Commit and merge the report
+
+1. Create a branch: `qa-report-<TIMESTAMP>`
+2. Stage only the report file: `git add qa/reports/qa-<TIMESTAMP>.md`
+3. Commit: `QA report: <TIMESTAMP> — X/Y passed`
+4. Push and create a PR with title `QA report: <TIMESTAMP>` and the summary table as the body
+5. Merge the PR via `gh pr merge <number> --merge`
+6. Switch back to main and pull
 
 ## Step 6: Cleanup
 
@@ -133,6 +140,8 @@ Stop the daemon and clean up:
 cargo run --bin quine -- daemon stop --socket /tmp/quine-qa.sock
 rm -f /tmp/quine-qa.sock
 ```
+
+Switch back to main branch if not already on it.
 
 ## Rules
 
