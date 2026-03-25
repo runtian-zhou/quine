@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # CLI Agent Management Commands

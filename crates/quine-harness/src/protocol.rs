@@ -114,6 +114,10 @@ pub mod methods {
     pub const LIST_SESSIONS: &str = "list_sessions";
     pub const GET_SESSION_LOG: &str = "get_session_log";
     pub const SUBMIT_INTERACTION_RESPONSE: &str = "submit_interaction_response";
+    pub const SPAWN_SESSION: &str = "spawn_session";
+    pub const SIGNAL_SESSION: &str = "signal_session";
+    pub const SEND_IPC_MESSAGE: &str = "send_ipc_message";
+    pub const RECV_IPC_MESSAGE: &str = "recv_ipc_message";
 }
 
 /// Notification method names.
