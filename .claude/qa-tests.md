@@ -139,3 +139,18 @@ Registered tools: `bash`, `read_file`, `write_file`, `ask_user`, `plan`, `subage
 **Description**: Three-tool chain: bash creates data, write_file saves it, read_file verifies.
 - **Send**: `"Use the bash tool to run 'echo CHAIN_TEST_VALUE'. Then use write_file to save that exact output to /tmp/quine-qa-chain.txt. Then use read_file to read it back. Include the final file contents in your response."`
 - **Expect**: Output contains `CHAIN_TEST_VALUE`
+
+---
+
+## tui_tool_status_display
+**Description**: Verify tool calls show status indicators in TUI output.
+- **Flags**: `--json`
+- **Send**: `"Use the bash tool to run: echo TOOL_STATUS_TEST"`
+- **Expect**: JSON `tool_calls` array is non-empty; response contains `TOOL_STATUS_TEST`
+- **Note**: Visual verification of colors requires manual TUI testing.
+
+## tui_turn_timing
+**Description**: Verify turn timing is reported.
+- **Flags**: `--json`
+- **Send**: `"Say hello"`
+- **Expect**: JSON output contains `duration_ms` field with value > 0

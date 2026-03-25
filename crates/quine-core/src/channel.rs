@@ -161,8 +161,21 @@ pub enum CoreOutput {
         content: String,
     },
 
+    /// A tool execution completed.
+    ToolResult {
+        session_id: SessionId,
+        tool_use_id: String,
+        tool_name: String,
+        is_error: bool,
+        duration_ms: u64,
+    },
+
     /// The agent turn is fully complete.
-    TurnComplete { session_id: SessionId },
+    TurnComplete {
+        session_id: SessionId,
+        duration_ms: u64,
+        usage: Option<quine_llm::TokenUsage>,
+    },
 }
 
 /// Configuration for channel buffer sizes.

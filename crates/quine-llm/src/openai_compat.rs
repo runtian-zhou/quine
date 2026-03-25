@@ -311,7 +311,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                 // Emit any accumulated tool calls, then Done
                                 let mut events: Vec<anyhow::Result<LlmEvent>> =
                                     tool_acc.take_completed().into_iter().map(Ok).collect();
-                                events.push(Ok(LlmEvent::Done));
+                                events.push(Ok(LlmEvent::Done { usage: None }));
                                 done = true;
                                 return Some((
                                     stream::iter(events),
@@ -382,7 +382,7 @@ impl LlmProvider for OpenAiCompatProvider {
                             // Stream ended without [DONE] — emit accumulated tools + Done
                             let mut events: Vec<anyhow::Result<LlmEvent>> =
                                 tool_acc.take_completed().into_iter().map(Ok).collect();
-                            events.push(Ok(LlmEvent::Done));
+                            events.push(Ok(LlmEvent::Done { usage: None }));
                             done = true;
                             return Some((
                                 stream::iter(events),

@@ -107,6 +107,13 @@ pub struct ToolDefinition {
     pub parameters: serde_json::Value,
 }
 
+/// Token usage statistics from an LLM response.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 /// Events streamed from the LLM provider.
 #[derive(Debug, Clone)]
 pub enum LlmEvent {
@@ -119,7 +126,7 @@ pub enum LlmEvent {
         arguments: serde_json::Value,
     },
     /// The stream is complete.
-    Done,
+    Done { usage: Option<TokenUsage> },
 }
 
 #[cfg(test)]
@@ -163,6 +170,18 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         let deserialized: Message = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.role, Role::User);
+    }
+
+    #[test]
+    fn token_usage_serde_roundtrip() {
+        let usage = TokenUsage {
+            input_tokens: 1200,
+            output_tokens: 350,
+        };
+        let json = serde_json::to_string(&usage).unwrap();
+        let deserialized: TokenUsage = serde_json::from_str(&json).unwrap();
+        assert_eq!(deserialized.input_tokens, 1200);
+        assert_eq!(deserialized.output_tokens, 350);
     }
 
     #[test]

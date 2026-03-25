@@ -105,7 +105,7 @@ async fn call_llm(
     session: &SessionContext,
     session_id: SessionId,
     output: &tokio::sync::mpsc::Sender<CoreOutput>,
-) -> Result<LlmTurnResult, CoreError> {
+) -> Result<LlmCallResult, CoreError> {
     let stream_result = provider
         .send(&session.history, &session.tools)
         .await
@@ -116,6 +116,7 @@ async fn call_llm(
     let mut stream = stream_result;
     let mut full_text = String::new();
     let mut tool_calls = Vec::new();
+    let mut usage = None;
 
     while let Some(event_result) = stream.next().await {
         match event_result {
@@ -139,7 +140,10 @@ async fn call_llm(
                     arguments,
                 });
             }
-            Ok(LlmEvent::Done) => break,
+            Ok(LlmEvent::Done { usage: u }) => {
+                usage = u;
+                break;
+            }
             Err(e) => {
                 return Err(CoreError::LlmError {
                     message: e.to_string(),
@@ -148,24 +152,30 @@ async fn call_llm(
         }
     }
 
-    if tool_calls.is_empty() {
-        Ok(LlmTurnResult::Text(full_text))
+    let turn = if tool_calls.is_empty() {
+        LlmTurnResult::Text(full_text)
     } else {
-        Ok(LlmTurnResult::ToolCalls {
+        LlmTurnResult::ToolCalls {
             text_before: if full_text.is_empty() {
                 None
             } else {
                 Some(full_text)
             },
             calls: tool_calls,
-        })
-    }
+        }
+    };
+    Ok(LlmCallResult { turn, usage })
 }
 
 struct PendingToolCall {
     tool_use_id: String,
     tool_name: String,
     arguments: serde_json::Value,
+}
+
+struct LlmCallResult {
+    turn: LlmTurnResult,
+    usage: Option<quine_llm::TokenUsage>,
 }
 
 enum LlmTurnResult {
@@ -498,9 +508,22 @@ async fn handle_llm_turn(
     input: &mut mpsc::Receiver<CoreInput>,
     permission_checker: Option<&dyn PermissionChecker>,
 ) {
+    let turn_start = std::time::Instant::now();
+    let mut accumulated_usage: Option<quine_llm::TokenUsage> = None;
+
     loop {
         match call_llm(provider, session, session_id, output).await {
-            Ok(LlmTurnResult::Text(full_text)) => {
+            Ok(LlmCallResult {
+                turn: LlmTurnResult::Text(full_text),
+                usage,
+            }) => {
+                // Accumulate usage from this LLM call.
+                if let Some(u) = usage {
+                    let acc = accumulated_usage.get_or_insert(quine_llm::TokenUsage::default());
+                    acc.input_tokens += u.input_tokens;
+                    acc.output_tokens += u.output_tokens;
+                }
+
                 session.history.push(Message::assistant(&full_text));
 
                 let _ = output
@@ -511,10 +534,27 @@ async fn handle_llm_turn(
                     .await;
 
                 session.state = SessionState::Idle;
-                let _ = output.send(CoreOutput::TurnComplete { session_id }).await;
+                let duration_ms = turn_start.elapsed().as_millis() as u64;
+                let _ = output
+                    .send(CoreOutput::TurnComplete {
+                        session_id,
+                        duration_ms,
+                        usage: accumulated_usage,
+                    })
+                    .await;
                 break;
             }
-            Ok(LlmTurnResult::ToolCalls { text_before, calls }) => {
+            Ok(LlmCallResult {
+                turn: LlmTurnResult::ToolCalls { text_before, calls },
+                usage,
+            }) => {
+                // Accumulate usage from this LLM call.
+                if let Some(u) = usage {
+                    let acc = accumulated_usage.get_or_insert(quine_llm::TokenUsage::default());
+                    acc.input_tokens += u.input_tokens;
+                    acc.output_tokens += u.output_tokens;
+                }
+
                 // Record the assistant's tool_use message in history.
                 let tool_use_requests: Vec<quine_llm::ToolUseRequest> = calls
                     .iter()
@@ -552,6 +592,7 @@ async fn handle_llm_turn(
                         })
                         .await;
 
+                    let tool_start = std::time::Instant::now();
                     let result = execute_tool_call(
                         call,
                         session,
@@ -561,6 +602,7 @@ async fn handle_llm_turn(
                         permission_checker,
                     )
                     .await;
+                    let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
 
                     // Append tool result to history
                     let (tool_output, is_error) = match &result {
@@ -570,6 +612,17 @@ async fn handle_llm_turn(
                             ("Tool execution was cancelled".to_string(), true)
                         }
                     };
+
+                    // Emit ToolResult with timing info
+                    let _ = output
+                        .send(CoreOutput::ToolResult {
+                            session_id,
+                            tool_use_id: call.tool_use_id.clone(),
+                            tool_name: call.tool_name.clone(),
+                            is_error,
+                            duration_ms: tool_duration_ms,
+                        })
+                        .await;
 
                     if debug {
                         let status = if is_error { "ERROR" } else { "OK" };
@@ -843,9 +896,12 @@ mod tests {
         {
             let text = self.response_text.clone();
             let events = if text.is_empty() {
-                vec![Ok(LlmEvent::Done)]
+                vec![Ok(LlmEvent::Done { usage: None })]
             } else {
-                vec![Ok(LlmEvent::TextDelta { text }), Ok(LlmEvent::Done)]
+                vec![
+                    Ok(LlmEvent::TextDelta { text }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ]
             };
             Ok(Box::pin(futures::stream::iter(events)))
         }
@@ -1088,14 +1144,14 @@ mod tests {
                             tool_name: "bash".into(),
                             arguments: serde_json::json!({"command": "echo hello_world"}),
                         }),
-                        Ok(LlmEvent::Done),
+                        Ok(LlmEvent::Done { usage: None }),
                     ]
                 } else {
                     vec![
                         Ok(LlmEvent::TextDelta {
                             text: "Done!".into(),
                         }),
-                        Ok(LlmEvent::Done),
+                        Ok(LlmEvent::Done { usage: None }),
                     ]
                 };
                 Ok(Box::pin(futures::stream::iter(events)))

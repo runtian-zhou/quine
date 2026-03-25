@@ -14,6 +14,19 @@ pub struct OneshotOutput {
     pub response: String,
     /// Tool calls made during the turn.
     pub tool_calls: Vec<ToolCallRecord>,
+    /// Duration of the agent turn in milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    /// Token usage for the turn (if available).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<TokenUsageOutput>,
+}
+
+/// Token usage in one-shot output.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TokenUsageOutput {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
 }
 
 /// A record of a single tool call during a one-shot run.
@@ -70,6 +83,8 @@ pub async fn run_oneshot(
     // Collect response notifications until TurnComplete.
     let mut full_response = String::new();
     let mut tool_calls = Vec::new();
+    let mut turn_duration_ms: Option<u64> = None;
+    let mut turn_usage: Option<TokenUsageOutput> = None;
 
     loop {
         match client.recv_notification().await {
@@ -144,6 +159,15 @@ pub async fn run_oneshot(
                     }
                 }
                 notifications::TURN_COMPLETE => {
+                    if let Some(params) = &notif.params {
+                        turn_duration_ms = params.get("duration_ms").and_then(|v| v.as_u64());
+                        turn_usage = params.get("usage").and_then(|v| {
+                            Some(TokenUsageOutput {
+                                input_tokens: v.get("input_tokens")?.as_u64()?,
+                                output_tokens: v.get("output_tokens")?.as_u64()?,
+                            })
+                        });
+                    }
                     break;
                 }
                 _ => {}
@@ -160,6 +184,8 @@ pub async fn run_oneshot(
             session_id,
             response: full_response,
             tool_calls,
+            duration_ms: turn_duration_ms,
+            usage: turn_usage,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -196,6 +222,8 @@ pub async fn run_respond(
     // Collect remaining notifications until TurnComplete.
     let mut full_response = String::new();
     let mut tool_calls = Vec::new();
+    let mut turn_duration_ms: Option<u64> = None;
+    let mut turn_usage: Option<TokenUsageOutput> = None;
 
     loop {
         match client.recv_notification().await {
@@ -266,6 +294,15 @@ pub async fn run_respond(
                     }
                 }
                 notifications::TURN_COMPLETE => {
+                    if let Some(params) = &notif.params {
+                        turn_duration_ms = params.get("duration_ms").and_then(|v| v.as_u64());
+                        turn_usage = params.get("usage").and_then(|v| {
+                            Some(TokenUsageOutput {
+                                input_tokens: v.get("input_tokens")?.as_u64()?,
+                                output_tokens: v.get("output_tokens")?.as_u64()?,
+                            })
+                        });
+                    }
                     break;
                 }
                 _ => {}
@@ -281,6 +318,8 @@ pub async fn run_respond(
             session_id: session_id.to_string(),
             response: full_response,
             tool_calls,
+            duration_ms: turn_duration_ms,
+            usage: turn_usage,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -303,6 +342,11 @@ mod tests {
                 tool_name: "bash".to_string(),
                 tool_use_id: "call_1".to_string(),
             }],
+            duration_ms: Some(1500),
+            usage: Some(TokenUsageOutput {
+                input_tokens: 100,
+                output_tokens: 50,
+            }),
         };
 
         let json = serde_json::to_string(&output).unwrap();

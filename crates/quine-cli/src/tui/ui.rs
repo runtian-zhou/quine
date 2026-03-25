@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AgentPhase, App, ConversationEntry, DiffLine};
+use super::app::{AgentPhase, App, ConversationEntry, DiffLine, ToolStatus};
 
 /// Render the entire TUI frame.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -34,7 +34,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line<'_>> = Vec::new();
 
-    for (i, entry) in app.messages.iter().enumerate() {
+    for entry in app.messages.iter() {
         match entry {
             ConversationEntry::User(text) => {
                 lines.push(Line::from(vec![
@@ -49,24 +49,36 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
             }
             ConversationEntry::AssistantText(text) => {
                 for line in text.lines() {
-                    lines.push(Line::from(Span::raw(line.to_string())));
+                    lines.push(Line::from(Span::raw(format!("  {line}"))));
                 }
             }
-            ConversationEntry::ToolCall { tool_name, summary } => {
-                let indicator = if app.expanded_tools.contains(&i) {
-                    "▼"
-                } else {
-                    "▶"
+            ConversationEntry::ToolCall {
+                tool_name,
+                summary,
+                status,
+                ..
+            } => {
+                let (marker, style) = match status {
+                    ToolStatus::Running => ("\u{27F3}", Style::default().fg(Color::Yellow)),
+                    ToolStatus::Success { .. } => ("\u{2713}", Style::default().fg(Color::Green)),
+                    ToolStatus::Error { .. } => ("\u{2717}", Style::default().fg(Color::Red)),
+                };
+                let duration_str = match status {
+                    ToolStatus::Running => String::new(),
+                    ToolStatus::Success { duration_ms } | ToolStatus::Error { duration_ms } => {
+                        format!(" ({:.1}s)", *duration_ms as f64 / 1000.0)
+                    }
                 };
                 let label = if summary.is_empty() {
-                    format!("{indicator} {tool_name}")
+                    format!(" {tool_name}{duration_str}")
                 } else {
-                    format!("{indicator} {tool_name}: {summary}")
+                    format!(" {tool_name}: {summary}{duration_str}")
                 };
-                lines.push(Line::from(Span::styled(
-                    label,
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-                )));
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(marker, style),
+                    Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
+                ]));
             }
             ConversationEntry::WriteDiff {
                 file_path: _,
@@ -76,7 +88,7 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
                     match dl {
                         DiffLine::Header(h) => {
                             lines.push(Line::from(Span::styled(
-                                h.clone(),
+                                format!("    {h}"),
                                 Style::default()
                                     .fg(Color::Cyan)
                                     .add_modifier(Modifier::BOLD),
@@ -84,13 +96,13 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
                         }
                         DiffLine::Add(l) => {
                             lines.push(Line::from(Span::styled(
-                                format!("+ {l}"),
+                                format!("    + {l}"),
                                 Style::default().fg(Color::Green),
                             )));
                         }
                         DiffLine::Remove(l) => {
                             lines.push(Line::from(Span::styled(
-                                format!("- {l}"),
+                                format!("    - {l}"),
                                 Style::default().fg(Color::Red),
                             )));
                         }
@@ -113,6 +125,21 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
                     ),
                     Span::raw(text),
                 ]));
+            }
+            ConversationEntry::TurnInfo { duration_ms, usage } => {
+                let time_str = format!("{:.1}s", *duration_ms as f64 / 1000.0);
+                let token_str = match usage {
+                    Some(u) => {
+                        format!(" | {} in / {} out tokens", u.input_tokens, u.output_tokens)
+                    }
+                    None => String::new(),
+                };
+                lines.push(Line::from(vec![Span::styled(
+                    format!("  \u{2500}\u{2500} {time_str}{token_str} \u{2500}\u{2500}"),
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                )]));
             }
         }
     }
@@ -248,6 +275,40 @@ mod tests {
     }
 
     #[test]
+    fn draw_does_not_panic_with_tool_status() {
+        let mut app = App::new("test".into());
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "bash".into(),
+            tool_use_id: "tc1".into(),
+            summary: "echo running".into(),
+            status: ToolStatus::Running,
+        });
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "read".into(),
+            tool_use_id: "tc2".into(),
+            summary: "file.txt".into(),
+            status: ToolStatus::Success { duration_ms: 150 },
+        });
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "write".into(),
+            tool_use_id: "tc3".into(),
+            summary: "output.txt".into(),
+            status: ToolStatus::Error { duration_ms: 300 },
+        });
+        app.messages.push(ConversationEntry::TurnInfo {
+            duration_ms: 4523,
+            usage: Some(quine_llm::TokenUsage {
+                input_tokens: 1200,
+                output_tokens: 350,
+            }),
+        });
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &app)).unwrap();
+    }
+
+    #[test]
     fn draw_does_not_panic_with_content() {
         let mut app = App::new("test".into());
         app.messages.push(ConversationEntry::User("hello".into()));
@@ -255,7 +316,9 @@ mod tests {
             .push(ConversationEntry::AssistantText("hi there".into()));
         app.messages.push(ConversationEntry::ToolCall {
             tool_name: "bash".into(),
+            tool_use_id: "tc1".into(),
             summary: "echo test".into(),
+            status: ToolStatus::Running,
         });
         app.messages
             .push(ConversationEntry::Error("something failed".into()));

@@ -184,7 +184,7 @@ async fn run_subagent_inner(
                 }) => {
                     tool_calls.push((tool_use_id, tool_name, arguments));
                 }
-                Ok(LlmEvent::Done) => break,
+                Ok(LlmEvent::Done { .. }) => break,
                 Err(e) => return Err(format!("LLM stream error: {e}")),
             }
         }
@@ -317,7 +317,10 @@ mod tests {
         ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
         {
             let text = self.text.clone();
-            let events = vec![Ok(LlmEvent::TextDelta { text }), Ok(LlmEvent::Done)];
+            let events = vec![
+                Ok(LlmEvent::TextDelta { text }),
+                Ok(LlmEvent::Done { usage: None }),
+            ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
     }
@@ -345,14 +348,14 @@ mod tests {
                         tool_name: "bash".into(),
                         arguments: serde_json::json!({"command": "echo SUBAGENT_OUTPUT_42"}),
                     }),
-                    Ok(LlmEvent::Done),
+                    Ok(LlmEvent::Done { usage: None }),
                 ]
             } else {
                 vec![
                     Ok(LlmEvent::TextDelta {
                         text: "The command output was: SUBAGENT_OUTPUT_42".into(),
                     }),
-                    Ok(LlmEvent::Done),
+                    Ok(LlmEvent::Done { usage: None }),
                 ]
             };
             Ok(Box::pin(futures::stream::iter(events)))
@@ -413,7 +416,7 @@ mod tests {
                         tool_name: "bash".into(),
                         arguments: serde_json::json!({"command": "echo loop"}),
                     }),
-                    Ok(LlmEvent::Done),
+                    Ok(LlmEvent::Done { usage: None }),
                 ];
                 Ok(Box::pin(futures::stream::iter(events)))
             }
