@@ -114,7 +114,7 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
 
     // Calculate scroll: we want to show the bottom unless user scrolled up.
     let content_height = text.lines.len() as u16;
-    let view_height = area.height.saturating_sub(2); // account for borders
+    let view_height = area.height;
     let max_scroll = content_height.saturating_sub(view_height);
     let scroll = if app.user_scrolled {
         max_scroll.saturating_sub(app.scroll_offset.min(max_scroll))
@@ -123,11 +123,6 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
     };
 
     let conversation = Paragraph::new(text)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Conversation "),
-        )
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
 
