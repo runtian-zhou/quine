@@ -8,6 +8,8 @@ status: pending
 
 Map Linux process control and IPC primitives to agent session lifecycle management in quine-core. This enables the LLM to spawn child agents for subtasks, wait for their completion, control them with signal-like semantics, and communicate between agents via pipes, messages, and shared memory.
 
+> **Note:** For simple subtask delegation, the `subagent` tool (see `features/simple-subagent-tool.md`) is the preferred mechanism. It spawns a child, waits for completion, and returns the result in a single blocking tool call. The process control APIs in this feature are for **advanced use cases** that require concurrency (multiple agents running in parallel), signaling (stop/kill/pause), or inter-agent communication (message passing, shared memory). The system prompt should guide the LLM to prefer `subagent` and only use these primitives when the simpler tool is insufficient.
+
 ## Linux API → Agent Mapping
 
 | Linux | Agent Equivalent | Channel Message |
