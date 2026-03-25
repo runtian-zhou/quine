@@ -143,6 +143,8 @@ enum DeltaPayload {
 /// Tracks in-flight tool calls as their arguments stream in.
 struct ToolCallTracker {
     calls: Vec<TrackedToolCall>,
+    /// Maps content block index to tool call index in `calls`.
+    block_to_tool: std::collections::HashMap<usize, usize>,
 }
 
 struct TrackedToolCall {
@@ -153,10 +155,15 @@ struct TrackedToolCall {
 
 impl ToolCallTracker {
     fn new() -> Self {
-        Self { calls: Vec::new() }
+        Self {
+            calls: Vec::new(),
+            block_to_tool: std::collections::HashMap::new(),
+        }
     }
 
-    fn start_tool(&mut self, id: String, name: String) {
+    fn start_tool(&mut self, block_index: usize, id: String, name: String) {
+        let tool_index = self.calls.len();
+        self.block_to_tool.insert(block_index, tool_index);
         self.calls.push(TrackedToolCall {
             id,
             name,
@@ -164,9 +171,11 @@ impl ToolCallTracker {
         });
     }
 
-    fn append_arguments(&mut self, index: usize, json: &str) {
-        if let Some(call) = self.calls.get_mut(index) {
-            call.arguments_json.push_str(json);
+    fn append_arguments(&mut self, block_index: usize, json: &str) {
+        if let Some(&tool_index) = self.block_to_tool.get(&block_index) {
+            if let Some(call) = self.calls.get_mut(tool_index) {
+                call.arguments_json.push_str(json);
+            }
         }
     }
 
@@ -354,7 +363,8 @@ impl LlmProvider for AnthropicProvider {
                                     if let Some(ContentBlockStart::ToolUse { id, name }) =
                                         sse.content_block
                                     {
-                                        tool_tracker.start_tool(id, name);
+                                        let block_index = sse.index.unwrap_or(0);
+                                        tool_tracker.start_tool(block_index, id, name);
                                     }
                                 }
                                 continue;
@@ -373,8 +383,9 @@ impl LlmProvider for AnthropicProvider {
                                             }
                                         }
                                         Some(DeltaPayload::InputJsonDelta { partial_json }) => {
-                                            if let Some(index) = sse.index {
-                                                tool_tracker.append_arguments(index, &partial_json);
+                                            if let Some(block_index) = sse.index {
+                                                tool_tracker
+                                                    .append_arguments(block_index, &partial_json);
                                             }
                                         }
                                         None => {}
@@ -456,9 +467,10 @@ mod tests {
     #[test]
     fn tool_call_tracker() {
         let mut tracker = ToolCallTracker::new();
-        tracker.start_tool("id-1".into(), "test_tool".into());
-        tracker.append_arguments(0, "{\"key\":");
-        tracker.append_arguments(0, "\"value\"}");
+        // block_index=1 (e.g., after a text block at index 0)
+        tracker.start_tool(1, "id-1".into(), "test_tool".into());
+        tracker.append_arguments(1, "{\"key\":");
+        tracker.append_arguments(1, "\"value\"}");
 
         let events = tracker.take_completed();
         assert_eq!(events.len(), 1);

@@ -529,8 +529,19 @@ async fn handle_llm_turn(
                     tool_use_requests,
                 ));
 
+                let debug = std::env::var("QUINE_DEBUG").is_ok();
+
                 // Execute each tool call directly
                 for call in &calls {
+                    if debug {
+                        eprintln!(
+                            "[tool] calling {} (id={}) args={}",
+                            call.tool_name,
+                            call.tool_use_id,
+                            serde_json::to_string(&call.arguments).unwrap_or_default()
+                        );
+                    }
+
                     // Emit ToolRequest for informational purposes
                     let _ = output
                         .send(CoreOutput::ToolRequest {
@@ -559,6 +570,17 @@ async fn handle_llm_turn(
                             ("Tool execution was cancelled".to_string(), true)
                         }
                     };
+
+                    if debug {
+                        let status = if is_error { "ERROR" } else { "OK" };
+                        let preview = if tool_output.len() > 200 {
+                            format!("{}...[{} bytes]", &tool_output[..200], tool_output.len())
+                        } else {
+                            tool_output.clone()
+                        };
+                        eprintln!("[tool] {} result ({}): {}", call.tool_name, status, preview);
+                    }
+
                     session.history.push(Message::tool_result(
                         &call.tool_use_id,
                         &tool_output,
