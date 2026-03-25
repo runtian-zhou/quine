@@ -1,0 +1,19 @@
+[meta]
+name = "bash_overlay_filesystem"
+description = "Verify bash tool sees overlay files and writes go to session layer"
+timeout = 180
+
+# Step 1: Write a file via write_file, then cat it via bash to verify visibility.
+[[action]]
+type = "run"
+message = "Use the write_file tool to create a file called 'overlay_test.txt' with the content 'OVERLAY_VISIBLE'. Then use the bash tool to run 'cat overlay_test.txt' and return the output."
+flags = ["--json"]
+save_session = "sid"
+expect_contains = "OVERLAY_VISIBLE"
+
+# Step 2: In the same session, use bash to create a file, then read it via read_file.
+[[action]]
+type = "run"
+session = "$sid"
+message = "Use the bash tool to run 'echo BASH_CREATED > bash_output.txt'. Then use the read_file tool to read 'bash_output.txt' and return its contents."
+expect_contains = "BASH_CREATED"
