@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # TUI: Render Diff on Write Tool Invocation

@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AgentPhase, App, ConversationEntry};
+use super::app::{AgentPhase, App, ConversationEntry, DiffLine};
 
 /// Render the entire TUI frame.
 pub fn draw(frame: &mut Frame, app: &App) {
@@ -65,6 +65,35 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
                     label,
                     Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
                 )));
+            }
+            ConversationEntry::WriteDiff {
+                file_path: _,
+                diff_lines,
+            } => {
+                for dl in diff_lines {
+                    match dl {
+                        DiffLine::Header(h) => {
+                            lines.push(Line::from(Span::styled(
+                                h.clone(),
+                                Style::default()
+                                    .fg(Color::Cyan)
+                                    .add_modifier(Modifier::BOLD),
+                            )));
+                        }
+                        DiffLine::Add(l) => {
+                            lines.push(Line::from(Span::styled(
+                                format!("+ {l}"),
+                                Style::default().fg(Color::Green),
+                            )));
+                        }
+                        DiffLine::Remove(l) => {
+                            lines.push(Line::from(Span::styled(
+                                format!("- {l}"),
+                                Style::default().fg(Color::Red),
+                            )));
+                        }
+                    }
+                }
             }
             ConversationEntry::Error(text) => {
                 lines.push(Line::from(Span::styled(
