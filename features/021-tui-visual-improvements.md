@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 ---
 
 # TUI Visual Improvements: Indentation, Timing, Tokens, and Tool Status Colors
