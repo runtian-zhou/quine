@@ -6,6 +6,7 @@ pub mod read;
 pub mod recv_message;
 pub mod send_message;
 pub mod signal;
+pub mod skill_template;
 pub mod spawn;
 pub mod subagent;
 pub mod wait_child;

@@ -6,6 +6,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
+use quine_core::SkillLoader;
+
 use crate::protocol::{
     error_codes, methods, notifications, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest,
     JsonRpcResponse,
@@ -325,9 +327,22 @@ async fn handle_request(
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
+            let skills: Vec<String> = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("skills"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+
             let config = crate::config::SessionConfig {
                 system_prompt,
                 working_directory: None,
+                skills,
             };
 
             match service.create_session(config).await {
@@ -772,6 +787,77 @@ async fn handle_request(
                         id,
                         error_codes::INVALID_PARAMS,
                         "missing source",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::LIST_SKILLS => {
+            let project_root = std::env::current_dir().unwrap_or_default();
+            let loader = quine_core::FileSystemSkillLoader::default_paths(&project_root);
+            match loader.list().await {
+                Ok(skills) => {
+                    let resp = JsonRpcResponse::success(
+                        id,
+                        serde_json::to_value(&skills).unwrap_or_default(),
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+                Err(e) => {
+                    let resp =
+                        JsonRpcErrorResponse::new(id, error_codes::INTERNAL_ERROR, e.to_string());
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::GET_SKILL => {
+            let skill_name = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str());
+
+            match skill_name {
+                Some(name) => {
+                    let project_root = std::env::current_dir().unwrap_or_default();
+                    let loader = quine_core::FileSystemSkillLoader::default_paths(&project_root);
+                    match loader.load(name).await {
+                        Ok(skill) => {
+                            let result = serde_json::json!({
+                                "name": skill.meta.name,
+                                "description": skill.meta.description,
+                                "version": skill.meta.version,
+                                "source_path": skill.source_path.to_string_lossy(),
+                                "system_prompt": skill.system_prompt,
+                                "tools": skill.tool_definitions.iter().map(|t| {
+                                    serde_json::json!({
+                                        "name": t.name,
+                                        "description": t.description,
+                                        "handler": t.handler,
+                                        "parameters": t.parameters,
+                                    })
+                                }).collect::<Vec<_>>(),
+                            });
+                            let resp = JsonRpcResponse::success(id, result);
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                None => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing name parameter",
                     );
                     Some(serde_json::to_string(&resp).unwrap_or_default())
                 }

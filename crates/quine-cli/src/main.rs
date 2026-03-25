@@ -25,6 +25,9 @@ enum Commands {
         /// Socket path to connect to the harness daemon.
         #[arg(long)]
         socket: Option<String>,
+        /// Skills to load for this session (can be repeated).
+        #[arg(long, short = 's')]
+        skill: Vec<String>,
     },
     /// Send a one-shot message to the agent and exit.
     Run {
@@ -39,6 +42,9 @@ enum Commands {
         /// Socket path to connect to the harness daemon.
         #[arg(long)]
         socket: Option<String>,
+        /// Skills to load for this session (can be repeated).
+        #[arg(long, short = 's')]
+        skill: Vec<String>,
     },
     /// Respond to an interaction request (e.g., ask_user prompt) on an existing session.
     Respond {
@@ -145,8 +151,34 @@ enum Commands {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Manage and inspect skills.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommands,
+    },
     /// Print version information.
     Version,
+}
+
+#[derive(Subcommand)]
+enum SkillsCommands {
+    /// List all available skills.
+    List {
+        /// Output as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Show details of a specific skill.
+    Show {
+        /// Skill name.
+        name: String,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -170,14 +202,14 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Chat { socket } => {
+        Commands::Chat { socket, skill } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(default_socket_path);
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                tui::run_tui_chat(&socket_path).await?;
+                tui::run_tui_chat(&socket_path, &skill).await?;
             } else {
-                chat::run_chat(&socket_path).await?;
+                chat::run_chat(&socket_path, &skill).await?;
             }
         }
         Commands::Run {
@@ -185,11 +217,12 @@ async fn main() -> anyhow::Result<()> {
             session,
             json,
             socket,
+            skill,
         } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(default_socket_path);
-            run::run_oneshot(&socket_path, &message, session.as_deref(), json).await?;
+            run::run_oneshot(&socket_path, &message, session.as_deref(), json, &skill).await?;
         }
         Commands::Respond {
             session,
@@ -306,6 +339,20 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(default_socket_path);
             agent_ctl::handle_recv(&socket_path, &source, non_blocking).await?;
         }
+        Commands::Skills { command } => match command {
+            SkillsCommands::List { json, socket } => {
+                let socket_path = socket
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(default_socket_path);
+                run::run_skills_list(&socket_path, json).await?;
+            }
+            SkillsCommands::Show { name, socket } => {
+                let socket_path = socket
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(default_socket_path);
+                run::run_skills_show(&socket_path, &name).await?;
+            }
+        },
         Commands::Version => {
             println!("quine {}", env!("CARGO_PKG_VERSION"));
         }

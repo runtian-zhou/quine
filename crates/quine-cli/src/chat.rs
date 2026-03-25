@@ -17,12 +17,17 @@ async fn shutdown_if_spawned(client: &mut IpcClient, daemon_spawned: bool) {
 ///
 /// Connects to the harness daemon, creates a session, then loops:
 /// read user input -> send message -> print streamed response.
-pub async fn run_chat(socket_path: &Path) -> anyhow::Result<()> {
+pub async fn run_chat(socket_path: &Path, skills: &[String]) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let mut renderer = TerminalRenderer::new();
 
     // Create a session.
-    let result = client.call(methods::CREATE_SESSION, None).await?;
+    let params = if skills.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({ "skills": skills }))
+    };
+    let result = client.call(methods::CREATE_SESSION, params).await?;
     let session_id = match result {
         Ok(value) => value
             .as_str()

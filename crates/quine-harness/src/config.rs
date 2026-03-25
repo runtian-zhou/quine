@@ -17,6 +17,9 @@ pub struct SessionConfig {
     pub system_prompt: Option<String>,
     /// Optional working directory for the session filesystem.
     pub working_directory: Option<std::path::PathBuf>,
+    /// Skill names to load for this session.
+    #[serde(default)]
+    pub skills: Vec<String>,
 }
 
 /// Configuration for the harness daemon.
@@ -137,6 +140,7 @@ mod tests {
         let config = SessionConfig {
             system_prompt: Some("You are helpful.".into()),
             working_directory: None,
+            skills: Vec::new(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: SessionConfig = serde_json::from_str(&json).unwrap();

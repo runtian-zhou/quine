@@ -118,6 +118,8 @@ pub mod methods {
     pub const SIGNAL_SESSION: &str = "signal_session";
     pub const SEND_IPC_MESSAGE: &str = "send_ipc_message";
     pub const RECV_IPC_MESSAGE: &str = "recv_ipc_message";
+    pub const LIST_SKILLS: &str = "list_skills";
+    pub const GET_SKILL: &str = "get_skill";
 }
 
 /// Notification method names.

@@ -5,6 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::error::CoreError;
 use crate::session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
+use crate::skill::Skill;
 use crate::tool;
 
 /// Operations the harness sends into the core event loop.
@@ -17,6 +18,8 @@ pub enum CoreInput {
         system_prompt: Option<String>,
         /// The working directory for this session's filesystem.
         working_directory: Option<PathBuf>,
+        /// Skills to load for this session.
+        skills: Vec<Skill>,
         /// Acknowledges session creation.
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -286,6 +289,7 @@ mod tests {
                 session_id,
                 system_prompt: None,
                 working_directory: None,
+                skills: Vec::new(),
                 reply: reply_tx,
             })
             .await
