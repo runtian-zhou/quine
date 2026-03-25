@@ -5,6 +5,7 @@ use quine_core::permission::composite::CompositeChecker;
 use quine_core::permission::llm_checker::LlmChecker;
 use quine_core::permission::rule_checker::RuleBasedChecker;
 use quine_core::PermissionChecker;
+use quine_llm::anthropic::AnthropicConfig;
 use quine_llm::config::ProviderConfig;
 use quine_llm::openai_compat::OpenAiCompatConfig;
 use serde::{Deserialize, Serialize};
@@ -48,17 +49,31 @@ pub fn default_socket_path() -> PathBuf {
 
 /// Build an LLM `ProviderConfig` from environment variables.
 ///
-/// Uses `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL` env vars,
-/// defaulting to a local OpenAI-compatible endpoint.
-/// Build an LLM `ProviderConfig` from environment variables.
+/// Uses `LLM_PROVIDER` to select the backend (`"anthropic"` or `"openai"`,
+/// default `"openai"`), plus `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL`.
 fn config_from_env() -> ProviderConfig {
-    ProviderConfig::OpenAiCompat(OpenAiCompatConfig {
-        base_url: std::env::var("LLM_BASE_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into()),
-        api_key: std::env::var("LLM_API_KEY").ok(),
-        model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "qwen-3.5".into()),
-        max_tokens: Some(4096),
-    })
+    let provider = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "openai".into());
+    if provider.eq_ignore_ascii_case("anthropic") {
+        let api_key = std::env::var("LLM_API_KEY")
+            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
+            .expect("LLM_API_KEY or ANTHROPIC_API_KEY must be set for Anthropic provider");
+        ProviderConfig::Anthropic(AnthropicConfig {
+            api_key,
+            base_url: std::env::var("LLM_BASE_URL")
+                .unwrap_or_else(|_| "https://api.anthropic.com".into()),
+            model: std::env::var("LLM_MODEL")
+                .unwrap_or_else(|_| "claude-sonnet-4-20250514".into()),
+            max_tokens: 4096,
+        })
+    } else {
+        ProviderConfig::OpenAiCompat(OpenAiCompatConfig {
+            base_url: std::env::var("LLM_BASE_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into()),
+            api_key: std::env::var("LLM_API_KEY").ok(),
+            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "qwen-3.5".into()),
+            max_tokens: Some(4096),
+        })
+    }
 }
 
 /// Create an LLM provider from environment variables.
