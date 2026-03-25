@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Scope Permission Checker to Bash Only and Improve Command Scoring

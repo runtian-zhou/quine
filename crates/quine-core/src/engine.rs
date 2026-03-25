@@ -273,12 +273,14 @@ async fn execute_tool_call(
     input: &mut mpsc::Receiver<CoreInput>,
     permission_checker: Option<&dyn PermissionChecker>,
 ) -> ToolOutcome {
-    // Check permissions before execution
-    if let Some(checker) = permission_checker {
-        if let Err(outcome) =
-            check_permission(checker, call, session, session_id, output, input).await
-        {
-            return outcome;
+    // Only check permissions for bash tool — other tools are safe by design.
+    if call.tool_name == "bash" {
+        if let Some(checker) = permission_checker {
+            if let Err(outcome) =
+                check_permission(checker, call, session, session_id, output, input).await
+            {
+                return outcome;
+            }
         }
     }
 
