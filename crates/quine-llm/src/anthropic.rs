@@ -86,6 +86,14 @@ enum AnthropicContent {
 #[derive(Serialize)]
 #[serde(tag = "type")]
 enum AnthropicContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "tool_use")]
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
     #[serde(rename = "tool_result")]
     ToolResult {
         tool_use_id: String,
@@ -197,14 +205,32 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicMessa
                     });
                 }
             }
-            Role::Assistant => {
-                if let MessageContent::Text(text) = &msg.content {
+            Role::Assistant => match &msg.content {
+                MessageContent::Text(text) => {
                     api_messages.push(AnthropicMessage {
                         role: "assistant".into(),
                         content: AnthropicContent::Text(text.clone()),
                     });
                 }
-            }
+                MessageContent::ToolUse { text, tool_calls } => {
+                    let mut blocks = Vec::new();
+                    if let Some(text) = text {
+                        blocks.push(AnthropicContentBlock::Text { text: text.clone() });
+                    }
+                    for tc in tool_calls {
+                        blocks.push(AnthropicContentBlock::ToolUse {
+                            id: tc.tool_use_id.clone(),
+                            name: tc.tool_name.clone(),
+                            input: tc.arguments.clone(),
+                        });
+                    }
+                    api_messages.push(AnthropicMessage {
+                        role: "assistant".into(),
+                        content: AnthropicContent::Blocks(blocks),
+                    });
+                }
+                _ => {}
+            },
             Role::Tool => {
                 if let MessageContent::ToolResult {
                     tool_use_id,
@@ -261,6 +287,10 @@ impl LlmProvider for AnthropicProvider {
             tools: convert_tools(tools),
         };
 
+        if let Ok(debug_json) = serde_json::to_string_pretty(&request_body) {
+            eprintln!("[anthropic] request body:\n{debug_json}");
+        }
+
         let response = self
             .client
             .post(&url)
@@ -278,6 +308,7 @@ impl LlmProvider for AnthropicProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".into());
+            eprintln!("[anthropic] error response: {body}");
             return Err(LlmError::ProviderHttp { status, body }.into());
         }
 

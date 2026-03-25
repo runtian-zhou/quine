@@ -8,4 +8,4 @@ pub mod types;
 pub use config::{create_provider, ProviderConfig};
 pub use error::LlmError;
 pub use provider::LlmProvider;
-pub use types::{LlmEvent, Message, MessageContent, Role, ToolDefinition};
+pub use types::{LlmEvent, Message, MessageContent, Role, ToolDefinition, ToolUseRequest};
