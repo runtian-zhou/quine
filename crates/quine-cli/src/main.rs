@@ -3,6 +3,9 @@ mod client;
 mod log;
 mod render;
 mod run;
+mod tui;
+
+use std::io::IsTerminal;
 
 use clap::{Parser, Subcommand};
 use quine_harness::default_socket_path;
@@ -95,7 +98,11 @@ async fn main() -> anyhow::Result<()> {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(default_socket_path);
-            chat::run_chat(&socket_path).await?;
+            if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                tui::run_tui_chat(&socket_path).await?;
+            } else {
+                chat::run_chat(&socket_path).await?;
+            }
         }
         Commands::Run {
             message,
