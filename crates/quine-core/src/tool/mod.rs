@@ -1,5 +1,6 @@
 pub mod ask_user;
 pub mod bash;
+pub mod find;
 pub mod plan;
 pub mod read;
 pub mod recv_message;

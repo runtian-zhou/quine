@@ -13,7 +13,7 @@ use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision
 use crate::planner::scheduler::{get_ready_actions, render_plan};
 use crate::session::{SessionId, SessionState};
 use crate::tool::{
-    ask_user::AskUserTool, bash::BashTool, plan::PlanTool, read::ReadTool,
+    ask_user::AskUserTool, bash::BashTool, find::FindTool, plan::PlanTool, read::ReadTool,
     recv_message::RecvMessageTool, send_message::SendMessageTool, signal::SignalTool,
     spawn::SpawnTool, subagent::SubagentTool, wait_child::WaitChildTool, write::WriteTool,
     ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse,
@@ -66,6 +66,7 @@ impl SessionContext {
         tool_registry.register(Arc::new(ReadTool));
         tool_registry.register(Arc::new(WriteTool));
         tool_registry.register(Arc::new(BashTool));
+        tool_registry.register(Arc::new(FindTool));
         tool_registry.register(Arc::new(AskUserTool));
         tool_registry.register(Arc::new(PlanTool::new(plan_store.clone())));
         tool_registry.register(Arc::new(SubagentTool::new(
