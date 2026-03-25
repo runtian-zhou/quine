@@ -287,8 +287,11 @@ impl LlmProvider for AnthropicProvider {
             tools: convert_tools(tools),
         };
 
-        if let Ok(debug_json) = serde_json::to_string_pretty(&request_body) {
-            eprintln!("[anthropic] request body:\n{debug_json}");
+        let debug = std::env::var("QUINE_DEBUG").is_ok();
+        if debug {
+            if let Ok(debug_json) = serde_json::to_string_pretty(&request_body) {
+                eprintln!("[anthropic] request body:\n{debug_json}");
+            }
         }
 
         let response = self
@@ -308,7 +311,9 @@ impl LlmProvider for AnthropicProvider {
                 .text()
                 .await
                 .unwrap_or_else(|_| "unable to read body".into());
-            eprintln!("[anthropic] error response: {body}");
+            if debug {
+                eprintln!("[anthropic] error response: {body}");
+            }
             return Err(LlmError::ProviderHttp { status, body }.into());
         }
 

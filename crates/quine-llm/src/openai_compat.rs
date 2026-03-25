@@ -169,8 +169,7 @@ fn convert_message(msg: &Message) -> ChatMessage {
                         r#type: "function".into(),
                         function: OpenAiToolCallFunction {
                             name: tc.tool_name.clone(),
-                            arguments: serde_json::to_string(&tc.arguments)
-                                .unwrap_or_default(),
+                            arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
                         },
                     })
                     .collect(),

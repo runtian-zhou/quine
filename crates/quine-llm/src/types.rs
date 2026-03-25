@@ -72,10 +72,7 @@ impl Message {
     }
 
     /// Create an assistant message requesting tool use.
-    pub fn assistant_tool_use(
-        text: Option<String>,
-        tool_calls: Vec<ToolUseRequest>,
-    ) -> Self {
+    pub fn assistant_tool_use(text: Option<String>, tool_calls: Vec<ToolUseRequest>) -> Self {
         Self {
             role: Role::Assistant,
             content: MessageContent::ToolUse { text, tool_calls },
