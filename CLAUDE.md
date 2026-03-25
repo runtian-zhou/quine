@@ -122,6 +122,16 @@ The `status` field tracks progress:
 8. Update the feature file status to `done`.
 9. Clean up the worktree (`git worktree remove`).
 
+### QA Reports
+
+QA reports live in `qa/reports/` as timestamped Markdown files. After triaging and fixing failures from a QA report, mark the report as **resolved** by adding a status line at the top (below the title):
+
+```markdown
+**Status**: resolved — fix merged in PR #<number>, verified in `qa-<timestamp>`
+```
+
+This makes it easy to distinguish actionable reports from already-addressed ones.
+
 ## The Bootstrapping Contract
 
 This project has a unique constraint: **the agent using this CLAUDE.md must be capable of building the entire project from this specification.** When adding a new crate, module, or capability:
