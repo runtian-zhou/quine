@@ -212,6 +212,41 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
             "turn_complete",
             serde_json::json!({}),
         ),
+        quine_core::CoreOutput::ChildSpawned {
+            parent_id,
+            child_id,
+        } => (
+            serde_json::to_value(parent_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "child_spawned",
+            serde_json::json!({"child_id": child_id}),
+        ),
+        quine_core::CoreOutput::ChildExited {
+            parent_id,
+            child_id,
+            status,
+        } => (
+            serde_json::to_value(parent_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "child_exited",
+            serde_json::json!({"child_id": child_id, "status": status}),
+        ),
+        quine_core::CoreOutput::MessageReceived {
+            session_id,
+            from,
+            content,
+        } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "message_received",
+            serde_json::json!({"from": from, "content": content}),
+        ),
     };
 
     let entry = SessionLogEntry {
@@ -613,6 +648,40 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
             notifications::TURN_COMPLETE,
             Some(serde_json::json!({
                 "session_id": session_id,
+            })),
+        ),
+        quine_core::CoreOutput::ChildSpawned {
+            parent_id,
+            child_id,
+        } => JsonRpcNotification::new(
+            notifications::CHILD_SPAWNED,
+            Some(serde_json::json!({
+                "parent_id": parent_id,
+                "child_id": child_id,
+            })),
+        ),
+        quine_core::CoreOutput::ChildExited {
+            parent_id,
+            child_id,
+            status,
+        } => JsonRpcNotification::new(
+            notifications::CHILD_EXITED,
+            Some(serde_json::json!({
+                "parent_id": parent_id,
+                "child_id": child_id,
+                "status": status,
+            })),
+        ),
+        quine_core::CoreOutput::MessageReceived {
+            session_id,
+            from,
+            content,
+        } => JsonRpcNotification::new(
+            notifications::MESSAGE_RECEIVED,
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "from": from,
+                "content": content,
             })),
         ),
     }

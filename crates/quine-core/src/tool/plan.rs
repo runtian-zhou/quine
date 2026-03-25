@@ -282,6 +282,7 @@ mod tests {
             working_directory: PathBuf::from("/tmp"),
             interaction_channel: None,
             plan_store: new_plan_store(),
+            core_input: None,
         }
     }
 

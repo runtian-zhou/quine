@@ -118,6 +118,7 @@ mod tests {
             working_directory: base.path().to_path_buf(),
             interaction_channel: None,
             plan_store: crate::tool::plan::new_plan_store(),
+            core_input: None,
         };
         (session_dir, ctx)
     }
