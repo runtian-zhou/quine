@@ -100,6 +100,16 @@ pub enum CoreOutput {
         request: tool::InteractionRequest,
     },
 
+    /// Progress update for an action plan.
+    PlanProgress {
+        session_id: SessionId,
+        plan_id: String,
+        action_id: String,
+        status: String,
+        remaining: usize,
+        total: usize,
+    },
+
     /// The agent turn is fully complete.
     TurnComplete { session_id: SessionId },
 }

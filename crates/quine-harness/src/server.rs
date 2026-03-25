@@ -183,6 +183,27 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
                 "kind": request.kind,
             }),
         ),
+        quine_core::CoreOutput::PlanProgress {
+            session_id,
+            plan_id,
+            action_id,
+            status,
+            remaining,
+            total,
+        } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "plan_progress",
+            serde_json::json!({
+                "plan_id": plan_id,
+                "action_id": action_id,
+                "status": status,
+                "remaining": remaining,
+                "total": total,
+            }),
+        ),
         quine_core::CoreOutput::TurnComplete { session_id } => (
             serde_json::to_value(session_id)
                 .ok()
@@ -567,6 +588,24 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
                 "session_id": session_id,
                 "prompt": request.prompt,
                 "kind": request.kind,
+            })),
+        ),
+        quine_core::CoreOutput::PlanProgress {
+            session_id,
+            plan_id,
+            action_id,
+            status,
+            remaining,
+            total,
+        } => JsonRpcNotification::new(
+            notifications::PLAN_PROGRESS,
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "plan_id": plan_id,
+                "action_id": action_id,
+                "status": status,
+                "remaining": remaining,
+                "total": total,
             })),
         ),
         quine_core::CoreOutput::TurnComplete { session_id } => JsonRpcNotification::new(

@@ -105,6 +105,7 @@ mod tests {
             filesystem: Arc::new(fs),
             working_directory: base.path().to_path_buf(),
             interaction_channel: None,
+            plan_store: crate::tool::plan::new_plan_store(),
         };
         (session_dir, ctx)
     }

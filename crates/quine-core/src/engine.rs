@@ -10,10 +10,12 @@ use crate::channel::{CoreHandle, CoreInput, CoreOutput, ToolOutcome};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
 use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision};
+use crate::planner::scheduler::{get_ready_actions, render_plan};
 use crate::session::{SessionId, SessionState};
 use crate::tool::{
-    ask_user::AskUserTool, bash::BashTool, read::ReadTool, write::WriteTool, ExecutionContext,
-    InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse, ToolRegistry,
+    ask_user::AskUserTool, bash::BashTool, plan::PlanTool, read::ReadTool, write::WriteTool,
+    ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse,
+    ToolRegistry,
 };
 
 /// Per-session context held by the core event loop.
@@ -33,6 +35,8 @@ struct SessionContext {
     working_directory: PathBuf,
     /// Sender for pending interaction responses (tool_use_id -> sender).
     pending_interaction: Option<oneshot::Sender<InteractionResponse>>,
+    /// Shared plan store for this session.
+    plan_store: crate::tool::plan::PlanStore,
 }
 
 impl SessionContext {
@@ -52,11 +56,14 @@ impl SessionContext {
                 })?,
         );
 
+        let plan_store = crate::tool::plan::new_plan_store();
+
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register(Arc::new(ReadTool));
         tool_registry.register(Arc::new(WriteTool));
         tool_registry.register(Arc::new(BashTool));
         tool_registry.register(Arc::new(AskUserTool));
+        tool_registry.register(Arc::new(PlanTool::new(plan_store.clone())));
 
         let tools = tool_registry.tool_definitions();
 
@@ -74,6 +81,7 @@ impl SessionContext {
             filesystem,
             working_directory,
             pending_interaction: None,
+            plan_store,
         })
     }
 }
@@ -289,6 +297,7 @@ async fn execute_tool_call(
             filesystem: Arc::clone(&session.filesystem),
             working_directory: session.working_directory.clone(),
             interaction_channel: Some(channel),
+            plan_store: session.plan_store.clone(),
         };
 
         let args = call.arguments.clone();
@@ -361,6 +370,7 @@ async fn execute_tool_call(
             filesystem: Arc::clone(&session.filesystem),
             working_directory: session.working_directory.clone(),
             interaction_channel: None,
+            plan_store: session.plan_store.clone(),
         };
 
         match tool.execute(call.arguments.clone(), &ctx).await {
@@ -378,6 +388,81 @@ async fn execute_tool_call(
             Err(tool_err) => ToolOutcome::Error {
                 message: tool_err.to_string(),
             },
+        }
+    }
+}
+
+/// Handle plan progress after an `update_plan` tool call.
+///
+/// Emits `PlanProgress` events and injects a prompt for newly ready actions.
+async fn handle_plan_progress(
+    session: &mut SessionContext,
+    session_id: SessionId,
+    output: &mpsc::Sender<CoreOutput>,
+    plan_id_str: &str,
+    action_id_str: &str,
+) {
+    let store = session.plan_store.lock().await;
+
+    let plan_id: Result<crate::planner::PlanId, _> = plan_id_str.parse();
+    let plan_id = match plan_id {
+        Ok(id) => id,
+        Err(_) => return,
+    };
+
+    let plan = match store.get(&plan_id) {
+        Some(p) => p,
+        None => return,
+    };
+
+    // Get the status of the updated action for the progress event
+    let action_id = crate::planner::ActionId::new(action_id_str);
+    let status_label = plan
+        .get_action(&action_id)
+        .map(|a| a.status.label().to_string())
+        .unwrap_or_default();
+
+    let remaining = plan.remaining_count();
+    let total = plan.actions.len();
+
+    // Emit PlanProgress
+    let _ = output
+        .send(CoreOutput::PlanProgress {
+            session_id,
+            plan_id: plan_id_str.to_string(),
+            action_id: action_id_str.to_string(),
+            status: status_label,
+            remaining,
+            total,
+        })
+        .await;
+
+    if plan.is_complete() {
+        // Emit a summary via a user-role message
+        let summary = render_plan(plan);
+        drop(store);
+        session.history.push(Message::user(format!(
+            "All actions in the plan are complete. Here is the final summary:\n\n{summary}"
+        )));
+    } else {
+        // Check for newly ready actions
+        let ready = get_ready_actions(plan);
+        if !ready.is_empty() {
+            let mut prompt_parts = Vec::new();
+            for action in &ready {
+                prompt_parts.push(format!(
+                    "[{}] {} — {}",
+                    action.action_id, action.title, action.description
+                ));
+            }
+            drop(store);
+            let prompt = format!(
+                "Execute the next action from your plan: {}. \
+                 When done, use the `plan` tool with operation `update_plan` \
+                 to mark it as completed.",
+                prompt_parts.join("; ")
+            );
+            session.history.push(Message::user(prompt));
         }
     }
 }
@@ -450,6 +535,32 @@ async fn handle_llm_turn(
                         &tool_output,
                         is_error,
                     ));
+
+                    // Plan execution integration: after update_plan, emit
+                    // progress and inject prompts for newly ready actions.
+                    if call.tool_name == "plan" {
+                        let is_update = call.arguments.get("operation").and_then(|v| v.as_str())
+                            == Some("update_plan");
+
+                        if is_update {
+                            if let Some(plan_id_str) =
+                                call.arguments.get("plan_id").and_then(|v| v.as_str())
+                            {
+                                if let Some(action_id_str) =
+                                    call.arguments.get("action_id").and_then(|v| v.as_str())
+                                {
+                                    handle_plan_progress(
+                                        session,
+                                        session_id,
+                                        output,
+                                        plan_id_str,
+                                        action_id_str,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Call LLM again with tool results
