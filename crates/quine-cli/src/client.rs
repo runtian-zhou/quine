@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::process::Stdio;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -95,6 +96,58 @@ impl IpcClient {
     /// Receive the next notification from the server.
     pub async fn recv_notification(&mut self) -> Option<JsonRpcNotification> {
         self.notification_rx.recv().await
+    }
+
+    /// Connect to the daemon, launching it automatically if it is not running.
+    ///
+    /// Tries to connect to the socket. If the connection fails, spawns the
+    /// daemon as a detached background process and polls until the socket
+    /// accepts connections.
+    /// Returns `(client, daemon_spawned)` where `daemon_spawned` is true if
+    /// this call launched the daemon process.
+    pub async fn connect_or_launch(socket_path: &Path) -> anyhow::Result<(Self, bool)> {
+        if let Ok(client) = Self::connect(socket_path).await {
+            return Ok((client, false));
+        }
+
+        // Remove stale socket file if present.
+        if socket_path.exists() {
+            let _ = tokio::fs::remove_file(socket_path).await;
+        }
+
+        eprintln!("Starting daemon...");
+
+        let exe = std::env::current_exe()?;
+        let socket_str = socket_path.to_string_lossy();
+
+        let _child = tokio::process::Command::new(&exe)
+            .args(["daemon", "start", "--socket", &socket_str])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .process_group(0)
+            .spawn()
+            .map_err(|e| anyhow::anyhow!("failed to spawn daemon: {e}"))?;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut interval = std::time::Duration::from_millis(50);
+
+        loop {
+            tokio::time::sleep(interval).await;
+
+            if let Ok(client) = Self::connect(socket_path).await {
+                return Ok((client, true));
+            }
+
+            if tokio::time::Instant::now() >= deadline {
+                anyhow::bail!(
+                    "timed out waiting for daemon to start at {}",
+                    socket_path.display()
+                );
+            }
+
+            interval = (interval * 2).min(std::time::Duration::from_millis(500));
+        }
     }
 }
 

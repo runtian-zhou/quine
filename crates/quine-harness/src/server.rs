@@ -4,6 +4,7 @@ use std::sync::Arc;
 use chrono::Utc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::sync::Notify;
 
 use crate::protocol::{
     error_codes, methods, notifications, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest,
@@ -33,22 +34,38 @@ pub async fn run_ipc_server(
     let listener = UnixListener::bind(socket_path)?;
     tracing::info!("IPC server listening on {:?}", socket_path);
 
-    loop {
-        let (stream, _addr) = listener.accept().await?;
-        let svc = Arc::clone(&service);
+    let shutdown_signal = Arc::new(Notify::new());
 
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, svc).await {
-                tracing::error!("connection error: {e}");
+    loop {
+        tokio::select! {
+            result = listener.accept() => {
+                let (stream, _addr) = result?;
+                let svc = Arc::clone(&service);
+                let shutdown = Arc::clone(&shutdown_signal);
+
+                tokio::spawn(async move {
+                    if let Err(e) = handle_connection(stream, svc, shutdown).await {
+                        tracing::error!("connection error: {e}");
+                    }
+                });
             }
-        });
+            _ = shutdown_signal.notified() => {
+                tracing::info!("IPC server shutting down");
+                // Clean up socket file.
+                let _ = std::fs::remove_file(socket_path);
+                break;
+            }
+        }
     }
+
+    Ok(())
 }
 
 /// Handle a single client connection.
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     service: Arc<dyn HarnessService>,
+    shutdown_signal: Arc<Notify>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -77,7 +94,7 @@ async fn handle_connection(
                 match line? {
                     Some(line) if line.trim().is_empty() => continue,
                     Some(line) => {
-                        let response = handle_request(&line, &*service).await;
+                        let response = handle_request(&line, &*service, &shutdown_signal).await;
                         if let Some(resp_str) = response {
                             writer.write_all(resp_str.as_bytes()).await?;
                             writer.write_all(b"\n").await?;
@@ -190,7 +207,11 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
 }
 
 /// Parse and dispatch a JSON-RPC request, returning the serialized response.
-async fn handle_request(line: &str, service: &dyn HarnessService) -> Option<String> {
+async fn handle_request(
+    line: &str,
+    service: &dyn HarnessService,
+    shutdown_signal: &Notify,
+) -> Option<String> {
     let request: JsonRpcRequest = match serde_json::from_str(line) {
         Ok(req) => req,
         Err(e) => {
@@ -309,7 +330,10 @@ async fn handle_request(line: &str, service: &dyn HarnessService) -> Option<Stri
         methods::SHUTDOWN => match service.shutdown().await {
             Ok(()) => {
                 let resp = JsonRpcResponse::success(id, "ok");
-                Some(serde_json::to_string(&resp).unwrap_or_default())
+                let result = Some(serde_json::to_string(&resp).unwrap_or_default());
+                // Signal the IPC server to stop accepting connections and exit.
+                shutdown_signal.notify_one();
+                result
             }
             Err(e) => {
                 let resp =

@@ -6,12 +6,19 @@ use crate::client::IpcClient;
 use crate::render::{Renderer, TerminalRenderer};
 use quine_harness::protocol::{methods, notifications};
 
+/// Shut down the daemon if we spawned it.
+async fn shutdown_if_spawned(client: &mut IpcClient, daemon_spawned: bool) {
+    if daemon_spawned {
+        let _ = client.call(methods::SHUTDOWN, None).await;
+    }
+}
+
 /// Run the interactive chat REPL.
 ///
 /// Connects to the harness daemon, creates a session, then loops:
 /// read user input -> send message -> print streamed response.
 pub async fn run_chat(socket_path: &Path) -> anyhow::Result<()> {
-    let mut client = IpcClient::connect(socket_path).await?;
+    let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let mut renderer = TerminalRenderer::new();
 
     // Create a session.
@@ -34,53 +41,72 @@ pub async fn run_chat(socket_path: &Path) -> anyhow::Result<()> {
         // Print prompt.
         eprint!("> ");
 
-        match lines.next_line().await? {
-            Some(line) => {
-                let trimmed = line.trim();
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if trimmed == "/quit" {
-                    break;
-                }
+        // Wait for either user input or Ctrl-C.
+        tokio::select! {
+            line_result = lines.next_line() => {
+                match line_result? {
+                    Some(line) => {
+                        let trimmed = line.trim();
+                        if trimmed.is_empty() {
+                            continue;
+                        }
+                        if trimmed == "/quit" {
+                            break;
+                        }
 
-                // Send message.
-                let params = serde_json::json!({
-                    "session_id": session_id,
-                    "content": trimmed,
-                });
-                let result = client.call(methods::SEND_MESSAGE, Some(params)).await?;
-                if let Err(e) = result {
-                    renderer.render_error(&e).await?;
-                    continue;
-                }
+                        // Send message.
+                        let params = serde_json::json!({
+                            "session_id": session_id,
+                            "content": trimmed,
+                        });
+                        let result = client.call(methods::SEND_MESSAGE, Some(params)).await?;
+                        if let Err(e) = result {
+                            renderer.render_error(&e).await?;
+                            continue;
+                        }
 
-                // Read notifications until TurnComplete.
-                loop {
-                    match client.recv_notification().await {
-                        Some(notif) => {
-                            let handled = handle_notification(&notif, &mut renderer).await?;
-                            if handled {
-                                break;
+                        // Read notifications until TurnComplete.
+                        loop {
+                            tokio::select! {
+                                notif = client.recv_notification() => {
+                                    match notif {
+                                        Some(notif) => {
+                                            let handled = handle_notification(&notif, &mut renderer).await?;
+                                            if handled {
+                                                break;
+                                            }
+                                        }
+                                        None => {
+                                            renderer.render_error("connection to daemon lost").await?;
+                                            return Ok(());
+                                        }
+                                    }
+                                }
+                                _ = tokio::signal::ctrl_c() => {
+                                    eprintln!("\nInterrupted.");
+                                    shutdown_if_spawned(&mut client, daemon_spawned).await;
+                                    return Ok(());
+                                }
                             }
                         }
-                        None => {
-                            renderer.render_error("connection to daemon lost").await?;
-                            return Ok(());
-                        }
+                    }
+                    None => {
+                        // EOF (Ctrl-D).
+                        eprintln!("\nGoodbye!");
+                        break;
                     }
                 }
             }
-            None => {
-                // EOF (Ctrl-D).
-                eprintln!("\nGoodbye!");
-                break;
+            _ = tokio::signal::ctrl_c() => {
+                eprintln!("\nInterrupted.");
+                shutdown_if_spawned(&mut client, daemon_spawned).await;
+                return Ok(());
             }
         }
     }
 
-    // Shutdown.
-    let _ = client.call(methods::SHUTDOWN, None).await;
+    shutdown_if_spawned(&mut client, daemon_spawned).await;
+    drop(client);
     Ok(())
 }
 
