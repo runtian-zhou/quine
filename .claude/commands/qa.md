@@ -29,32 +29,18 @@ For natural language descriptions, extract:
 - The message to send to the agent
 - The expected output criteria (contains string, JSON fields, file contents match, etc.)
 
-## Step 3: Default Test Suite
+## Step 3: Load Test Suite
 
-If running "all" or no argument, execute these test cases in order:
+Read the test case definitions from `.claude/qa-tests.md` in the project root.
 
-### Test 1: simple_greeting
-- **Send**: `cargo run --bin quine -- run --socket /tmp/quine-qa.sock "Hello, please respond with exactly: PONG"`
-- **Expect**: Output contains "PONG"
+If the user specified **"all"** or no argument, run every test case in that file in order.
+If the user specified a **test name** (e.g., "bash_tool"), run only that test.
 
-### Test 2: bash_tool
-- **Send**: `cargo run --bin quine -- run --socket /tmp/quine-qa.sock "Use the bash tool to run: echo TOOLTEST_42. Include the exact output in your response."`
-- **Expect**: Output contains "TOOLTEST_42"
-
-### Test 3: read_file_tool
-- **Send**: `cargo run --bin quine -- run --socket /tmp/quine-qa.sock "Use the read_file tool to read the file at Cargo.toml in the current directory. Return the first line of the file exactly."`
-- **Read** `Cargo.toml` yourself to know the expected first line.
-- **Expect**: Output contains the actual first line of Cargo.toml
-
-### Test 4: json_output
-- **Send**: `cargo run --bin quine -- run --json --socket /tmp/quine-qa.sock "Say hello"`
-- **Expect**: Output is valid JSON with fields: `session_id`, `response`, `tool_calls`
-
-### Test 5: session_persistence
-- **Send first message**: `cargo run --bin quine -- run --json --socket /tmp/quine-qa.sock "Remember this number: 7742. Reply with OK."`
-- **Extract** `session_id` from the JSON output
-- **Send second message**: `cargo run --bin quine -- run --socket /tmp/quine-qa.sock --session <session_id> "What number did I ask you to remember?"`
-- **Expect**: Output contains "7742"
+For each test case, construct the appropriate `cargo run --bin quine -- run` command:
+- Always include `--socket /tmp/quine-qa.sock`
+- Add `--json` if the test specifies the `--json` flag
+- Add `--session <id>` for multi-turn tests after extracting the session ID from the previous turn
+- For tests with a **Pre-check** step (e.g., read_file_tool), read the expected file yourself first to know the expected value
 
 ## Step 4: Execute Each Test
 
