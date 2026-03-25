@@ -26,6 +26,8 @@ Parse the user's argument to determine what to test. The argument can be:
 - **A natural language test description**, e.g.: "send a message asking to read CLAUDE.md, expect the full file contents returned"
 - **"all"** or empty — run the default test suite (Step 3)
 - **A specific test name** from the defaults, e.g.: "bash_tool"
+- **"scenarios"** — run all TOML scenario files from `qa/scenarios/` using `cargo run --bin quine -- test qa/scenarios/ --socket /tmp/quine-qa.sock`
+- **"scenario:NAME"** — run a specific scenario, e.g.: `cargo run --bin quine -- test qa/scenarios/NAME.toml --socket /tmp/quine-qa.sock`
 
 For natural language descriptions, extract:
 - The message to send to the agent

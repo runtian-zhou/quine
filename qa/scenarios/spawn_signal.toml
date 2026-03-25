@@ -1,0 +1,22 @@
+[meta]
+name = "spawn_and_signal"
+description = "Verify spawn + signal termination works"
+timeout = 180
+
+[[action]]
+type = "spawn"
+task = "Use the bash tool to run 'sleep 60' and then return done."
+save_session = "child_sid"
+
+[[action]]
+type = "sleep"
+seconds = 3.0
+
+[[action]]
+type = "signal"
+session = "$child_sid"
+signal = "term"
+
+[[action]]
+type = "ps"
+flags = ["--all", "--json"]

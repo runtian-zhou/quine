@@ -4,6 +4,7 @@ mod client;
 mod log;
 mod render;
 mod run;
+mod test_runner;
 mod tui;
 
 use std::io::IsTerminal;
@@ -155,6 +156,17 @@ enum Commands {
     Skills {
         #[command(subcommand)]
         command: SkillsCommands,
+    },
+    /// Run a scripted test scenario against the daemon.
+    Test {
+        /// Path to a test scenario TOML file, or a directory of scenarios.
+        scenario: String,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
+        /// Output results as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Print version information.
     Version,
@@ -353,6 +365,13 @@ async fn main() -> anyhow::Result<()> {
                 run::run_skills_show(&socket_path, &name).await?;
             }
         },
+        Commands::Test {
+            scenario,
+            socket,
+            json,
+        } => {
+            test_runner::run_test(&scenario, socket, json).await?;
+        }
         Commands::Version => {
             println!("quine {}", env!("CARGO_PKG_VERSION"));
         }

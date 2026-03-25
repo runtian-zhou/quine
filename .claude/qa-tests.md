@@ -1,6 +1,9 @@
 # QA Test Cases
 
-Default test suite consumed by the `/qa` skill. Each test case specifies:
+Default test suite consumed by the `/qa` skill. For scripted multi-session scenarios,
+use `quine test qa/scenarios/` or `/qa scenarios`.
+
+Each test case specifies:
 - **name**: unique identifier
 - **description**: what the test verifies
 - **turns**: ordered list of messages to send and expectations to check
@@ -154,3 +157,25 @@ Registered tools: `bash`, `read_file`, `write_file`, `ask_user`, `plan`, `subage
 - **Flags**: `--json`
 - **Send**: `"Say hello"`
 - **Expect**: JSON output contains `duration_ms` field with value > 0
+
+---
+
+## ask_user_interaction
+**Description**: Verify ask_user pauses execution and resumes with user response.
+- **Scenario**: `qa/scenarios/ask_user.toml`
+- **Expect**: Scenario passes (agent uses the provided response)
+
+## spawn_and_wait_child
+**Description**: Verify spawn creates a child and wait_child collects the result.
+- **Scenario**: `qa/scenarios/spawn_wait.toml`
+- **Expect**: Scenario passes (child result is collected by parent)
+
+## signal_child
+**Description**: Verify signal terminates a running child session.
+- **Scenario**: `qa/scenarios/spawn_signal.toml`
+- **Expect**: Scenario passes (child is terminated)
+
+## ipc_send_recv
+**Description**: Verify send_message and recv_message between sessions.
+- **Scenario**: `qa/scenarios/ipc_messaging.toml`
+- **Expect**: Scenario passes (message content matches)
