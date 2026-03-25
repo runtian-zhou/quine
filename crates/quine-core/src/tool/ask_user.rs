@@ -152,6 +152,7 @@ mod tests {
             working_directory: base.path().to_path_buf(),
             interaction_channel: Some(channel),
             plan_store: crate::tool::plan::new_plan_store(),
+            core_input: None,
         };
 
         (base, session_dir, ctx, rx)
@@ -259,6 +260,7 @@ mod tests {
             working_directory: base.path().to_path_buf(),
             interaction_channel: None,
             plan_store: crate::tool::plan::new_plan_store(),
+            core_input: None,
         };
 
         let tool = AskUserTool;

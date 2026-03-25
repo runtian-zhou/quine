@@ -126,6 +126,9 @@ pub mod notifications {
     pub const INTERACTION_NEEDED: &str = "interaction_needed";
     pub const PLAN_PROGRESS: &str = "plan_progress";
     pub const TURN_COMPLETE: &str = "turn_complete";
+    pub const CHILD_SPAWNED: &str = "child_spawned";
+    pub const CHILD_EXITED: &str = "child_exited";
+    pub const MESSAGE_RECEIVED: &str = "message_received";
 }
 
 #[cfg(test)]

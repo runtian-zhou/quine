@@ -13,9 +13,11 @@ use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision
 use crate::planner::scheduler::{get_ready_actions, render_plan};
 use crate::session::{SessionId, SessionState};
 use crate::tool::{
-    ask_user::AskUserTool, bash::BashTool, plan::PlanTool, read::ReadTool, subagent::SubagentTool,
-    write::WriteTool, ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest,
-    InteractionResponse, ToolRegistry,
+    ask_user::AskUserTool, bash::BashTool, plan::PlanTool, read::ReadTool,
+    recv_message::RecvMessageTool, send_message::SendMessageTool, signal::SignalTool,
+    spawn::SpawnTool, subagent::SubagentTool, wait_child::WaitChildTool, write::WriteTool,
+    ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse,
+    ToolRegistry,
 };
 
 /// Per-session context held by the core event loop.
@@ -70,6 +72,11 @@ impl SessionContext {
             Arc::clone(provider),
             permission_checker.clone(),
         )));
+        tool_registry.register(Arc::new(SpawnTool));
+        tool_registry.register(Arc::new(WaitChildTool));
+        tool_registry.register(Arc::new(SignalTool));
+        tool_registry.register(Arc::new(SendMessageTool));
+        tool_registry.register(Arc::new(RecvMessageTool));
 
         let tools = tool_registry.tool_definitions();
 
@@ -308,6 +315,7 @@ async fn execute_tool_call(
             working_directory: session.working_directory.clone(),
             interaction_channel: Some(channel),
             plan_store: session.plan_store.clone(),
+            core_input: None,
         };
 
         let args = call.arguments.clone();
@@ -381,6 +389,7 @@ async fn execute_tool_call(
             working_directory: session.working_directory.clone(),
             interaction_channel: None,
             plan_store: session.plan_store.clone(),
+            core_input: None,
         };
 
         match tool.execute(call.arguments.clone(), &ctx).await {
@@ -755,6 +764,15 @@ pub async fn run_core_loop(
             }
 
             CoreInput::Shutdown => break,
+
+            // IPC / process-control variants — handled by the harness layer.
+            CoreInput::SpawnSession { reply, .. } => {
+                let _ = reply.send(Err("not implemented in core loop".into()));
+            }
+            CoreInput::Signal { .. } | CoreInput::SendMessage { .. } => {}
+            CoreInput::WaitSession { reply, .. } => {
+                let _ = reply.send(None);
+            }
         }
     }
 }

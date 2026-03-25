@@ -2,7 +2,12 @@ pub mod ask_user;
 pub mod bash;
 pub mod plan;
 pub mod read;
+pub mod recv_message;
+pub mod send_message;
+pub mod signal;
+pub mod spawn;
 pub mod subagent;
+pub mod wait_child;
 pub mod write;
 
 use std::collections::HashMap;
@@ -152,6 +157,8 @@ pub struct ExecutionContext {
     pub interaction_channel: Option<InteractionChannel>,
     /// Shared plan store for this session.
     pub plan_store: crate::tool::plan::PlanStore,
+    /// Sender for sending messages back to the core event loop (for spawn, signal, etc.).
+    pub core_input: Option<mpsc::Sender<crate::channel::CoreInput>>,
 }
 
 /// Trait for a tool that the agent can invoke.

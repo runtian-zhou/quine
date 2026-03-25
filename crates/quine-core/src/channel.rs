@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::CoreError;
-use crate::session::{SessionId, SessionState};
+use crate::session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 use crate::tool;
 
 /// Operations the harness sends into the core event loop.
@@ -43,6 +43,37 @@ pub enum CoreInput {
 
     /// Cancel any in-flight work for a session.
     Cancel { session_id: SessionId },
+
+    /// Spawn a child session under an existing parent session.
+    SpawnSession {
+        parent_id: SessionId,
+        child_id: SessionId,
+        task: String,
+        system_prompt: Option<String>,
+        inheritance: InheritanceFlags,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+
+    /// Send a signal to a session.
+    Signal {
+        session_id: SessionId,
+        signal: SessionSignal,
+    },
+
+    /// Wait for a child session to exit.
+    WaitSession {
+        parent_id: SessionId,
+        child_id: SessionId,
+        reply: oneshot::Sender<Option<ExitStatus>>,
+        non_blocking: bool,
+    },
+
+    /// Send an inter-session message.
+    SendMessage {
+        from: SessionId,
+        to: SessionId,
+        content: String,
+    },
 
     /// Graceful shutdown of the entire core event loop.
     Shutdown,
@@ -108,6 +139,26 @@ pub enum CoreOutput {
         status: String,
         remaining: usize,
         total: usize,
+    },
+
+    /// A child session was successfully spawned.
+    ChildSpawned {
+        parent_id: SessionId,
+        child_id: SessionId,
+    },
+
+    /// A child session has exited.
+    ChildExited {
+        parent_id: SessionId,
+        child_id: SessionId,
+        status: ExitStatus,
+    },
+
+    /// An inter-session message was received.
+    MessageReceived {
+        session_id: SessionId,
+        from: SessionId,
+        content: String,
     },
 
     /// The agent turn is fully complete.
