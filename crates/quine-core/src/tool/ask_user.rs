@@ -1,11 +1,15 @@
 use async_trait::async_trait;
 
-use super::{ExecutionContext, InteractionKind, InteractionRequest, Tool, ToolError, ToolOutput};
+use super::{
+    ExecutionContext, InteractionKind, InteractionRequest, SelectOption, Tool, ToolError,
+    ToolOutput,
+};
 
 /// Tool for asking the user a question.
 ///
-/// This is an interactive tool that sends a prompt to the user and waits
-/// for their response via the `InteractionChannel`.
+/// Supports free-form text questions, single-select from options, and
+/// multi-select from options. This is an interactive tool that sends a
+/// prompt to the user and waits for their response via the `InteractionChannel`.
 pub(crate) struct AskUserTool;
 
 #[async_trait]
@@ -15,8 +19,8 @@ impl Tool for AskUserTool {
     }
 
     fn description(&self) -> &str {
-        "Ask the user a question and wait for their response. Use this when you need \
-         clarification or confirmation from the user before proceeding."
+        "Ask the user a question and wait for their response. Supports free-form text input, \
+         single-select from a list of options, and multi-select from options."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -26,6 +30,19 @@ impl Tool for AskUserTool {
                 "question": {
                     "type": "string",
                     "description": "The question to ask the user."
+                },
+                "options": {
+                    "type": "array",
+                    "items": { "type": "string" },
+                    "description": "Optional list of options for the user to choose from."
+                },
+                "multi_select": {
+                    "type": "boolean",
+                    "description": "If true, user can select multiple options. Defaults to false."
+                },
+                "allow_freeform": {
+                    "type": "boolean",
+                    "description": "If true, user can type a custom answer in addition to options. Defaults to true."
                 }
             },
             "required": ["question"]
@@ -48,6 +65,39 @@ impl Tool for AskUserTool {
                 message: "missing required parameter: question".into(),
             })?;
 
+        let options: Vec<SelectOption> = arguments
+            .get("options")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| {
+                        v.as_str().map(|s| SelectOption {
+                            label: s.to_string(),
+                            description: None,
+                        })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let multi_select = arguments
+            .get("multi_select")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        let allow_freeform = arguments
+            .get("allow_freeform")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        let kind = if options.is_empty() {
+            InteractionKind::Question
+        } else if multi_select {
+            InteractionKind::MultiSelect
+        } else {
+            InteractionKind::SingleSelect
+        };
+
         let channel = context
             .interaction_channel
             .as_ref()
@@ -58,7 +108,9 @@ impl Tool for AskUserTool {
         let response = channel
             .ask(InteractionRequest {
                 prompt: question.to_string(),
-                kind: InteractionKind::Question,
+                kind,
+                options,
+                allow_freeform,
             })
             .await?;
 
@@ -76,8 +128,12 @@ mod tests {
     use tempfile::TempDir;
     use tokio::sync::{mpsc, oneshot};
 
-    #[tokio::test]
-    async fn ask_user_sends_and_receives() {
+    async fn make_test_context() -> (
+        TempDir,
+        TempDir,
+        ExecutionContext,
+        mpsc::Receiver<(InteractionRequest, oneshot::Sender<InteractionResponse>)>,
+    ) {
         let base = TempDir::new().unwrap();
         let session_dir = TempDir::new().unwrap();
         let fs =
@@ -85,7 +141,7 @@ mod tests {
                 .await
                 .unwrap();
 
-        let (tx, mut rx) =
+        let (tx, rx) =
             mpsc::channel::<(InteractionRequest, oneshot::Sender<InteractionResponse>)>(1);
 
         let channel = super::super::InteractionChannel { request_tx: tx };
@@ -98,26 +154,94 @@ mod tests {
             plan_store: crate::tool::plan::new_plan_store(),
         };
 
+        (base, session_dir, ctx, rx)
+    }
+
+    #[tokio::test]
+    async fn ask_user_sends_and_receives() {
+        let (_base, _session, ctx, mut rx) = make_test_context().await;
         let tool = AskUserTool;
 
-        // Spawn the tool execution
         let handle = tokio::spawn(async move {
             tool.execute(serde_json::json!({"question": "What is your name?"}), &ctx)
                 .await
         });
 
-        // Receive the interaction request and respond
         let (req, reply_tx) = rx.recv().await.unwrap();
         assert_eq!(req.prompt, "What is your name?");
+        assert_eq!(req.kind, InteractionKind::Question);
+        assert!(req.options.is_empty());
         reply_tx
             .send(InteractionResponse {
                 response: "Alice".into(),
+                selected_indices: Vec::new(),
             })
             .unwrap();
 
         let result = handle.await.unwrap().unwrap();
         assert_eq!(result.content, "Alice");
         assert!(!result.is_error);
+    }
+
+    #[tokio::test]
+    async fn ask_user_single_select() {
+        let (_base, _session, ctx, mut rx) = make_test_context().await;
+        let tool = AskUserTool;
+
+        let handle = tokio::spawn(async move {
+            tool.execute(
+                serde_json::json!({
+                    "question": "Pick a color",
+                    "options": ["red", "green", "blue"]
+                }),
+                &ctx,
+            )
+            .await
+        });
+
+        let (req, reply_tx) = rx.recv().await.unwrap();
+        assert_eq!(req.kind, InteractionKind::SingleSelect);
+        assert_eq!(req.options.len(), 3);
+        assert_eq!(req.options[0].label, "red");
+        reply_tx
+            .send(InteractionResponse {
+                response: "green".into(),
+                selected_indices: vec![1],
+            })
+            .unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.content, "green");
+    }
+
+    #[tokio::test]
+    async fn ask_user_multi_select() {
+        let (_base, _session, ctx, mut rx) = make_test_context().await;
+        let tool = AskUserTool;
+
+        let handle = tokio::spawn(async move {
+            tool.execute(
+                serde_json::json!({
+                    "question": "Pick features",
+                    "options": ["A", "B", "C"],
+                    "multi_select": true
+                }),
+                &ctx,
+            )
+            .await
+        });
+
+        let (req, reply_tx) = rx.recv().await.unwrap();
+        assert_eq!(req.kind, InteractionKind::MultiSelect);
+        reply_tx
+            .send(InteractionResponse {
+                response: "A, C".into(),
+                selected_indices: vec![0, 2],
+            })
+            .unwrap();
+
+        let result = handle.await.unwrap().unwrap();
+        assert_eq!(result.content, "A, C");
     }
 
     #[tokio::test]

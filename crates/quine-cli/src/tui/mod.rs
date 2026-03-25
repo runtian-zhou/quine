@@ -144,6 +144,30 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 return Some(AppAction::Quit);
             }
 
+            // In option-select mode, route keys differently.
+            if app.is_selecting_options() {
+                return match code {
+                    KeyCode::Enter => app.submit_input(),
+                    KeyCode::Up => {
+                        app.option_cursor_up();
+                        None
+                    }
+                    KeyCode::Down => {
+                        app.option_cursor_down();
+                        None
+                    }
+                    KeyCode::Char(' ') => {
+                        app.option_toggle();
+                        None
+                    }
+                    KeyCode::Esc => {
+                        app.option_select = None;
+                        None
+                    }
+                    _ => None,
+                };
+            }
+
             match code {
                 KeyCode::Enter => app.submit_input(),
                 KeyCode::Backspace => {

@@ -8,11 +8,19 @@ use super::app::{AgentPhase, App, ConversationEntry};
 
 /// Render the entire TUI frame.
 pub fn draw(frame: &mut Frame, app: &App) {
+    // Dynamic input box height: expand for option selection.
+    let input_height = if let Some(ref select) = app.option_select {
+        // 2 for borders + 1 for label + option count, capped at half terminal
+        let content_rows = (select.options.len() as u16 + 1).min(frame.area().height / 2);
+        content_rows + 2
+    } else {
+        3
+    };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(3),    // conversation view
-            Constraint::Length(3), // input box
+            Constraint::Min(3),               // conversation view
+            Constraint::Length(input_height), // input box
         ])
         .split(frame.area());
 
@@ -131,6 +139,46 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
 
 /// Render the input box at the bottom.
 fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    // If in option-select mode, render option list instead of text input.
+    if let Some(ref select) = app.option_select {
+        let mut lines: Vec<Line> = Vec::new();
+        let label = app.input_label();
+        lines.push(Line::from(Span::styled(
+            label,
+            Style::default().fg(Color::Cyan),
+        )));
+        for (i, opt) in select.options.iter().enumerate() {
+            let is_cursor = i == select.cursor;
+            let prefix = if select.multi_select {
+                let check = if select.selected.contains(&i) {
+                    "x"
+                } else {
+                    " "
+                };
+                if is_cursor {
+                    format!("  › [{check}] ")
+                } else {
+                    format!("    [{check}] ")
+                }
+            } else if is_cursor {
+                "  › ".to_string()
+            } else {
+                "    ".to_string()
+            };
+            let style = if is_cursor {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(Span::styled(format!("{prefix}{opt}"), style)));
+        }
+        let widget = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
+        frame.render_widget(widget, area);
+        return;
+    }
+
     let label = app.input_label();
     let display_text = format!("{}{}", label, app.input);
 
