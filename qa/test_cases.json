@@ -33,5 +33,25 @@
         "expect_json_fields": ["session_id", "response", "tool_calls"]
       }
     ]
+  },
+  {
+    "name": "bash_tool",
+    "description": "Verify the bash tool executes commands and returns output",
+    "turns": [
+      {
+        "message": "Use the bash tool to run: echo TOOLTEST_42. Include the output in your response.",
+        "expect_contains": "TOOLTEST_42"
+      }
+    ]
+  },
+  {
+    "name": "bash_write_then_read",
+    "description": "Verify bash tool can write a file and read tool can read it back",
+    "turns": [
+      {
+        "message": "Use the bash tool to run: echo QA_WRITE_CHECK_789 > /tmp/quine-qa-test-file.txt. Then use the read tool to read /tmp/quine-qa-test-file.txt. Include the file contents in your response.",
+        "expect_contains": "QA_WRITE_CHECK_789"
+      }
+    ]
   }
 ]

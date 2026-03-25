@@ -389,6 +389,63 @@ async fn handle_request(
             }
         }
 
+        methods::SUBMIT_INTERACTION_RESPONSE => {
+            let params = request.params.as_ref();
+            let session_id_str = params
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str());
+            let response_text = params
+                .and_then(|p| p.get("response"))
+                .and_then(|v| v.as_str());
+
+            match (session_id_str, response_text) {
+                (Some(sid), Some(response)) => {
+                    let session_id: quine_core::SessionId =
+                        match serde_json::from_value(serde_json::Value::String(sid.to_string())) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                let resp = JsonRpcErrorResponse::new(
+                                    id,
+                                    error_codes::INVALID_PARAMS,
+                                    format!("invalid session_id: {e}"),
+                                );
+                                return Some(serde_json::to_string(&resp).unwrap_or_default());
+                            }
+                        };
+
+                    let interaction_response = quine_core::InteractionResponse {
+                        response: response.to_string(),
+                    };
+
+                    match service
+                        .submit_interaction_response(session_id, interaction_response)
+                        .await
+                    {
+                        Ok(()) => {
+                            let resp = JsonRpcResponse::success(id, "ok");
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                _ => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing session_id or response",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
         methods::LIST_SESSIONS => match session_log::list_sessions().await {
             Ok(summaries) => {
                 let resp = JsonRpcResponse::success(

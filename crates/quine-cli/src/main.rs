@@ -36,6 +36,20 @@ enum Commands {
         #[arg(long)]
         socket: Option<String>,
     },
+    /// Respond to an interaction request (e.g., ask_user prompt) on an existing session.
+    Respond {
+        /// The session ID to respond to.
+        #[arg(long)]
+        session: String,
+        /// The response text.
+        response: String,
+        /// Output structured JSON instead of plain text.
+        #[arg(long)]
+        json: bool,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
+    },
     /// View session logs.
     Log {
         /// The session ID to dump logs for. If omitted, use --list.
@@ -93,6 +107,17 @@ async fn main() -> anyhow::Result<()> {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(default_socket_path);
             run::run_oneshot(&socket_path, &message, session.as_deref(), json).await?;
+        }
+        Commands::Respond {
+            session,
+            response,
+            json,
+            socket,
+        } => {
+            let socket_path = socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(default_socket_path);
+            run::run_respond(&socket_path, &session, &response, json).await?;
         }
         Commands::Log {
             session_id,
