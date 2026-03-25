@@ -238,6 +238,7 @@ async fn check_permission(
                 kind: InteractionKind::Confirmation,
                 options: Vec::new(),
                 allow_freeform: false,
+                source_label: None,
             };
 
             let _ = output
