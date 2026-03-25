@@ -1,4 +1,6 @@
 use async_trait::async_trait;
+use std::sync::Arc;
+
 use quine_core::{
     create_channels, ChannelConfig, CoreInput, CoreOutput, HarnessHandle, InteractionResponse,
     PermissionChecker, SessionId,
@@ -28,8 +30,8 @@ impl LocalHarness {
     /// Create a new `LocalHarness` that spawns the core event loop with the
     /// given LLM provider and optional permission checker.
     pub fn new(
-        provider: Box<dyn LlmProvider>,
-        permission_checker: Option<Box<dyn PermissionChecker>>,
+        provider: Arc<dyn LlmProvider>,
+        permission_checker: Option<Arc<dyn PermissionChecker>>,
     ) -> Self {
         let (harness_handle, core_handle) = create_channels(ChannelConfig::default());
 
@@ -207,7 +209,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_harness_create_session_and_message() {
-        let harness = LocalHarness::new(Box::new(MockProvider), None);
+        let harness = LocalHarness::new(Arc::new(MockProvider), None);
         let mut rx = harness.subscribe();
 
         let session_id = harness

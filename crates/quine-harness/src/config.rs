@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use quine_core::permission::composite::CompositeChecker;
 use quine_core::permission::llm_checker::LlmChecker;
@@ -60,19 +61,19 @@ fn config_from_env() -> ProviderConfig {
     })
 }
 
-/// Create a boxed LLM provider from environment variables.
+/// Create an LLM provider from environment variables.
 ///
 /// Convenience function that combines `config_from_env` with
 /// `quine_llm::config::create_provider`.
-pub fn create_provider_from_env() -> Box<dyn quine_llm::LlmProvider> {
-    quine_llm::config::create_provider(config_from_env())
+pub fn create_provider_from_env() -> Arc<dyn quine_llm::LlmProvider> {
+    Arc::from(quine_llm::config::create_provider(config_from_env()))
 }
 
 /// Create the default permission checker from environment configuration.
 ///
 /// Always includes `RuleBasedChecker`. Optionally includes `LlmChecker` when
 /// `PERMISSION_LLM_ENABLED=true` is set in the environment.
-pub fn create_default_permission_checker() -> Box<dyn PermissionChecker> {
+pub fn create_default_permission_checker() -> Arc<dyn PermissionChecker> {
     let mut checkers: Vec<Box<dyn PermissionChecker>> = vec![Box::new(RuleBasedChecker::new())];
 
     if std::env::var("PERMISSION_LLM_ENABLED")
@@ -83,7 +84,7 @@ pub fn create_default_permission_checker() -> Box<dyn PermissionChecker> {
         checkers.push(Box::new(LlmChecker::new(provider)));
     }
 
-    Box::new(CompositeChecker::new(checkers))
+    Arc::new(CompositeChecker::new(checkers))
 }
 
 #[cfg(test)]

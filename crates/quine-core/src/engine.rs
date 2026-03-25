@@ -13,9 +13,9 @@ use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision
 use crate::planner::scheduler::{get_ready_actions, render_plan};
 use crate::session::{SessionId, SessionState};
 use crate::tool::{
-    ask_user::AskUserTool, bash::BashTool, plan::PlanTool, read::ReadTool, write::WriteTool,
-    ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse,
-    ToolRegistry,
+    ask_user::AskUserTool, bash::BashTool, plan::PlanTool, read::ReadTool, subagent::SubagentTool,
+    write::WriteTool, ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest,
+    InteractionResponse, ToolRegistry,
 };
 
 /// Per-session context held by the core event loop.
@@ -43,6 +43,8 @@ impl SessionContext {
     async fn new(
         system_prompt: Option<String>,
         working_directory: PathBuf,
+        provider: &Arc<dyn LlmProvider>,
+        permission_checker: &Option<Arc<dyn PermissionChecker>>,
     ) -> Result<Self, CoreError> {
         let session_dir = std::env::temp_dir()
             .join("quine-sessions")
@@ -64,6 +66,10 @@ impl SessionContext {
         tool_registry.register(Arc::new(BashTool));
         tool_registry.register(Arc::new(AskUserTool));
         tool_registry.register(Arc::new(PlanTool::new(plan_store.clone())));
+        tool_registry.register(Arc::new(SubagentTool::new(
+            Arc::clone(provider),
+            permission_checker.clone(),
+        )));
 
         let tools = tool_registry.tool_definitions();
 
@@ -583,8 +589,8 @@ async fn handle_llm_turn(
 /// stream back responses. Tools are executed directly within the core.
 pub async fn run_core_loop(
     mut handle: CoreHandle,
-    provider: Box<dyn LlmProvider>,
-    permission_checker: Option<Box<dyn PermissionChecker>>,
+    provider: Arc<dyn LlmProvider>,
+    permission_checker: Option<Arc<dyn PermissionChecker>>,
 ) {
     let mut sessions: HashMap<SessionId, SessionContext> = HashMap::new();
 
@@ -604,7 +610,9 @@ pub async fn run_core_loop(
                 let work_dir = working_directory
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-                match SessionContext::new(system_prompt, work_dir).await {
+                match SessionContext::new(system_prompt, work_dir, &provider, &permission_checker)
+                    .await
+                {
                     Ok(ctx) => {
                         sessions.insert(session_id, ctx);
                         let _ = handle
@@ -793,7 +801,7 @@ mod tests {
     async fn create_session_and_shutdown() {
         let (harness, core) = create_channels(ChannelConfig::default());
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -819,7 +827,7 @@ mod tests {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
         harness
@@ -849,7 +857,7 @@ mod tests {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -901,7 +909,7 @@ mod tests {
     async fn duplicate_session_id_returns_error() {
         let (harness, core) = create_channels(ChannelConfig::default());
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
 
@@ -941,7 +949,7 @@ mod tests {
         let mut output = harness.output;
 
         let provider = MockProvider::new("Hello from the LLM!");
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(provider), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1046,7 +1054,7 @@ mod tests {
         let provider = ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
         };
-        let loop_handle = tokio::spawn(run_core_loop(core, Box::new(provider), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
