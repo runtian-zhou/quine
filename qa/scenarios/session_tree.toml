@@ -1,0 +1,19 @@
+[meta]
+name = "session_tree"
+description = "Verify spawn + ps --tree shows parent-child hierarchy"
+timeout = 180
+
+[[action]]
+type = "run"
+message = "Use the spawn tool to create a child agent with the task: 'Use the bash tool to run echo TREE_CHILD and return the output.'"
+flags = ["--json"]
+save_session = "parent_sid"
+
+[[action]]
+type = "sleep"
+seconds = 3.0
+
+[[action]]
+type = "ps"
+flags = ["--tree", "--all"]
+expect_contains = "$parent_sid"

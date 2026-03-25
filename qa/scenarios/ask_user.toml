@@ -1,0 +1,17 @@
+[meta]
+name = "ask_user_interaction"
+description = "Verify ask_user pauses and resumes on interaction response"
+timeout = 120
+
+[[action]]
+type = "run"
+message = "Use the ask_user tool to ask: 'What is your name?'"
+expect_interaction = true
+save_session = "sid"
+flags = ["--json"]
+
+[[action]]
+type = "respond"
+session = "$sid"
+response = "Alice"
+expect_contains = "Alice"

@@ -1,5 +1,5 @@
 ---
-status: pending
+status: in-progress
 ---
 
 # Multi-Session Test Harness for Interactive & Multi-Agent Tools

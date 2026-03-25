@@ -1,0 +1,25 @@
+[meta]
+name = "ipc_send_recv"
+description = "Verify send_message and recv_message between sessions"
+timeout = 180
+
+[[action]]
+type = "spawn"
+task = "Wait for instructions."
+save_session = "session_a"
+
+[[action]]
+type = "spawn"
+task = "Wait for instructions."
+save_session = "session_b"
+
+[[action]]
+type = "send"
+target = "$session_b"
+message = "HELLO_IPC_TEST_42"
+
+[[action]]
+type = "recv"
+source = "$session_b"
+non_blocking = true
+expect_contains = "HELLO_IPC_TEST_42"

@@ -1,0 +1,20 @@
+[meta]
+name = "spawn_and_wait_child"
+description = "Verify spawn creates a child and wait_child collects the result"
+timeout = 180
+
+[[action]]
+type = "run"
+message = "Use the spawn tool to create a child agent with the task: 'Use the bash tool to run echo CHILD_DONE and return the output.'"
+flags = ["--json"]
+save_session = "parent_sid"
+
+[[action]]
+type = "sleep"
+seconds = 5.0
+
+[[action]]
+type = "run"
+session = "$parent_sid"
+message = "Use wait_child to collect the result of the child session you just spawned."
+expect_contains = "CHILD_DONE"
