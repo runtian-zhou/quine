@@ -36,7 +36,7 @@ pub async fn run_oneshot(
     session_id: Option<&str>,
     json_output: bool,
 ) -> anyhow::Result<()> {
-    let mut client = IpcClient::connect(socket_path).await?;
+    let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
     // Create or reuse session.
     let session_id = match session_id {
