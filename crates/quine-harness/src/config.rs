@@ -61,8 +61,7 @@ fn config_from_env() -> ProviderConfig {
             api_key,
             base_url: std::env::var("LLM_BASE_URL")
                 .unwrap_or_else(|_| "https://api.anthropic.com".into()),
-            model: std::env::var("LLM_MODEL")
-                .unwrap_or_else(|_| "claude-sonnet-4-20250514".into()),
+            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".into()),
             max_tokens: 4096,
         })
     } else {
