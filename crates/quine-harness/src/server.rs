@@ -554,6 +554,196 @@ async fn handle_request(
             }
         }
 
+        methods::SPAWN_SESSION => {
+            let params = request.params.as_ref();
+            let task = params
+                .and_then(|p| p.get("task"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let parent_id_str = params
+                .and_then(|p| p.get("parent_id"))
+                .and_then(|v| v.as_str());
+            let system_prompt = params
+                .and_then(|p| p.get("system_prompt"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            match task {
+                Some(task) => {
+                    let parent_id: Option<quine_core::SessionId> = parent_id_str.and_then(|s| {
+                        serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+                    });
+
+                    match service
+                        .spawn_child_session(parent_id, task, system_prompt)
+                        .await
+                    {
+                        Ok(session_id) => {
+                            let resp = JsonRpcResponse::success(id, session_id);
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                None => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing task parameter",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::SIGNAL_SESSION => {
+            let params = request.params.as_ref();
+            let session_id_str = params
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str());
+            let signal_str = params
+                .and_then(|p| p.get("signal"))
+                .and_then(|v| v.as_str());
+
+            match (session_id_str, signal_str) {
+                (Some(sid), Some(sig)) => {
+                    let session_id: quine_core::SessionId =
+                        match serde_json::from_value(serde_json::Value::String(sid.to_string())) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                let resp = JsonRpcErrorResponse::new(
+                                    id,
+                                    error_codes::INVALID_PARAMS,
+                                    format!("invalid session_id: {e}"),
+                                );
+                                return Some(serde_json::to_string(&resp).unwrap_or_default());
+                            }
+                        };
+
+                    let signal: quine_core::SessionSignal = match sig {
+                        "term" | "Term" => quine_core::SessionSignal::Term,
+                        "kill" | "Kill" => quine_core::SessionSignal::Kill,
+                        "stop" | "Stop" => quine_core::SessionSignal::Stop,
+                        "continue" | "Continue" => quine_core::SessionSignal::Continue,
+                        _ => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INVALID_PARAMS,
+                                format!("unknown signal: {sig}"),
+                            );
+                            return Some(serde_json::to_string(&resp).unwrap_or_default());
+                        }
+                    };
+
+                    match service.signal_session(session_id, signal).await {
+                        Ok(()) => {
+                            let resp = JsonRpcResponse::success(id, "ok");
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                _ => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing session_id or signal",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::SEND_IPC_MESSAGE => {
+            let params = request.params.as_ref();
+            let target = params
+                .and_then(|p| p.get("target"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let content = params
+                .and_then(|p| p.get("content"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            match (target, content) {
+                (Some(target), Some(content)) => {
+                    match service.send_ipc_message(target, content).await {
+                        Ok(()) => {
+                            let resp = JsonRpcResponse::success(id, "ok");
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                _ => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing target or content",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::RECV_IPC_MESSAGE => {
+            let params = request.params.as_ref();
+            let source = params
+                .and_then(|p| p.get("source"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let non_blocking = params
+                .and_then(|p| p.get("non_blocking"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            match source {
+                Some(source) => match service.recv_ipc_message(source, non_blocking).await {
+                    Ok(msg) => {
+                        let resp = JsonRpcResponse::success(id, msg);
+                        Some(serde_json::to_string(&resp).unwrap_or_default())
+                    }
+                    Err(e) => {
+                        let resp = JsonRpcErrorResponse::new(
+                            id,
+                            error_codes::INTERNAL_ERROR,
+                            e.to_string(),
+                        );
+                        Some(serde_json::to_string(&resp).unwrap_or_default())
+                    }
+                },
+                None => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing source",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
         _ => {
             let resp = JsonRpcErrorResponse::new(
                 id,

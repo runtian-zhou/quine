@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use quine_core::{CoreOutput, InteractionResponse, SessionId};
+use quine_core::{CoreOutput, InteractionResponse, SessionId, SessionSignal};
 use tokio::sync::broadcast;
 
 use crate::config::SessionConfig;
@@ -48,6 +48,58 @@ pub trait HarnessService: Send + Sync {
     ///
     /// Returns a broadcast receiver that yields `CoreOutput` events.
     fn subscribe(&self) -> broadcast::Receiver<CoreOutput>;
+
+    /// List all active sessions with metadata.
+    async fn list_sessions(&self) -> Result<Vec<serde_json::Value>, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    /// Spawn a child session under an optional parent.
+    async fn spawn_child_session(
+        &self,
+        _parent_id: Option<SessionId>,
+        _task: String,
+        _system_prompt: Option<String>,
+    ) -> Result<SessionId, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    /// Send a signal to a session.
+    async fn signal_session(
+        &self,
+        _session_id: SessionId,
+        _signal: SessionSignal,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    /// Send an IPC message to a target session.
+    async fn send_ipc_message(
+        &self,
+        _target: String,
+        _content: String,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    /// Receive an IPC message from a source session.
+    async fn recv_ipc_message(
+        &self,
+        _source: String,
+        _non_blocking: bool,
+    ) -> Result<Option<String>, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
 }
 
 #[cfg(test)]

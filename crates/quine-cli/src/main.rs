@@ -1,3 +1,4 @@
+mod agent_ctl;
 mod chat;
 mod client;
 mod log;
@@ -68,6 +69,81 @@ enum Commands {
     Daemon {
         #[command(subcommand)]
         command: DaemonCommands,
+    },
+    /// List active agent sessions.
+    Ps {
+        /// Show all sessions including completed ones.
+        #[arg(long, short = 'a')]
+        all: bool,
+        /// Display sessions as a tree hierarchy.
+        #[arg(long, short = 't')]
+        tree: bool,
+        /// Output as JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Spawn a new child agent session.
+    Spawn {
+        /// The task description for the new session.
+        task: String,
+        /// Parent session ID to spawn under.
+        #[arg(long)]
+        parent: Option<String>,
+        /// System prompt for the new session.
+        #[arg(long)]
+        system_prompt: Option<String>,
+        /// Inherit conversation history from parent.
+        #[arg(long)]
+        inherit_history: bool,
+        /// Output as JSON instead of plain text.
+        #[arg(long)]
+        json: bool,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Send a signal to an agent session.
+    Signal {
+        /// The session ID to signal.
+        session_id: String,
+        /// The signal to send (term, kill, stop, continue).
+        signal: String,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Send an IPC message to a target session.
+    Send {
+        /// The target session ID.
+        target: String,
+        /// The message content. If omitted, reads from stdin.
+        message: Option<String>,
+        /// Optional key for keyed messaging.
+        #[arg(long)]
+        key: Option<String>,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
+    },
+    /// Receive an IPC message from a source session.
+    Recv {
+        /// The source session ID to receive from.
+        source: String,
+        /// Return immediately if no message is available.
+        #[arg(long)]
+        non_blocking: bool,
+        /// Optional key for keyed messaging.
+        #[arg(long)]
+        key: Option<String>,
+        /// Output as JSON instead of plain text.
+        #[arg(long)]
+        json: bool,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
     },
     /// Print version information.
     Version,
@@ -166,6 +242,70 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         },
+        Commands::Ps {
+            all,
+            tree,
+            json,
+            socket,
+        } => {
+            let socket_path = socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(default_socket_path);
+            agent_ctl::handle_ps(&socket_path, all, tree, json).await?;
+        }
+        Commands::Spawn {
+            task,
+            parent,
+            system_prompt,
+            inherit_history: _,
+            json,
+            socket,
+        } => {
+            let socket_path = socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(default_socket_path);
+            agent_ctl::handle_spawn(
+                &socket_path,
+                &task,
+                parent.as_deref(),
+                system_prompt.as_deref(),
+                json,
+            )
+            .await?;
+        }
+        Commands::Signal {
+            session_id,
+            signal,
+            socket,
+        } => {
+            let socket_path = socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(default_socket_path);
+            agent_ctl::handle_signal(&socket_path, &session_id, &signal).await?;
+        }
+        Commands::Send {
+            target,
+            message,
+            key: _,
+            socket,
+        } => {
+            let socket_path = socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(default_socket_path);
+            agent_ctl::handle_send(&socket_path, &target, message.as_deref()).await?;
+        }
+        Commands::Recv {
+            source,
+            non_blocking,
+            key: _,
+            json: _,
+            socket,
+        } => {
+            let socket_path = socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(default_socket_path);
+            agent_ctl::handle_recv(&socket_path, &source, non_blocking).await?;
+        }
         Commands::Version => {
             println!("quine {}", env!("CARGO_PKG_VERSION"));
         }

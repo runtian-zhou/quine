@@ -2,8 +2,8 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use quine_core::{
-    create_channels, ChannelConfig, CoreInput, CoreOutput, HarnessHandle, InteractionResponse,
-    PermissionChecker, SessionId,
+    create_channels, ChannelConfig, CoreInput, CoreOutput, HarnessHandle, InheritanceFlags,
+    InteractionResponse, PermissionChecker, SessionId, SessionSignal,
 };
 use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -176,6 +176,69 @@ impl HarnessService for LocalHarness {
 
     fn subscribe(&self) -> broadcast::Receiver<CoreOutput> {
         self.event_tx.subscribe()
+    }
+
+    async fn spawn_child_session(
+        &self,
+        parent_id: Option<SessionId>,
+        task: String,
+        system_prompt: Option<String>,
+    ) -> Result<SessionId, HarnessError> {
+        let parent = parent_id.unwrap_or_default();
+        let child_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        self.harness_input
+            .send(CoreInput::SpawnSession {
+                parent_id: parent,
+                child_id,
+                task,
+                system_prompt,
+                inheritance: InheritanceFlags::default(),
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+
+        reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|reason| HarnessError::SessionCreationFailed { reason })?;
+
+        Ok(child_id)
+    }
+
+    async fn signal_session(
+        &self,
+        session_id: SessionId,
+        signal: SessionSignal,
+    ) -> Result<(), HarnessError> {
+        self.harness_input
+            .send(CoreInput::Signal { session_id, signal })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)
+    }
+
+    async fn send_ipc_message(
+        &self,
+        _target: String,
+        _content: String,
+    ) -> Result<(), HarnessError> {
+        // IPC messaging requires session context to identify sender.
+        // For now, return an error since CLI-level IPC needs session addressing.
+        Err(HarnessError::Internal {
+            message: "send_ipc_message requires session context".into(),
+        })
+    }
+
+    async fn recv_ipc_message(
+        &self,
+        _source: String,
+        _non_blocking: bool,
+    ) -> Result<Option<String>, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "recv_ipc_message requires session context".into(),
+        })
     }
 }
 
