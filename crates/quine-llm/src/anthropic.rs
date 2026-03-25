@@ -247,15 +247,29 @@ fn convert_messages(messages: &[Message]) -> (Option<String>, Vec<AnthropicMessa
                     is_error,
                 } = &msg.content
                 {
+                    let block = AnthropicContentBlock::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        content: output.clone(),
+                        is_error: *is_error,
+                    };
+                    // Merge consecutive tool results into a single "user" message
+                    // to satisfy the Anthropic API's alternating-roles requirement.
+                    if let Some(last) = api_messages.last_mut() {
+                        if last.role == "user" {
+                            if let AnthropicContent::Blocks(ref mut blocks) = last.content {
+                                if blocks
+                                    .iter()
+                                    .all(|b| matches!(b, AnthropicContentBlock::ToolResult { .. }))
+                                {
+                                    blocks.push(block);
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     api_messages.push(AnthropicMessage {
                         role: "user".into(),
-                        content: AnthropicContent::Blocks(vec![
-                            AnthropicContentBlock::ToolResult {
-                                tool_use_id: tool_use_id.clone(),
-                                content: output.clone(),
-                                is_error: *is_error,
-                            },
-                        ]),
+                        content: AnthropicContent::Blocks(vec![block]),
                     });
                 }
             }
@@ -462,6 +476,48 @@ mod tests {
         assert_eq!(api_msgs.len(), 2);
         // Tool results become "user" role in Anthropic API
         assert_eq!(api_msgs[1].role, "user");
+    }
+
+    #[test]
+    fn convert_messages_batches_consecutive_tool_results() {
+        let messages = vec![
+            Message::user("do two things"),
+            Message::assistant_tool_use(
+                None,
+                vec![
+                    crate::types::ToolUseRequest {
+                        tool_use_id: "tc_1".into(),
+                        tool_name: "bash".into(),
+                        arguments: serde_json::json!({"command": "echo hello"}),
+                    },
+                    crate::types::ToolUseRequest {
+                        tool_use_id: "tc_2".into(),
+                        tool_name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "Cargo.toml"}),
+                    },
+                ],
+            ),
+            Message::tool_result("tc_1", "hello", false),
+            Message::tool_result("tc_2", "[workspace]", false),
+        ];
+        let (_, api_msgs) = convert_messages(&messages);
+        // user, assistant, user (batched tool results) — 3 messages, not 4
+        assert_eq!(
+            api_msgs.len(),
+            3,
+            "consecutive tool results should be batched into one user message"
+        );
+        assert_eq!(api_msgs[2].role, "user");
+        match &api_msgs[2].content {
+            AnthropicContent::Blocks(blocks) => {
+                assert_eq!(
+                    blocks.len(),
+                    2,
+                    "batched message should contain 2 tool_result blocks"
+                );
+            }
+            _ => panic!("expected Blocks content for batched tool results"),
+        }
     }
 
     #[test]
