@@ -1,5 +1,5 @@
 ---
-status: pending
+status: in-progress
 ---
 
 # Skill Loader: Load, Display, and Invoke Skills from CLI

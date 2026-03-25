@@ -21,11 +21,16 @@ use quine_harness::protocol::methods;
 ///
 /// Sets up the terminal in raw/alternate-screen mode, runs the main event loop,
 /// and restores the terminal on exit (including panics).
-pub async fn run_tui_chat(socket_path: &Path) -> anyhow::Result<()> {
+pub async fn run_tui_chat(socket_path: &Path, skills: &[String]) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
     // Create session.
-    let result = client.call(methods::CREATE_SESSION, None).await?;
+    let params = if skills.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({ "skills": skills }))
+    };
+    let result = client.call(methods::CREATE_SESSION, params).await?;
     let session_id = match result {
         Ok(value) => value
             .as_str()

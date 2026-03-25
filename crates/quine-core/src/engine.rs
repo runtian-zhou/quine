@@ -12,12 +12,13 @@ use crate::filesystem::OverlayFilesystem;
 use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision};
 use crate::planner::scheduler::{get_ready_actions, render_plan};
 use crate::session::{SessionId, SessionState};
+use crate::skill::Skill;
 use crate::tool::{
     ask_user::AskUserTool, bash::BashTool, find::FindTool, plan::PlanTool, read::ReadTool,
     recv_message::RecvMessageTool, send_message::SendMessageTool, signal::SignalTool,
-    spawn::SpawnTool, subagent::SubagentTool, wait_child::WaitChildTool, write::WriteTool,
-    ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse,
-    ToolRegistry,
+    skill_template::SkillTemplateTool, spawn::SpawnTool, subagent::SubagentTool,
+    wait_child::WaitChildTool, write::WriteTool, ExecutionContext, InteractionChannel,
+    InteractionKind, InteractionRequest, InteractionResponse, ToolRegistry,
 };
 
 /// Per-session context held by the core event loop.
@@ -44,6 +45,7 @@ struct SessionContext {
 impl SessionContext {
     async fn new(
         system_prompt: Option<String>,
+        skills: Vec<Skill>,
         working_directory: PathBuf,
         provider: &Arc<dyn LlmProvider>,
         permission_checker: &Option<Arc<dyn PermissionChecker>>,
@@ -79,16 +81,41 @@ impl SessionContext {
         tool_registry.register(Arc::new(SendMessageTool));
         tool_registry.register(Arc::new(RecvMessageTool));
 
+        // Register skill template tools.
+        for skill in &skills {
+            for tool_def in &skill.tool_definitions {
+                tool_registry.register(Arc::new(SkillTemplateTool::new(tool_def.clone())));
+            }
+        }
+
         let tools = tool_registry.tool_definitions();
 
+        // Build combined system prompt from base + skill prompts.
+        let combined_prompt = {
+            let mut prompt_parts = Vec::new();
+            if let Some(base) = &system_prompt {
+                prompt_parts.push(base.clone());
+            }
+            for skill in &skills {
+                if let Some(sp) = &skill.system_prompt {
+                    prompt_parts.push(format!("\n## Skill: {}\n{}", skill.meta.name, sp));
+                }
+            }
+            if prompt_parts.is_empty() {
+                None
+            } else {
+                Some(prompt_parts.join("\n"))
+            }
+        };
+
         let mut history = Vec::new();
-        if let Some(prompt) = &system_prompt {
+        if let Some(prompt) = &combined_prompt {
             history.push(Message::system(prompt.clone()));
         }
 
         Ok(Self {
             state: SessionState::Idle,
-            system_prompt,
+            system_prompt: combined_prompt,
             history,
             tools,
             tool_registry,
@@ -700,6 +727,7 @@ pub async fn run_core_loop(
                 session_id,
                 system_prompt,
                 working_directory,
+                skills,
                 reply,
             } => {
                 if sessions.contains_key(&session_id) {
@@ -710,8 +738,14 @@ pub async fn run_core_loop(
                 let work_dir = working_directory
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
-                match SessionContext::new(system_prompt, work_dir, &provider, &permission_checker)
-                    .await
+                match SessionContext::new(
+                    system_prompt,
+                    skills,
+                    work_dir,
+                    &provider,
+                    &permission_checker,
+                )
+                .await
                 {
                     Ok(ctx) => {
                         sessions.insert(session_id, ctx);
@@ -923,6 +957,7 @@ mod tests {
                 session_id,
                 system_prompt: None,
                 working_directory: None,
+                skills: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -979,6 +1014,7 @@ mod tests {
                 session_id,
                 system_prompt: None,
                 working_directory: None,
+                skills: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -1032,6 +1068,7 @@ mod tests {
                 session_id,
                 system_prompt: None,
                 working_directory: None,
+                skills: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -1045,6 +1082,7 @@ mod tests {
                 session_id,
                 system_prompt: None,
                 working_directory: None,
+                skills: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -1071,6 +1109,7 @@ mod tests {
                 session_id,
                 system_prompt: None,
                 working_directory: None,
+                skills: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -1176,6 +1215,7 @@ mod tests {
                 session_id,
                 system_prompt: None,
                 working_directory: None,
+                skills: Vec::new(),
                 reply: reply_tx,
             })
             .await

@@ -48,6 +48,7 @@ pub async fn run_oneshot(
     message: &str,
     session_id: Option<&str>,
     json_output: bool,
+    skills: &[String],
 ) -> anyhow::Result<()> {
     let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
@@ -55,7 +56,12 @@ pub async fn run_oneshot(
     let session_id = match session_id {
         Some(sid) => sid.to_string(),
         None => {
-            let result = client.call(methods::CREATE_SESSION, None).await?;
+            let params = if skills.is_empty() {
+                None
+            } else {
+                Some(serde_json::json!({ "skills": skills }))
+            };
+            let result = client.call(methods::CREATE_SESSION, params).await?;
             match result {
                 Ok(value) => {
                     let sid = value
@@ -353,6 +359,123 @@ pub async fn run_respond(
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("{full_response}");
+    }
+
+    Ok(())
+}
+
+/// List all available skills.
+pub async fn run_skills_list(socket_path: &Path, json_output: bool) -> anyhow::Result<()> {
+    let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
+
+    let result = client.call(methods::LIST_SKILLS, None).await?;
+    match result {
+        Ok(value) => {
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&value)?);
+            } else {
+                let skills = value.as_array().cloned().unwrap_or_default();
+                if skills.is_empty() {
+                    println!("No skills found.");
+                } else {
+                    println!("{:<20}| {:<10}| Description", "Name", "Version");
+                    println!("{:-<20}|{:-<10}|{:-<40}", "", "", "");
+                    for skill in &skills {
+                        let name = skill.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let version = skill.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+                        let desc = skill
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        println!("{:<20}| {:<9}| {}", name, version, desc);
+                    }
+                }
+            }
+        }
+        Err(e) => anyhow::bail!("failed to list skills: {e}"),
+    }
+
+    Ok(())
+}
+
+/// Show details of a specific skill.
+pub async fn run_skills_show(socket_path: &Path, name: &str) -> anyhow::Result<()> {
+    let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
+
+    let params = serde_json::json!({ "name": name });
+    let result = client.call(methods::GET_SKILL, Some(params)).await?;
+    match result {
+        Ok(value) => {
+            let skill_name = value.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+            let version = value.get("version").and_then(|v| v.as_str()).unwrap_or("?");
+            let description = value
+                .get("description")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let source_path = value
+                .get("source_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+
+            println!("Skill: {skill_name} (v{version})");
+            println!("Description: {description}");
+            println!("Source: {source_path}");
+
+            if let Some(prompt) = value.get("system_prompt").and_then(|v| v.as_str()) {
+                println!("\nSystem Prompt:");
+                for line in prompt.lines() {
+                    println!("  {line}");
+                }
+            }
+
+            if let Some(tools) = value.get("tools").and_then(|v| v.as_array()) {
+                if !tools.is_empty() {
+                    println!("\nTools ({}):", tools.len());
+                    for tool in tools {
+                        let tool_name = tool.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                        let tool_desc = tool
+                            .get("description")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let handler = tool.get("handler").and_then(|v| v.as_str()).unwrap_or("?");
+
+                        println!("  - {tool_name}: {tool_desc}");
+
+                        // Show parameter names.
+                        if let Some(params) = tool.get("parameters") {
+                            if let Some(props) = params.get("properties") {
+                                if let Some(obj) = props.as_object() {
+                                    let required: Vec<&str> = params
+                                        .get("required")
+                                        .and_then(|v| v.as_array())
+                                        .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+                                        .unwrap_or_default();
+
+                                    let param_strs: Vec<String> = obj
+                                        .iter()
+                                        .map(|(k, v)| {
+                                            let typ = v
+                                                .get("type")
+                                                .and_then(|t| t.as_str())
+                                                .unwrap_or("any");
+                                            let req = if required.contains(&k.as_str()) {
+                                                "required"
+                                            } else {
+                                                "optional"
+                                            };
+                                            format!("{k} ({typ}, {req})")
+                                        })
+                                        .collect();
+                                    println!("    Parameters: {}", param_strs.join(", "));
+                                }
+                            }
+                        }
+                        println!("    Handler: {handler}");
+                    }
+                }
+            }
+        }
+        Err(e) => anyhow::bail!("skill not found: {e}"),
     }
 
     Ok(())
