@@ -75,10 +75,16 @@ fn config_from_env() -> ProviderConfig {
     };
     match &config {
         ProviderConfig::Anthropic(c) => {
-            eprintln!("[daemon] LLM provider: Anthropic, model={}, base_url={}", c.model, c.base_url);
+            eprintln!(
+                "[daemon] LLM provider: Anthropic, model={}, base_url={}",
+                c.model, c.base_url
+            );
         }
         ProviderConfig::OpenAiCompat(c) => {
-            eprintln!("[daemon] LLM provider: OpenAI-compat, model={}, base_url={}", c.model, c.base_url);
+            eprintln!(
+                "[daemon] LLM provider: OpenAI-compat, model={}, base_url={}",
+                c.model, c.base_url
+            );
         }
     }
     config
