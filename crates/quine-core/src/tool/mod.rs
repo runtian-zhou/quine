@@ -112,6 +112,9 @@ pub struct InteractionRequest {
     /// Whether to allow free-form input in addition to options.
     #[serde(default)]
     pub allow_freeform: bool,
+    /// Label identifying the source of this interaction (e.g. "subagent: <task>").
+    #[serde(default)]
+    pub source_label: Option<String>,
 }
 
 /// The user's response to an interaction request.
@@ -127,6 +130,7 @@ pub struct InteractionResponse {
 /// A channel for tools to request user interaction.
 ///
 /// The tool sends an `InteractionRequest` and awaits an `InteractionResponse`.
+#[derive(Clone)]
 pub struct InteractionChannel {
     /// Send interaction requests out to the harness/CLI.
     pub(crate) request_tx: mpsc::Sender<(InteractionRequest, oneshot::Sender<InteractionResponse>)>,
@@ -327,6 +331,7 @@ mod tests {
             kind: InteractionKind::Confirmation,
             options: Vec::new(),
             allow_freeform: false,
+            source_label: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let de: InteractionRequest = serde_json::from_str(&json).unwrap();
@@ -349,6 +354,7 @@ mod tests {
                 },
             ],
             allow_freeform: true,
+            source_label: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let de: InteractionRequest = serde_json::from_str(&json).unwrap();

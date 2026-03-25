@@ -1,5 +1,5 @@
 ---
-status: pending
+status: in-progress
 ---
 
 # Subagent Interaction Bubbling

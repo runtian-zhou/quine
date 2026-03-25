@@ -111,6 +111,7 @@ impl Tool for AskUserTool {
                 kind,
                 options,
                 allow_freeform,
+                source_label: None,
             })
             .await?;
 

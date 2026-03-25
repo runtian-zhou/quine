@@ -87,6 +87,8 @@ pub struct PendingInteraction {
     /// Whether free-form "Other" input is allowed.
     #[allow(dead_code)]
     pub allow_freeform: bool,
+    /// Label identifying the source of this interaction (e.g. "subagent: <task>").
+    pub source_label: Option<String>,
 }
 
 /// State for option-based selection in the TUI.
@@ -345,6 +347,7 @@ impl App {
     /// rendered in the conversation view instead.
     pub fn input_label(&self) -> String {
         if let Some(interaction) = self.interaction_queue.front() {
+            let source = interaction.source_label.as_deref().unwrap_or("agent");
             let pending = self.interaction_queue.len();
             let badge = if pending > 1 {
                 format!(" [{pending} pending]")
@@ -353,16 +356,16 @@ impl App {
             };
             match interaction.kind {
                 InteractionKind::Permission => {
-                    format!("[permission]{badge} (y/n) > ")
+                    format!("[{source}] [permission]{badge} (y/n) > ")
                 }
                 InteractionKind::AskUser => {
-                    format!("[ask_user]{badge} > ")
+                    format!("[{source}] [ask_user]{badge} > ")
                 }
                 InteractionKind::SingleSelect => {
-                    format!("[select]{badge} [↑↓] Enter > ")
+                    format!("[{source}] [select]{badge} [↑↓] Enter > ")
                 }
                 InteractionKind::MultiSelect => {
-                    format!("[multi-select]{badge} [↑↓] Space/Enter > ")
+                    format!("[{source}] [multi-select]{badge} [↑↓] Space/Enter > ")
                 }
             }
         } else {
@@ -701,6 +704,12 @@ impl App {
                     .and_then(|p| p.get("kind"))
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
+                let source_label = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("source_label"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
                 let options: Vec<String> = notif
                     .params
                     .as_ref()
@@ -728,17 +737,23 @@ impl App {
                     "MultiSelect" => InteractionKind::MultiSelect,
                     _ => InteractionKind::AskUser,
                 };
-                // Show the prompt in the conversation view.
+                // Show the prompt in the conversation view, prefixed with source label.
+                let source_prefix = source_label
+                    .as_deref()
+                    .map(|s| format!("[{s}] "))
+                    .unwrap_or_default();
                 let label = match kind {
-                    InteractionKind::Permission => format!("⚠ Permission: {prompt}"),
-                    InteractionKind::AskUser => format!("❓ {prompt}"),
+                    InteractionKind::Permission => {
+                        format!("{source_prefix}⚠ Permission: {prompt}")
+                    }
+                    InteractionKind::AskUser => format!("{source_prefix}❓ {prompt}"),
                     InteractionKind::SingleSelect | InteractionKind::MultiSelect => {
                         let opt_list: Vec<String> = options
                             .iter()
                             .enumerate()
                             .map(|(i, o)| format!("  {}. {o}", i + 1))
                             .collect();
-                        format!("❓ {prompt}\n{}", opt_list.join("\n"))
+                        format!("{source_prefix}❓ {prompt}\n{}", opt_list.join("\n"))
                     }
                 };
                 self.messages.push(ConversationEntry::Error(label));
@@ -753,6 +768,7 @@ impl App {
                     kind: kind.clone(),
                     options: options.clone(),
                     allow_freeform,
+                    source_label,
                 });
 
                 // If this is the first interaction and it has options, enter select mode.
@@ -831,6 +847,7 @@ mod tests {
             kind: InteractionKind::AskUser,
             options: Vec::new(),
             allow_freeform: false,
+            source_label: None,
         });
         app.input.set_from_string("Alice");
 
@@ -925,8 +942,9 @@ mod tests {
             kind: InteractionKind::AskUser,
             options: Vec::new(),
             allow_freeform: false,
+            source_label: None,
         });
-        assert_eq!(app.input_label(), "[ask_user] > ");
+        assert_eq!(app.input_label(), "[agent] [ask_user] > ");
     }
 
     #[test]
@@ -937,12 +955,14 @@ mod tests {
             kind: InteractionKind::AskUser,
             options: Vec::new(),
             allow_freeform: false,
+            source_label: None,
         });
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Q2?".into(),
             kind: InteractionKind::AskUser,
             options: Vec::new(),
             allow_freeform: false,
+            source_label: None,
         });
         assert!(app.input_label().contains("[2 pending]"));
     }
@@ -1034,6 +1054,7 @@ mod tests {
             kind: InteractionKind::Permission,
             options: Vec::new(),
             allow_freeform: false,
+            source_label: None,
         });
         let label = app.input_label();
         assert!(label.contains("[permission]"));
@@ -1048,6 +1069,7 @@ mod tests {
             kind: InteractionKind::Permission,
             options: Vec::new(),
             allow_freeform: false,
+            source_label: None,
         });
         app.input.set_from_string("y");
         let action = app.submit_input();
@@ -1062,6 +1084,7 @@ mod tests {
             kind: InteractionKind::Permission,
             options: Vec::new(),
             allow_freeform: false,
+            source_label: None,
         });
         app.input.set_from_string("n");
         let action = app.submit_input();
@@ -1301,5 +1324,43 @@ mod tests {
         buf.delete_char_before();
         assert_eq!(buf.content(), "ñ");
         assert_eq!(buf.col(), 0);
+    }
+
+    #[test]
+    fn pending_interaction_shows_source_label() {
+        let mut app = App::new("s".into());
+        app.interaction_queue.push_back(PendingInteraction {
+            prompt: "What color?".into(),
+            kind: InteractionKind::AskUser,
+            options: Vec::new(),
+            allow_freeform: false,
+            source_label: Some("subagent: summarize the codebase".into()),
+        });
+        let label = app.input_label();
+        assert!(
+            label.contains("[subagent: summarize the codebase]"),
+            "input_label should contain the source_label, got: {label}"
+        );
+        assert!(
+            label.contains("[ask_user]"),
+            "input_label should still contain kind label, got: {label}"
+        );
+    }
+
+    #[test]
+    fn pending_interaction_no_source_label_shows_agent() {
+        let mut app = App::new("s".into());
+        app.interaction_queue.push_back(PendingInteraction {
+            prompt: "Continue?".into(),
+            kind: InteractionKind::AskUser,
+            options: Vec::new(),
+            allow_freeform: false,
+            source_label: None,
+        });
+        let label = app.input_label();
+        assert!(
+            label.contains("[agent]"),
+            "input_label should show 'agent' when source_label is None, got: {label}"
+        );
     }
 }

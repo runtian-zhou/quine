@@ -842,14 +842,17 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
         quine_core::CoreOutput::InteractionNeeded {
             session_id,
             request,
-        } => JsonRpcNotification::new(
-            notifications::INTERACTION_NEEDED,
-            Some(serde_json::json!({
+        } => {
+            let mut params = serde_json::json!({
                 "session_id": session_id,
                 "prompt": request.prompt,
                 "kind": request.kind,
-            })),
-        ),
+            });
+            if let Some(label) = &request.source_label {
+                params["source_label"] = serde_json::Value::String(label.clone());
+            }
+            JsonRpcNotification::new(notifications::INTERACTION_NEEDED, Some(params))
+        }
         quine_core::CoreOutput::PlanProgress {
             session_id,
             plan_id,

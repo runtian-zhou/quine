@@ -132,15 +132,30 @@ pub async fn run_oneshot(
                         .and_then(|v| v.as_str())
                         .unwrap_or("(interaction requested)");
 
+                    let source_label = notif
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("source_label"))
+                        .and_then(|v| v.as_str());
+
                     if json_output {
-                        let output = serde_json::json!({
+                        let mut output = serde_json::json!({
                             "session_id": session_id,
                             "interaction_needed": true,
                             "prompt": prompt,
                             "response": full_response,
                             "tool_calls": tool_calls,
                         });
+                        if let Some(label) = source_label {
+                            output["source_label"] = serde_json::Value::String(label.to_string());
+                        }
                         println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else if let Some(label) = source_label {
+                        eprintln!("interaction needed [{label}]: {prompt}");
+                        // Print any partial response accumulated so far.
+                        if !full_response.is_empty() {
+                            println!("{full_response}");
+                        }
                     } else {
                         eprintln!("interaction needed: {prompt}");
                         // Print any partial response accumulated so far.
@@ -269,15 +284,29 @@ pub async fn run_respond(
                         .and_then(|v| v.as_str())
                         .unwrap_or("(interaction requested)");
 
+                    let source_label = notif
+                        .params
+                        .as_ref()
+                        .and_then(|p| p.get("source_label"))
+                        .and_then(|v| v.as_str());
+
                     if json_output {
-                        let output = serde_json::json!({
+                        let mut output = serde_json::json!({
                             "session_id": session_id,
                             "interaction_needed": true,
                             "prompt": prompt,
                             "response": full_response,
                             "tool_calls": tool_calls,
                         });
+                        if let Some(label) = source_label {
+                            output["source_label"] = serde_json::Value::String(label.to_string());
+                        }
                         println!("{}", serde_json::to_string_pretty(&output)?);
+                    } else if let Some(label) = source_label {
+                        eprintln!("interaction needed [{label}]: {prompt}");
+                        if !full_response.is_empty() {
+                            println!("{full_response}");
+                        }
                     } else {
                         eprintln!("interaction needed: {prompt}");
                         if !full_response.is_empty() {
