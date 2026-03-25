@@ -115,31 +115,94 @@ impl RuleBasedChecker {
 
         // Low risk (allow) patterns — checked before medium risk
         let low_risk = vec![
+            // File inspection
             (r"^\s*ls(\s|$)", "ls (list files)"),
-            (r"^\s*cat\s", "cat (view file)"),
-            (r"^\s*echo\s", "echo (print text)"),
+            (r"^\s*cat(\s|$)", "cat (view file)"),
+            (r"^\s*echo(\s|$)", "echo (print text)"),
             (r"^\s*pwd\s*$", "pwd (print working directory)"),
-            (r"^\s*grep(\s|$)", "grep (search text)"),
-            (r"^\s*find(\s|$)", "find (search files)"),
-            (
-                r"^\s*cargo\s+(build|test|check|clippy|fmt|doc)\b",
-                "cargo build/test commands",
-            ),
-            (
-                r"^\s*git\s+(status|log|diff|branch|show|remote)\b",
-                "git read-only commands",
-            ),
             (r"^\s*head(\s|$)", "head (view file beginning)"),
             (r"^\s*tail(\s|$)", "tail (view file end)"),
+            (r"^\s*less(\s|$)", "less (view file)"),
+            (r"^\s*more(\s|$)", "more (view file)"),
             (r"^\s*wc(\s|$)", "wc (word count)"),
+            (r"^\s*file(\s|$)", "file (identify file type)"),
+            (r"^\s*stat(\s|$)", "stat (file info)"),
+            (r"^\s*du(\s|$)", "du (disk usage)"),
+            (r"^\s*df(\s|$)", "df (filesystem info)"),
+            (r"^\s*tree(\s|$)", "tree (directory tree)"),
+            (r"^\s*readlink(\s|$)", "readlink (resolve symlink)"),
+            // Search
+            (r"^\s*grep(\s|$)", "grep (search text)"),
+            (r"^\s*rg(\s|$)", "rg (ripgrep search)"),
+            (r"^\s*ag(\s|$)", "ag (silver searcher)"),
+            (r"^\s*find(\s|$)", "find (search files)"),
+            // Text processing
+            (r"^\s*awk(\s|$)", "awk (text processing)"),
+            (r"^\s*sed\s+(?!.*-i)", "sed (stream editor, no in-place)"),
             (r"^\s*sort(\s|$)", "sort (sort text)"),
             (r"^\s*uniq(\s|$)", "uniq (unique lines)"),
+            (r"^\s*cut(\s|$)", "cut (extract columns)"),
+            (r"^\s*tr(\s|$)", "tr (translate chars)"),
             (r"^\s*diff(\s|$)", "diff (compare files)"),
+            (r"^\s*comm(\s|$)", "comm (compare sorted files)"),
+            (r"^\s*jq(\s|$)", "jq (JSON processor)"),
+            (r"^\s*yq(\s|$)", "yq (YAML processor)"),
+            // Directory
+            (r"^\s*cd(\s|$)", "cd (change directory)"),
+            (r"^\s*basename(\s|$)", "basename (strip path)"),
+            (r"^\s*dirname(\s|$)", "dirname (strip filename)"),
+            (r"^\s*realpath(\s|$)", "realpath (resolve path)"),
+            (r"^\s*mkdir(\s|$)", "mkdir (create directory)"),
+            // System info
             (r"^\s*which(\s|$)", "which (locate command)"),
+            (r"^\s*whereis(\s|$)", "whereis (locate binary)"),
+            (r"^\s*type(\s|$)", "type (command type)"),
             (r"^\s*env\s*$", "env (show environment)"),
+            (r"^\s*printenv(\s|$)", "printenv (show env vars)"),
             (r"^\s*whoami\s*$", "whoami (current user)"),
+            (r"^\s*id(\s|$)", "id (user identity)"),
+            (r"^\s*hostname(\s|$)", "hostname (system name)"),
             (r"^\s*date(\s|$)", "date (show date)"),
             (r"^\s*uname(\s|$)", "uname (system info)"),
+            (r"^\s*uptime(\s|$)", "uptime (system uptime)"),
+            (r"^\s*ps(\s|$)", "ps (process list)"),
+            (r"^\s*top\s+-bn1", "top -bn1 (one-shot process info)"),
+            // Build tools
+            (
+                r"^\s*cargo\s+(build|test|check|clippy|fmt|doc|bench|run)\b",
+                "cargo build/test commands",
+            ),
+            (r"^\s*make(\s|$)", "make (build tool)"),
+            (r"^\s*cmake(\s|$)", "cmake (build generator)"),
+            (r"^\s*npm\s+run(\s|$)", "npm run (script runner)"),
+            (r"^\s*yarn(\s|$)", "yarn (package manager)"),
+            (r"^\s*go\s+(build|test|run|vet|fmt)\b", "go build/test"),
+            (r"^\s*rustc(\s|$)", "rustc (Rust compiler)"),
+            (r"^\s*gcc(\s|$)", "gcc (C compiler)"),
+            (r"^\s*g\+\+(\s|$)", "g++ (C++ compiler)"),
+            (r"^\s*javac(\s|$)", "javac (Java compiler)"),
+            (r"^\s*python\s+-m\s+pytest", "python pytest"),
+            (r"^\s*mvn(\s|$)", "mvn (Maven build)"),
+            (r"^\s*gradle(\s|$)", "gradle (build tool)"),
+            // Version managers
+            (r"^\s*rustup(\s|$)", "rustup (Rust toolchain manager)"),
+            (r"^\s*nvm(\s|$)", "nvm (Node version manager)"),
+            (r"^\s*pyenv(\s|$)", "pyenv (Python version manager)"),
+            (r"^\s*rbenv(\s|$)", "rbenv (Ruby version manager)"),
+            // Git read-only
+            (
+                r"^\s*git\s+(status|log|diff|branch|show|remote|stash\s+list|tag|describe|shortlog)\b",
+                "git read-only commands",
+            ),
+            // Misc safe
+            (r"^\s*true\s*$", "true (no-op)"),
+            (r"^\s*false\s*$", "false (no-op)"),
+            (r"^\s*test(\s|$)", "test (condition check)"),
+            (r"^\s*\[(\s|$)", "[ (condition check)"),
+            (r"^\s*printf(\s|$)", "printf (formatted print)"),
+            (r"^\s*touch(\s|$)", "touch (create/update timestamp)"),
+            (r"^\s*tee(\s|$)", "tee (write to file and stdout)"),
+            (r"^\s*xargs(\s|$)", "xargs (build arguments)"),
         ];
 
         for (pattern, desc) in low_risk {
@@ -166,8 +229,8 @@ impl RuleBasedChecker {
                 "pip install (Python package installation)",
             ),
             (
-                r"\bnpm\s+install\s+-g\b",
-                "npm install -g (global Node.js package installation)",
+                r"\bnpm\s+install\b",
+                "npm install (Node.js package installation)",
             ),
             (
                 r"\bapt\s+install\b|\bapt-get\s+install\b",
@@ -177,6 +240,18 @@ impl RuleBasedChecker {
                 r"\bbrew\s+install\b",
                 "brew install (Homebrew package installation)",
             ),
+            (r"\bsed\s+-i\b", "sed -i (in-place file editing)"),
+            (r"\btar(\s|$)", "tar (archive operations)"),
+            (r"\bzip(\s|$)", "zip (archive creation)"),
+            (r"\bunzip(\s|$)", "unzip (archive extraction)"),
+            (r"\bdocker(\s|$)", "docker (container operations)"),
+            (r"\bpodman(\s|$)", "podman (container operations)"),
+            (r"\bssh(\s|$)", "ssh (remote connection)"),
+            (r"\bscp(\s|$)", "scp (remote file copy)"),
+            (r"\brsync(\s|$)", "rsync (remote sync)"),
+            (r"\bcrontab(\s|$)", "crontab (scheduling)"),
+            (r"\bsystemctl(\s|$)", "systemctl (service management)"),
+            (r"\bservice(\s|$)", "service (service management)"),
         ];
 
         for (pattern, desc) in medium_risk {
@@ -240,10 +315,23 @@ impl PermissionChecker for RuleBasedChecker {
             }
         }
 
-        // Default: require confirmation for unknown commands
+        // Default: smarter heuristic for unknown commands.
+        // Check for pipes, redirections, or subshells that compose commands.
+        let has_pipe = command.contains('|');
+        let has_redirect = command.contains('>') || command.contains(">>>");
+        let has_subshell = command.contains("$(") || command.contains('`');
+
+        if has_pipe || has_redirect || has_subshell {
+            return Ok(PermissionDecision::RequiresConfirmation {
+                risk_score: 0.4,
+                reason: "unrecognized command with pipes/redirections — reviewing for safety"
+                    .into(),
+            });
+        }
+
         Ok(PermissionDecision::RequiresConfirmation {
-            risk_score: 0.5,
-            reason: "unknown command pattern — requires confirmation".into(),
+            risk_score: 0.3,
+            reason: "unrecognized command — reviewing for safety".into(),
         })
     }
 }
@@ -453,7 +541,10 @@ mod tests {
             .unwrap();
         match decision {
             PermissionDecision::RequiresConfirmation { risk_score, .. } => {
-                assert!((risk_score - 0.5).abs() < f64::EPSILON);
+                assert!(
+                    (risk_score - 0.3).abs() < f64::EPSILON,
+                    "expected 0.3, got {risk_score}"
+                );
             }
             _ => panic!("expected RequiresConfirmation for unknown command"),
         }
@@ -591,5 +682,217 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    // --- New tests for expanded rule coverage ---
+
+    #[tokio::test]
+    async fn allows_cargo_build_release() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("cargo build --release"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_cargo_test_with_flags() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("cargo test -- --test-threads=1"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_cargo_clippy_with_flags() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check(
+                "bash",
+                &bash_args("cargo clippy --all-targets -- -D warnings"),
+                &ctx,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_python_pytest() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("python -m pytest tests/"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_git_log_oneline() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("git log --oneline -10"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_cat_source_file() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("cat src/main.rs"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_grep_recursive() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("grep -r \"TODO\" src/"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_wc_lines() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("wc -l src/*.rs"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_jq() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("jq '.name' package.json"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_tree() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("tree -L 2 src/"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_rustup_show() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("rustup show"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn allows_which() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("which cargo"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::Allow));
+    }
+
+    #[tokio::test]
+    async fn confirms_sed_in_place() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("sed -i 's/foo/bar/g' file.txt"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::RequiresConfirmation { .. }));
+    }
+
+    #[tokio::test]
+    async fn confirms_docker_run() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("docker run ubuntu"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::RequiresConfirmation { .. }));
+    }
+
+    #[tokio::test]
+    async fn confirms_ssh() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("ssh user@host"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::RequiresConfirmation { .. }));
+    }
+
+    #[tokio::test]
+    async fn confirms_npm_install() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("npm install express"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::RequiresConfirmation { .. }));
+    }
+
+    #[tokio::test]
+    async fn confirms_pip_install() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("pip install requests"), &ctx)
+            .await
+            .unwrap();
+        assert!(matches!(d, PermissionDecision::RequiresConfirmation { .. }));
+    }
+
+    #[tokio::test]
+    async fn pipe_bumps_risk_for_unknown() {
+        let checker = RuleBasedChecker::new();
+        let ctx = test_context();
+        let d = checker
+            .check("bash", &bash_args("some-cmd | other-cmd"), &ctx)
+            .await
+            .unwrap();
+        match d {
+            PermissionDecision::RequiresConfirmation { risk_score, .. } => {
+                assert!(
+                    (risk_score - 0.4).abs() < f64::EPSILON,
+                    "expected 0.4 for piped unknown, got {risk_score}"
+                );
+            }
+            _ => panic!("expected RequiresConfirmation"),
+        }
     }
 }
