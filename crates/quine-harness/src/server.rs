@@ -935,6 +935,8 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
                 "session_id": session_id,
                 "prompt": request.prompt,
                 "kind": request.kind,
+                "options": request.options,
+                "allow_freeform": request.allow_freeform,
             });
             if let Some(label) = &request.source_label {
                 params["source_label"] = serde_json::Value::String(label.clone());
@@ -1026,5 +1028,55 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
                 "content": content,
             })),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interaction_needed_notification_includes_options() {
+        let session_id = quine_core::SessionId::new();
+        let event = quine_core::CoreOutput::InteractionNeeded {
+            session_id,
+            request: quine_core::tool::InteractionRequest {
+                prompt: "Pick a color".into(),
+                kind: quine_core::tool::InteractionKind::SingleSelect,
+                options: vec![
+                    quine_core::tool::SelectOption {
+                        label: "red".into(),
+                        description: None,
+                    },
+                    quine_core::tool::SelectOption {
+                        label: "green".into(),
+                        description: None,
+                    },
+                    quine_core::tool::SelectOption {
+                        label: "blue".into(),
+                        description: None,
+                    },
+                ],
+                allow_freeform: true,
+                source_label: None,
+            },
+        };
+
+        let notif = core_output_to_notification(&event);
+        let params = notif.params.expect("params should be present");
+
+        // Verify options are included.
+        let options = params.get("options").expect("options field missing");
+        let arr = options.as_array().expect("options should be an array");
+        assert_eq!(arr.len(), 3);
+        assert_eq!(arr[0]["label"], "red");
+        assert_eq!(arr[1]["label"], "green");
+        assert_eq!(arr[2]["label"], "blue");
+
+        // Verify allow_freeform is included.
+        let allow_freeform = params
+            .get("allow_freeform")
+            .expect("allow_freeform field missing");
+        assert_eq!(allow_freeform, true);
     }
 }
