@@ -199,6 +199,7 @@ impl RuleBasedChecker {
             (r"^\s*false\s*$", "false (no-op)"),
             (r"^\s*test(\s|$)", "test (condition check)"),
             (r"^\s*\[(\s|$)", "[ (condition check)"),
+            (r"^\s*exit(\s|$)", "exit (shell exit)"),
             (r"^\s*printf(\s|$)", "printf (formatted print)"),
             (r"^\s*touch(\s|$)", "touch (create/update timestamp)"),
             (r"^\s*tee(\s|$)", "tee (write to file and stdout)"),
