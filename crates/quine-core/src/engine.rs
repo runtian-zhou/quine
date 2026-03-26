@@ -616,6 +616,16 @@ async fn handle_llm_turn(
                     acc.output_tokens += u.output_tokens;
                 }
 
+                // Flush any text that preceded the tool calls to the TUI.
+                if let Some(ref text) = text_before {
+                    let _ = output
+                        .send(CoreOutput::TextComplete {
+                            session_id,
+                            full_text: text.clone(),
+                        })
+                        .await;
+                }
+
                 // Record the assistant's tool_use message in history.
                 let tool_use_requests: Vec<quine_llm::ToolUseRequest> = calls
                     .iter()
