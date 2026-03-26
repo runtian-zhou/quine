@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Option Selector "Other..." Freeform Entry
