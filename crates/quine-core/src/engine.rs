@@ -965,9 +965,68 @@ pub async fn run_core_loop(
 
             CoreInput::Shutdown => break,
 
-            // IPC / process-control variants — handled by the harness layer.
-            CoreInput::SpawnSession { reply, .. } => {
-                let _ = reply.send(Err("not implemented in core loop".into()));
+            CoreInput::SpawnSession {
+                parent_id: _,
+                child_id,
+                task,
+                system_prompt,
+                inheritance: _,
+                reply,
+            } => {
+                if sessions.contains_key(&child_id) {
+                    let _ = reply.send(Err("session already exists".into()));
+                    continue;
+                }
+
+                let work_dir = std::env::current_dir().unwrap_or_default();
+
+                match SessionContext::new(
+                    system_prompt,
+                    Vec::new(),
+                    work_dir,
+                    &provider,
+                    &permission_checker,
+                    false,
+                )
+                .await
+                {
+                    Ok(ctx) => {
+                        sessions.insert(child_id, ctx);
+                        let _ = handle
+                            .output
+                            .send(CoreOutput::SessionStateChanged {
+                                session_id: child_id,
+                                state: SessionState::Idle,
+                            })
+                            .await;
+                        let _ = reply.send(Ok(()));
+
+                        // Send the task as the first user message.
+                        let session = sessions.get_mut(&child_id).unwrap();
+                        session.state = SessionState::Streaming;
+                        session.history.push(Message::user(&task));
+                        let _ = handle
+                            .output
+                            .send(CoreOutput::SessionStateChanged {
+                                session_id: child_id,
+                                state: SessionState::Streaming,
+                            })
+                            .await;
+
+                        handle_llm_turn(
+                            &*provider,
+                            session,
+                            child_id,
+                            &handle.output,
+                            &mut handle.input,
+                            permission_checker.as_deref(),
+                        )
+                        .await;
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e.to_string()));
+                    }
+                }
             }
             CoreInput::Signal { .. } | CoreInput::SendMessage { .. } => {}
             CoreInput::WaitSession { reply, .. } => {
