@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use quine_core::{
@@ -25,6 +26,9 @@ pub struct LocalHarness {
     _core_task: tokio::task::JoinHandle<()>,
     /// Handle for the event fan-out task.
     _fanout_task: tokio::task::JoinHandle<()>,
+    /// IPC mailboxes keyed by target session ID string.
+    /// Each mailbox is a list of messages (content strings) sent to that target.
+    ipc_mailboxes: Arc<Mutex<HashMap<String, Vec<String>>>>,
 }
 
 impl LocalHarness {
@@ -65,6 +69,7 @@ impl LocalHarness {
             event_tx,
             _core_task: core_task,
             _fanout_task: fanout_task,
+            ipc_mailboxes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -250,26 +255,27 @@ impl HarnessService for LocalHarness {
             .map_err(|_| HarnessError::CoreChannelClosed)
     }
 
-    async fn send_ipc_message(
-        &self,
-        _target: String,
-        _content: String,
-    ) -> Result<(), HarnessError> {
-        // IPC messaging requires session context to identify sender.
-        // For now, return an error since CLI-level IPC needs session addressing.
-        Err(HarnessError::Internal {
-            message: "send_ipc_message requires session context".into(),
-        })
+    async fn send_ipc_message(&self, target: String, content: String) -> Result<(), HarnessError> {
+        let mut mailboxes = self.ipc_mailboxes.lock().await;
+        mailboxes.entry(target).or_default().push(content);
+        Ok(())
     }
 
     async fn recv_ipc_message(
         &self,
-        _source: String,
+        source: String,
         _non_blocking: bool,
     ) -> Result<Option<String>, HarnessError> {
-        Err(HarnessError::Internal {
-            message: "recv_ipc_message requires session context".into(),
-        })
+        let mut mailboxes = self.ipc_mailboxes.lock().await;
+        if let Some(messages) = mailboxes.get_mut(&source) {
+            if messages.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(messages.remove(0)))
+            }
+        } else {
+            Ok(None)
+        }
     }
 }
 

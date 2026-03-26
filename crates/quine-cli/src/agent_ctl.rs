@@ -10,7 +10,7 @@ pub async fn handle_ps(
     _tree: bool,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut client = IpcClient::connect(socket_path).await?;
+    let (mut client, _) = IpcClient::connect_or_launch(socket_path).await?;
     let result = client.call(methods::LIST_SESSIONS, None).await?;
 
     match result {
@@ -39,7 +39,7 @@ pub async fn handle_spawn(
     system_prompt: Option<&str>,
     json: bool,
 ) -> anyhow::Result<()> {
-    let mut client = IpcClient::connect(socket_path).await?;
+    let (mut client, _) = IpcClient::connect_or_launch(socket_path).await?;
 
     let mut params = serde_json::json!({ "task": task });
     if let Some(parent_id) = parent {
@@ -84,7 +84,7 @@ pub async fn handle_signal(
     signal: &str,
 ) -> anyhow::Result<()> {
     let parsed = parse_signal_string(signal)?;
-    let mut client = IpcClient::connect(socket_path).await?;
+    let (mut client, _) = IpcClient::connect_or_launch(socket_path).await?;
 
     let params = serde_json::json!({
         "session_id": session_id,
@@ -123,7 +123,7 @@ pub async fn handle_send(
         }
     };
 
-    let mut client = IpcClient::connect(socket_path).await?;
+    let (mut client, _) = IpcClient::connect_or_launch(socket_path).await?;
 
     let params = serde_json::json!({
         "target": target,
@@ -151,7 +151,7 @@ pub async fn handle_recv(
     source: &str,
     non_blocking: bool,
 ) -> anyhow::Result<()> {
-    let mut client = IpcClient::connect(socket_path).await?;
+    let (mut client, _) = IpcClient::connect_or_launch(socket_path).await?;
 
     let params = serde_json::json!({
         "source": source,
