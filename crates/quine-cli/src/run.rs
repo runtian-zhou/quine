@@ -103,10 +103,17 @@ pub async fn run_oneshot(
                     }
                 }
                 notifications::TEXT_COMPLETE => {
-                    // Use full_text if available, otherwise keep accumulated deltas.
+                    // Append non-empty text completions. Multiple TextComplete events
+                    // fire in multi-tool turns (one per LLM call). Don't let an empty
+                    // second TextComplete overwrite the first response.
                     if let Some(params) = &notif.params {
                         if let Some(full_text) = params.get("full_text").and_then(|v| v.as_str()) {
-                            full_response = full_text.to_string();
+                            if !full_text.trim().is_empty() {
+                                if !full_response.is_empty() {
+                                    full_response.push('\n');
+                                }
+                                full_response.push_str(full_text);
+                            }
                         }
                     }
                 }

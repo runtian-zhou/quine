@@ -4,7 +4,7 @@ use regex::Regex;
 use super::{PermissionChecker, PermissionContext, PermissionDecision, PermissionError};
 
 /// Risk level for a pattern match.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RiskLevel {
     /// Command is safe to execute.
     Low,
@@ -203,6 +203,14 @@ impl RuleBasedChecker {
             (r"^\s*touch(\s|$)", "touch (create/update timestamp)"),
             (r"^\s*tee(\s|$)", "tee (write to file and stdout)"),
             (r"^\s*xargs(\s|$)", "xargs (build arguments)"),
+            (r"^\s*seq(\s|$)", "seq (number sequence)"),
+            (r"^\s*yes(\s|$)", "yes (repeat string)"),
+            (r"^\s*rev(\s|$)", "rev (reverse lines)"),
+            (r"^\s*nl(\s|$)", "nl (number lines)"),
+            (r"^\s*expand(\s|$)", "expand (tabs to spaces)"),
+            (r"^\s*fold(\s|$)", "fold (wrap lines)"),
+            (r"^\s*paste(\s|$)", "paste (merge lines)"),
+            (r"^\s*column(\s|$)", "column (columnate)"),
         ];
 
         for (pattern, desc) in low_risk {
@@ -322,6 +330,22 @@ impl PermissionChecker for RuleBasedChecker {
         let has_subshell = command.contains("$(") || command.contains('`');
 
         if has_pipe || has_redirect || has_subshell {
+            // For pipes: if every segment matches a low-risk rule, allow the whole pipeline.
+            if has_pipe && !has_subshell {
+                let segments: Vec<&str> = command.split('|').collect();
+                let all_safe = segments.iter().all(|seg| {
+                    let seg = seg.trim();
+                    // Check if this segment (before any redirect) matches a low-risk rule.
+                    let seg_cmd = seg.split('>').next().unwrap_or(seg).trim();
+                    self.rules.iter().any(|rule| {
+                        rule.risk_level == RiskLevel::Low && rule.pattern.is_match(seg_cmd)
+                    })
+                });
+                if all_safe {
+                    return Ok(PermissionDecision::Allow);
+                }
+            }
+
             return Ok(PermissionDecision::RequiresConfirmation {
                 risk_score: 0.4,
                 reason: "unrecognized command with pipes/redirections — reviewing for safety"
