@@ -21,14 +21,25 @@ use quine_harness::protocol::methods;
 ///
 /// Sets up the terminal in raw/alternate-screen mode, runs the main event loop,
 /// and restores the terminal on exit (including panics).
-pub async fn run_tui_chat(socket_path: &Path, skills: &[String]) -> anyhow::Result<()> {
+pub async fn run_tui_chat(
+    socket_path: &Path,
+    skills: &[String],
+    plan_mode: bool,
+) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
     // Create session.
-    let params = if skills.is_empty() {
+    let mut session_params = serde_json::json!({});
+    if !skills.is_empty() {
+        session_params["skills"] = serde_json::json!(skills);
+    }
+    if plan_mode {
+        session_params["plan_mode"] = serde_json::json!(true);
+    }
+    let params = if session_params.as_object().unwrap().is_empty() {
         None
     } else {
-        Some(serde_json::json!({ "skills": skills }))
+        Some(session_params)
     };
     let result = client.call(methods::CREATE_SESSION, params).await?;
     let session_id = match result {
@@ -55,7 +66,7 @@ pub async fn run_tui_chat(socket_path: &Path, skills: &[String]) -> anyhow::Resu
         original_hook(info);
     }));
 
-    let mut app = app::App::new(session_id.clone());
+    let mut app = app::App::new(session_id.clone(), plan_mode);
     let mut event_stream = EventStream::new();
     let mut spinner_interval = tokio::time::interval(Duration::from_millis(80));
 

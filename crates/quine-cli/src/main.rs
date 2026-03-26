@@ -29,6 +29,9 @@ enum Commands {
         /// Skills to load for this session (can be repeated).
         #[arg(long, short = 's')]
         skill: Vec<String>,
+        /// Start in read-only plan mode (restricted to exploration and planning).
+        #[arg(long)]
+        plan: bool,
     },
     /// Send a one-shot message to the agent and exit.
     Run {
@@ -214,14 +217,18 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Chat { socket, skill } => {
+        Commands::Chat {
+            socket,
+            skill,
+            plan,
+        } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(default_socket_path);
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                tui::run_tui_chat(&socket_path, &skill).await?;
+                tui::run_tui_chat(&socket_path, &skill, plan).await?;
             } else {
-                chat::run_chat(&socket_path, &skill).await?;
+                chat::run_chat(&socket_path, &skill, plan).await?;
             }
         }
         Commands::Run {

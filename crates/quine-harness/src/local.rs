@@ -126,6 +126,7 @@ impl HarnessService for LocalHarness {
                 system_prompt: config.system_prompt,
                 working_directory: config.working_directory,
                 skills,
+                plan_mode: config.plan_mode,
                 reply: reply_tx,
             })
             .await

@@ -20,6 +20,9 @@ pub struct SessionConfig {
     /// Skill names to load for this session.
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Whether this session operates in read-only plan mode.
+    #[serde(default)]
+    pub plan_mode: bool,
 }
 
 /// Configuration for the harness daemon.
@@ -141,6 +144,7 @@ mod tests {
             system_prompt: Some("You are helpful.".into()),
             working_directory: None,
             skills: Vec::new(),
+            plan_mode: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: SessionConfig = serde_json::from_str(&json).unwrap();
