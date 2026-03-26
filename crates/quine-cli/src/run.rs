@@ -87,7 +87,11 @@ pub async fn run_oneshot(
     }
 
     // Collect response notifications until TurnComplete.
-    let mut full_response = String::new();
+    // `completed_text` accumulates authoritative TextComplete events (one per LLM call).
+    // `delta_buffer` accumulates streaming deltas for real-time display.
+    // TextComplete is the source of truth for the final response.
+    let mut completed_text = String::new();
+    let mut delta_buffer = String::new();
     let mut tool_calls = Vec::new();
     let mut turn_duration_ms: Option<u64> = None;
     let mut turn_usage: Option<TokenUsageOutput> = None;
@@ -98,24 +102,25 @@ pub async fn run_oneshot(
                 notifications::STREAM_DELTA => {
                     if let Some(params) = &notif.params {
                         if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
-                            full_response.push_str(delta);
+                            delta_buffer.push_str(delta);
                         }
                     }
                 }
                 notifications::TEXT_COMPLETE => {
-                    // Append non-empty text completions. Multiple TextComplete events
-                    // fire in multi-tool turns (one per LLM call). Don't let an empty
-                    // second TextComplete overwrite the first response.
+                    // Append non-empty text from each LLM call. Multiple TextComplete
+                    // events fire in multi-tool turns. Clear delta_buffer since
+                    // TextComplete is authoritative for its LLM call.
                     if let Some(params) = &notif.params {
                         if let Some(full_text) = params.get("full_text").and_then(|v| v.as_str()) {
                             if !full_text.trim().is_empty() {
-                                if !full_response.is_empty() {
-                                    full_response.push('\n');
+                                if !completed_text.is_empty() {
+                                    completed_text.push('\n');
                                 }
-                                full_response.push_str(full_text);
+                                completed_text.push_str(full_text);
                             }
                         }
                     }
+                    delta_buffer.clear();
                 }
                 notifications::TOOL_REQUEST => {
                     if let Some(params) = &notif.params {
@@ -151,12 +156,18 @@ pub async fn run_oneshot(
                         .and_then(|p| p.get("source_label"))
                         .and_then(|v| v.as_str());
 
+                    let partial = if !completed_text.is_empty() {
+                        &completed_text
+                    } else {
+                        &delta_buffer
+                    };
+
                     if json_output {
                         let mut output = serde_json::json!({
                             "session_id": session_id,
                             "interaction_needed": true,
                             "prompt": prompt,
-                            "response": full_response,
+                            "response": partial,
                             "tool_calls": tool_calls,
                         });
                         if let Some(label) = source_label {
@@ -166,14 +177,14 @@ pub async fn run_oneshot(
                     } else if let Some(label) = source_label {
                         eprintln!("interaction needed [{label}]: {prompt}");
                         // Print any partial response accumulated so far.
-                        if !full_response.is_empty() {
-                            println!("{full_response}");
+                        if !partial.is_empty() {
+                            println!("{partial}");
                         }
                     } else {
                         eprintln!("interaction needed: {prompt}");
                         // Print any partial response accumulated so far.
-                        if !full_response.is_empty() {
-                            println!("{full_response}");
+                        if !partial.is_empty() {
+                            println!("{partial}");
                         }
                     }
                     // Exit so the caller can use `quine respond` to continue.
@@ -205,6 +216,13 @@ pub async fn run_oneshot(
             }
         }
     }
+
+    // Use completed_text (from TextComplete) if available, fall back to deltas.
+    let full_response = if !completed_text.is_empty() {
+        completed_text
+    } else {
+        delta_buffer
+    };
 
     // Output results.
     if json_output {
@@ -248,7 +266,8 @@ pub async fn run_respond(
     }
 
     // Collect remaining notifications until TurnComplete.
-    let mut full_response = String::new();
+    let mut completed_text = String::new();
+    let mut delta_buffer = String::new();
     let mut tool_calls = Vec::new();
     let mut turn_duration_ms: Option<u64> = None;
     let mut turn_usage: Option<TokenUsageOutput> = None;
@@ -259,16 +278,22 @@ pub async fn run_respond(
                 notifications::STREAM_DELTA => {
                     if let Some(params) = &notif.params {
                         if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
-                            full_response.push_str(delta);
+                            delta_buffer.push_str(delta);
                         }
                     }
                 }
                 notifications::TEXT_COMPLETE => {
                     if let Some(params) = &notif.params {
                         if let Some(full_text) = params.get("full_text").and_then(|v| v.as_str()) {
-                            full_response = full_text.to_string();
+                            if !full_text.trim().is_empty() {
+                                if !completed_text.is_empty() {
+                                    completed_text.push('\n');
+                                }
+                                completed_text.push_str(full_text);
+                            }
                         }
                     }
+                    delta_buffer.clear();
                 }
                 notifications::TOOL_REQUEST => {
                     if let Some(params) = &notif.params {
@@ -303,12 +328,18 @@ pub async fn run_respond(
                         .and_then(|p| p.get("source_label"))
                         .and_then(|v| v.as_str());
 
+                    let partial = if !completed_text.is_empty() {
+                        &completed_text
+                    } else {
+                        &delta_buffer
+                    };
+
                     if json_output {
                         let mut output = serde_json::json!({
                             "session_id": session_id,
                             "interaction_needed": true,
                             "prompt": prompt,
-                            "response": full_response,
+                            "response": partial,
                             "tool_calls": tool_calls,
                         });
                         if let Some(label) = source_label {
@@ -317,13 +348,13 @@ pub async fn run_respond(
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else if let Some(label) = source_label {
                         eprintln!("interaction needed [{label}]: {prompt}");
-                        if !full_response.is_empty() {
-                            println!("{full_response}");
+                        if !partial.is_empty() {
+                            println!("{partial}");
                         }
                     } else {
                         eprintln!("interaction needed: {prompt}");
-                        if !full_response.is_empty() {
-                            println!("{full_response}");
+                        if !partial.is_empty() {
+                            println!("{partial}");
                         }
                     }
                     return Ok(());
@@ -354,6 +385,12 @@ pub async fn run_respond(
             }
         }
     }
+
+    let full_response = if !completed_text.is_empty() {
+        completed_text
+    } else {
+        delta_buffer
+    };
 
     if json_output {
         let output = OneshotOutput {
