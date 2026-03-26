@@ -44,6 +44,12 @@ pub enum ConversationEntry {
         diff_lines: Vec<DiffLine>,
     },
     Error(String),
+    /// An interaction prompt from the agent (ask_user, permission, etc.)
+    /// Contains the prompt text and optional numbered options.
+    InteractionQuestion {
+        prompt: String,
+        options: Vec<String>,
+    },
     InteractionPrompt(String),
     /// Turn summary with timing and token usage.
     TurnInfo {
@@ -548,6 +554,12 @@ impl App {
                 self.auto_scroll();
             }
             notifications::TOOL_REQUEST => {
+                // Flush any streaming text that preceded this tool call.
+                if !self.streaming_buffer.is_empty() {
+                    let text = std::mem::take(&mut self.streaming_buffer);
+                    self.messages.push(ConversationEntry::AssistantText(text));
+                }
+
                 if let Some(params) = &notif.params {
                     let tool_name = params
                         .get("tool_name")
@@ -738,26 +750,26 @@ impl App {
                     "MultiSelect" => InteractionKind::MultiSelect,
                     _ => InteractionKind::AskUser,
                 };
-                // Show the prompt in the conversation view, prefixed with source label.
-                let source_prefix = source_label
-                    .as_deref()
-                    .map(|s| format!("[{s}] "))
-                    .unwrap_or_default();
-                let label = match kind {
-                    InteractionKind::Permission => {
-                        format!("{source_prefix}⚠ Permission: {prompt}")
-                    }
-                    InteractionKind::AskUser => format!("{source_prefix}❓ {prompt}"),
-                    InteractionKind::SingleSelect | InteractionKind::MultiSelect => {
-                        let opt_list: Vec<String> = options
-                            .iter()
-                            .enumerate()
-                            .map(|(i, o)| format!("  {}. {o}", i + 1))
-                            .collect();
-                        format!("{source_prefix}❓ {prompt}\n{}", opt_list.join("\n"))
-                    }
-                };
-                self.messages.push(ConversationEntry::Error(label));
+                // Show the prompt in the conversation view.
+                if kind == InteractionKind::Permission {
+                    let source_prefix = source_label
+                        .as_deref()
+                        .map(|s| format!("[{s}] "))
+                        .unwrap_or_default();
+                    self.messages.push(ConversationEntry::InteractionQuestion {
+                        prompt: format!("{source_prefix}⚠ Permission: {prompt}"),
+                        options: Vec::new(),
+                    });
+                } else {
+                    let source_prefix = source_label
+                        .as_deref()
+                        .map(|s| format!("[{s}] "))
+                        .unwrap_or_default();
+                    self.messages.push(ConversationEntry::InteractionQuestion {
+                        prompt: format!("{source_prefix}❓ {prompt}"),
+                        options: options.clone(),
+                    });
+                }
                 self.auto_scroll();
 
                 let is_select = matches!(

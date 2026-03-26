@@ -110,10 +110,32 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
                 }
             }
             ConversationEntry::Error(text) => {
-                lines.push(Line::from(Span::styled(
-                    format!("Error: {text}"),
-                    Style::default().fg(Color::Red),
-                )));
+                for (i, line) in text.lines().enumerate() {
+                    let prefix = if i == 0 { "Error: " } else { "       " };
+                    lines.push(Line::from(Span::styled(
+                        format!("{prefix}{line}"),
+                        Style::default().fg(Color::Red),
+                    )));
+                }
+            }
+            ConversationEntry::InteractionQuestion { prompt, options } => {
+                // Render the question line in yellow/bold.
+                lines.push(Line::from(vec![
+                    Span::styled("  ", Style::default().fg(Color::Yellow)),
+                    Span::styled(
+                        prompt.to_string(),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                // Render each option as a separate line in cyan.
+                for (i, opt) in options.iter().enumerate() {
+                    lines.push(Line::from(Span::styled(
+                        format!("     {}. {opt}", i + 1),
+                        Style::default().fg(Color::Cyan),
+                    )));
+                }
             }
             ConversationEntry::InteractionPrompt(text) => {
                 lines.push(Line::from(vec![

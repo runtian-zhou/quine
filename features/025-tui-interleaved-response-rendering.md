@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # TUI Interleaved Response and Tool Result Rendering
