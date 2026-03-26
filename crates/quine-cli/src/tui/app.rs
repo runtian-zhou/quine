@@ -556,7 +556,7 @@ impl App {
                 } else {
                     std::mem::take(&mut self.streaming_buffer)
                 };
-                if !text.is_empty() {
+                if !text.trim().is_empty() {
                     self.messages.push(ConversationEntry::AssistantText(text));
                 }
                 self.streaming_buffer.clear();
@@ -564,10 +564,11 @@ impl App {
             }
             notifications::TOOL_REQUEST => {
                 // Flush any streaming text that preceded this tool call.
-                if !self.streaming_buffer.is_empty() {
+                if !self.streaming_buffer.trim().is_empty() {
                     let text = std::mem::take(&mut self.streaming_buffer);
                     self.messages.push(ConversationEntry::AssistantText(text));
                 }
+                self.streaming_buffer.clear();
 
                 if let Some(params) = &notif.params {
                     let tool_name = params
@@ -672,10 +673,11 @@ impl App {
             }
             notifications::TURN_COMPLETE => {
                 // Flush any remaining streaming buffer.
-                if !self.streaming_buffer.is_empty() {
+                if !self.streaming_buffer.trim().is_empty() {
                     let text = std::mem::take(&mut self.streaming_buffer);
                     self.messages.push(ConversationEntry::AssistantText(text));
                 }
+                self.streaming_buffer.clear();
                 let duration_ms = notif
                     .params
                     .as_ref()
