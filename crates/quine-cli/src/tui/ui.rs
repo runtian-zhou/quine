@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn draw_does_not_panic_empty_app() {
         // Verify rendering logic doesn't panic with empty state.
-        let app = App::new("test".into());
+        let app = App::new("test".into(), false);
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &app)).unwrap();
@@ -298,7 +298,7 @@ mod tests {
 
     #[test]
     fn draw_does_not_panic_with_tool_status() {
-        let mut app = App::new("test".into());
+        let mut app = App::new("test".into(), false);
         app.messages.push(ConversationEntry::ToolCall {
             tool_name: "bash".into(),
             tool_use_id: "tc1".into(),
@@ -332,7 +332,7 @@ mod tests {
 
     #[test]
     fn draw_does_not_panic_with_content() {
-        let mut app = App::new("test".into());
+        let mut app = App::new("test".into(), false);
         app.messages.push(ConversationEntry::User("hello".into()));
         app.messages
             .push(ConversationEntry::AssistantText("hi there".into()));

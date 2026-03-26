@@ -20,6 +20,8 @@ pub enum CoreInput {
         working_directory: Option<PathBuf>,
         /// Skills to load for this session.
         skills: Vec<Skill>,
+        /// Whether this session operates in read-only plan mode.
+        plan_mode: bool,
         /// Acknowledges session creation.
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -290,6 +292,7 @@ mod tests {
                 system_prompt: None,
                 working_directory: None,
                 skills: Vec::new(),
+                plan_mode: false,
                 reply: reply_tx,
             })
             .await

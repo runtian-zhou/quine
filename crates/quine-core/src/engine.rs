@@ -28,6 +28,32 @@ using the tools available to you. Each message from the user is a new request â€
 respond to it directly. Use tools when needed to read files, run commands, or \
 write code. Be concise and accurate.";
 
+/// System prompt prepended in plan mode to restrict the agent to read-only exploration.
+const PLAN_MODE_SYSTEM_PROMPT: &str = "\
+You are a software architect and planning specialist. Your role is to explore the \
+codebase and create detailed implementation plans. You are in READ-ONLY mode.
+
+CRITICAL CONSTRAINTS:
+- You MUST NOT create, edit, delete, or modify any files
+- You MUST NOT run commands that alter system state (no writes, no installs, no git commits)
+- You can ONLY use read-only tools: read_file, find, bash (read-only commands like ls, cat, grep, git log)
+
+PROCESS:
+1. Understand the user's requirements
+2. Explore the codebase thoroughly using read-only tools
+3. Analyze existing patterns, architecture, and conventions
+4. Design a solution that fits the existing codebase
+5. Produce a detailed step-by-step implementation plan
+
+YOUR PLAN MUST INCLUDE:
+- Overview of the approach
+- Specific files to create or modify (with paths)
+- Code sketches or type signatures where helpful
+- Dependencies between steps
+- Critical files for implementation (3-5 key files with justifications)
+
+Remember: You can ONLY explore and plan. You CANNOT modify any files.";
+
 /// Walk up from `start` looking for CLAUDE.md, returning the first one found.
 fn find_claude_md(start: &std::path::Path) -> Option<PathBuf> {
     let mut dir = start.to_path_buf();
@@ -70,6 +96,7 @@ impl SessionContext {
         working_directory: PathBuf,
         provider: &Arc<dyn LlmProvider>,
         permission_checker: &Option<Arc<dyn PermissionChecker>>,
+        plan_mode: bool,
     ) -> Result<Self, CoreError> {
         let session_dir = std::env::temp_dir()
             .join("quine-sessions")
@@ -87,20 +114,23 @@ impl SessionContext {
 
         let mut tool_registry = ToolRegistry::new();
         tool_registry.register(Arc::new(ReadTool));
-        tool_registry.register(Arc::new(WriteTool));
         tool_registry.register(Arc::new(BashTool));
         tool_registry.register(Arc::new(FindTool));
         tool_registry.register(Arc::new(AskUserTool));
         tool_registry.register(Arc::new(PlanTool::new(plan_store.clone())));
-        tool_registry.register(Arc::new(SubagentTool::new(
-            Arc::clone(provider),
-            permission_checker.clone(),
-        )));
-        tool_registry.register(Arc::new(SpawnTool));
-        tool_registry.register(Arc::new(WaitChildTool));
-        tool_registry.register(Arc::new(SignalTool));
-        tool_registry.register(Arc::new(SendMessageTool));
-        tool_registry.register(Arc::new(RecvMessageTool));
+
+        if !plan_mode {
+            tool_registry.register(Arc::new(WriteTool));
+            tool_registry.register(Arc::new(SubagentTool::new(
+                Arc::clone(provider),
+                permission_checker.clone(),
+            )));
+            tool_registry.register(Arc::new(SpawnTool));
+            tool_registry.register(Arc::new(WaitChildTool));
+            tool_registry.register(Arc::new(SignalTool));
+            tool_registry.register(Arc::new(SendMessageTool));
+            tool_registry.register(Arc::new(RecvMessageTool));
+        }
 
         // Register skill template tools.
         for skill in &skills {
@@ -114,6 +144,11 @@ impl SessionContext {
         // Build combined system prompt: CLAUDE.md + base + skills + default fallback.
         let combined_prompt = {
             let mut prompt_parts = Vec::new();
+
+            // In plan mode, prepend the read-only architect prompt.
+            if plan_mode {
+                prompt_parts.push(PLAN_MODE_SYSTEM_PROMPT.to_string());
+            }
 
             // Auto-load CLAUDE.md from working directory (with parent traversal).
             if let Some(claude_md_path) = find_claude_md(&working_directory) {
@@ -770,6 +805,7 @@ pub async fn run_core_loop(
                 system_prompt,
                 working_directory,
                 skills,
+                plan_mode,
                 reply,
             } => {
                 if sessions.contains_key(&session_id) {
@@ -786,6 +822,7 @@ pub async fn run_core_loop(
                     work_dir,
                     &provider,
                     &permission_checker,
+                    plan_mode,
                 )
                 .await
                 {
@@ -1000,6 +1037,7 @@ mod tests {
                 system_prompt: None,
                 working_directory: None,
                 skills: Vec::new(),
+                plan_mode: false,
                 reply: reply_tx,
             })
             .await
@@ -1057,6 +1095,7 @@ mod tests {
                 system_prompt: None,
                 working_directory: None,
                 skills: Vec::new(),
+                plan_mode: false,
                 reply: reply_tx,
             })
             .await
@@ -1111,6 +1150,7 @@ mod tests {
                 system_prompt: None,
                 working_directory: None,
                 skills: Vec::new(),
+                plan_mode: false,
                 reply: reply_tx,
             })
             .await
@@ -1125,6 +1165,7 @@ mod tests {
                 system_prompt: None,
                 working_directory: None,
                 skills: Vec::new(),
+                plan_mode: false,
                 reply: reply_tx,
             })
             .await
@@ -1152,6 +1193,7 @@ mod tests {
                 system_prompt: None,
                 working_directory: None,
                 skills: Vec::new(),
+                plan_mode: false,
                 reply: reply_tx,
             })
             .await
@@ -1258,6 +1300,7 @@ mod tests {
                 system_prompt: None,
                 working_directory: None,
                 skills: Vec::new(),
+                plan_mode: false,
                 reply: reply_tx,
             })
             .await

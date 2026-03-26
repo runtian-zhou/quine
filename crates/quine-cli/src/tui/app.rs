@@ -312,10 +312,12 @@ pub struct App {
     saved_input: String,
     /// Active option selector state (for SingleSelect/MultiSelect interactions).
     pub option_select: Option<OptionSelectState>,
+    /// Whether this session is in read-only plan mode.
+    pub plan_mode: bool,
 }
 
 impl App {
-    pub fn new(session_id: String) -> Self {
+    pub fn new(session_id: String, plan_mode: bool) -> Self {
         Self {
             messages: Vec::new(),
             streaming_buffer: String::new(),
@@ -332,6 +334,7 @@ impl App {
             history_index: None,
             saved_input: String::new(),
             option_select: None,
+            plan_mode,
         }
     }
 
@@ -374,6 +377,8 @@ impl App {
                     format!("[{source}] [multi-select]{badge} [↑↓] Space/Enter > ")
                 }
             }
+        } else if self.plan_mode {
+            "[plan] > ".to_string()
         } else {
             "> ".to_string()
         }
@@ -849,7 +854,7 @@ mod tests {
 
     #[test]
     fn submit_input_sends_message_when_no_interaction() {
-        let mut app = App::new("test-session".into());
+        let mut app = App::new("test-session".into(), false);
         app.input.set_from_string("hello");
 
         let action = app.submit_input();
@@ -862,7 +867,7 @@ mod tests {
 
     #[test]
     fn submit_input_responds_to_interaction() {
-        let mut app = App::new("test-session".into());
+        let mut app = App::new("test-session".into(), false);
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "What is your name?".into(),
             kind: InteractionKind::AskUser,
@@ -879,14 +884,14 @@ mod tests {
 
     #[test]
     fn submit_empty_input_does_nothing() {
-        let mut app = App::new("test-session".into());
+        let mut app = App::new("test-session".into(), false);
         app.input.set_from_string("   ");
         assert!(app.submit_input().is_none());
     }
 
     #[test]
     fn apply_stream_delta() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         let notif = make_notif(
             notifications::STREAM_DELTA,
             Some(serde_json::json!({"delta": "hello"})),
@@ -898,7 +903,7 @@ mod tests {
 
     #[test]
     fn apply_text_complete_flushes_buffer() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.streaming_buffer = "hello world".into();
         let notif = make_notif(notifications::TEXT_COMPLETE, Some(serde_json::json!({})));
         app.apply_notification(&notif);
@@ -911,7 +916,7 @@ mod tests {
 
     #[test]
     fn apply_tool_request() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         let notif = make_notif(
             notifications::TOOL_REQUEST,
             Some(serde_json::json!({
@@ -927,7 +932,7 @@ mod tests {
 
     #[test]
     fn apply_turn_complete() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.phase = AgentPhase::Streaming;
         app.streaming_buffer = "leftover".into();
         let notif = make_notif(notifications::TURN_COMPLETE, Some(serde_json::json!({})));
@@ -939,7 +944,7 @@ mod tests {
 
     #[test]
     fn apply_interaction_needed_queues() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         let notif = make_notif(
             notifications::INTERACTION_NEEDED,
             Some(serde_json::json!({"prompt": "Continue?"})),
@@ -951,13 +956,13 @@ mod tests {
 
     #[test]
     fn input_label_normal() {
-        let app = App::new("s".into());
+        let app = App::new("s".into(), false);
         assert_eq!(app.input_label(), "> ");
     }
 
     #[test]
     fn input_label_with_interaction() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Name?".into(),
             kind: InteractionKind::AskUser,
@@ -970,7 +975,7 @@ mod tests {
 
     #[test]
     fn input_label_with_multiple_interactions() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Q1?".into(),
             kind: InteractionKind::AskUser,
@@ -990,7 +995,7 @@ mod tests {
 
     #[test]
     fn spinner_cycles() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.phase = AgentPhase::Thinking;
         let first = app.spinner_char();
         app.tick_spinner();
@@ -1000,7 +1005,7 @@ mod tests {
 
     #[test]
     fn scroll_up_down() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.scroll_up(5);
         assert_eq!(app.scroll_offset, 5);
         assert!(app.user_scrolled);
@@ -1014,7 +1019,7 @@ mod tests {
 
     #[test]
     fn insert_and_delete_chars() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.input.insert_char('h');
         app.input.insert_char('i');
         assert_eq!(app.input.content(), "hi");
@@ -1026,7 +1031,7 @@ mod tests {
 
     #[test]
     fn history_navigation() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.input_history.push("first".into());
         app.input_history.push("second".into());
         app.input.set_from_string("current");
@@ -1053,7 +1058,7 @@ mod tests {
 
     #[test]
     fn history_empty_does_nothing() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.input.set_from_string("hello");
         app.history_prev();
         assert_eq!(app.input.content(), "hello");
@@ -1061,7 +1066,7 @@ mod tests {
 
     #[test]
     fn submit_pushes_to_history() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.input.set_from_string("hello");
         app.submit_input();
         assert_eq!(app.input_history, vec!["hello"]);
@@ -1069,7 +1074,7 @@ mod tests {
 
     #[test]
     fn permission_label() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Allow bash: rm -rf /tmp/foo?".into(),
             kind: InteractionKind::Permission,
@@ -1084,7 +1089,7 @@ mod tests {
 
     #[test]
     fn permission_y_shorthand() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Allow?".into(),
             kind: InteractionKind::Permission,
@@ -1099,7 +1104,7 @@ mod tests {
 
     #[test]
     fn permission_n_shorthand() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Allow?".into(),
             kind: InteractionKind::Permission,
@@ -1114,7 +1119,7 @@ mod tests {
 
     #[test]
     fn tool_status_transitions() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         // Apply TOOL_REQUEST notification.
         let notif = make_notif(
             notifications::TOOL_REQUEST,
@@ -1156,7 +1161,7 @@ mod tests {
 
     #[test]
     fn tool_result_error_status() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         let notif = make_notif(
             notifications::TOOL_REQUEST,
             Some(serde_json::json!({
@@ -1188,7 +1193,7 @@ mod tests {
 
     #[test]
     fn turn_info_created_on_complete() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.phase = AgentPhase::Streaming;
         let notif = make_notif(
             notifications::TURN_COMPLETE,
@@ -1349,7 +1354,7 @@ mod tests {
 
     #[test]
     fn pending_interaction_shows_source_label() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "What color?".into(),
             kind: InteractionKind::AskUser,
@@ -1370,7 +1375,7 @@ mod tests {
 
     #[test]
     fn pending_interaction_no_source_label_shows_agent() {
-        let mut app = App::new("s".into());
+        let mut app = App::new("s".into(), false);
         app.interaction_queue.push_back(PendingInteraction {
             prompt: "Continue?".into(),
             kind: InteractionKind::AskUser,

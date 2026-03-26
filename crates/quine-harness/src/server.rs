@@ -341,10 +341,18 @@ async fn handle_request(
                 })
                 .unwrap_or_default();
 
+            let plan_mode = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("plan_mode"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
             let config = crate::config::SessionConfig {
                 system_prompt,
                 working_directory: None,
                 skills,
+                plan_mode,
             };
 
             match service.create_session(config).await {
