@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Esc to Cancel In-Flight Agent Work

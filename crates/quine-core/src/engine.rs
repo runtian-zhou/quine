@@ -21,6 +21,27 @@ use crate::tool::{
     InteractionKind, InteractionRequest, InteractionResponse, ToolRegistry,
 };
 
+/// Default system prompt used when no CLAUDE.md and no explicit prompt is provided.
+const DEFAULT_SYSTEM_PROMPT: &str = "\
+You are a helpful coding assistant. You help users with software engineering tasks \
+using the tools available to you. Each message from the user is a new request — \
+respond to it directly. Use tools when needed to read files, run commands, or \
+write code. Be concise and accurate.";
+
+/// Walk up from `start` looking for CLAUDE.md, returning the first one found.
+fn find_claude_md(start: &std::path::Path) -> Option<PathBuf> {
+    let mut dir = start.to_path_buf();
+    loop {
+        let candidate = dir.join("CLAUDE.md");
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
 /// Per-session context held by the core event loop.
 struct SessionContext {
     state: SessionState,
@@ -90,9 +111,19 @@ impl SessionContext {
 
         let tools = tool_registry.tool_definitions();
 
-        // Build combined system prompt from base + skill prompts.
+        // Build combined system prompt: CLAUDE.md + base + skills + default fallback.
         let combined_prompt = {
             let mut prompt_parts = Vec::new();
+
+            // Auto-load CLAUDE.md from working directory (with parent traversal).
+            if let Some(claude_md_path) = find_claude_md(&working_directory) {
+                if let Ok(content) = std::fs::read_to_string(&claude_md_path) {
+                    prompt_parts.push(format!(
+                        "# Project Instructions (from CLAUDE.md)\n\n{content}"
+                    ));
+                }
+            }
+
             if let Some(base) = &system_prompt {
                 prompt_parts.push(base.clone());
             }
@@ -101,11 +132,12 @@ impl SessionContext {
                     prompt_parts.push(format!("\n## Skill: {}\n{}", skill.meta.name, sp));
                 }
             }
+
+            // Always ensure a system prompt exists (critical for local models).
             if prompt_parts.is_empty() {
-                None
-            } else {
-                Some(prompt_parts.join("\n"))
+                prompt_parts.push(DEFAULT_SYSTEM_PROMPT.to_string());
             }
+            Some(prompt_parts.join("\n\n"))
         };
 
         let mut history = Vec::new();

@@ -110,6 +110,7 @@ pub struct OptionSelectState {
 pub enum AppAction {
     SendMessage(String),
     SubmitInteraction(String),
+    Cancel,
     Quit,
 }
 
