@@ -255,17 +255,17 @@ impl TestRunner {
         }
     }
 
-    /// Run the command and capture output with a per-action timeout of 120s.
+    /// Run the command and capture output with a per-action timeout of 180s.
     async fn run_command(
         &self,
         mut cmd: tokio::process::Command,
     ) -> Result<std::process::Output, String> {
-        let result = tokio::time::timeout(std::time::Duration::from_secs(120), cmd.output()).await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(180), cmd.output()).await;
 
         match result {
             Ok(Ok(output)) => Ok(output),
             Ok(Err(e)) => Err(format!("Command execution error: {e}")),
-            Err(_) => Err("Action timed out after 120 seconds".to_string()),
+            Err(_) => Err("Action timed out after 180 seconds".to_string()),
         }
     }
 
