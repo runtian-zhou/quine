@@ -212,6 +212,15 @@ impl RuleBasedChecker {
             (r"^\s*fold(\s|$)", "fold (wrap lines)"),
             (r"^\s*paste(\s|$)", "paste (merge lines)"),
             (r"^\s*column(\s|$)", "column (columnate)"),
+            (r"^\s*expr(\s|$)", "expr (arithmetic/string eval)"),
+            (r"^\s*bc(\s|$)", "bc (calculator)"),
+            (r"^\s*md5sum(\s|$)", "md5sum (hash)"),
+            (r"^\s*sha256sum(\s|$)", "sha256sum (hash)"),
+            (r"^\s*shasum(\s|$)", "shasum (hash)"),
+            (r"^\s*base64(\s|$)", "base64 (encode/decode)"),
+            (r"^\s*od(\s|$)", "od (octal dump)"),
+            (r"^\s*xxd(\s|$)", "xxd (hex dump)"),
+            (r"^\s*hexdump(\s|$)", "hexdump (hex dump)"),
         ];
 
         for (pattern, desc) in low_risk {

@@ -342,13 +342,17 @@ async fn check_permission(
                 })
                 .await;
 
-            // Wait for user response
+            // Wait for user response with a 30-second timeout.
+            // Without a timeout, unanswered prompts block the core loop
+            // forever and consume unrelated CoreInputs (like CreateSession),
+            // effectively crashing the daemon for all clients.
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                match input.recv().await {
-                    Some(CoreInput::InteractionResponse {
+                match tokio::time::timeout_at(deadline, input.recv()).await {
+                    Ok(Some(CoreInput::InteractionResponse {
                         session_id: resp_sid,
                         response,
-                    }) if resp_sid == session_id => {
+                    })) if resp_sid == session_id => {
                         let answer = response.response.trim().to_lowercase();
                         if answer == "y" || answer == "yes" {
                             return Ok(());
@@ -357,15 +361,23 @@ async fn check_permission(
                             message: format!("permission denied by user: {reason}"),
                         });
                     }
-                    Some(CoreInput::Cancel {
+                    Ok(Some(CoreInput::Cancel {
                         session_id: cancel_sid,
-                    }) if cancel_sid == session_id => {
+                    })) if cancel_sid == session_id => {
                         return Err(ToolOutcome::Cancelled);
                     }
-                    Some(_) => continue,
-                    None => {
+                    Ok(Some(_)) => continue,
+                    Ok(None) => {
                         return Err(ToolOutcome::Error {
                             message: "input channel closed during permission check".into(),
+                        });
+                    }
+                    Err(_) => {
+                        // Timeout — auto-deny to avoid blocking the core loop.
+                        return Err(ToolOutcome::Error {
+                            message: format!(
+                                "permission check timed out (no response within 30s): {reason}"
+                            ),
                         });
                     }
                 }
