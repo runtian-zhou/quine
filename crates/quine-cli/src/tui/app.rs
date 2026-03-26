@@ -108,7 +108,6 @@ pub struct OptionSelectState {
     /// Whether multi-select is enabled.
     pub multi_select: bool,
     /// Whether freeform input is allowed.
-    #[allow(dead_code)]
     pub allow_freeform: bool,
 }
 
@@ -384,6 +383,11 @@ impl App {
     pub fn submit_input(&mut self) -> Option<AppAction> {
         // If in option-select mode, submit the selection.
         if let Some(select) = self.option_select.take() {
+            // "Other..." selected — dismiss selector, switch to text input.
+            if select.allow_freeform && select.cursor == select.options.len() - 1 {
+                // Interaction stays in queue; user types and submits normally.
+                return None;
+            }
             let response = if select.multi_select {
                 let labels: Vec<String> = select
                     .selected
@@ -786,8 +790,12 @@ impl App {
 
                 // If this is the first interaction and it has options, enter select mode.
                 if is_select && self.interaction_queue.len() == 1 {
+                    let mut select_options = options;
+                    if allow_freeform {
+                        select_options.push("Other...".to_string());
+                    }
                     self.option_select = Some(OptionSelectState {
-                        options,
+                        options: select_options,
                         cursor: 0,
                         selected: HashSet::new(),
                         multi_select: kind == InteractionKind::MultiSelect,
