@@ -183,6 +183,8 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
             serde_json::json!({
                 "prompt": request.prompt,
                 "kind": request.kind,
+                "options": request.options,
+                "allow_freeform": request.allow_freeform,
             }),
         ),
         quine_core::CoreOutput::PlanProgress {

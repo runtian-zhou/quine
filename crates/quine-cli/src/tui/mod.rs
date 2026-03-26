@@ -234,8 +234,14 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                     None
                 }
                 KeyCode::Esc => {
-                    app.input.clear();
-                    None
+                    if app.phase != AgentPhase::Idle {
+                        // Agent is busy — cancel in-flight work.
+                        Some(AppAction::Cancel)
+                    } else {
+                        // Agent is idle — clear input buffer.
+                        app.input.clear();
+                        None
+                    }
                 }
                 KeyCode::Char(c) => {
                     app.input.insert_char(c);
@@ -279,6 +285,19 @@ async fn execute_action(
                 app.messages
                     .push(app::ConversationEntry::Error(e.to_string()));
             }
+        }
+        AppAction::Cancel => {
+            let params = serde_json::json!({
+                "session_id": app.session_id,
+            });
+            if let Err(e) = client.call(methods::CANCEL, Some(params)).await {
+                app.messages
+                    .push(app::ConversationEntry::Error(e.to_string()));
+            }
+            app.phase = AgentPhase::Idle;
+            app.streaming_buffer.clear();
+            app.messages
+                .push(app::ConversationEntry::Error("(cancelled)".into()));
         }
         AppAction::Quit => {
             app.should_quit = true;

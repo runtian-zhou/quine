@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Auto-Import CLAUDE.md into System Prompt
