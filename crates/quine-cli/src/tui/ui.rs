@@ -116,23 +116,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                     Span::raw(text),
                 ]));
             }
-            ConversationEntry::ReasoningText(text) => {
-                let mut first = true;
-                for line in text.lines() {
-                    let prefix = if first { "Reasoning: " } else { "           " };
-                    first = false;
-                    lines.push(Line::from(vec![
-                        Span::styled(
-                            prefix,
-                            Style::default().fg(Color::Blue).add_modifier(Modifier::DIM),
-                        ),
-                        Span::styled(
-                            line.to_string(),
-                            Style::default().fg(Color::Blue).add_modifier(Modifier::DIM),
-                        ),
-                    ]));
-                }
-            }
             ConversationEntry::AssistantText(text) => {
                 for line in text.lines() {
                     lines.push(Line::from(Span::raw(format!("  {line}"))));
@@ -218,26 +201,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                         .add_modifier(Modifier::DIM),
                 )]));
             }
-        }
-    }
-
-    if !app.reasoning_buffer.is_empty() {
-        let mut started = false;
-        for line in app.reasoning_buffer.lines() {
-            if !started && line.trim().is_empty() {
-                continue;
-            }
-            started = true;
-            lines.push(Line::from(vec![
-                Span::styled(
-                    "Reasoning: ",
-                    Style::default().fg(Color::Blue).add_modifier(Modifier::DIM),
-                ),
-                Span::styled(
-                    line.to_string(),
-                    Style::default().fg(Color::Blue).add_modifier(Modifier::DIM),
-                ),
-            ]));
         }
     }
 
