@@ -132,6 +132,7 @@ impl HarnessService for LocalHarness {
                 working_directory: config.working_directory,
                 skills,
                 plan_mode: config.plan_mode,
+                auto_approve_permissions: config.auto_approve_permissions,
                 reply: reply_tx,
             })
             .await

@@ -25,6 +25,7 @@ pub async fn run_tui_chat(
     socket_path: &Path,
     skills: &[String],
     plan_mode: bool,
+    auto_approve_permissions: bool,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
@@ -35,6 +36,9 @@ pub async fn run_tui_chat(
     }
     if plan_mode {
         session_params["plan_mode"] = serde_json::json!(true);
+    }
+    if auto_approve_permissions {
+        session_params["auto_approve_permissions"] = serde_json::json!(true);
     }
     let params = if session_params.as_object().unwrap().is_empty() {
         None

@@ -83,6 +83,8 @@ struct SessionContext {
     filesystem: Arc<dyn crate::filesystem::SessionFilesystem>,
     /// Working directory for this session.
     working_directory: PathBuf,
+    /// Whether bash permission prompts should be auto-approved.
+    auto_approve_permissions: bool,
     /// Sender for pending interaction responses (tool_use_id -> sender).
     pending_interaction: Option<oneshot::Sender<InteractionResponse>>,
     /// Shared plan store for this session.
@@ -97,6 +99,7 @@ impl SessionContext {
         provider: &Arc<dyn LlmProvider>,
         permission_checker: &Option<Arc<dyn PermissionChecker>>,
         plan_mode: bool,
+        auto_approve_permissions: bool,
     ) -> Result<Self, CoreError> {
         let filesystem = Arc::new(
             OverlayFilesystem::new(working_directory.clone(), working_directory.clone())
@@ -184,6 +187,7 @@ impl SessionContext {
             tool_registry,
             filesystem,
             working_directory,
+            auto_approve_permissions,
             pending_interaction: None,
             plan_store,
         })
@@ -298,6 +302,10 @@ async fn check_permission(
     output: &mpsc::Sender<CoreOutput>,
     input: &mut mpsc::Receiver<CoreInput>,
 ) -> Result<(), ToolOutcome> {
+    if session.auto_approve_permissions {
+        return Ok(());
+    }
+
     let context = PermissionContext {
         session_id,
         working_directory: session.working_directory.clone(),
@@ -822,6 +830,7 @@ pub async fn run_core_loop(
                 working_directory,
                 skills,
                 plan_mode,
+                auto_approve_permissions,
                 reply,
             } => {
                 if sessions.contains_key(&session_id) {
@@ -839,6 +848,7 @@ pub async fn run_core_loop(
                     &provider,
                     &permission_checker,
                     plan_mode,
+                    auto_approve_permissions,
                 )
                 .await
                 {
@@ -1003,6 +1013,7 @@ pub async fn run_core_loop(
                     &provider,
                     &permission_checker,
                     false,
+                    false,
                 )
                 .await
                 {
@@ -1056,6 +1067,7 @@ pub async fn run_core_loop(
 mod tests {
     use super::*;
     use crate::channel::{create_channels, ChannelConfig};
+    use crate::permission::PermissionError;
     use std::pin::Pin;
     use tokio::sync::oneshot;
 
@@ -1097,6 +1109,23 @@ mod tests {
         }
     }
 
+    struct ConfirmChecker;
+
+    #[async_trait::async_trait]
+    impl PermissionChecker for ConfirmChecker {
+        async fn check(
+            &self,
+            _tool_name: &str,
+            _arguments: &serde_json::Value,
+            _context: &PermissionContext,
+        ) -> Result<PermissionDecision, PermissionError> {
+            Ok(PermissionDecision::RequiresConfirmation {
+                risk_score: 0.9,
+                reason: "test confirmation".into(),
+            })
+        }
+    }
+
     #[tokio::test]
     async fn create_session_and_shutdown() {
         let (harness, core) = create_channels(ChannelConfig::default());
@@ -1113,6 +1142,7 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                auto_approve_permissions: false,
                 reply: reply_tx,
             })
             .await
@@ -1171,6 +1201,7 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                auto_approve_permissions: false,
                 reply: reply_tx,
             })
             .await
@@ -1226,6 +1257,7 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                auto_approve_permissions: false,
                 reply: reply_tx,
             })
             .await
@@ -1241,6 +1273,7 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                auto_approve_permissions: false,
                 reply: reply_tx,
             })
             .await
@@ -1269,6 +1302,7 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                auto_approve_permissions: false,
                 reply: reply_tx,
             })
             .await
@@ -1376,6 +1410,7 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                auto_approve_permissions: false,
                 reply: reply_tx,
             })
             .await
@@ -1423,6 +1458,107 @@ mod tests {
         assert!(got_tool_request, "should have received ToolRequest");
         assert!(got_text_complete, "should have received TextComplete");
         assert!(got_turn_complete, "should have received TurnComplete");
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn auto_approve_session_bypasses_permission_prompt() {
+        struct ToolThenTextProvider {
+            call_count: std::sync::atomic::AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for ToolThenTextProvider {
+            async fn send(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+            {
+                let count = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let events = if count == 0 {
+                    vec![
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_1".into(),
+                            tool_name: "bash".into(),
+                            arguments: serde_json::json!({"command": "echo hello_world"}),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else {
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            text: "Done!".into(),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let checker: Arc<dyn PermissionChecker> = Arc::new(ConfirmChecker);
+        let provider = ToolThenTextProvider {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        };
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), Some(checker)));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                auto_approve_permissions: true,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        let _ = output.recv().await.unwrap();
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "run echo".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut saw_interaction_needed = false;
+        let mut saw_turn_complete = false;
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
+                Ok(Some(CoreOutput::InteractionNeeded { .. })) => {
+                    saw_interaction_needed = true;
+                }
+                Ok(Some(CoreOutput::TurnComplete { .. })) => {
+                    saw_turn_complete = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timeout waiting for events"),
+            }
+        }
+
+        assert!(
+            !saw_interaction_needed,
+            "auto-approve session should not prompt"
+        );
+        assert!(saw_turn_complete, "turn should complete successfully");
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();

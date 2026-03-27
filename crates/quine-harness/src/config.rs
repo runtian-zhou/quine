@@ -23,6 +23,9 @@ pub struct SessionConfig {
     /// Whether this session operates in read-only plan mode.
     #[serde(default)]
     pub plan_mode: bool,
+    /// Whether bash permission prompts should be auto-approved for this session.
+    #[serde(default)]
+    pub auto_approve_permissions: bool,
 }
 
 /// Configuration for the harness daemon.
@@ -145,6 +148,7 @@ mod tests {
             working_directory: None,
             skills: Vec::new(),
             plan_mode: false,
+            auto_approve_permissions: true,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: SessionConfig = serde_json::from_str(&json).unwrap();
@@ -152,5 +156,6 @@ mod tests {
             deserialized.system_prompt.as_deref(),
             Some("You are helpful.")
         );
+        assert!(deserialized.auto_approve_permissions);
     }
 }
