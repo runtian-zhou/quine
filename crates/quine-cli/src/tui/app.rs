@@ -307,7 +307,7 @@ impl fmt::Display for InputBuffer {
 pub struct App {
     pub messages: Vec<ConversationEntry>,
     pub streaming_buffer: String,
-    pub scroll_offset: u16,
+    pub scroll_offset: u32,
     pub user_scrolled: bool,
     pub input: InputBuffer,
     pub interaction_queue: VecDeque<PendingInteraction>,
@@ -327,7 +327,7 @@ pub struct App {
     /// Whether this session is in read-only plan mode.
     pub plan_mode: bool,
     /// Last known conversation view height (set during rendering for scroll step sizing).
-    pub last_view_height: u16,
+    pub last_view_height: u32,
 }
 
 impl App {
@@ -834,12 +834,12 @@ impl App {
         }
     }
 
-    pub fn scroll_up(&mut self, amount: u16) {
+    pub fn scroll_up(&mut self, amount: u32) {
         self.scroll_offset = self.scroll_offset.saturating_add(amount);
         self.user_scrolled = true;
     }
 
-    pub fn scroll_down(&mut self, amount: u16) {
+    pub fn scroll_down(&mut self, amount: u32) {
         self.scroll_offset = self.scroll_offset.saturating_sub(amount);
         if self.scroll_offset == 0 {
             self.user_scrolled = false;

@@ -218,8 +218,8 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
     // Use ratatui's Paragraph::line_count to get the exact wrapped line count,
     // which accounts for word-boundary wrapping. This fixes scroll calculation
     // that previously undercounted wrapped lines using text.lines.len().
-    let content_height = conversation.line_count(area.width) as u16;
-    let view_height = area.height;
+    let content_height = conversation.line_count(area.width) as u32;
+    let view_height = area.height as u32;
     // Store view_height in app so PageUp/PageDown can use viewport-proportional steps.
     app.last_view_height = view_height;
     let max_scroll = content_height.saturating_sub(view_height);
@@ -229,7 +229,10 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
         max_scroll
     };
 
-    let conversation = conversation.scroll((scroll, 0));
+    // ratatui scroll takes u16; clamp (content that exceeds u16::MAX lines is
+    // extremely unlikely but we handle it gracefully).
+    let scroll_u16 = scroll.min(u16::MAX as u32) as u16;
+    let conversation = conversation.scroll((scroll_u16, 0));
 
     frame.render_widget(conversation, area);
 }

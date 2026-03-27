@@ -247,11 +247,11 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                     None
                 }
                 KeyCode::Home => {
-                    app.scroll_up(u16::MAX);
+                    app.scroll_up(u32::MAX);
                     None
                 }
                 KeyCode::End => {
-                    app.scroll_down(u16::MAX);
+                    app.scroll_down(u32::MAX);
                     None
                 }
                 KeyCode::Esc => {
