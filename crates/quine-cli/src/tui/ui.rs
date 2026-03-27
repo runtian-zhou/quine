@@ -34,7 +34,23 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line<'_>> = Vec::new();
 
-    for entry in app.messages.iter() {
+    for (i, entry) in app.messages.iter().enumerate() {
+        // Add blank line separator between entries, but not between
+        // consecutive tool-related entries (ToolCall, WriteDiff) so they
+        // render as a compact group.
+        if i > 0 {
+            let prev = &app.messages[i - 1];
+            let both_tool_related = matches!(
+                (prev, entry),
+                (
+                    ConversationEntry::ToolCall { .. } | ConversationEntry::WriteDiff { .. },
+                    ConversationEntry::ToolCall { .. } | ConversationEntry::WriteDiff { .. },
+                )
+            );
+            if !both_tool_related {
+                lines.push(Line::from(""));
+            }
+        }
         match entry {
             ConversationEntry::User(text) => {
                 lines.push(Line::from(vec![
@@ -166,9 +182,14 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
         }
     }
 
-    // Show streaming buffer if non-empty.
+    // Show streaming buffer if non-empty, trimming leading blank lines.
     if !app.streaming_buffer.is_empty() {
+        let mut started = false;
         for line in app.streaming_buffer.lines() {
+            if !started && line.trim().is_empty() {
+                continue;
+            }
+            started = true;
             lines.push(Line::from(Span::styled(
                 line.to_string(),
                 Style::default().add_modifier(Modifier::DIM),
