@@ -58,8 +58,8 @@ pub struct DirEntry {
 
 /// Trait abstracting filesystem access for a session.
 ///
-/// Implementations may be backed by the real filesystem, an overlay,
-/// or an in-memory store for testing.
+/// Implementations may be backed by the real filesystem or an in-memory store
+/// for testing.
 #[async_trait]
 pub trait SessionFilesystem: Send + Sync {
     /// Read the contents of a file at the given path.

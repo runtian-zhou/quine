@@ -98,15 +98,11 @@ impl SessionContext {
         permission_checker: &Option<Arc<dyn PermissionChecker>>,
         plan_mode: bool,
     ) -> Result<Self, CoreError> {
-        let session_dir = std::env::temp_dir()
-            .join("quine-sessions")
-            .join(uuid::Uuid::new_v4().to_string());
-
         let filesystem = Arc::new(
-            OverlayFilesystem::new(working_directory.clone(), session_dir)
+            OverlayFilesystem::new(working_directory.clone(), working_directory.clone())
                 .await
                 .map_err(|e| CoreError::Internal {
-                    message: format!("failed to create overlay filesystem: {e}"),
+                    message: format!("failed to create session filesystem: {e}"),
                 })?,
         );
 
