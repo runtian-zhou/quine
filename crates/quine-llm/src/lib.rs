@@ -3,6 +3,7 @@ pub mod config;
 pub mod error;
 pub mod openai_compat;
 pub mod provider;
+pub mod retry;
 pub mod types;
 
 pub use config::{create_provider, ProviderConfig};

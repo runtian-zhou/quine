@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::LlmError;
 use crate::provider::LlmProvider;
+use crate::retry::send_with_retry;
 use crate::types::{LlmEvent, Message, MessageContent, Role, ToolDefinition};
 
 /// Configuration for an OpenAI-compatible LLM endpoint.
@@ -300,7 +301,7 @@ impl LlmProvider for OpenAiCompatProvider {
             req = req.bearer_auth(key);
         }
 
-        let response = req.send().await.map_err(LlmError::from)?;
+        let response = send_with_retry(req, "openai_compat").await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();

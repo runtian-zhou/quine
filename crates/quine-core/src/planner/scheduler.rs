@@ -159,27 +159,26 @@ pub fn render_plan(plan: &ActionPlan) -> String {
         plan.title,
         plan.actions.len()
     ));
-    lines.push(String::new());
 
     for action in &plan.actions {
-        let status_indicator = match &action.status {
+        let (status_emoji, status_indicator) = match &action.status {
             ActionStatus::Pending => {
                 if ready_set.contains(&action.action_id) {
-                    "(ready)".to_string()
+                    ("🟢", "ready".to_string())
                 } else {
                     let deps: Vec<&str> = action.depends_on.iter().map(|d| d.as_str()).collect();
-                    format!("(blocked by: {})", deps.join(", "))
+                    ("🟡", format!("blocked by: {}", deps.join(", ")))
                 }
             }
-            ActionStatus::InProgress => "(in-progress)".to_string(),
-            ActionStatus::Completed => "(completed)".to_string(),
-            ActionStatus::Failed { error } => format!("(failed: {error})"),
-            ActionStatus::Skipped { reason } => format!("(skipped: {reason})"),
+            ActionStatus::InProgress => ("🔄", "in-progress".to_string()),
+            ActionStatus::Completed => ("✅", "completed".to_string()),
+            ActionStatus::Failed { error } => ("❌", format!("failed: {error}")),
+            ActionStatus::Skipped { reason } => ("⏭️", format!("skipped: {reason}")),
         };
 
         lines.push(format!(
-            "  [{}] {:<30} {}",
-            action.action_id, action.title, status_indicator
+            "  {status_emoji} [{}] {:<30} {status_indicator}",
+            action.action_id, action.title
         ));
     }
 
@@ -350,8 +349,8 @@ mod tests {
         ]);
         let rendered = render_plan(&plan);
         assert!(rendered.contains("Test Plan"));
-        assert!(rendered.contains("(ready)"));
-        assert!(rendered.contains("(blocked by:"));
+        assert!(rendered.contains("🟢"));
+        assert!(rendered.contains("blocked by:"));
         assert!(rendered.contains("[a1]"));
         assert!(rendered.contains("[a3]"));
     }
@@ -370,8 +369,8 @@ mod tests {
         };
 
         let rendered = render_plan(&plan);
-        assert!(rendered.contains("(completed)"));
-        assert!(rendered.contains("(in-progress)"));
-        assert!(rendered.contains("(skipped:"));
+        assert!(rendered.contains("✅"));
+        assert!(rendered.contains("🔄"));
+        assert!(rendered.contains("⏭️"));
     }
 }

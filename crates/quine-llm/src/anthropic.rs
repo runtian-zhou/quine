@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::LlmError;
 use crate::provider::LlmProvider;
+use crate::retry::send_with_retry;
 use crate::types::{LlmEvent, Message, MessageContent, Role, TokenUsage, ToolDefinition};
 
 /// Configuration for the Anthropic Messages API.
@@ -330,16 +331,16 @@ impl LlmProvider for AnthropicProvider {
             }
         }
 
-        let response = self
-            .client
-            .post(&url)
-            .header("x-api-key", &self.config.api_key)
-            .header("anthropic-version", "2023-06-01")
-            .header("content-type", "application/json")
-            .json(&request_body)
-            .send()
-            .await
-            .map_err(LlmError::from)?;
+        let response = send_with_retry(
+            self.client
+                .post(&url)
+                .header("x-api-key", &self.config.api_key)
+                .header("anthropic-version", "2023-06-01")
+                .header("content-type", "application/json")
+                .json(&request_body),
+            "anthropic",
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status().as_u16();
