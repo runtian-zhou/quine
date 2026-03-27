@@ -74,8 +74,14 @@ pub async fn run_oneshot(
                 Ok(value) => {
                     let sid = value
                         .as_str()
-                        .ok_or_else(|| anyhow::anyhow!("expected string session_id"))?
-                        .to_string();
+                        .map(str::to_string)
+                        .or_else(|| {
+                            value
+                                .get("session_id")
+                                .and_then(|v| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .ok_or_else(|| anyhow::anyhow!("expected string session_id"))?;
                     eprintln!("session: {sid}");
                     sid
                 }

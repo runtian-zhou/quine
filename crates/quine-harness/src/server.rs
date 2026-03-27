@@ -382,14 +382,20 @@ async fn handle_request(
                         .unwrap_or_default();
                     let entry = SessionLogEntry {
                         timestamp: Utc::now(),
-                        session_id: sid_str,
+                        session_id: sid_str.clone(),
                         event_type: "session_created".to_string(),
                         direction: EventDirection::Inbound,
                         payload: serde_json::json!({}),
                     };
                     let _ = session_log::append_log_entry(&entry).await;
 
-                    let resp = JsonRpcResponse::success(id, session_id);
+                    let resp = JsonRpcResponse::success(
+                        id,
+                        serde_json::json!({
+                            "session_id": sid_str,
+                            "max_context_window": crate::config::max_context_window_from_env(),
+                        }),
+                    );
                     Some(serde_json::to_string(&resp).unwrap_or_default())
                 }
                 Err(e) => {

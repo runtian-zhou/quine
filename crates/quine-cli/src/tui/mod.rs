@@ -46,11 +46,20 @@ pub async fn run_tui_chat(
         Some(session_params)
     };
     let result = client.call(methods::CREATE_SESSION, params).await?;
-    let session_id = match result {
-        Ok(value) => value
-            .as_str()
-            .ok_or_else(|| anyhow::anyhow!("expected string session_id"))?
-            .to_string(),
+    let (session_id, max_context_window) = match result {
+        Ok(value) => {
+            if let Some(session_id) = value.as_str() {
+                (session_id.to_string(), None)
+            } else {
+                let session_id = value
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow::anyhow!("expected string session_id"))?
+                    .to_string();
+                let max_context_window = value.get("max_context_window").and_then(|v| v.as_u64());
+                (session_id, max_context_window)
+            }
+        }
         Err(e) => anyhow::bail!("failed to create session: {e}"),
     };
 
@@ -70,7 +79,7 @@ pub async fn run_tui_chat(
         original_hook(info);
     }));
 
-    let mut app = app::App::new(session_id.clone(), plan_mode);
+    let mut app = app::App::new(session_id.clone(), plan_mode, max_context_window);
     let mut event_stream = EventStream::new();
     let mut spinner_interval = tokio::time::interval(Duration::from_millis(80));
 
