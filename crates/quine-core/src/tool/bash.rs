@@ -8,6 +8,9 @@ use super::{ExecutionContext, Tool, ToolError, ToolOutput};
 /// Default timeout for bash command execution (120 seconds).
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
+const FILE_EDIT_HINT: &str =
+    "bash cannot be used for file edits; use the apply_patch tool for source changes";
+
 /// Tool for executing shell commands.
 ///
 /// Spawns `/bin/sh -c <command>`, captures stdout and stderr, and enforces
@@ -23,8 +26,9 @@ impl Tool for BashTool {
 
     fn description(&self) -> &str {
         "Execute a bash command. The command runs in /bin/sh with the working directory set to \
-         the session working directory. Stdout and stderr are captured and returned. Commands \
-         time out after 120 seconds by default."
+         the session working directory. Use this for inspection, build, and test commands, not \
+         file modifications. Stdout and stderr are captured and returned. Commands time out after \
+         120 seconds by default."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -60,6 +64,12 @@ impl Tool for BashTool {
             .get("timeout")
             .and_then(|v| v.as_u64())
             .unwrap_or(DEFAULT_TIMEOUT_SECS);
+
+        if is_probably_file_edit_command(command) {
+            return Err(ToolError::PermissionDenied {
+                reason: FILE_EDIT_HINT.into(),
+            });
+        }
 
         let timeout = Duration::from_secs(timeout_secs);
 
@@ -106,6 +116,48 @@ impl Tool for BashTool {
             }),
         }
     }
+}
+
+fn is_probably_file_edit_command(command: &str) -> bool {
+    let command = command.trim().to_ascii_lowercase();
+    let file_edit_prefixes = [
+        "sed -i",
+        "perl -i",
+        "touch ",
+        "rm ",
+        "mv ",
+        "cp ",
+        "mkdir ",
+        "rmdir ",
+        "ln ",
+        "install ",
+        "truncate ",
+        "dd ",
+        "tee ",
+        "ed ",
+        "ex ",
+        "vi ",
+        "vim ",
+        "nano ",
+        "emacs ",
+    ];
+
+    if file_edit_prefixes
+        .iter()
+        .any(|prefix| command.starts_with(prefix) || command.contains(&format!(" && {prefix}")))
+    {
+        return true;
+    }
+
+    if command.contains(">>") || command.contains("<<") {
+        return true;
+    }
+
+    if command.contains('>') && !command.contains(">&") {
+        return true;
+    }
+
+    false
 }
 
 #[cfg(test)]
@@ -198,5 +250,22 @@ mod tests {
             .await;
 
         assert!(matches!(result, Err(ToolError::Timeout { .. })));
+    }
+
+    #[tokio::test]
+    async fn bash_rejects_file_edit_commands() {
+        let (_base, ctx) = make_context().await;
+        let tool = BashTool;
+
+        let result = tool
+            .execute(
+                serde_json::json!({"command": "echo hello > test.txt"}),
+                &ctx,
+            )
+            .await;
+
+        assert!(
+            matches!(result, Err(ToolError::PermissionDenied { reason }) if reason.contains("apply_patch"))
+        );
     }
 }

@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
 
-use super::app::{AgentPhase, App, ConversationEntry, DiffLine, ToolStatus};
+use super::app::{AgentPhase, App, ConversationEntry, InputBuffer, ToolStatus};
 
 /// Format a duration in microseconds to a human-readable string.
 fn format_duration_us(us: u64) -> String {
@@ -32,7 +32,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         let content_rows = (select.options.len() as u16 + 1).min(frame.area().height / 2);
         content_rows + 2
     } else {
-        let content_rows = app.input.line_count().max(1) as u16;
+        let label = app.input_label();
+        let content_rows =
+            input_content_rows(&app.input, &label, frame.area().width.saturating_sub(2));
         (content_rows + 2).max(3).min(max_height) // +2 for borders
     };
     let chunks = Layout::default()
@@ -47,18 +49,57 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_input(frame, app, chunks[1]);
 }
 
+fn wrapped_rows(width: usize, area_width: u16) -> u16 {
+    if area_width == 0 {
+        return 1;
+    }
+    let area_width = usize::from(area_width);
+    width.max(1).div_ceil(area_width) as u16
+}
+
+fn input_content_rows(input: &InputBuffer, label: &str, area_width: u16) -> u16 {
+    let total_rows: u16 = (0..input.line_count())
+        .map(|index| {
+            let prefix_width = if index == 0 { label.chars().count() } else { 0 };
+            wrapped_rows(prefix_width + input.line(index).chars().count(), area_width)
+        })
+        .sum();
+
+    let (cursor_row, _) = input_cursor_position(input, label, area_width);
+    total_rows.max(cursor_row + 1)
+}
+
+fn input_cursor_position(input: &InputBuffer, label: &str, area_width: u16) -> (u16, u16) {
+    if area_width == 0 {
+        return (0, 0);
+    }
+
+    let mut row = 0u16;
+    for index in 0..input.row() {
+        let prefix_width = if index == 0 { label.chars().count() } else { 0 };
+        row += wrapped_rows(prefix_width + input.line(index).chars().count(), area_width);
+    }
+
+    let prefix_width = if input.row() == 0 {
+        label.chars().count()
+    } else {
+        0
+    };
+    let cursor_width = input.line_prefix_width(input.row(), input.col()) + prefix_width;
+    row += (cursor_width / usize::from(area_width)) as u16;
+    let col = (cursor_width % usize::from(area_width)) as u16;
+    (row, col)
+}
+
 /// Render the scrollable conversation view.
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     for (i, entry) in app.messages.iter().enumerate() {
         // Add blank line separator between entries, but keep tool-related
-        // entries (ToolCall, WriteDiff) compact — no blank line before them.
+        // entries compact — no blank line before them.
         if i > 0 {
-            let is_tool_related = matches!(
-                entry,
-                ConversationEntry::ToolCall { .. } | ConversationEntry::WriteDiff { .. }
-            );
+            let is_tool_related = matches!(entry, ConversationEntry::ToolCall { .. });
             if !is_tool_related {
                 lines.push(Line::from(""));
             }
@@ -104,9 +145,9 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                 ..
             } => {
                 let (marker, style) = match status {
-                    ToolStatus::Running => ("\u{27F3}", Style::default().fg(Color::Yellow)),
-                    ToolStatus::Success { .. } => ("\u{2713}", Style::default().fg(Color::Green)),
-                    ToolStatus::Error { .. } => ("\u{2717}", Style::default().fg(Color::Red)),
+                    ToolStatus::Running => ("⟳", Style::default().fg(Color::Yellow)),
+                    ToolStatus::Success { .. } => ("✓", Style::default().fg(Color::Green)),
+                    ToolStatus::Error { .. } => ("✗", Style::default().fg(Color::Red)),
                 };
                 let duration_str = match status {
                     ToolStatus::Running => String::new(),
@@ -125,35 +166,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                     Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
                 ]));
             }
-            ConversationEntry::WriteDiff {
-                file_path: _,
-                diff_lines,
-            } => {
-                for dl in diff_lines {
-                    match dl {
-                        DiffLine::Header(h) => {
-                            lines.push(Line::from(Span::styled(
-                                format!("    {h}"),
-                                Style::default()
-                                    .fg(Color::Cyan)
-                                    .add_modifier(Modifier::BOLD),
-                            )));
-                        }
-                        DiffLine::Add(l) => {
-                            lines.push(Line::from(Span::styled(
-                                format!("    + {l}"),
-                                Style::default().fg(Color::Green),
-                            )));
-                        }
-                        DiffLine::Remove(l) => {
-                            lines.push(Line::from(Span::styled(
-                                format!("    - {l}"),
-                                Style::default().fg(Color::Red),
-                            )));
-                        }
-                    }
-                }
-            }
             ConversationEntry::Error(text) => {
                 for (i, line) in text.lines().enumerate() {
                     let prefix = if i == 0 { "Error: " } else { "       " };
@@ -164,7 +176,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                 }
             }
             ConversationEntry::InteractionQuestion { prompt, options } => {
-                // Render the question line in yellow/bold.
                 lines.push(Line::from(vec![
                     Span::styled("  ", Style::default().fg(Color::Yellow)),
                     Span::styled(
@@ -174,7 +185,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                             .add_modifier(Modifier::BOLD),
                     ),
                 ]));
-                // Render each option as a separate line in cyan.
                 for (i, opt) in options.iter().enumerate() {
                     lines.push(Line::from(Span::styled(
                         format!("     {}. {opt}", i + 1),
@@ -202,7 +212,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                     None => String::new(),
                 };
                 lines.push(Line::from(vec![Span::styled(
-                    format!("  \u{2500}\u{2500} {time_str}{token_str} \u{2500}\u{2500}"),
+                    format!("  ── {time_str}{token_str} ──"),
                     Style::default()
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::DIM),
@@ -231,7 +241,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
         }
     }
 
-    // Show streaming buffer if non-empty, trimming leading blank lines.
     if !app.streaming_buffer.is_empty() {
         let mut started = false;
         for line in app.streaming_buffer.lines() {
@@ -246,7 +255,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
         }
     }
 
-    // Show spinner line based on phase.
     match &app.phase {
         AgentPhase::Thinking => {
             lines.push(Line::from(Span::styled(
@@ -263,18 +271,11 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
         AgentPhase::Streaming | AgentPhase::Idle => {}
     }
 
-    // No trailing blank line — entry separators handle spacing.
-
     let text = Text::from(lines);
-
     let conversation = Paragraph::new(text).wrap(Wrap { trim: false });
 
-    // Use ratatui's Paragraph::line_count to get the exact wrapped line count,
-    // which accounts for word-boundary wrapping. This fixes scroll calculation
-    // that previously undercounted wrapped lines using text.lines.len().
     let content_height = conversation.line_count(area.width) as u32;
     let view_height = area.height as u32;
-    // Store view_height in app so PageUp/PageDown can use viewport-proportional steps.
     app.last_view_height = view_height;
     let max_scroll = content_height.saturating_sub(view_height);
     let scroll = if app.user_scrolled {
@@ -283,8 +284,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
         max_scroll
     };
 
-    // ratatui scroll takes u16; clamp (content that exceeds u16::MAX lines is
-    // extremely unlikely but we handle it gracefully).
     let scroll_u16 = scroll.min(u16::MAX as u32) as u16;
     let conversation = conversation.scroll((scroll_u16, 0));
 
@@ -292,10 +291,6 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
 }
 
 /// Compute the number of visual rows a single line occupies when wrapped to `area_width`.
-///
-/// This is a simple ceiling-division approximation. For exact results during
-/// rendering we use `Paragraph::line_count`, but this helper is useful for
-/// targeted unit tests of the wrapping math.
 #[cfg(test)]
 fn wrapped_line_count(line: &Line, area_width: u16) -> u16 {
     if area_width == 0 {
@@ -310,7 +305,6 @@ fn wrapped_line_count(line: &Line, area_width: u16) -> u16 {
 
 /// Render the input box at the bottom.
 fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
-    // If in option-select mode, render option list instead of text input.
     if let Some(ref select) = app.option_select {
         let mut lines: Vec<Line> = Vec::new();
         let label = app.input_label();
@@ -351,7 +345,6 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let label = app.input_label();
-    // Build display text: label prefixes the first line, subsequent lines have no prefix.
     let content = app.input.content();
     let display_text = format!("{}{}", label, content);
 
@@ -361,17 +354,11 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     frame.render_widget(input_widget, area);
 
-    // Position cursor for multi-line input.
-    let cursor_y = area.y + 1 + app.input.row() as u16; // +1 for border
-    let cursor_x = if app.input.row() == 0 {
-        (label.len() + app.input.col()) as u16 + 1 // +1 for border
-    } else {
-        app.input.col() as u16 + 1 // +1 for border
-    };
-    // Clamp to area bounds.
-    let cursor_x = cursor_x.min(area.x + area.width.saturating_sub(2));
-    let cursor_y = cursor_y.min(area.y + area.height.saturating_sub(2));
-    frame.set_cursor_position((area.x + cursor_x, cursor_y));
+    let (cursor_row, cursor_col) =
+        input_cursor_position(&app.input, &label, area.width.saturating_sub(2));
+    let cursor_y = (area.y + 1 + cursor_row).min(area.y + area.height.saturating_sub(2));
+    let cursor_x = (area.x + 1 + cursor_col).min(area.x + area.width.saturating_sub(2));
+    frame.set_cursor_position((cursor_x, cursor_y));
 }
 
 #[cfg(test)]
@@ -380,7 +367,6 @@ mod tests {
 
     #[test]
     fn draw_does_not_panic_empty_app() {
-        // Verify rendering logic doesn't panic with empty state.
         let mut app = App::new("test".into(), false);
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -445,43 +431,63 @@ mod tests {
 
     #[test]
     fn test_wrapped_line_count_single_row() {
-        // A short line (width < area width) returns 1 row.
         let line = Line::from("hello");
         assert_eq!(wrapped_line_count(&line, 80), 1);
     }
 
     #[test]
     fn test_wrapped_line_count_multi_row() {
-        // A line of width 200 in a 80-column area returns 3 rows.
         let line = Line::from("a".repeat(200));
         assert_eq!(wrapped_line_count(&line, 80), 3);
     }
 
     #[test]
     fn test_wrapped_line_count_exact_fit() {
-        // A line of width 80 in 80-column area returns 1 row.
         let line = Line::from("x".repeat(80));
         assert_eq!(wrapped_line_count(&line, 80), 1);
     }
 
     #[test]
     fn test_wrapped_line_count_empty() {
-        // An empty line returns 1 row.
         let line = Line::from("");
         assert_eq!(wrapped_line_count(&line, 80), 1);
     }
 
     #[test]
     fn test_content_height_with_wrapping() {
-        // Total height for a mix of short and long lines matches expected wrapped row count.
         let lines = [
-            Line::from("short"),         // 1 row
-            Line::from("a".repeat(200)), // 3 rows in 80-col
-            Line::from("x".repeat(80)),  // 1 row (exact fit)
-            Line::from(""),              // 1 row (empty)
-            Line::from("b".repeat(160)), // 2 rows in 80-col
+            Line::from("short"),
+            Line::from("a".repeat(200)),
+            Line::from("x".repeat(80)),
+            Line::from(""),
+            Line::from("b".repeat(160)),
         ];
         let total: u16 = lines.iter().map(|l| wrapped_line_count(l, 80)).sum();
-        assert_eq!(total, 8); // 1 + 3 + 1 + 1 + 2
+        assert_eq!(total, 8);
+    }
+
+    #[test]
+    fn input_height_counts_soft_wrapped_rows() {
+        let mut input = InputBuffer::new();
+        input.set_from_string("abcdefghijklmnopqrstuvwxyz");
+
+        assert_eq!(input_content_rows(&input, "> ", 10), 3);
+    }
+
+    #[test]
+    fn input_height_keeps_cursor_visible_at_wrap_boundary() {
+        let mut input = InputBuffer::new();
+        input.set_from_string("12345678");
+
+        assert_eq!(input_cursor_position(&input, "> ", 10), (1, 0));
+        assert_eq!(input_content_rows(&input, "> ", 10), 2);
+    }
+
+    #[test]
+    fn input_cursor_position_tracks_wrapped_second_line() {
+        let mut input = InputBuffer::new();
+        input.set_from_string("abc\ndefghijklmnop");
+
+        assert_eq!(input_cursor_position(&input, "> ", 8), (2, 5));
     }
 }
