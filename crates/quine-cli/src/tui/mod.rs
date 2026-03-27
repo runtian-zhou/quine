@@ -229,11 +229,21 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                     None
                 }
                 KeyCode::PageUp => {
-                    app.scroll_up(10);
+                    let step = if app.last_view_height > 2 {
+                        app.last_view_height.saturating_sub(2)
+                    } else {
+                        10
+                    };
+                    app.scroll_up(step);
                     None
                 }
                 KeyCode::PageDown => {
-                    app.scroll_down(10);
+                    let step = if app.last_view_height > 2 {
+                        app.last_view_height.saturating_sub(2)
+                    } else {
+                        10
+                    };
+                    app.scroll_down(step);
                     None
                 }
                 KeyCode::Home => {

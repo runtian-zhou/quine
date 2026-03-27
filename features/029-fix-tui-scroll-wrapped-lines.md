@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Fix TUI Scroll for Wrapped Lines

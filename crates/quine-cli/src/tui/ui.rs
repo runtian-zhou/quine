@@ -7,7 +7,7 @@ use ratatui::Frame;
 use super::app::{AgentPhase, App, ConversationEntry, DiffLine, ToolStatus};
 
 /// Render the entire TUI frame.
-pub fn draw(frame: &mut Frame, app: &App) {
+pub fn draw(frame: &mut Frame, app: &mut App) {
     // Dynamic input box height: expand for option selection or multi-line input.
     let max_height = (frame.area().height / 2).min(12);
     let input_height = if let Some(ref select) = app.option_select {
@@ -31,7 +31,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 /// Render the scrollable conversation view.
-fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     for entry in app.messages.iter() {
@@ -200,9 +200,15 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
 
     let text = Text::from(lines);
 
-    // Calculate scroll: we want to show the bottom unless user scrolled up.
-    let content_height = text.lines.len() as u16;
+    let conversation = Paragraph::new(text).wrap(Wrap { trim: false });
+
+    // Use ratatui's Paragraph::line_count to get the exact wrapped line count,
+    // which accounts for word-boundary wrapping. This fixes scroll calculation
+    // that previously undercounted wrapped lines using text.lines.len().
+    let content_height = conversation.line_count(area.width) as u16;
     let view_height = area.height;
+    // Store view_height in app so PageUp/PageDown can use viewport-proportional steps.
+    app.last_view_height = view_height;
     let max_scroll = content_height.saturating_sub(view_height);
     let scroll = if app.user_scrolled {
         max_scroll.saturating_sub(app.scroll_offset.min(max_scroll))
@@ -210,11 +216,26 @@ fn draw_conversation(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) 
         max_scroll
     };
 
-    let conversation = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
+    let conversation = conversation.scroll((scroll, 0));
 
     frame.render_widget(conversation, area);
+}
+
+/// Compute the number of visual rows a single line occupies when wrapped to `area_width`.
+///
+/// This is a simple ceiling-division approximation. For exact results during
+/// rendering we use `Paragraph::line_count`, but this helper is useful for
+/// targeted unit tests of the wrapping math.
+#[cfg(test)]
+fn wrapped_line_count(line: &Line, area_width: u16) -> u16 {
+    if area_width == 0 {
+        return 1;
+    }
+    let width = line.width() as u16;
+    if width == 0 {
+        return 1;
+    }
+    width.div_ceil(area_width)
 }
 
 /// Render the input box at the bottom.
@@ -290,10 +311,10 @@ mod tests {
     #[test]
     fn draw_does_not_panic_empty_app() {
         // Verify rendering logic doesn't panic with empty state.
-        let app = App::new("test".into(), false);
+        let mut app = App::new("test".into(), false);
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     }
 
     #[test]
@@ -327,7 +348,7 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     }
 
     #[test]
@@ -349,6 +370,48 @@ mod tests {
 
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        terminal.draw(|frame| draw(frame, &app)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn test_wrapped_line_count_single_row() {
+        // A short line (width < area width) returns 1 row.
+        let line = Line::from("hello");
+        assert_eq!(wrapped_line_count(&line, 80), 1);
+    }
+
+    #[test]
+    fn test_wrapped_line_count_multi_row() {
+        // A line of width 200 in a 80-column area returns 3 rows.
+        let line = Line::from("a".repeat(200));
+        assert_eq!(wrapped_line_count(&line, 80), 3);
+    }
+
+    #[test]
+    fn test_wrapped_line_count_exact_fit() {
+        // A line of width 80 in 80-column area returns 1 row.
+        let line = Line::from("x".repeat(80));
+        assert_eq!(wrapped_line_count(&line, 80), 1);
+    }
+
+    #[test]
+    fn test_wrapped_line_count_empty() {
+        // An empty line returns 1 row.
+        let line = Line::from("");
+        assert_eq!(wrapped_line_count(&line, 80), 1);
+    }
+
+    #[test]
+    fn test_content_height_with_wrapping() {
+        // Total height for a mix of short and long lines matches expected wrapped row count.
+        let lines = [
+            Line::from("short"),         // 1 row
+            Line::from("a".repeat(200)), // 3 rows in 80-col
+            Line::from("x".repeat(80)),  // 1 row (exact fit)
+            Line::from(""),              // 1 row (empty)
+            Line::from("b".repeat(160)), // 2 rows in 80-col
+        ];
+        let total: u16 = lines.iter().map(|l| wrapped_line_count(l, 80)).sum();
+        assert_eq!(total, 8); // 1 + 3 + 1 + 1 + 2
     }
 }

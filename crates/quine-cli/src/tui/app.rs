@@ -314,6 +314,8 @@ pub struct App {
     pub option_select: Option<OptionSelectState>,
     /// Whether this session is in read-only plan mode.
     pub plan_mode: bool,
+    /// Last known conversation view height (set during rendering for scroll step sizing).
+    pub last_view_height: u16,
 }
 
 impl App {
@@ -335,6 +337,7 @@ impl App {
             saved_input: String::new(),
             option_select: None,
             plan_mode,
+            last_view_height: 0,
         }
     }
 
