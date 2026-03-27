@@ -11,7 +11,8 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 /// Tool for executing shell commands.
 ///
 /// Spawns `/bin/sh -c <command>`, captures stdout and stderr, and enforces
-/// a configurable timeout. The working directory is set to the session root.
+/// a configurable timeout. The working directory is set to the real session
+/// working directory.
 pub(crate) struct BashTool;
 
 #[async_trait]
@@ -22,8 +23,8 @@ impl Tool for BashTool {
 
     fn description(&self) -> &str {
         "Execute a bash command. The command runs in /bin/sh with the working directory set to \
-         the session root. Stdout and stderr are captured and returned. Commands time out after \
-         120 seconds by default."
+         the session working directory. Stdout and stderr are captured and returned. Commands \
+         time out after 120 seconds by default."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {

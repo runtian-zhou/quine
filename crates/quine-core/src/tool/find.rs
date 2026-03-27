@@ -61,7 +61,7 @@ struct WalkParams<'a> {
 
 /// Recursively walk a directory tree, collecting matching entries.
 ///
-/// All paths passed to the filesystem are relative (to the overlay root).
+/// All paths passed to the filesystem are relative to the session root.
 /// `fs_path` is the relative path to the current directory being listed.
 /// `display_prefix` is the relative path from the user's search root for display.
 async fn walk_directory(
@@ -215,7 +215,7 @@ impl Tool for FindTool {
             .map(|v| v as usize)
             .unwrap_or(200);
 
-        // Resolve path as a relative path for the overlay filesystem.
+        // Resolve path as a relative path for the session filesystem.
         // If the user provides a path, use it as-is (relative to the filesystem root).
         // If no path is provided, use "" (the root of the filesystem / working directory).
         let fs_path = match path_str {
