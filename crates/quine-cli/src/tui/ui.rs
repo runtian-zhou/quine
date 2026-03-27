@@ -69,6 +69,15 @@ fn input_content_rows(input: &InputBuffer, label: &str, area_width: u16) -> u16 
     total_rows.max(cursor_row + 1)
 }
 
+fn input_lines(input: &InputBuffer, label: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(input.line_count());
+    for index in 0..input.line_count() {
+        let prefix = if index == 0 { label } else { "" };
+        lines.push(Line::from(format!("{prefix}{}", input.line(index))));
+    }
+    lines
+}
+
 fn input_cursor_position(input: &InputBuffer, label: &str, area_width: u16) -> (u16, u16) {
     if area_width == 0 {
         return (0, 0);
@@ -147,6 +156,36 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                     Span::raw("    "),
                     Span::styled(marker, style),
                     Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
+                ]));
+            }
+            ConversationEntry::PatchPreview(preview) => {
+                for line in preview.lines() {
+                    let style = if line.starts_with("+ ") {
+                        Style::default().fg(Color::Green)
+                    } else if line.starts_with("- ") {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw("      "),
+                        Span::styled(line.to_string(), style),
+                    ]));
+                }
+            }
+            ConversationEntry::PlanProgress {
+                action_id,
+                status,
+                remaining,
+                total,
+            } => {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("plan", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!(" {action_id} -> {status} ({remaining} remaining / {total} total)"),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                    ),
                 ]));
             }
             ConversationEntry::Error(text) => {
@@ -308,10 +347,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let label = app.input_label();
-    let content = app.input.content();
-    let display_text = format!("{}{}", label, content);
-
-    let input_widget = Paragraph::new(display_text.as_str())
+    let input_widget = Paragraph::new(Text::from(input_lines(&app.input, &label)))
         .block(Block::default().borders(Borders::ALL))
         .wrap(Wrap { trim: false });
 
