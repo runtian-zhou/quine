@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::process::Command;
+use tokio::select;
 
 use super::{ExecutionContext, Tool, ToolError, ToolOutput};
 
@@ -73,17 +74,39 @@ impl Tool for BashTool {
 
         let timeout = Duration::from_secs(timeout_secs);
 
-        let result = tokio::time::timeout(timeout, async {
-            Command::new("/bin/sh")
-                .arg("-c")
-                .arg(command)
-                .current_dir(&context.working_directory)
-                .output()
-                .await
+        let mut command_builder = Command::new("/bin/sh");
+        command_builder
+            .arg("-c")
+            .arg(command)
+            .current_dir(&context.working_directory)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .process_group(0)
+            .kill_on_drop(true);
+
+        let child = command_builder.spawn().map_err(|e| ToolError::Internal {
+            message: format!("failed to spawn process: {e}"),
+        })?;
+        let child_pid = child.id().ok_or_else(|| ToolError::Internal {
+            message: "failed to determine child process id".into(),
+        })? as i32;
+
+        let wait_result = tokio::time::timeout(timeout, async {
+            select! {
+                output = child.wait_with_output() => output.map_err(|e| ToolError::Internal {
+                    message: format!("failed to run process: {e}"),
+                }),
+                _ = context.cancellation.cancelled() => {
+                    unsafe {
+                        libc::kill(-child_pid, libc::SIGKILL);
+                    }
+                    Err(ToolError::Cancelled)
+                },
+            }
         })
         .await;
 
-        match result {
+        match wait_result {
             Ok(Ok(output)) => {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
@@ -108,12 +131,15 @@ impl Tool for BashTool {
                     Ok(ToolOutput::success(text))
                 }
             }
-            Ok(Err(e)) => Err(ToolError::Internal {
-                message: format!("failed to spawn process: {e}"),
-            }),
-            Err(_) => Err(ToolError::Timeout {
-                seconds: timeout_secs,
-            }),
+            Ok(Err(tool_error)) => Err(tool_error),
+            Err(_) => {
+                unsafe {
+                    libc::kill(-child_pid, libc::SIGKILL);
+                }
+                Err(ToolError::Timeout {
+                    seconds: timeout_secs,
+                })
+            }
         }
     }
 }
@@ -165,8 +191,51 @@ mod tests {
     use super::*;
     use crate::filesystem::OverlayFilesystem;
     use crate::session::SessionId;
+    use std::path::Path;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[tokio::test]
+    async fn bash_cancellation_kills_background_process_group() {
+        let base = TempDir::new().unwrap();
+        let session_dir = TempDir::new().unwrap();
+        let fs =
+            OverlayFilesystem::new(base.path().to_path_buf(), session_dir.path().to_path_buf())
+                .await
+                .unwrap();
+        let marker = base.path().join("marker.txt");
+        let command = format!(
+            "sh -c 'sleep 5; python -c \"from pathlib import Path; Path(r#\"{}\"#).write_text(\"done\")\"' & wait",
+            marker.display()
+        );
+        let (cancel_tx, cancellation) = crate::tool::CancellationChannel::new_pair();
+        let ctx = ExecutionContext {
+            session_id: SessionId::new(),
+            filesystem: Arc::new(fs),
+            working_directory: base.path().to_path_buf(),
+            interaction_channel: None,
+            plan_store: crate::tool::plan::new_plan_store(),
+            core_input: None,
+            cancellation,
+        };
+        let tool = BashTool;
+
+        let handle = tokio::spawn(async move {
+            tool.execute(serde_json::json!({"command": command, "timeout": 30}), &ctx)
+                .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let _ = cancel_tx.send(true);
+        let result = handle.await.unwrap();
+        assert!(matches!(result, Err(ToolError::Cancelled)));
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !Path::new(&marker).exists(),
+            "background process survived cancellation and wrote marker"
+        );
+    }
 
     async fn make_context() -> (TempDir, ExecutionContext) {
         let base = TempDir::new().unwrap();
@@ -182,6 +251,7 @@ mod tests {
             interaction_channel: None,
             plan_store: crate::tool::plan::new_plan_store(),
             core_input: None,
+            cancellation: crate::tool::CancellationChannel::never(),
         };
         (base, ctx)
     }
@@ -249,7 +319,45 @@ mod tests {
             )
             .await;
 
-        assert!(matches!(result, Err(ToolError::Timeout { .. })));
+        assert!(
+            matches!(result, Err(ToolError::Timeout { .. })),
+            "expected timeout, got: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bash_cancels_immediately() {
+        let base = TempDir::new().unwrap();
+        let session_dir = TempDir::new().unwrap();
+        let fs =
+            OverlayFilesystem::new(base.path().to_path_buf(), session_dir.path().to_path_buf())
+                .await
+                .unwrap();
+        let (cancel_tx, cancellation) = crate::tool::CancellationChannel::new_pair();
+        let ctx = ExecutionContext {
+            session_id: SessionId::new(),
+            filesystem: Arc::new(fs),
+            working_directory: base.path().to_path_buf(),
+            interaction_channel: None,
+            plan_store: crate::tool::plan::new_plan_store(),
+            core_input: None,
+            cancellation,
+        };
+        let tool = BashTool;
+
+        let handle = tokio::spawn(async move {
+            tool.execute(
+                serde_json::json!({"command": "sleep 10", "timeout": 30}),
+                &ctx,
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        cancel_tx.send(true).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result, Err(ToolError::Cancelled)));
     }
 
     #[tokio::test]

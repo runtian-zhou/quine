@@ -119,6 +119,7 @@ mod tests {
             interaction_channel: None,
             plan_store: crate::tool::plan::new_plan_store(),
             core_input: None,
+            cancellation: crate::tool::CancellationChannel::never(),
         };
         (session_dir, ctx)
     }

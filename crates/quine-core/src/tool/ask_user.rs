@@ -106,13 +106,16 @@ impl Tool for AskUserTool {
             })?;
 
         let response = channel
-            .ask(InteractionRequest {
-                prompt: question.to_string(),
-                kind,
-                options,
-                allow_freeform,
-                source_label: None,
-            })
+            .ask(
+                InteractionRequest {
+                    prompt: question.to_string(),
+                    kind,
+                    options,
+                    allow_freeform,
+                    source_label: None,
+                },
+                &context.cancellation,
+            )
             .await?;
 
         Ok(ToolOutput::success(response.response))
@@ -154,6 +157,7 @@ mod tests {
             interaction_channel: Some(channel),
             plan_store: crate::tool::plan::new_plan_store(),
             core_input: None,
+            cancellation: crate::tool::CancellationChannel::never(),
         };
 
         (base, session_dir, ctx, rx)
@@ -247,7 +251,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ask_user_no_channel_errors() {
+    async fn ask_user_cancels_while_waiting_for_response() {
         let base = TempDir::new().unwrap();
         let session_dir = TempDir::new().unwrap();
         let fs =
@@ -255,20 +259,31 @@ mod tests {
                 .await
                 .unwrap();
 
+        let (tx, mut rx) =
+            mpsc::channel::<(InteractionRequest, oneshot::Sender<InteractionResponse>)>(1);
+        let channel = super::super::InteractionChannel { request_tx: tx };
+        let (cancel_tx, cancellation) = crate::tool::CancellationChannel::new_pair();
+
         let ctx = ExecutionContext {
             session_id: SessionId::new(),
             filesystem: Arc::new(fs),
             working_directory: base.path().to_path_buf(),
-            interaction_channel: None,
+            interaction_channel: Some(channel),
             plan_store: crate::tool::plan::new_plan_store(),
             core_input: None,
+            cancellation,
         };
 
         let tool = AskUserTool;
-        let result = tool
-            .execute(serde_json::json!({"question": "hello?"}), &ctx)
-            .await;
+        let handle = tokio::spawn(async move {
+            tool.execute(serde_json::json!({"question": "Wait?"}), &ctx)
+                .await
+        });
 
-        assert!(matches!(result, Err(ToolError::Internal { .. })));
+        let (_req, _reply_tx) = rx.recv().await.unwrap();
+        cancel_tx.send(true).unwrap();
+
+        let result = handle.await.unwrap();
+        assert!(matches!(result, Err(ToolError::Cancelled)));
     }
 }

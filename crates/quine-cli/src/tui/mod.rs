@@ -329,8 +329,7 @@ async fn execute_action(
                 app.messages
                     .push(app::ConversationEntry::Error(e.to_string()));
             }
-            app.phase = AgentPhase::Idle;
-            app.streaming_buffer.clear();
+            app.cancel_active_turn();
             app.messages
                 .push(app::ConversationEntry::Error("(cancelled)".into()));
         }

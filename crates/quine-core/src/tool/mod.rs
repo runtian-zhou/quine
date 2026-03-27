@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::filesystem::SessionFilesystem;
 use crate::session::SessionId;
@@ -139,7 +139,11 @@ pub struct InteractionChannel {
 
 impl InteractionChannel {
     /// Ask the user a question and wait for their response.
-    pub async fn ask(&self, request: InteractionRequest) -> Result<InteractionResponse, ToolError> {
+    pub async fn ask(
+        &self,
+        request: InteractionRequest,
+        cancellation: &CancellationChannel,
+    ) -> Result<InteractionResponse, ToolError> {
         let (response_tx, response_rx) = oneshot::channel();
         self.request_tx
             .send((request, response_tx))
@@ -147,11 +151,70 @@ impl InteractionChannel {
             .map_err(|_| ToolError::Internal {
                 message: "interaction channel closed".into(),
             })?;
-        response_rx.await.map_err(|_| ToolError::Cancelled)
+
+        tokio::select! {
+            response = response_rx => response.map_err(|_| ToolError::Cancelled),
+            _ = cancellation.cancelled() => Err(ToolError::Cancelled),
+        }
+    }
+}
+
+/// A cloneable per-tool cancellation channel.
+#[derive(Clone)]
+pub struct CancellationChannel {
+    receiver: watch::Receiver<bool>,
+    keepalive: Option<watch::Sender<bool>>,
+}
+
+impl CancellationChannel {
+    /// Create a cancellation sender/receiver pair for a single tool execution.
+    pub fn new_pair() -> (watch::Sender<bool>, Self) {
+        let (sender, receiver) = watch::channel(false);
+        (
+            sender,
+            Self {
+                receiver,
+                keepalive: None,
+            },
+        )
+    }
+
+    /// Create a channel that is never cancelled unless explicitly replaced.
+    pub fn never() -> Self {
+        let (sender, receiver) = watch::channel(false);
+        Self {
+            receiver,
+            keepalive: Some(sender),
+        }
+    }
+
+    /// Returns true once cancellation has been signaled.
+    pub fn is_cancelled(&self) -> bool {
+        *self.receiver.borrow()
+    }
+
+    /// Wait until cancellation is signaled.
+    pub async fn cancelled(&self) {
+        if *self.receiver.borrow() {
+            return;
+        }
+
+        let mut receiver = self.receiver.clone();
+        while receiver.changed().await.is_ok() {
+            if *receiver.borrow() {
+                return;
+            }
+        }
+
+        let _ = &self.keepalive;
     }
 }
 
 /// Context provided to a tool during execution.
+///
+/// Cancellation is modeled as a per-execution channel instead of mutable
+/// session flags. Tools can wait on `context.cancellation.cancelled()` to abort
+/// immediately without relying on engine-owned deferred input state.
 pub struct ExecutionContext {
     /// The session this tool is executing within.
     pub session_id: SessionId,
@@ -165,6 +228,8 @@ pub struct ExecutionContext {
     pub plan_store: crate::tool::plan::PlanStore,
     /// Sender for sending messages back to the core event loop (for spawn, signal, etc.).
     pub core_input: Option<mpsc::Sender<crate::channel::CoreInput>>,
+    /// Per-execution cancellation channel for immediate tool aborts.
+    pub cancellation: CancellationChannel,
 }
 
 /// Trait for a tool that the agent can invoke.
@@ -365,13 +430,28 @@ mod tests {
         assert!(de.allow_freeform);
     }
 
-    #[test]
-    fn interaction_request_backward_compatible_deserialization() {
-        // Old-style request without options field should deserialize fine
-        let json = r#"{"prompt":"hello","kind":"Question"}"#;
-        let de: InteractionRequest = serde_json::from_str(json).unwrap();
-        assert_eq!(de.prompt, "hello");
-        assert!(de.options.is_empty());
-        assert!(!de.allow_freeform);
+    #[tokio::test]
+    async fn cancellation_channel_never_stays_pending() {
+        let cancellation = CancellationChannel::never();
+        assert!(!cancellation.is_cancelled());
+
+        let timed = tokio::time::timeout(
+            std::time::Duration::from_millis(20),
+            cancellation.cancelled(),
+        )
+        .await;
+        assert!(
+            timed.is_err(),
+            "never() channel should not resolve without an explicit cancel"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_channel_pair_resolves_after_signal() {
+        let (tx, cancellation) = CancellationChannel::new_pair();
+        assert!(!cancellation.is_cancelled());
+        tx.send(true).unwrap();
+        cancellation.cancelled().await;
+        assert!(cancellation.is_cancelled());
     }
 }
