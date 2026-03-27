@@ -415,6 +415,16 @@ impl App {
         }
     }
 
+    /// Reset UI state after cancelling in-flight work.
+    pub fn cancel_active_turn(&mut self) {
+        self.phase = AgentPhase::Idle;
+        self.reasoning_buffer.clear();
+        self.streaming_buffer.clear();
+        self.interaction_queue.clear();
+        self.option_select = None;
+        self.auto_scroll();
+    }
+
     /// Advance the spinner animation frame.
     pub fn tick_spinner(&mut self) {
         if self.phase != AgentPhase::Idle {
@@ -1016,5 +1026,35 @@ mod tests {
                 && *remaining == 2
                 && *total == 5
         ));
+    }
+
+    #[test]
+    fn cancel_active_turn_clears_pending_interaction_state() {
+        let mut app = App::new("test".into(), false, None);
+        app.phase = AgentPhase::RunningTool("bash".into());
+        app.reasoning_buffer = "thinking".into();
+        app.streaming_buffer = "partial output".into();
+        app.interaction_queue.push_back(PendingInteraction {
+            prompt: "Allow?".into(),
+            kind: InteractionKind::Permission,
+            options: Vec::new(),
+            allow_freeform: false,
+            source_label: Some("agent".into()),
+        });
+        app.option_select = Some(OptionSelectState {
+            options: vec!["Yes".into(), "No".into()],
+            cursor: 0,
+            selected: HashSet::new(),
+            multi_select: false,
+            allow_freeform: false,
+        });
+
+        app.cancel_active_turn();
+
+        assert_eq!(app.phase, AgentPhase::Idle);
+        assert!(app.reasoning_buffer.is_empty());
+        assert!(app.streaming_buffer.is_empty());
+        assert!(app.interaction_queue.is_empty());
+        assert!(app.option_select.is_none());
     }
 }

@@ -302,6 +302,7 @@ async fn run_subagent_inner(
                 interaction_channel: child_channel.clone(),
                 plan_store: plan_store.clone(),
                 core_input: None,
+                cancellation: crate::tool::CancellationChannel::never(),
             };
 
             match tool.execute(arguments.clone(), &ctx).await {
@@ -348,6 +349,7 @@ mod tests {
             interaction_channel: None,
             plan_store: crate::tool::plan::new_plan_store(),
             core_input: None,
+            cancellation: crate::tool::CancellationChannel::never(),
         };
         (base, session_dir, ctx)
     }
@@ -593,6 +595,7 @@ mod tests {
             interaction_channel: Some(parent_channel),
             plan_store: crate::tool::plan::new_plan_store(),
             core_input: None,
+            cancellation: crate::tool::CancellationChannel::never(),
         };
 
         let provider: Arc<dyn LlmProvider> = Arc::new(AskUserProvider {

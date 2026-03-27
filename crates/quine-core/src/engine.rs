@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -17,8 +17,9 @@ use crate::tool::{
     ask_user::AskUserTool, bash::BashTool, find::FindTool, plan::PlanTool, read::ReadTool,
     recv_message::RecvMessageTool, send_message::SendMessageTool, signal::SignalTool,
     skill_template::SkillTemplateTool, spawn::SpawnTool, subagent::SubagentTool,
-    wait_child::WaitChildTool, write::WriteTool, ExecutionContext, InteractionChannel,
-    InteractionKind, InteractionRequest, InteractionResponse, ToolRegistry,
+    wait_child::WaitChildTool, write::WriteTool, CancellationChannel, ExecutionContext,
+    InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse, ToolError,
+    ToolRegistry,
 };
 
 /// Default system prompt used when no CLAUDE.md and no explicit prompt is provided.
@@ -89,6 +90,8 @@ struct SessionContext {
     pending_interaction: Option<oneshot::Sender<InteractionResponse>>,
     /// Shared plan store for this session.
     plan_store: crate::tool::plan::PlanStore,
+    /// Per-turn cancellation sender for the currently running tool or prompt.
+    cancel_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
 
 impl SessionContext {
@@ -190,6 +193,7 @@ impl SessionContext {
             auto_approve_permissions,
             pending_interaction: None,
             plan_store,
+            cancel_tx: None,
         })
     }
 }
@@ -290,6 +294,13 @@ enum LlmTurnResult {
     },
 }
 
+struct PermissionWait<'a> {
+    output: &'a mpsc::Sender<CoreOutput>,
+    input: &'a mut mpsc::Receiver<CoreInput>,
+    deferred_inputs: &'a mut VecDeque<CoreInput>,
+    cancellation: &'a CancellationChannel,
+}
+
 /// Check permissions for a tool call, optionally requesting user confirmation.
 ///
 /// Returns `Ok(())` if the tool is allowed to proceed, or `Err(ToolOutcome)` with
@@ -299,13 +310,8 @@ async fn check_permission(
     call: &PendingToolCall,
     session: &SessionContext,
     session_id: SessionId,
-    output: &mpsc::Sender<CoreOutput>,
-    input: &mut mpsc::Receiver<CoreInput>,
+    wait: PermissionWait<'_>,
 ) -> Result<(), ToolOutcome> {
-    if session.auto_approve_permissions {
-        return Ok(());
-    }
-
     let context = PermissionContext {
         session_id,
         working_directory: session.working_directory.clone(),
@@ -347,50 +353,56 @@ async fn check_permission(
                 source_label: None,
             };
 
-            let _ = output
+            let _ = wait
+                .output
                 .send(CoreOutput::InteractionNeeded {
                     session_id,
                     request,
                 })
                 .await;
 
-            // Wait for user response with a 30-second timeout.
-            // Without a timeout, unanswered prompts block the core loop
-            // forever and consume unrelated CoreInputs (like CreateSession),
-            // effectively crashing the daemon for all clients.
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
             loop {
-                match tokio::time::timeout_at(deadline, input.recv()).await {
-                    Ok(Some(CoreInput::InteractionResponse {
-                        session_id: resp_sid,
-                        response,
-                    })) if resp_sid == session_id => {
-                        let answer = response.response.trim().to_lowercase();
-                        if answer == "y" || answer == "yes" {
-                            return Ok(());
-                        }
-                        return Err(ToolOutcome::Error {
-                            message: format!("permission denied by user: {reason}"),
-                        });
-                    }
-                    Ok(Some(CoreInput::Cancel {
-                        session_id: cancel_sid,
-                    })) if cancel_sid == session_id => {
+                tokio::select! {
+                    _ = wait.cancellation.cancelled() => {
                         return Err(ToolOutcome::Cancelled);
                     }
-                    Ok(Some(_)) => continue,
-                    Ok(None) => {
-                        return Err(ToolOutcome::Error {
-                            message: "input channel closed during permission check".into(),
-                        });
-                    }
-                    Err(_) => {
-                        // Timeout — auto-deny to avoid blocking the core loop.
-                        return Err(ToolOutcome::Error {
-                            message: format!(
-                                "permission check timed out (no response within 30s): {reason}"
-                            ),
-                        });
+                    recv = tokio::time::timeout_at(deadline, wait.input.recv()) => {
+                        match recv {
+                            Ok(Some(CoreInput::InteractionResponse {
+                                session_id: resp_sid,
+                                response,
+                            })) if resp_sid == session_id => {
+                                let answer = response.response.trim().to_lowercase();
+                                if answer == "y" || answer == "yes" {
+                                    return Ok(());
+                                }
+                                return Err(ToolOutcome::Error {
+                                    message: format!("permission denied by user: {reason}"),
+                                });
+                            }
+                            Ok(Some(CoreInput::Cancel {
+                                session_id: cancel_sid,
+                            })) if cancel_sid == session_id => {
+                                return Err(ToolOutcome::Cancelled);
+                            }
+                            Ok(Some(other)) => {
+                                wait.deferred_inputs.push_back(other);
+                                continue;
+                            }
+                            Ok(None) => {
+                                return Err(ToolOutcome::Error {
+                                    message: "input channel closed during permission check".into(),
+                                });
+                            }
+                            Err(_) => {
+                                return Err(ToolOutcome::Error {
+                                    message: format!(
+                                        "permission check timed out (no response within 30s): {reason}"
+                                    ),
+                                });
+                            }
+                        }
                     }
                 }
             }
@@ -408,14 +420,30 @@ async fn execute_tool_call(
     session_id: SessionId,
     output: &mpsc::Sender<CoreOutput>,
     input: &mut mpsc::Receiver<CoreInput>,
+    deferred_inputs: &mut VecDeque<CoreInput>,
     permission_checker: Option<&dyn PermissionChecker>,
 ) -> ToolOutcome {
+    let (cancel_tx, cancellation) = CancellationChannel::new_pair();
+    session.cancel_tx = Some(cancel_tx.clone());
+
     // Only check permissions for bash tool — other tools are safe by design.
     if call.tool_name == "bash" {
-        if let Some(checker) = permission_checker {
-            if let Err(outcome) =
-                check_permission(checker, call, session, session_id, output, input).await
+        if let Some(checker) = permission_checker.filter(|_| !session.auto_approve_permissions) {
+            if let Err(outcome) = check_permission(
+                checker,
+                call,
+                session,
+                session_id,
+                PermissionWait {
+                    output,
+                    input,
+                    deferred_inputs,
+                    cancellation: &cancellation,
+                },
+            )
+            .await
             {
+                session.cancel_tx = None;
                 return outcome;
             }
         }
@@ -446,6 +474,7 @@ async fn execute_tool_call(
             interaction_channel: Some(channel),
             plan_store: session.plan_store.clone(),
             core_input: None,
+            cancellation: cancellation.clone(),
         };
 
         let args = call.arguments.clone();
@@ -454,11 +483,10 @@ async fn execute_tool_call(
         let output_clone = output.clone();
         let sid = session_id;
 
-        // Poll: either the tool finishes or it needs interaction
-        loop {
+        let outcome = 'tool_loop: loop {
             tokio::select! {
                 result = &mut tool_handle => {
-                    return match result {
+                    break 'tool_loop match result {
                         Ok(Ok(tool_output)) => {
                             if tool_output.is_error {
                                 ToolOutcome::Error { message: tool_output.content }
@@ -466,6 +494,7 @@ async fn execute_tool_call(
                                 ToolOutcome::Success { output: tool_output.content }
                             }
                         }
+                        Ok(Err(ToolError::Cancelled)) => ToolOutcome::Cancelled,
                         Ok(Err(tool_err)) => {
                             ToolOutcome::Error { message: tool_err.to_string() }
                         }
@@ -478,13 +507,11 @@ async fn execute_tool_call(
                 }
                 interaction = req_rx.recv() => {
                     if let Some((request, reply_tx)) = interaction {
-                        // Emit InteractionNeeded
                         let _ = output_clone.send(CoreOutput::InteractionNeeded {
                             session_id: sid,
                             request,
                         }).await;
 
-                        // Wait for CoreInput::InteractionResponse from the harness
                         loop {
                             match input.recv().await {
                                 Some(CoreInput::InteractionResponse { session_id: resp_sid, response }) if resp_sid == sid => {
@@ -492,16 +519,16 @@ async fn execute_tool_call(
                                     break;
                                 }
                                 Some(CoreInput::Cancel { session_id: cancel_sid }) if cancel_sid == sid => {
-                                    // Drop the reply sender to cancel the tool
+                                    let _ = cancel_tx.send(true);
                                     drop(reply_tx);
-                                    return ToolOutcome::Cancelled;
+                                    break 'tool_loop ToolOutcome::Cancelled;
                                 }
-                                Some(_) => {
-                                    // Ignore other messages while waiting for interaction response
+                                Some(other) => {
+                                    deferred_inputs.push_back(other);
                                     continue;
                                 }
                                 None => {
-                                    return ToolOutcome::Error {
+                                    break 'tool_loop ToolOutcome::Error {
                                         message: "input channel closed".into(),
                                     };
                                 }
@@ -510,7 +537,11 @@ async fn execute_tool_call(
                     }
                 }
             }
-        }
+        };
+
+        let _ = cancel_tx.send(true);
+        session.cancel_tx = None;
+        outcome
     } else {
         // Non-interactive tool: execute directly
         let ctx = ExecutionContext {
@@ -520,24 +551,54 @@ async fn execute_tool_call(
             interaction_channel: None,
             plan_store: session.plan_store.clone(),
             core_input: None,
+            cancellation: cancellation.clone(),
         };
 
-        match tool.execute(call.arguments.clone(), &ctx).await {
-            Ok(tool_output) => {
-                if tool_output.is_error {
-                    ToolOutcome::Error {
-                        message: tool_output.content,
-                    }
-                } else {
-                    ToolOutcome::Success {
-                        output: tool_output.content,
+        let tool_future = tool.execute(call.arguments.clone(), &ctx);
+        tokio::pin!(tool_future);
+        let result = loop {
+            tokio::select! {
+                result = &mut tool_future => {
+                    break match result {
+                        Ok(tool_output) => {
+                            if tool_output.is_error {
+                                ToolOutcome::Error {
+                                    message: tool_output.content,
+                                }
+                            } else {
+                                ToolOutcome::Success {
+                                    output: tool_output.content,
+                                }
+                            }
+                        }
+                        Err(ToolError::Cancelled) => ToolOutcome::Cancelled,
+                        Err(tool_err) => ToolOutcome::Error {
+                            message: tool_err.to_string(),
+                        },
+                    };
+                }
+                maybe_input = input.recv() => {
+                    match maybe_input {
+                        Some(CoreInput::Cancel { session_id: cancel_sid }) if cancel_sid == session_id => {
+                            let _ = cancel_tx.send(true);
+                            break ToolOutcome::Cancelled;
+                        }
+                        Some(other) => {
+                            deferred_inputs.push_back(other);
+                            continue;
+                        }
+                        None => {
+                            let _ = cancel_tx.send(true);
+                            break ToolOutcome::Error { message: "input channel closed".into() };
+                        }
                     }
                 }
             }
-            Err(tool_err) => ToolOutcome::Error {
-                message: tool_err.to_string(),
-            },
-        }
+        };
+
+        let _ = cancel_tx.send(true);
+        session.cancel_tx = None;
+        result
     }
 }
 
@@ -626,6 +687,7 @@ async fn handle_llm_turn(
     session_id: SessionId,
     output: &mpsc::Sender<CoreOutput>,
     input: &mut mpsc::Receiver<CoreInput>,
+    deferred_inputs: &mut VecDeque<CoreInput>,
     permission_checker: Option<&dyn PermissionChecker>,
 ) {
     let turn_start = std::time::Instant::now();
@@ -729,6 +791,7 @@ async fn handle_llm_turn(
                         session_id,
                         output,
                         input,
+                        deferred_inputs,
                         permission_checker,
                     )
                     .await;
@@ -770,6 +833,20 @@ async fn handle_llm_turn(
                         &tool_output,
                         is_error,
                     ));
+
+                    if matches!(result, ToolOutcome::Cancelled) {
+                        session.cancel_tx = None;
+                        session.state = SessionState::Idle;
+                        let duration_us = turn_start.elapsed().as_micros() as u64;
+                        let _ = output
+                            .send(CoreOutput::TurnComplete {
+                                session_id,
+                                duration_us,
+                                usage: accumulated_usage.clone(),
+                            })
+                            .await;
+                        return;
+                    }
 
                     // Plan execution integration: after update_plan, emit
                     // progress and inject prompts for newly ready actions.
@@ -822,8 +899,16 @@ pub async fn run_core_loop(
     permission_checker: Option<Arc<dyn PermissionChecker>>,
 ) {
     let mut sessions: HashMap<SessionId, SessionContext> = HashMap::new();
+    let mut deferred_inputs = VecDeque::new();
 
-    while let Some(input) = handle.input.recv().await {
+    loop {
+        let input = match deferred_inputs.pop_front() {
+            Some(input) => input,
+            None => match handle.input.recv().await {
+                Some(input) => input,
+                None => break,
+            },
+        };
         match input {
             CoreInput::CreateSession {
                 session_id,
@@ -892,6 +977,7 @@ pub async fn run_core_loop(
                         session_id,
                         &handle.output,
                         &mut handle.input,
+                        &mut deferred_inputs,
                         permission_checker.as_deref(),
                     )
                     .await;
@@ -955,6 +1041,7 @@ pub async fn run_core_loop(
                             session_id,
                             &handle.output,
                             &mut handle.input,
+                            &mut deferred_inputs,
                             permission_checker.as_deref(),
                         )
                         .await;
@@ -978,7 +1065,10 @@ pub async fn run_core_loop(
             CoreInput::Cancel { session_id } => {
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.state = SessionState::Idle;
-                    // Drop any pending interaction
+                    if let Some(cancel_tx) = &session.cancel_tx {
+                        let _ = cancel_tx.send(true);
+                    }
+                    session.cancel_tx = None;
                     session.pending_interaction.take();
                     let _ = handle
                         .output
@@ -1047,6 +1137,7 @@ pub async fn run_core_loop(
                             child_id,
                             &handle.output,
                             &mut handle.input,
+                            &mut deferred_inputs,
                             permission_checker.as_deref(),
                         )
                         .await;
@@ -1125,6 +1216,114 @@ mod tests {
                 reason: "test confirmation".into(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_consumes_cancel_for_non_interactive_tool() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
+        let mut session = SessionContext::new(
+            None,
+            Vec::new(),
+            std::env::current_dir().unwrap_or_default(),
+            &provider,
+            &permission_checker,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let call = PendingToolCall {
+            tool_use_id: "toolu_cancel".into(),
+            tool_name: "bash".into(),
+            arguments: serde_json::json!({"command": "sleep 5"}),
+        };
+
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(4);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let session_id = SessionId::new();
+        input_tx
+            .send(CoreInput::Cancel { session_id })
+            .await
+            .unwrap();
+
+        let result = execute_tool_call(
+            &call,
+            &mut session,
+            session_id,
+            &output_tx,
+            &mut input_rx,
+            &mut deferred_inputs,
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, ToolOutcome::Cancelled));
+        assert!(session.cancel_tx.is_none());
+        assert!(deferred_inputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_buffers_unrelated_input_while_waiting_for_cancel() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
+        let mut session = SessionContext::new(
+            None,
+            Vec::new(),
+            std::env::current_dir().unwrap_or_default(),
+            &provider,
+            &permission_checker,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let call = PendingToolCall {
+            tool_use_id: "toolu_cancel".into(),
+            tool_name: "bash".into(),
+            arguments: serde_json::json!({"command": "sleep 5"}),
+        };
+
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(4);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let session_id = SessionId::new();
+        let other_session_id = SessionId::new();
+
+        input_tx
+            .send(CoreInput::UserMessage {
+                session_id: other_session_id,
+                content: "hello".into(),
+            })
+            .await
+            .unwrap();
+        input_tx
+            .send(CoreInput::Cancel { session_id })
+            .await
+            .unwrap();
+
+        let result = execute_tool_call(
+            &call,
+            &mut session,
+            session_id,
+            &output_tx,
+            &mut input_rx,
+            &mut deferred_inputs,
+            None,
+        )
+        .await;
+
+        assert!(matches!(result, ToolOutcome::Cancelled));
+        assert!(matches!(
+            deferred_inputs.pop_front(),
+            Some(CoreInput::UserMessage {
+                session_id,
+                content
+            }) if session_id == other_session_id && content == "hello"
+        ));
     }
 
     #[tokio::test]

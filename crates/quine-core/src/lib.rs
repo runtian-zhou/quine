@@ -23,6 +23,6 @@ pub use skill::{
     FileSystemSkillLoader, Skill, SkillLoader, SkillMeta, SkillService, SkillToolDef,
 };
 pub use tool::{
-    ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse,
-    SelectOption, Tool, ToolError, ToolOutput, ToolRegistry,
+    CancellationChannel, ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest,
+    InteractionResponse, SelectOption, Tool, ToolError, ToolOutput, ToolRegistry,
 };
