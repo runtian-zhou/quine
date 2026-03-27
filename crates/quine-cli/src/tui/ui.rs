@@ -100,6 +100,36 @@ fn input_cursor_position(input: &InputBuffer, label: &str, area_width: u16) -> (
     (row, col)
 }
 
+fn plan_status_style(status_line: &str) -> Style {
+    if status_line.starts_with("✅") {
+        Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD)
+    } else if status_line.starts_with("🔄") {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else if status_line.starts_with("🟢") {
+        Style::default()
+            .fg(Color::LightGreen)
+            .add_modifier(Modifier::BOLD)
+    } else if status_line.starts_with("🟡") {
+        Style::default()
+            .fg(Color::LightYellow)
+            .add_modifier(Modifier::BOLD)
+    } else if status_line.starts_with("❌") {
+        Style::default()
+            .fg(Color::LightRed)
+            .add_modifier(Modifier::BOLD)
+    } else if status_line.starts_with("⏭️") {
+        Style::default()
+            .fg(Color::LightBlue)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::White)
+    }
+}
+
 /// Render the scrollable conversation view.
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
     let mut lines: Vec<Line<'_>> = Vec::new();
@@ -161,12 +191,16 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                 if tool_name == "plan" {
                     if let Some(preview) = result_preview {
                         for line in preview.lines() {
+                            let style = if line.starts_with("Plan:") {
+                                Style::default()
+                                    .fg(Color::White)
+                                    .add_modifier(Modifier::BOLD)
+                            } else {
+                                plan_status_style(line)
+                            };
                             lines.push(Line::from(vec![
                                 Span::raw("      "),
-                                Span::styled(
-                                    line.to_string(),
-                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-                                ),
+                                Span::styled(line.to_string(), style),
                             ]));
                         }
                     }
