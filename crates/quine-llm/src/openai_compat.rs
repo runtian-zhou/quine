@@ -98,6 +98,8 @@ struct ChunkDelta {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
 
@@ -204,6 +206,34 @@ struct AccumulatedToolCall {
     arguments: String,
 }
 
+fn split_reasoning_tags(text: &str, in_think_block: &mut bool) -> (String, String) {
+    let mut visible = String::new();
+    let mut reasoning = String::new();
+    let mut rest = text;
+
+    while !rest.is_empty() {
+        if *in_think_block {
+            if let Some(end) = rest.find("</think>") {
+                reasoning.push_str(&rest[..end]);
+                rest = &rest[end + "</think>".len()..];
+                *in_think_block = false;
+            } else {
+                reasoning.push_str(rest);
+                break;
+            }
+        } else if let Some(start) = rest.find("<think>") {
+            visible.push_str(&rest[..start]);
+            rest = &rest[start + "<think>".len()..];
+            *in_think_block = true;
+        } else {
+            visible.push_str(rest);
+            break;
+        }
+    }
+
+    (visible, reasoning)
+}
+
 impl ToolCallAccumulator {
     fn process_delta(&mut self, delta: &OpenAiToolCallDelta) {
         let index = delta.index;
@@ -289,8 +319,9 @@ impl LlmProvider for OpenAiCompatProvider {
                 String::new(),
                 ToolCallAccumulator::default(),
                 false,
+                false,
             ),
-            |(mut byte_stream, mut buffer, mut tool_acc, mut done)| async move {
+            |(mut byte_stream, mut buffer, mut tool_acc, mut in_think_block, mut done)| async move {
                 if done {
                     return None;
                 }
@@ -315,7 +346,13 @@ impl LlmProvider for OpenAiCompatProvider {
                                 done = true;
                                 return Some((
                                     stream::iter(events),
-                                    (byte_stream, buffer, ToolCallAccumulator::default(), done),
+                                    (
+                                        byte_stream,
+                                        buffer,
+                                        ToolCallAccumulator::default(),
+                                        in_think_block,
+                                        done,
+                                    ),
                                 ));
                             }
 
@@ -324,10 +361,26 @@ impl LlmProvider for OpenAiCompatProvider {
                                     let mut events: Vec<anyhow::Result<LlmEvent>> = Vec::new();
 
                                     for choice in &chunk.choices {
+                                        if let Some(reasoning_text) =
+                                            &choice.delta.reasoning_content
+                                        {
+                                            if !reasoning_text.is_empty() {
+                                                events.push(Ok(LlmEvent::ReasoningDelta {
+                                                    text: reasoning_text.clone(),
+                                                }));
+                                            }
+                                        }
                                         if let Some(text) = &choice.delta.content {
-                                            if !text.is_empty() {
+                                            let (visible_text, reasoning_text) =
+                                                split_reasoning_tags(text, &mut in_think_block);
+                                            if !reasoning_text.is_empty() {
+                                                events.push(Ok(LlmEvent::ReasoningDelta {
+                                                    text: reasoning_text,
+                                                }));
+                                            }
+                                            if !visible_text.is_empty() {
                                                 events.push(Ok(LlmEvent::TextDelta {
-                                                    text: text.clone(),
+                                                    text: visible_text,
                                                 }));
                                             }
                                         }
@@ -346,7 +399,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     if !events.is_empty() {
                                         return Some((
                                             stream::iter(events),
-                                            (byte_stream, buffer, tool_acc, done),
+                                            (byte_stream, buffer, tool_acc, in_think_block, done),
                                         ));
                                     }
                                     continue;
@@ -357,7 +410,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                             message: format!("failed to parse chunk: {e}: {data}"),
                                         }
                                         .into())]),
-                                        (byte_stream, buffer, tool_acc, done),
+                                        (byte_stream, buffer, tool_acc, in_think_block, done),
                                     ));
                                 }
                             }
@@ -375,7 +428,7 @@ impl LlmProvider for OpenAiCompatProvider {
                         Some(Err(e)) => {
                             return Some((
                                 stream::iter(vec![Err(e.into())]),
-                                (byte_stream, buffer, tool_acc, done),
+                                (byte_stream, buffer, tool_acc, in_think_block, done),
                             ));
                         }
                         None => {
@@ -386,7 +439,13 @@ impl LlmProvider for OpenAiCompatProvider {
                             done = true;
                             return Some((
                                 stream::iter(events),
-                                (byte_stream, buffer, ToolCallAccumulator::default(), done),
+                                (
+                                    byte_stream,
+                                    buffer,
+                                    ToolCallAccumulator::default(),
+                                    in_think_block,
+                                    done,
+                                ),
                             ));
                         }
                     }
@@ -417,6 +476,28 @@ mod tests {
         let chat = convert_message(&msg);
         assert_eq!(chat.role, "tool");
         assert_eq!(chat.tool_call_id.unwrap(), "id-1");
+    }
+
+    #[test]
+    fn split_reasoning_tags_separates_visible_and_reasoning_text() {
+        let mut in_think_block = false;
+        let (visible, reasoning) =
+            split_reasoning_tags("before<think>hidden</think>after", &mut in_think_block);
+        assert_eq!(visible, "beforeafter");
+        assert_eq!(reasoning, "hidden");
+        assert!(!in_think_block);
+    }
+
+    #[test]
+    fn split_reasoning_tags_handles_multichunk_blocks() {
+        let mut in_think_block = false;
+        let (visible1, reasoning1) = split_reasoning_tags("a<think>hidden", &mut in_think_block);
+        let (visible2, reasoning2) = split_reasoning_tags(" more</think>b", &mut in_think_block);
+        assert_eq!(visible1, "a");
+        assert_eq!(reasoning1, "hidden");
+        assert_eq!(visible2, "b");
+        assert_eq!(reasoning2, " more");
+        assert!(!in_think_block);
     }
 
     #[test]

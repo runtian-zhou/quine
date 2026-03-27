@@ -42,6 +42,7 @@ pub enum ToolStatus {
 #[derive(Debug, Clone)]
 pub enum ConversationEntry {
     User(String),
+    ReasoningText(String),
     AssistantText(String),
     ToolCall {
         tool_name: String,
@@ -306,6 +307,7 @@ impl fmt::Display for InputBuffer {
 /// The main application state.
 pub struct App {
     pub messages: Vec<ConversationEntry>,
+    pub reasoning_buffer: String,
     pub streaming_buffer: String,
     pub scroll_offset: u32,
     pub user_scrolled: bool,
@@ -334,6 +336,7 @@ impl App {
     pub fn new(session_id: String, plan_mode: bool) -> Self {
         Self {
             messages: Vec::new(),
+            reasoning_buffer: String::new(),
             streaming_buffer: String::new(),
             scroll_offset: 0,
             user_scrolled: false,
@@ -548,6 +551,18 @@ impl App {
     /// Apply a daemon notification to the app state.
     pub fn apply_notification(&mut self, notif: &JsonRpcNotification) {
         match notif.method.as_str() {
+            notifications::REASONING_DELTA => {
+                self.phase = AgentPhase::Streaming;
+                if let Some(delta) = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("delta"))
+                    .and_then(|v| v.as_str())
+                {
+                    self.reasoning_buffer.push_str(delta);
+                }
+                self.auto_scroll();
+            }
             notifications::STREAM_DELTA => {
                 self.phase = AgentPhase::Streaming;
                 if let Some(delta) = notif
@@ -561,6 +576,12 @@ impl App {
                 self.auto_scroll();
             }
             notifications::TEXT_COMPLETE => {
+                if !self.reasoning_buffer.trim().is_empty() {
+                    let text = trim_blank_lines(&std::mem::take(&mut self.reasoning_buffer));
+                    if !text.is_empty() {
+                        self.messages.push(ConversationEntry::ReasoningText(text));
+                    }
+                }
                 let text = if let Some(full_text) = notif
                     .params
                     .as_ref()
@@ -579,6 +600,12 @@ impl App {
                 self.auto_scroll();
             }
             notifications::TOOL_REQUEST => {
+                if !self.reasoning_buffer.trim().is_empty() {
+                    let text = trim_blank_lines(&std::mem::take(&mut self.reasoning_buffer));
+                    if !text.is_empty() {
+                        self.messages.push(ConversationEntry::ReasoningText(text));
+                    }
+                }
                 // Flush any streaming text that preceded this tool call.
                 if !self.streaming_buffer.trim().is_empty() {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
@@ -690,6 +717,12 @@ impl App {
                 }
             }
             notifications::TURN_COMPLETE => {
+                if !self.reasoning_buffer.trim().is_empty() {
+                    let text = trim_blank_lines(&std::mem::take(&mut self.reasoning_buffer));
+                    if !text.is_empty() {
+                        self.messages.push(ConversationEntry::ReasoningText(text));
+                    }
+                }
                 // Flush any remaining streaming buffer.
                 if !self.streaming_buffer.trim().is_empty() {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));

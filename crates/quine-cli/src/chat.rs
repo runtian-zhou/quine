@@ -221,6 +221,14 @@ async fn handle_notification(
     renderer: &mut impl Renderer,
 ) -> anyhow::Result<bool> {
     match notif.method.as_str() {
+        notifications::REASONING_DELTA => {
+            if let Some(params) = &notif.params {
+                if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
+                    renderer.render_reasoning_delta(delta).await?;
+                }
+            }
+            Ok(false)
+        }
         notifications::STREAM_DELTA => {
             if let Some(params) = &notif.params {
                 if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {

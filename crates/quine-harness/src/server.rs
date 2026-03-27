@@ -119,6 +119,14 @@ async fn handle_connection(
 /// Log a CoreOutput event to the session's JSONL log file.
 async fn log_core_output(event: &quine_core::CoreOutput) {
     let (session_id_str, event_type, payload) = match event {
+        quine_core::CoreOutput::ReasoningDelta { session_id, delta } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "reasoning_delta",
+            serde_json::json!({"delta": delta}),
+        ),
         quine_core::CoreOutput::StreamDelta { session_id, delta } => (
             serde_json::to_value(session_id)
                 .ok()
@@ -888,6 +896,13 @@ async fn handle_request(
 /// Convert a `CoreOutput` event to a JSON-RPC notification.
 fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotification {
     match event {
+        quine_core::CoreOutput::ReasoningDelta { session_id, delta } => JsonRpcNotification::new(
+            notifications::REASONING_DELTA,
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "delta": delta,
+            })),
+        ),
         quine_core::CoreOutput::StreamDelta { session_id, delta } => JsonRpcNotification::new(
             notifications::STREAM_DELTA,
             Some(serde_json::json!({

@@ -232,6 +232,7 @@ async fn run_subagent_inner(
 
         while let Some(event_result) = stream.next().await {
             match event_result {
+                Ok(LlmEvent::ReasoningDelta { .. }) => {}
                 Ok(LlmEvent::TextDelta { text }) => full_text.push_str(&text),
                 Ok(LlmEvent::ToolCall {
                     tool_use_id,

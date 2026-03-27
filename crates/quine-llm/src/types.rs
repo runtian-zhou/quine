@@ -117,6 +117,8 @@ pub struct TokenUsage {
 /// Events streamed from the LLM provider.
 #[derive(Debug, Clone)]
 pub enum LlmEvent {
+    /// A partial reasoning token from the stream.
+    ReasoningDelta { text: String },
     /// A partial text token from the stream.
     TextDelta { text: String },
     /// The LLM is requesting a tool invocation.
