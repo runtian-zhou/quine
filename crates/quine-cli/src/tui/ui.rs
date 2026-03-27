@@ -35,19 +35,14 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     for (i, entry) in app.messages.iter().enumerate() {
-        // Add blank line separator between entries, but not between
-        // consecutive tool-related entries (ToolCall, WriteDiff) so they
-        // render as a compact group.
+        // Add blank line separator between entries, but keep tool-related
+        // entries (ToolCall, WriteDiff) compact — no blank line before them.
         if i > 0 {
-            let prev = &app.messages[i - 1];
-            let both_tool_related = matches!(
-                (prev, entry),
-                (
-                    ConversationEntry::ToolCall { .. } | ConversationEntry::WriteDiff { .. },
-                    ConversationEntry::ToolCall { .. } | ConversationEntry::WriteDiff { .. },
-                )
+            let is_tool_related = matches!(
+                entry,
+                ConversationEntry::ToolCall { .. } | ConversationEntry::WriteDiff { .. }
             );
-            if !both_tool_related {
+            if !is_tool_related {
                 lines.push(Line::from(""));
             }
         }
@@ -214,10 +209,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
         AgentPhase::Streaming | AgentPhase::Idle => {}
     }
 
-    // Add empty line at the end for spacing.
-    if !lines.is_empty() {
-        lines.push(Line::from(""));
-    }
+    // No trailing blank line — entry separators handle spacing.
 
     let text = Text::from(lines);
 
