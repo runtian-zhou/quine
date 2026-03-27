@@ -716,10 +716,7 @@ impl App {
                         .get("duration_us")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
-                    let content = params
-                        .get("content")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("");
+                    let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     for entry in self.messages.iter_mut().rev() {
                         if let ConversationEntry::ToolCall {
                             tool_name,
