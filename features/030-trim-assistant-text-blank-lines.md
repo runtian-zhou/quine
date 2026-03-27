@@ -1,5 +1,5 @@
 ---
-status: pending
+status: in-progress
 ---
 
 # Trim Leading/Trailing Blank Lines from Assistant Text in TUI

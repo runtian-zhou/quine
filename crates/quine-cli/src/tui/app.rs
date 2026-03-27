@@ -6,6 +6,18 @@ use quine_harness::protocol::{notifications, JsonRpcNotification};
 /// Spinner braille frames for the waiting animation.
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
+/// Strip leading and trailing blank lines from text while preserving internal blank lines.
+fn trim_blank_lines(text: &str) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.iter().position(|l| !l.trim().is_empty()).unwrap_or(0);
+    let end = lines
+        .iter()
+        .rposition(|l| !l.trim().is_empty())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    lines[start..end].join("\n")
+}
+
 /// A single line in a diff display.
 #[derive(Debug, Clone)]
 pub enum DiffLine {
@@ -559,7 +571,8 @@ impl App {
                 } else {
                     std::mem::take(&mut self.streaming_buffer)
                 };
-                if !text.trim().is_empty() {
+                let text = trim_blank_lines(&text);
+                if !text.is_empty() {
                     self.messages.push(ConversationEntry::AssistantText(text));
                 }
                 self.streaming_buffer.clear();
@@ -568,8 +581,10 @@ impl App {
             notifications::TOOL_REQUEST => {
                 // Flush any streaming text that preceded this tool call.
                 if !self.streaming_buffer.trim().is_empty() {
-                    let text = std::mem::take(&mut self.streaming_buffer);
-                    self.messages.push(ConversationEntry::AssistantText(text));
+                    let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
+                    if !text.is_empty() {
+                        self.messages.push(ConversationEntry::AssistantText(text));
+                    }
                 }
                 self.streaming_buffer.clear();
 
@@ -677,8 +692,10 @@ impl App {
             notifications::TURN_COMPLETE => {
                 // Flush any remaining streaming buffer.
                 if !self.streaming_buffer.trim().is_empty() {
-                    let text = std::mem::take(&mut self.streaming_buffer);
-                    self.messages.push(ConversationEntry::AssistantText(text));
+                    let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
+                    if !text.is_empty() {
+                        self.messages.push(ConversationEntry::AssistantText(text));
+                    }
                 }
                 self.streaming_buffer.clear();
                 let duration_ms = notif
@@ -1393,5 +1410,54 @@ mod tests {
             label.contains("[agent]"),
             "input_label should show 'agent' when source_label is None, got: {label}"
         );
+    }
+
+    #[test]
+    fn trim_blank_lines_strips_leading_and_trailing() {
+        assert_eq!(
+            super::trim_blank_lines("\n\n\nhello\nworld\n\n"),
+            "hello\nworld"
+        );
+    }
+
+    #[test]
+    fn trim_blank_lines_preserves_internal() {
+        assert_eq!(
+            super::trim_blank_lines("\nhello\n\nworld\n"),
+            "hello\n\nworld"
+        );
+    }
+
+    #[test]
+    fn trim_blank_lines_all_blank() {
+        assert_eq!(super::trim_blank_lines("\n\n  \n"), "");
+    }
+
+    #[test]
+    fn trim_blank_lines_no_blanks() {
+        assert_eq!(super::trim_blank_lines("hello"), "hello");
+    }
+
+    #[test]
+    fn text_complete_trims_leading_newlines() {
+        let mut app = App::new("s".into(), false);
+        app.streaming_buffer = "\n\nhello world\n".into();
+        let notif = make_notif(notifications::TEXT_COMPLETE, Some(serde_json::json!({})));
+        app.apply_notification(&notif);
+        assert_eq!(app.messages.len(), 1);
+        assert!(
+            matches!(&app.messages[0], ConversationEntry::AssistantText(t) if t == "hello world")
+        );
+    }
+
+    #[test]
+    fn turn_complete_trims_leading_newlines() {
+        let mut app = App::new("s".into(), false);
+        app.phase = AgentPhase::Streaming;
+        app.streaming_buffer = "\n\nleftover\n\n".into();
+        let notif = make_notif(notifications::TURN_COMPLETE, Some(serde_json::json!({})));
+        app.apply_notification(&notif);
+        assert_eq!(app.messages.len(), 1);
+        assert!(matches!(&app.messages[0], ConversationEntry::AssistantText(t) if t == "leftover"));
     }
 }
