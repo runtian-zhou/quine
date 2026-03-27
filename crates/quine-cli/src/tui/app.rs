@@ -34,8 +34,8 @@ pub enum DiffLine {
 #[derive(Debug, Clone)]
 pub enum ToolStatus {
     Running,
-    Success { duration_ms: u64 },
-    Error { duration_ms: u64 },
+    Success { duration_us: u64 },
+    Error { duration_us: u64 },
 }
 
 /// A single entry in the conversation view.
@@ -65,7 +65,7 @@ pub enum ConversationEntry {
     InteractionPrompt(String),
     /// Turn summary with timing and token usage.
     TurnInfo {
-        duration_ms: u64,
+        duration_us: u64,
         usage: Option<quine_llm::TokenUsage>,
     },
 }
@@ -665,8 +665,8 @@ impl App {
                         .get("is_error")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    let duration_ms = params
-                        .get("duration_ms")
+                    let duration_us = params
+                        .get("duration_us")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
                     // Find matching ToolCall entry (search from end).
@@ -679,9 +679,9 @@ impl App {
                         {
                             if id.as_str() == tool_use_id {
                                 *status = if is_error {
-                                    ToolStatus::Error { duration_ms }
+                                    ToolStatus::Error { duration_us }
                                 } else {
-                                    ToolStatus::Success { duration_ms }
+                                    ToolStatus::Success { duration_us }
                                 };
                                 break;
                             }
@@ -698,10 +698,10 @@ impl App {
                     }
                 }
                 self.streaming_buffer.clear();
-                let duration_ms = notif
+                let duration_us = notif
                     .params
                     .as_ref()
-                    .and_then(|p| p.get("duration_ms"))
+                    .and_then(|p| p.get("duration_us"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
                 let usage = notif
@@ -714,9 +714,9 @@ impl App {
                             output_tokens: v.get("output_tokens")?.as_u64()?,
                         })
                     });
-                if duration_ms > 0 {
+                if duration_us > 0 {
                     self.messages
-                        .push(ConversationEntry::TurnInfo { duration_ms, usage });
+                        .push(ConversationEntry::TurnInfo { duration_us, usage });
                 }
                 self.phase = AgentPhase::Idle;
                 self.auto_scroll();
@@ -1168,14 +1168,14 @@ mod tests {
                 "tool_use_id": "tc_42",
                 "tool_name": "bash",
                 "is_error": false,
-                "duration_ms": 150
+                "duration_us": 150
             })),
         );
         app.apply_notification(&notif);
         assert!(matches!(
             &app.messages[0],
             ConversationEntry::ToolCall {
-                status: ToolStatus::Success { duration_ms: 150 },
+                status: ToolStatus::Success { duration_us: 150 },
                 ..
             }
         ));
@@ -1200,14 +1200,14 @@ mod tests {
                 "tool_use_id": "tc_err",
                 "tool_name": "bash",
                 "is_error": true,
-                "duration_ms": 200
+                "duration_us": 200
             })),
         );
         app.apply_notification(&notif);
         assert!(matches!(
             &app.messages[0],
             ConversationEntry::ToolCall {
-                status: ToolStatus::Error { duration_ms: 200 },
+                status: ToolStatus::Error { duration_us: 200 },
                 ..
             }
         ));
@@ -1220,7 +1220,7 @@ mod tests {
         let notif = make_notif(
             notifications::TURN_COMPLETE,
             Some(serde_json::json!({
-                "duration_ms": 4500,
+                "duration_us": 4500,
                 "usage": {
                     "input_tokens": 1200,
                     "output_tokens": 350
@@ -1231,8 +1231,8 @@ mod tests {
         assert_eq!(app.phase, AgentPhase::Idle);
         assert_eq!(app.messages.len(), 1);
         match &app.messages[0] {
-            ConversationEntry::TurnInfo { duration_ms, usage } => {
-                assert_eq!(*duration_ms, 4500);
+            ConversationEntry::TurnInfo { duration_us, usage } => {
+                assert_eq!(*duration_us, 4500);
                 let u = usage.as_ref().expect("usage should be present");
                 assert_eq!(u.input_tokens, 1200);
                 assert_eq!(u.output_tokens, 350);

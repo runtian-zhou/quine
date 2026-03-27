@@ -213,7 +213,7 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
             tool_use_id,
             tool_name,
             is_error,
-            duration_ms,
+            duration_us,
         } => (
             serde_json::to_value(session_id)
                 .ok()
@@ -224,16 +224,16 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
                 "is_error": is_error,
-                "duration_ms": duration_ms,
+                "duration_us": duration_us,
             }),
         ),
         quine_core::CoreOutput::TurnComplete {
             session_id,
-            duration_ms,
+            duration_us,
             usage,
         } => {
             let mut payload = serde_json::json!({
-                "duration_ms": duration_ms,
+                "duration_us": duration_us,
             });
             if let Some(u) = usage {
                 payload["usage"] = serde_json::json!({
@@ -974,7 +974,7 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
             tool_use_id,
             tool_name,
             is_error,
-            duration_ms,
+            duration_us,
         } => JsonRpcNotification::new(
             notifications::TOOL_RESULT,
             Some(serde_json::json!({
@@ -982,17 +982,17 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
                 "is_error": is_error,
-                "duration_ms": duration_ms,
+                "duration_us": duration_us,
             })),
         ),
         quine_core::CoreOutput::TurnComplete {
             session_id,
-            duration_ms,
+            duration_us,
             usage,
         } => {
             let mut params = serde_json::json!({
                 "session_id": session_id,
-                "duration_ms": duration_ms,
+                "duration_us": duration_us,
             });
             if let Some(u) = usage {
                 params["usage"] = serde_json::json!({

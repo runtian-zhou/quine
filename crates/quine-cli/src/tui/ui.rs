@@ -76,8 +76,8 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                 };
                 let duration_str = match status {
                     ToolStatus::Running => String::new(),
-                    ToolStatus::Success { duration_ms } | ToolStatus::Error { duration_ms } => {
-                        format!(" ({:.1}s)", *duration_ms as f64 / 1000.0)
+                    ToolStatus::Success { duration_us } | ToolStatus::Error { duration_us } => {
+                        format!(" ({:.1}s)", *duration_us as f64 / 1_000_000.0)
                     }
                 };
                 let label = if summary.is_empty() {
@@ -159,8 +159,8 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                     Span::raw(text),
                 ]));
             }
-            ConversationEntry::TurnInfo { duration_ms, usage } => {
-                let time_str = format!("{:.1}s", *duration_ms as f64 / 1000.0);
+            ConversationEntry::TurnInfo { duration_us, usage } => {
+                let time_str = format!("{:.1}s", *duration_us as f64 / 1_000_000.0);
                 let token_str = match usage {
                     Some(u) => {
                         format!(" | {} in / {} out tokens", u.input_tokens, u.output_tokens)
@@ -346,16 +346,16 @@ mod tests {
             tool_name: "read".into(),
             tool_use_id: "tc2".into(),
             summary: "file.txt".into(),
-            status: ToolStatus::Success { duration_ms: 150 },
+            status: ToolStatus::Success { duration_us: 150 },
         });
         app.messages.push(ConversationEntry::ToolCall {
             tool_name: "write".into(),
             tool_use_id: "tc3".into(),
             summary: "output.txt".into(),
-            status: ToolStatus::Error { duration_ms: 300 },
+            status: ToolStatus::Error { duration_us: 300 },
         });
         app.messages.push(ConversationEntry::TurnInfo {
-            duration_ms: 4523,
+            duration_us: 4523,
             usage: Some(quine_llm::TokenUsage {
                 input_tokens: 1200,
                 output_tokens: 350,

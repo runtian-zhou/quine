@@ -14,9 +14,9 @@ pub struct OneshotOutput {
     pub response: String,
     /// Tool calls made during the turn.
     pub tool_calls: Vec<ToolCallRecord>,
-    /// Duration of the agent turn in milliseconds.
+    /// Duration of the agent turn in microseconds.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub duration_ms: Option<u64>,
+    pub duration_us: Option<u64>,
     /// Token usage for the turn (if available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsageOutput>,
@@ -93,7 +93,7 @@ pub async fn run_oneshot(
     let mut completed_text = String::new();
     let mut delta_buffer = String::new();
     let mut tool_calls = Vec::new();
-    let mut turn_duration_ms: Option<u64> = None;
+    let mut turn_duration_us: Option<u64> = None;
     let mut turn_usage: Option<TokenUsageOutput> = None;
 
     loop {
@@ -199,7 +199,7 @@ pub async fn run_oneshot(
                 }
                 notifications::TURN_COMPLETE => {
                     if let Some(params) = &notif.params {
-                        turn_duration_ms = params.get("duration_ms").and_then(|v| v.as_u64());
+                        turn_duration_us = params.get("duration_us").and_then(|v| v.as_u64());
                         turn_usage = params.get("usage").and_then(|v| {
                             Some(TokenUsageOutput {
                                 input_tokens: v.get("input_tokens")?.as_u64()?,
@@ -230,7 +230,7 @@ pub async fn run_oneshot(
             session_id,
             response: full_response,
             tool_calls,
-            duration_ms: turn_duration_ms,
+            duration_us: turn_duration_us,
             usage: turn_usage,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -269,7 +269,7 @@ pub async fn run_respond(
     let mut completed_text = String::new();
     let mut delta_buffer = String::new();
     let mut tool_calls = Vec::new();
-    let mut turn_duration_ms: Option<u64> = None;
+    let mut turn_duration_us: Option<u64> = None;
     let mut turn_usage: Option<TokenUsageOutput> = None;
 
     loop {
@@ -368,7 +368,7 @@ pub async fn run_respond(
                 }
                 notifications::TURN_COMPLETE => {
                     if let Some(params) = &notif.params {
-                        turn_duration_ms = params.get("duration_ms").and_then(|v| v.as_u64());
+                        turn_duration_us = params.get("duration_us").and_then(|v| v.as_u64());
                         turn_usage = params.get("usage").and_then(|v| {
                             Some(TokenUsageOutput {
                                 input_tokens: v.get("input_tokens")?.as_u64()?,
@@ -397,7 +397,7 @@ pub async fn run_respond(
             session_id: session_id.to_string(),
             response: full_response,
             tool_calls,
-            duration_ms: turn_duration_ms,
+            duration_us: turn_duration_us,
             usage: turn_usage,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -538,7 +538,7 @@ mod tests {
                 tool_name: "bash".to_string(),
                 tool_use_id: "call_1".to_string(),
             }],
-            duration_ms: Some(1500),
+            duration_us: Some(1500),
             usage: Some(TokenUsageOutput {
                 input_tokens: 100,
                 output_tokens: 50,

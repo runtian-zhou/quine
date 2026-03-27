@@ -642,11 +642,11 @@ async fn handle_llm_turn(
                     .await;
 
                 session.state = SessionState::Idle;
-                let duration_ms = turn_start.elapsed().as_millis() as u64;
+                let duration_us = turn_start.elapsed().as_micros() as u64;
                 let _ = output
                     .send(CoreOutput::TurnComplete {
                         session_id,
-                        duration_ms,
+                        duration_us,
                         usage: accumulated_usage,
                     })
                     .await;
@@ -720,7 +720,7 @@ async fn handle_llm_turn(
                         permission_checker,
                     )
                     .await;
-                    let tool_duration_ms = tool_start.elapsed().as_millis() as u64;
+                    let tool_duration_us = tool_start.elapsed().as_micros() as u64;
 
                     // Append tool result to history
                     let (tool_output, is_error) = match &result {
@@ -738,7 +738,7 @@ async fn handle_llm_turn(
                             tool_use_id: call.tool_use_id.clone(),
                             tool_name: call.tool_name.clone(),
                             is_error,
-                            duration_ms: tool_duration_ms,
+                            duration_us: tool_duration_us,
                         })
                         .await;
 
