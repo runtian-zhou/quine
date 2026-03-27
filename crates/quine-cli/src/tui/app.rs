@@ -30,7 +30,6 @@ pub enum ToolStatus {
 #[derive(Debug, Clone)]
 pub enum ConversationEntry {
     User(String),
-    ReasoningText(String),
     AssistantText(String),
     ToolCall {
         tool_name: String,
@@ -551,15 +550,14 @@ impl App {
     pub fn apply_notification(&mut self, notif: &JsonRpcNotification) {
         match notif.method.as_str() {
             notifications::REASONING_DELTA => {
-                if let Some(delta) = notif
+                if notif
                     .params
                     .as_ref()
                     .and_then(|p| p.get("delta"))
                     .and_then(|v| v.as_str())
+                    .is_some()
                 {
-                    self.phase = AgentPhase::Streaming;
-                    self.reasoning_buffer.push_str(delta);
-                    self.auto_scroll();
+                    self.reasoning_buffer.clear();
                 }
             }
             notifications::STREAM_DELTA => {
@@ -575,12 +573,7 @@ impl App {
                 }
             }
             notifications::TEXT_COMPLETE => {
-                if !self.reasoning_buffer.trim().is_empty() {
-                    let text = trim_blank_lines(&std::mem::take(&mut self.reasoning_buffer));
-                    if !text.is_empty() {
-                        self.messages.push(ConversationEntry::ReasoningText(text));
-                    }
-                }
+                self.reasoning_buffer.clear();
                 let text = if let Some(full_text) = notif
                     .params
                     .as_ref()
@@ -599,12 +592,7 @@ impl App {
                 self.auto_scroll();
             }
             notifications::TOOL_REQUEST => {
-                if !self.reasoning_buffer.trim().is_empty() {
-                    let text = trim_blank_lines(&std::mem::take(&mut self.reasoning_buffer));
-                    if !text.is_empty() {
-                        self.messages.push(ConversationEntry::ReasoningText(text));
-                    }
-                }
+                self.reasoning_buffer.clear();
                 if !self.streaming_buffer.trim().is_empty() {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
                     if !text.is_empty() {
@@ -683,12 +671,7 @@ impl App {
                 }
             }
             notifications::TURN_COMPLETE => {
-                if !self.reasoning_buffer.trim().is_empty() {
-                    let text = trim_blank_lines(&std::mem::take(&mut self.reasoning_buffer));
-                    if !text.is_empty() {
-                        self.messages.push(ConversationEntry::ReasoningText(text));
-                    }
-                }
+                self.reasoning_buffer.clear();
                 if !self.streaming_buffer.trim().is_empty() {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
                     if !text.is_empty() {
