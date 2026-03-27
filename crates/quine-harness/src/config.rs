@@ -107,6 +107,57 @@ pub fn create_provider_from_env() -> Arc<dyn quine_llm::LlmProvider> {
     Arc::from(quine_llm::config::create_provider(config_from_env()))
 }
 
+/// Resolve the configured model's max context window.
+///
+/// Prefers `LLM_CONTEXT_WINDOW` when set. Otherwise falls back to a small
+/// built-in model lookup for known defaults.
+pub fn max_context_window_from_env() -> Option<u64> {
+    if let Ok(value) = std::env::var("LLM_CONTEXT_WINDOW") {
+        if let Ok(parsed) = value.parse::<u64>() {
+            return Some(parsed);
+        }
+    }
+
+    let provider = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "openai".into());
+    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| {
+        if provider.eq_ignore_ascii_case("anthropic") {
+            "claude-sonnet-4-20250514".into()
+        } else {
+            "qwen-3.5".into()
+        }
+    });
+
+    if provider.eq_ignore_ascii_case("anthropic") {
+        return anthropic_context_window(&model);
+    }
+
+    openai_compat_context_window(&model)
+}
+
+fn anthropic_context_window(model: &str) -> Option<u64> {
+    let normalized = model.to_ascii_lowercase();
+    if normalized.starts_with("claude") {
+        Some(200_000)
+    } else {
+        None
+    }
+}
+
+fn openai_compat_context_window(model: &str) -> Option<u64> {
+    let normalized = model.to_ascii_lowercase();
+    if normalized.starts_with("gpt-4.1") || normalized.starts_with("gpt-4o") {
+        Some(128_000)
+    } else if normalized.starts_with("o1") || normalized.starts_with("o3") {
+        Some(200_000)
+    } else if normalized.starts_with("qwen") {
+        Some(131_072)
+    } else if normalized.starts_with("llama-3.1") || normalized.starts_with("llama3.1") {
+        Some(128_000)
+    } else {
+        None
+    }
+}
+
 /// Create the default permission checker from environment configuration.
 ///
 /// Always includes `RuleBasedChecker`. Optionally includes `LlmChecker` when
@@ -157,5 +208,12 @@ mod tests {
             Some("You are helpful.")
         );
         assert!(deserialized.auto_approve_permissions);
+    }
+
+    #[test]
+    fn explicit_context_window_override_is_used() {
+        std::env::set_var("LLM_CONTEXT_WINDOW", "65536");
+        assert_eq!(max_context_window_from_env(), Some(65_536));
+        std::env::remove_var("LLM_CONTEXT_WINDOW");
     }
 }

@@ -1,4 +1,4 @@
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -23,6 +23,15 @@ fn format_duration_us(us: u64) -> String {
     }
 }
 
+/// Format token usage in a compact, TUI-friendly form.
+fn format_token_usage(usage: &quine_llm::TokenUsage, max_context_window: u64) -> String {
+    format!(
+        "ctx {current}/{max}",
+        current = usage.input_tokens + usage.output_tokens,
+        max = max_context_window,
+    )
+}
+
 /// Render the entire TUI frame.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // Dynamic input box height: expand for option selection or multi-line input.
@@ -40,13 +49,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),            // status bar
             Constraint::Min(3),               // conversation view
             Constraint::Length(input_height), // input box
         ])
         .split(frame.area());
 
-    draw_conversation(frame, app, chunks[0]);
-    draw_input(frame, app, chunks[1]);
+    draw_status_bar(frame, app, chunks[0]);
+    draw_conversation(frame, app, chunks[1]);
+    draw_input(frame, app, chunks[2]);
 }
 
 fn wrapped_rows(width: usize, area_width: u16) -> u16 {
@@ -128,6 +139,41 @@ fn plan_status_style(status_line: &str) -> Style {
     } else {
         Style::default().fg(Color::White)
     }
+}
+
+fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    let mode = if app.plan_mode { "plan" } else { "chat" };
+    let phase = match &app.phase {
+        AgentPhase::Idle => "idle".to_string(),
+        AgentPhase::Thinking => format!("{} thinking", app.spinner_char()),
+        AgentPhase::Streaming => format!("{} streaming", app.spinner_char()),
+        AgentPhase::RunningTool(name) => format!("{} tool:{name}", app.spinner_char()),
+    };
+    let usage = match (&app.last_turn_usage, app.max_context_window) {
+        (Some(usage), Some(max_context_window)) => format_token_usage(usage, max_context_window),
+        (Some(usage), None) => format!("ctx {} used", usage.input_tokens + usage.output_tokens),
+        (None, Some(max_context_window)) => format!("ctx --/{max_context_window}"),
+        (None, None) => "ctx --".to_string(),
+    };
+    let left = format!(" session:{} | {} | {} ", app.session_id, mode, phase);
+    let right = format!(" {} ", usage);
+
+    let chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(1), Constraint::Length(right.len() as u16)])
+        .split(area);
+
+    let left_widget = Paragraph::new(left).style(
+        Style::default()
+            .fg(Color::DarkGray)
+            .add_modifier(Modifier::DIM),
+    );
+    let right_widget = Paragraph::new(right)
+        .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM))
+        .alignment(Alignment::Right);
+
+    frame.render_widget(left_widget, chunks[0]);
+    frame.render_widget(right_widget, chunks[1]);
 }
 
 /// Render the scrollable conversation view.
@@ -275,11 +321,14 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
             }
             ConversationEntry::TurnInfo { duration_us, usage } => {
                 let time_str = format_duration_us(*duration_us);
-                let token_str = match usage {
-                    Some(u) => {
-                        format!(" | {} in / {} out tokens", u.input_tokens, u.output_tokens)
+                let token_str = match (usage, app.max_context_window) {
+                    (Some(u), Some(max_context_window)) => {
+                        format!(" | {}", format_token_usage(u, max_context_window))
                     }
-                    None => String::new(),
+                    (Some(u), None) => {
+                        format!(" | ctx {} used", u.input_tokens + u.output_tokens)
+                    }
+                    (None, _) => String::new(),
                 };
                 lines.push(Line::from(vec![Span::styled(
                     format!("  ── {time_str}{token_str} ──"),
@@ -413,8 +462,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn format_token_usage_compacts_values() {
+        let usage = quine_llm::TokenUsage {
+            input_tokens: 1200,
+            output_tokens: 350,
+        };
+
+        assert_eq!(format_token_usage(&usage, 200_000), "ctx 1550/200000");
+    }
+
+    #[test]
     fn draw_does_not_panic_empty_app() {
-        let mut app = App::new("test".into(), false);
+        let mut app = App::new("test".into(), false, None);
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -422,7 +481,7 @@ mod tests {
 
     #[test]
     fn draw_does_not_panic_with_tool_status() {
-        let mut app = App::new("test".into(), false);
+        let mut app = App::new("test".into(), false, Some(200_000));
         app.messages.push(ConversationEntry::ToolCall {
             tool_name: "bash".into(),
             tool_use_id: "tc1".into(),
@@ -459,7 +518,7 @@ mod tests {
 
     #[test]
     fn draw_does_not_panic_with_content() {
-        let mut app = App::new("test".into(), false);
+        let mut app = App::new("test".into(), false, None);
         app.messages.push(ConversationEntry::User("hello".into()));
         app.messages
             .push(ConversationEntry::AssistantText("hi there".into()));

@@ -372,6 +372,10 @@ pub struct App {
     pub spinner_frame: usize,
     pub should_quit: bool,
     pub session_id: String,
+    /// Token usage from the most recently completed turn.
+    pub last_turn_usage: Option<quine_llm::TokenUsage>,
+    /// Max context window for the configured model, if known.
+    pub max_context_window: Option<u64>,
     /// History of submitted inputs (oldest first).
     pub input_history: Vec<String>,
     /// Current position in history (None = not browsing history).
@@ -387,7 +391,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(session_id: String, plan_mode: bool) -> Self {
+    pub fn new(session_id: String, plan_mode: bool, max_context_window: Option<u64>) -> Self {
         Self {
             messages: Vec::new(),
             reasoning_buffer: String::new(),
@@ -400,6 +404,8 @@ impl App {
             spinner_frame: 0,
             should_quit: false,
             session_id,
+            last_turn_usage: None,
+            max_context_window,
             input_history: Vec::new(),
             history_index: None,
             saved_input: String::new(),
@@ -767,6 +773,7 @@ impl App {
                         })
                     })
                 });
+                self.last_turn_usage = usage.clone();
                 self.messages
                     .push(ConversationEntry::TurnInfo { duration_us, usage });
                 self.phase = AgentPhase::Idle;
@@ -908,7 +915,7 @@ mod tests {
 
     #[test]
     fn tool_request_for_apply_patch_adds_preview() {
-        let mut app = App::new("test".into(), false);
+        let mut app = App::new("test".into(), false, None);
         let notif = make_notif(
             notifications::TOOL_REQUEST,
             serde_json::json!({
@@ -943,7 +950,7 @@ mod tests {
 
     #[test]
     fn plan_tool_result_is_attached_to_tool_call() {
-        let mut app = App::new("test".into(), false);
+        let mut app = App::new("test".into(), false, None);
         let request = make_notif(
             notifications::TOOL_REQUEST,
             serde_json::json!({
@@ -983,7 +990,7 @@ mod tests {
 
     #[test]
     fn plan_progress_notification_is_recorded() {
-        let mut app = App::new("test".into(), false);
+        let mut app = App::new("test".into(), false, None);
         let notif = make_notif(
             notifications::PLAN_PROGRESS,
             serde_json::json!({
