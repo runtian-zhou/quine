@@ -6,6 +6,23 @@ use ratatui::Frame;
 
 use super::app::{AgentPhase, App, ConversationEntry, DiffLine, ToolStatus};
 
+/// Format a duration in microseconds to a human-readable string.
+fn format_duration_us(us: u64) -> String {
+    let secs = us as f64 / 1_000_000.0;
+    if secs >= 10.0 {
+        format!("{:.0}s", secs)
+    } else if secs >= 1.0 {
+        format!("{:.1}s", secs)
+    } else {
+        let ms = us as f64 / 1_000.0;
+        if ms >= 1.0 {
+            format!("{:.0}ms", ms)
+        } else {
+            "<1ms".to_string()
+        }
+    }
+}
+
 /// Render the entire TUI frame.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // Dynamic input box height: expand for option selection or multi-line input.
@@ -77,7 +94,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                 let duration_str = match status {
                     ToolStatus::Running => String::new(),
                     ToolStatus::Success { duration_us } | ToolStatus::Error { duration_us } => {
-                        format!(" ({:.1}s)", *duration_us as f64 / 1_000_000.0)
+                        format!(" ({})", format_duration_us(*duration_us))
                     }
                 };
                 let label = if summary.is_empty() {
@@ -160,7 +177,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                 ]));
             }
             ConversationEntry::TurnInfo { duration_us, usage } => {
-                let time_str = format!("{:.1}s", *duration_us as f64 / 1_000_000.0);
+                let time_str = format_duration_us(*duration_us);
                 let token_str = match usage {
                     Some(u) => {
                         format!(" | {} in / {} out tokens", u.input_tokens, u.output_tokens)
