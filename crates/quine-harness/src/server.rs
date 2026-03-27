@@ -220,6 +220,7 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
             session_id,
             tool_use_id,
             tool_name,
+            content,
             is_error,
             duration_us,
         } => (
@@ -231,6 +232,7 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
             serde_json::json!({
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
+                "content": content,
                 "is_error": is_error,
                 "duration_us": duration_us,
             }),
@@ -996,6 +998,7 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
             session_id,
             tool_use_id,
             tool_name,
+            content,
             is_error,
             duration_us,
         } => JsonRpcNotification::new(
@@ -1004,6 +1007,7 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
                 "session_id": session_id,
                 "tool_use_id": tool_use_id,
                 "tool_name": tool_name,
+                "content": content,
                 "is_error": is_error,
                 "duration_us": duration_us,
             })),

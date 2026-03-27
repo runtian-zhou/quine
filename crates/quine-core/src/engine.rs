@@ -749,6 +749,7 @@ async fn handle_llm_turn(
                             session_id,
                             tool_use_id: call.tool_use_id.clone(),
                             tool_name: call.tool_name.clone(),
+                            content: tool_output.clone(),
                             is_error,
                             duration_us: tool_duration_us,
                         })

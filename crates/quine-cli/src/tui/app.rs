@@ -18,6 +18,80 @@ fn trim_blank_lines(text: &str) -> String {
     lines[start..end].join("\n")
 }
 
+fn summarize_tool_call(tool_name: &str, arguments: &serde_json::Value) -> String {
+    match tool_name {
+        "plan" => {
+            let operation = arguments
+                .get("operation")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown");
+            match operation {
+                "create_plan" => arguments
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .map(|title| format!("create_plan: {title}"))
+                    .unwrap_or_else(|| "create_plan".to_string()),
+                "update_plan" => {
+                    let action_id = arguments
+                        .get("action_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let status = arguments
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    format!("update_plan: {action_id} -> {status}")
+                }
+                _ => operation.to_string(),
+            }
+        }
+        _ => arguments
+            .get("command")
+            .or(arguments.get("file_path"))
+            .or(arguments.get("question"))
+            .and_then(|s| s.as_str())
+            .unwrap_or("")
+            .to_string(),
+    }
+}
+
+fn build_apply_patch_preview(arguments: &serde_json::Value) -> Option<String> {
+    let file_path = arguments.get("file_path")?.as_str()?;
+    let mut lines = vec![format!("apply_patch: {file_path}")];
+
+    if let Some(content) = arguments.get("new_file_content").and_then(|v| v.as_str()) {
+        lines.push("--- new file ---".to_string());
+        lines.extend(content.lines().map(|line| format!("+ {line}")));
+        return Some(lines.join("\n"));
+    }
+
+    let edits = arguments.get("edits")?.as_array()?;
+    for (index, edit) in edits.iter().enumerate() {
+        if index > 0 {
+            lines.push("---".to_string());
+        }
+        if edit
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            lines.push("(replace_all)".to_string());
+        }
+        let old_text = edit
+            .get("old_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let new_text = edit
+            .get("new_text")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        lines.extend(old_text.lines().map(|line| format!("- {line}")));
+        lines.extend(new_text.lines().map(|line| format!("+ {line}")));
+    }
+
+    Some(lines.join("\n"))
+}
+
 /// Status of a tool call execution.
 #[derive(Debug, Clone)]
 pub enum ToolStatus {
@@ -36,6 +110,14 @@ pub enum ConversationEntry {
         tool_use_id: String,
         summary: String,
         status: ToolStatus,
+        result_preview: Option<String>,
+    },
+    PatchPreview(String),
+    PlanProgress {
+        action_id: String,
+        status: String,
+        remaining: usize,
+        total: usize,
     },
     Error(String),
     /// An interaction prompt from the agent (ask_user, permission, etc.)
@@ -139,21 +221,6 @@ impl InputBuffer {
             .unwrap_or(line.len());
         line.insert(byte_offset, c);
         self.col += 1;
-    }
-
-    /// Insert a newline, splitting the current line at the cursor column.
-    pub fn insert_newline(&mut self) {
-        let line = &self.lines[self.row];
-        let byte_offset = line
-            .char_indices()
-            .nth(self.col)
-            .map(|(i, _)| i)
-            .unwrap_or(line.len());
-        let remainder = self.lines[self.row][byte_offset..].to_string();
-        self.lines[self.row].truncate(byte_offset);
-        self.row += 1;
-        self.lines.insert(self.row, remainder);
-        self.col = 0;
     }
 
     /// Delete the character before the cursor (backspace).
@@ -612,16 +679,8 @@ impl App {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
-                    let summary = params
-                        .get("arguments")
-                        .and_then(|v| {
-                            v.get("command")
-                                .or(v.get("file_path"))
-                                .or(v.get("question"))
-                                .and_then(|s| s.as_str())
-                        })
-                        .unwrap_or("")
-                        .to_string();
+                    let arguments = params.get("arguments").cloned().unwrap_or_default();
+                    let summary = summarize_tool_call(&tool_name, &arguments);
                     let summary = if summary.len() > 60 {
                         format!("{}…", &summary[..59])
                     } else {
@@ -629,11 +688,17 @@ impl App {
                     };
                     self.phase = AgentPhase::RunningTool(tool_name.clone());
                     self.messages.push(ConversationEntry::ToolCall {
-                        tool_name,
+                        tool_name: tool_name.clone(),
                         tool_use_id,
                         summary,
                         status: ToolStatus::Running,
+                        result_preview: None,
                     });
+                    if tool_name == "apply_patch" {
+                        if let Some(preview) = build_apply_patch_preview(&arguments) {
+                            self.messages.push(ConversationEntry::PatchPreview(preview));
+                        }
+                    }
                     self.auto_scroll();
                 }
             }
@@ -651,10 +716,13 @@ impl App {
                         .get("duration_us")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    let content = params.get("content").and_then(|v| v.as_str()).unwrap_or("");
                     for entry in self.messages.iter_mut().rev() {
                         if let ConversationEntry::ToolCall {
+                            tool_name,
                             tool_use_id: id,
                             status,
+                            result_preview,
                             ..
                         } = entry
                         {
@@ -664,6 +732,12 @@ impl App {
                                 } else {
                                     ToolStatus::Success { duration_us }
                                 };
+                                if tool_name == "plan" {
+                                    let trimmed = trim_blank_lines(content);
+                                    if !trimmed.is_empty() {
+                                        *result_preview = Some(trimmed);
+                                    }
+                                }
                                 break;
                             }
                         }
@@ -697,6 +771,32 @@ impl App {
                     .push(ConversationEntry::TurnInfo { duration_us, usage });
                 self.phase = AgentPhase::Idle;
                 self.auto_scroll();
+            }
+            notifications::PLAN_PROGRESS => {
+                if let Some(params) = &notif.params {
+                    let action_id = params
+                        .get("action_id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?")
+                        .to_string();
+                    let status = params
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown")
+                        .to_string();
+                    let remaining = params
+                        .get("remaining")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize;
+                    let total = params.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                    self.messages.push(ConversationEntry::PlanProgress {
+                        action_id,
+                        status,
+                        remaining,
+                        total,
+                    });
+                    self.auto_scroll();
+                }
             }
             notifications::SESSION_ERROR => {
                 if let Some(err) = notif
@@ -791,5 +891,123 @@ impl App {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_notif(method: &str, params: serde_json::Value) -> JsonRpcNotification {
+        JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params: Some(params),
+        }
+    }
+
+    #[test]
+    fn tool_request_for_apply_patch_adds_preview() {
+        let mut app = App::new("test".into(), false);
+        let notif = make_notif(
+            notifications::TOOL_REQUEST,
+            serde_json::json!({
+                "tool_name": "apply_patch",
+                "tool_use_id": "toolu_1",
+                "arguments": {
+                    "file_path": "src/main.rs",
+                    "edits": [
+                        {
+                            "old_text": "old line\n",
+                            "new_text": "new line\n"
+                        }
+                    ]
+                }
+            }),
+        );
+
+        app.apply_notification(&notif);
+
+        assert!(matches!(
+            app.messages.first(),
+            Some(ConversationEntry::ToolCall { tool_name, .. }) if tool_name == "apply_patch"
+        ));
+        assert!(matches!(
+            app.messages.get(1),
+            Some(ConversationEntry::PatchPreview(preview))
+                if preview.contains("apply_patch: src/main.rs")
+                && preview.contains("- old line")
+                && preview.contains("+ new line")
+        ));
+    }
+
+    #[test]
+    fn plan_tool_result_is_attached_to_tool_call() {
+        let mut app = App::new("test".into(), false);
+        let request = make_notif(
+            notifications::TOOL_REQUEST,
+            serde_json::json!({
+                "tool_name": "plan",
+                "tool_use_id": "toolu_plan",
+                "arguments": {
+                    "operation": "create_plan",
+                    "title": "Example plan",
+                    "actions": []
+                }
+            }),
+        );
+        app.apply_notification(&request);
+
+        let result = make_notif(
+            notifications::TOOL_RESULT,
+            serde_json::json!({
+                "tool_use_id": "toolu_plan",
+                "tool_name": "plan",
+                "content": "Plan: Example plan (2 actions)\n\n  [a1] First task                     (ready)\n  [a2] Second task                    (blocked by: a1)",
+                "is_error": false,
+                "duration_us": 42
+            }),
+        );
+        app.apply_notification(&result);
+
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::ToolCall {
+                tool_name,
+                status: ToolStatus::Success { duration_us: 42 },
+                result_preview: Some(preview),
+                ..
+            }) if tool_name == "plan" && preview.contains("[a1]") && preview.contains("[a2]")
+        ));
+    }
+
+    #[test]
+    fn plan_progress_notification_is_recorded() {
+        let mut app = App::new("test".into(), false);
+        let notif = make_notif(
+            notifications::PLAN_PROGRESS,
+            serde_json::json!({
+                "plan_id": "plan_123",
+                "action_id": "implement-ui",
+                "status": "in_progress",
+                "remaining": 2,
+                "total": 5
+            }),
+        );
+
+        app.apply_notification(&notif);
+
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::PlanProgress {
+                action_id,
+                status,
+                remaining,
+                total,
+            }) if action_id == "implement-ui"
+                && status == "in_progress"
+                && *remaining == 2
+                && *total == 5
+        ));
     }
 }

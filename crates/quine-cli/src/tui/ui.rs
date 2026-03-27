@@ -69,6 +69,15 @@ fn input_content_rows(input: &InputBuffer, label: &str, area_width: u16) -> u16 
     total_rows.max(cursor_row + 1)
 }
 
+fn input_lines(input: &InputBuffer, label: &str) -> Vec<Line<'static>> {
+    let mut lines = Vec::with_capacity(input.line_count());
+    for index in 0..input.line_count() {
+        let prefix = if index == 0 { label } else { "" };
+        lines.push(Line::from(format!("{prefix}{}", input.line(index))));
+    }
+    lines
+}
+
 fn input_cursor_position(input: &InputBuffer, label: &str, area_width: u16) -> (u16, u16) {
     if area_width == 0 {
         return (0, 0);
@@ -125,6 +134,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                 tool_name,
                 summary,
                 status,
+                result_preview,
                 ..
             } => {
                 let (marker, style) = match status {
@@ -147,6 +157,49 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                     Span::raw("    "),
                     Span::styled(marker, style),
                     Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
+                ]));
+                if tool_name == "plan" {
+                    if let Some(preview) = result_preview {
+                        for line in preview.lines() {
+                            lines.push(Line::from(vec![
+                                Span::raw("      "),
+                                Span::styled(
+                                    line.to_string(),
+                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                                ),
+                            ]));
+                        }
+                    }
+                }
+            }
+            ConversationEntry::PatchPreview(preview) => {
+                for line in preview.lines() {
+                    let style = if line.starts_with("+ ") {
+                        Style::default().fg(Color::Green)
+                    } else if line.starts_with("- ") {
+                        Style::default().fg(Color::Red)
+                    } else {
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::raw("      "),
+                        Span::styled(line.to_string(), style),
+                    ]));
+                }
+            }
+            ConversationEntry::PlanProgress {
+                action_id,
+                status,
+                remaining,
+                total,
+            } => {
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("plan", Style::default().fg(Color::Cyan)),
+                    Span::styled(
+                        format!(" {action_id} -> {status} ({remaining} remaining / {total} total)"),
+                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                    ),
                 ]));
             }
             ConversationEntry::Error(text) => {
@@ -308,10 +361,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let label = app.input_label();
-    let content = app.input.content();
-    let display_text = format!("{}{}", label, content);
-
-    let input_widget = Paragraph::new(display_text.as_str())
+    let input_widget = Paragraph::new(Text::from(input_lines(&app.input, &label)))
         .block(Block::default().borders(Borders::ALL))
         .wrap(Wrap { trim: false });
 
@@ -344,18 +394,21 @@ mod tests {
             tool_use_id: "tc1".into(),
             summary: "echo running".into(),
             status: ToolStatus::Running,
+            result_preview: None,
         });
         app.messages.push(ConversationEntry::ToolCall {
             tool_name: "read".into(),
             tool_use_id: "tc2".into(),
             summary: "file.txt".into(),
             status: ToolStatus::Success { duration_us: 150 },
+            result_preview: None,
         });
         app.messages.push(ConversationEntry::ToolCall {
             tool_name: "write".into(),
             tool_use_id: "tc3".into(),
             summary: "output.txt".into(),
             status: ToolStatus::Error { duration_us: 300 },
+            result_preview: None,
         });
         app.messages.push(ConversationEntry::TurnInfo {
             duration_us: 4523,
@@ -381,6 +434,7 @@ mod tests {
             tool_use_id: "tc1".into(),
             summary: "echo test".into(),
             status: ToolStatus::Running,
+            result_preview: None,
         });
         app.messages
             .push(ConversationEntry::Error("something failed".into()));

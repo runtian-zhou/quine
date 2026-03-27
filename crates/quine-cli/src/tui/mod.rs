@@ -203,22 +203,12 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 return None;
             }
 
-            // Ctrl+S submits input.
-            if code == KeyCode::Char('s') && modifiers.contains(KeyModifiers::CONTROL) {
+            // Enter submits input.
+            if code == KeyCode::Enter {
                 return app.submit_input();
             }
 
-            // Shift+Enter or Alt+Enter inserts a newline.
-            if code == KeyCode::Enter
-                && (modifiers.contains(KeyModifiers::SHIFT)
-                    || modifiers.contains(KeyModifiers::ALT))
-            {
-                app.input.insert_newline();
-                return None;
-            }
-
             match code {
-                KeyCode::Enter => app.submit_input(),
                 KeyCode::Backspace => {
                     app.input.delete_char_before();
                     None
