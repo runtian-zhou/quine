@@ -1,24 +1,24 @@
 use async_trait::async_trait;
 
 use super::{PermissionChecker, PermissionContext, PermissionDecision, PermissionError};
+use crate::permission::llm_checker::LlmChecker;
+use crate::permission::rule_checker::RuleBasedChecker;
 
-/// Composite permission checker that chains multiple checkers and takes the
-/// most restrictive decision.
-///
-/// Runs all checkers in order. The final decision is the most restrictive
-/// across all results:
-/// - If any checker returns `Deny`, the final decision is `Deny`.
-/// - If any checker returns `RequiresConfirmation`, the highest risk score
-///   and its reason are used.
-/// - Otherwise, `Allow`.
+/// Permission checker that evaluates commands with the LLM first, then applies
+/// a manual allowlist override only for commands the LLM marked as dangerous.
 pub struct CompositeChecker {
-    checkers: Vec<Box<dyn PermissionChecker>>,
+    llm_checker: Option<LlmChecker>,
+    rule_checker: RuleBasedChecker,
 }
 
 impl CompositeChecker {
-    /// Create a new `CompositeChecker` with the given list of checkers.
-    pub fn new(checkers: Vec<Box<dyn PermissionChecker>>) -> Self {
-        Self { checkers }
+    /// Create a composite checker with an optional LLM evaluator and a
+    /// rule-based checker used as a manual override.
+    pub fn new(llm_checker: Option<LlmChecker>, rule_checker: RuleBasedChecker) -> Self {
+        Self {
+            llm_checker,
+            rule_checker,
+        }
     }
 }
 
@@ -30,59 +30,33 @@ impl PermissionChecker for CompositeChecker {
         arguments: &serde_json::Value,
         context: &PermissionContext,
     ) -> Result<PermissionDecision, PermissionError> {
-        let mut most_restrictive = PermissionDecision::Allow;
+        if let Some(llm_checker) = &self.llm_checker {
+            let llm_decision = llm_checker.check(tool_name, arguments, context).await?;
 
-        for checker in &self.checkers {
-            let decision = checker.check(tool_name, arguments, context).await?;
-
-            if decision.is_more_restrictive_than(&most_restrictive) {
-                most_restrictive = match (&most_restrictive, &decision) {
-                    // If both are RequiresConfirmation, keep the higher risk score
-                    (
-                        PermissionDecision::RequiresConfirmation {
-                            risk_score: existing_score,
-                            ..
-                        },
-                        PermissionDecision::RequiresConfirmation {
-                            risk_score: new_score,
-                            ..
-                        },
-                    ) => {
-                        if *new_score > *existing_score {
-                            decision
-                        } else {
-                            most_restrictive
-                        }
-                    }
-                    _ => decision,
-                };
-            } else if let (
-                PermissionDecision::RequiresConfirmation {
-                    risk_score: existing_score,
-                    ..
-                },
-                PermissionDecision::RequiresConfirmation {
-                    risk_score: new_score,
-                    ..
-                },
-            ) = (&most_restrictive, &decision)
+            if matches!(llm_decision, PermissionDecision::Deny { .. })
+                && self
+                    .rule_checker
+                    .is_manually_allowlisted(tool_name, arguments)
             {
-                // Same severity level but check if the new score is higher
-                if new_score > existing_score {
-                    most_restrictive = decision;
-                }
+                return Ok(PermissionDecision::Allow);
             }
+
+            return Ok(llm_decision);
         }
 
-        Ok(most_restrictive)
+        self.rule_checker.check(tool_name, arguments, context).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::permission::llm_checker::LlmChecker;
     use crate::session::SessionId;
+    use quine_llm::{LlmEvent, LlmProvider, Message, ToolDefinition};
     use std::path::PathBuf;
+    use std::pin::Pin;
+    use std::sync::Arc;
 
     fn test_context() -> PermissionContext {
         PermissionContext {
@@ -91,86 +65,60 @@ mod tests {
         }
     }
 
-    /// A checker that always returns a fixed decision.
-    struct FixedChecker {
-        decision: PermissionDecision,
+    struct MockPermissionProvider {
+        response: String,
     }
 
-    impl FixedChecker {
-        fn allow() -> Self {
+    impl MockPermissionProvider {
+        fn new(response: &str) -> Self {
             Self {
-                decision: PermissionDecision::Allow,
-            }
-        }
-
-        fn confirm(score: f64, reason: &str) -> Self {
-            Self {
-                decision: PermissionDecision::RequiresConfirmation {
-                    risk_score: score,
-                    reason: reason.to_string(),
-                },
-            }
-        }
-
-        fn deny(reason: &str) -> Self {
-            Self {
-                decision: PermissionDecision::Deny {
-                    reason: reason.to_string(),
-                },
+                response: response.to_string(),
             }
         }
     }
 
     #[async_trait]
-    impl PermissionChecker for FixedChecker {
-        async fn check(
+    impl LlmProvider for MockPermissionProvider {
+        async fn send(
             &self,
-            _tool_name: &str,
-            _arguments: &serde_json::Value,
-            _context: &PermissionContext,
-        ) -> Result<PermissionDecision, PermissionError> {
-            Ok(self.decision.clone())
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            let events = vec![
+                Ok(LlmEvent::TextDelta {
+                    text: self.response.clone(),
+                }),
+                Ok(LlmEvent::Done { usage: None }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
         }
     }
 
     #[tokio::test]
-    async fn composite_all_allow() {
-        let checker = CompositeChecker::new(vec![
-            Box::new(FixedChecker::allow()),
-            Box::new(FixedChecker::allow()),
-        ]);
+    async fn falls_back_to_rule_checker_without_llm() {
+        let checker = CompositeChecker::new(None, RuleBasedChecker::new());
         let ctx = test_context();
         let decision = checker
-            .check("bash", &serde_json::json!({}), &ctx)
+            .check("bash", &serde_json::json!({"command": "ls -la"}), &ctx)
             .await
             .unwrap();
         assert!(matches!(decision, PermissionDecision::Allow));
     }
 
     #[tokio::test]
-    async fn composite_deny_wins() {
-        let checker = CompositeChecker::new(vec![
-            Box::new(FixedChecker::allow()),
-            Box::new(FixedChecker::deny("dangerous")),
-            Box::new(FixedChecker::confirm(0.5, "risky")),
-        ]);
+    async fn returns_llm_decision_when_not_dangerous() {
+        let llm = LlmChecker::new(Arc::new(MockPermissionProvider::new(
+            r#"{"score": 0.5, "reason": "network access", "decision": "confirm"}"#,
+        )));
+        let checker = CompositeChecker::new(Some(llm), RuleBasedChecker::new());
         let ctx = test_context();
         let decision = checker
-            .check("bash", &serde_json::json!({}), &ctx)
-            .await
-            .unwrap();
-        assert!(matches!(decision, PermissionDecision::Deny { .. }));
-    }
-
-    #[tokio::test]
-    async fn composite_confirm_wins_over_allow() {
-        let checker = CompositeChecker::new(vec![
-            Box::new(FixedChecker::allow()),
-            Box::new(FixedChecker::confirm(0.6, "network access")),
-        ]);
-        let ctx = test_context();
-        let decision = checker
-            .check("bash", &serde_json::json!({}), &ctx)
+            .check(
+                "bash",
+                &serde_json::json!({"command": "curl https://example.com"}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -180,45 +128,32 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn composite_highest_risk_score_wins() {
-        let checker = CompositeChecker::new(vec![
-            Box::new(FixedChecker::confirm(0.3, "low risk")),
-            Box::new(FixedChecker::confirm(0.8, "high risk")),
-        ]);
+    async fn manual_allowlist_overrides_dangerous_llm_decision() {
+        let llm = LlmChecker::new(Arc::new(MockPermissionProvider::new(
+            r#"{"score": 0.95, "reason": "dangerous", "decision": "deny"}"#,
+        )));
+        let checker = CompositeChecker::new(Some(llm), RuleBasedChecker::new());
         let ctx = test_context();
         let decision = checker
-            .check("bash", &serde_json::json!({}), &ctx)
-            .await
-            .unwrap();
-        match decision {
-            PermissionDecision::RequiresConfirmation { risk_score, reason } => {
-                assert!((risk_score - 0.8).abs() < f64::EPSILON);
-                assert_eq!(reason, "high risk");
-            }
-            _ => panic!("expected RequiresConfirmation"),
-        }
-    }
-
-    #[tokio::test]
-    async fn composite_empty_checkers_allows() {
-        let checker = CompositeChecker::new(vec![]);
-        let ctx = test_context();
-        let decision = checker
-            .check("bash", &serde_json::json!({}), &ctx)
+            .check("bash", &serde_json::json!({"command": "ls -la"}), &ctx)
             .await
             .unwrap();
         assert!(matches!(decision, PermissionDecision::Allow));
     }
 
     #[tokio::test]
-    async fn composite_deny_first_still_wins() {
-        let checker = CompositeChecker::new(vec![
-            Box::new(FixedChecker::deny("blocked")),
-            Box::new(FixedChecker::allow()),
-        ]);
+    async fn dangerous_llm_decision_stands_without_allowlist_override() {
+        let llm = LlmChecker::new(Arc::new(MockPermissionProvider::new(
+            r#"{"score": 0.95, "reason": "dangerous", "decision": "deny"}"#,
+        )));
+        let checker = CompositeChecker::new(Some(llm), RuleBasedChecker::new());
         let ctx = test_context();
         let decision = checker
-            .check("bash", &serde_json::json!({}), &ctx)
+            .check(
+                "bash",
+                &serde_json::json!({"command": "curl https://example.com"}),
+                &ctx,
+            )
             .await
             .unwrap();
         assert!(matches!(decision, PermissionDecision::Deny { .. }));

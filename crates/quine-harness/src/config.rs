@@ -160,20 +160,21 @@ fn openai_compat_context_window(model: &str) -> Option<u64> {
 
 /// Create the default permission checker from environment configuration.
 ///
-/// Always includes `RuleBasedChecker`. Optionally includes `LlmChecker` when
-/// `PERMISSION_LLM_ENABLED=true` is set in the environment.
+/// Uses `LlmChecker` first when `PERMISSION_LLM_ENABLED=true` is set in the
+/// environment. If the LLM marks a command as dangerous, a manual low-risk
+/// allowlist in `RuleBasedChecker` may override that decision to allow it.
 pub fn create_default_permission_checker() -> Arc<dyn PermissionChecker> {
-    let mut checkers: Vec<Box<dyn PermissionChecker>> = vec![Box::new(RuleBasedChecker::new())];
-
-    if std::env::var("PERMISSION_LLM_ENABLED")
+    let llm_checker = if std::env::var("PERMISSION_LLM_ENABLED")
         .map(|v| v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
     {
         let provider = create_provider_from_env();
-        checkers.push(Box::new(LlmChecker::new(provider)));
-    }
+        Some(LlmChecker::new(provider))
+    } else {
+        None
+    };
 
-    Arc::new(CompositeChecker::new(checkers))
+    Arc::new(CompositeChecker::new(llm_checker, RuleBasedChecker::new()))
 }
 
 #[cfg(test)]
