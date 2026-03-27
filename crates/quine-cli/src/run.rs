@@ -49,6 +49,7 @@ pub async fn run_oneshot(
     session_id: Option<&str>,
     json_output: bool,
     skills: &[String],
+    auto_approve_permissions: bool,
 ) -> anyhow::Result<()> {
     let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
@@ -56,10 +57,17 @@ pub async fn run_oneshot(
     let session_id = match session_id {
         Some(sid) => sid.to_string(),
         None => {
-            let params = if skills.is_empty() {
+            let mut session_params = serde_json::json!({});
+            if !skills.is_empty() {
+                session_params["skills"] = serde_json::json!(skills);
+            }
+            if auto_approve_permissions {
+                session_params["auto_approve_permissions"] = serde_json::json!(true);
+            }
+            let params = if session_params.as_object().unwrap().is_empty() {
                 None
             } else {
-                Some(serde_json::json!({ "skills": skills }))
+                Some(session_params)
             };
             let result = client.call(methods::CREATE_SESSION, params).await?;
             match result {

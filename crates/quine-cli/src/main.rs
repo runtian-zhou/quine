@@ -32,6 +32,9 @@ enum Commands {
         /// Start in read-only plan mode (restricted to exploration and planning).
         #[arg(long)]
         plan: bool,
+        /// Auto-approve permission checks for this session.
+        #[arg(long)]
+        auto_approve: bool,
     },
     /// Send a one-shot message to the agent and exit.
     Run {
@@ -49,6 +52,9 @@ enum Commands {
         /// Skills to load for this session (can be repeated).
         #[arg(long, short = 's')]
         skill: Vec<String>,
+        /// Auto-approve permission checks for the created session.
+        #[arg(long)]
+        auto_approve: bool,
     },
     /// Respond to an interaction request (e.g., ask_user prompt) on an existing session.
     Respond {
@@ -203,6 +209,9 @@ enum DaemonCommands {
         /// Socket path override.
         #[arg(long)]
         socket: Option<String>,
+        /// Disable permission checks and allow all bash commands without confirmation.
+        #[arg(long)]
+        auto_approve: bool,
     },
     /// Stop the harness daemon.
     Stop {
@@ -221,14 +230,15 @@ async fn main() -> anyhow::Result<()> {
             socket,
             skill,
             plan,
+            auto_approve,
         } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(default_socket_path);
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                tui::run_tui_chat(&socket_path, &skill, plan).await?;
+                tui::run_tui_chat(&socket_path, &skill, plan, auto_approve).await?;
             } else {
-                chat::run_chat(&socket_path, &skill, plan).await?;
+                chat::run_chat(&socket_path, &skill, plan, auto_approve).await?;
             }
         }
         Commands::Run {
@@ -237,11 +247,20 @@ async fn main() -> anyhow::Result<()> {
             json,
             socket,
             skill,
+            auto_approve,
         } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(default_socket_path);
-            run::run_oneshot(&socket_path, &message, session.as_deref(), json, &skill).await?;
+            run::run_oneshot(
+                &socket_path,
+                &message,
+                session.as_deref(),
+                json,
+                &skill,
+                auto_approve,
+            )
+            .await?;
         }
         Commands::Respond {
             session,
@@ -268,16 +287,20 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Daemon { command } => match command {
-            DaemonCommands::Start { socket } => {
+            DaemonCommands::Start {
+                socket,
+                auto_approve,
+            } => {
                 let socket_path = socket
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(default_socket_path);
 
                 // Start the daemon in-process.
                 let provider = quine_harness::create_provider_from_env();
-                let checker = quine_harness::create_default_permission_checker();
+                let checker =
+                    (!auto_approve).then(quine_harness::create_default_permission_checker);
                 let harness =
-                    std::sync::Arc::new(quine_harness::LocalHarness::new(provider, Some(checker)));
+                    std::sync::Arc::new(quine_harness::LocalHarness::new(provider, checker));
                 quine_harness::server::run_ipc_server(&socket_path, harness).await?;
             }
             DaemonCommands::Stop { socket } => {

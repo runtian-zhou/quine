@@ -22,6 +22,8 @@ pub enum CoreInput {
         skills: Vec<Skill>,
         /// Whether this session operates in read-only plan mode.
         plan_mode: bool,
+        /// Whether bash permission prompts should be auto-approved.
+        auto_approve_permissions: bool,
         /// Acknowledges session creation.
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -299,6 +301,7 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                auto_approve_permissions: false,
                 reply: reply_tx,
             })
             .await

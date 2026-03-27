@@ -356,11 +356,19 @@ async fn handle_request(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            let auto_approve_permissions = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("auto_approve_permissions"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
             let config = crate::config::SessionConfig {
                 system_prompt,
                 working_directory: None,
                 skills,
                 plan_mode,
+                auto_approve_permissions,
             };
 
             match service.create_session(config).await {

@@ -19,6 +19,9 @@ enum Commands {
         /// Socket path override.
         #[arg(long)]
         socket: Option<String>,
+        /// Disable permission checks and allow all bash commands without confirmation.
+        #[arg(long)]
+        auto_approve: bool,
     },
 }
 
@@ -27,7 +30,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { socket } => {
+        Commands::Start {
+            socket,
+            auto_approve,
+        } => {
             let config = HarnessConfig {
                 socket_path: socket
                     .map(std::path::PathBuf::from)
@@ -35,8 +41,8 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let provider = create_provider_from_env();
-            let checker = create_default_permission_checker();
-            let harness = Arc::new(LocalHarness::new(provider, Some(checker)));
+            let checker = (!auto_approve).then(create_default_permission_checker);
+            let harness = Arc::new(LocalHarness::new(provider, checker));
 
             quine_harness::server::run_ipc_server(&config.socket_path, harness).await?;
         }
