@@ -134,6 +134,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                 tool_name,
                 summary,
                 status,
+                result_preview,
                 ..
             } => {
                 let (marker, style) = match status {
@@ -157,6 +158,19 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                     Span::styled(marker, style),
                     Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
                 ]));
+                if tool_name == "plan" {
+                    if let Some(preview) = result_preview {
+                        for line in preview.lines() {
+                            lines.push(Line::from(vec![
+                                Span::raw("      "),
+                                Span::styled(
+                                    line.to_string(),
+                                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                                ),
+                            ]));
+                        }
+                    }
+                }
             }
             ConversationEntry::PatchPreview(preview) => {
                 for line in preview.lines() {
@@ -380,18 +394,21 @@ mod tests {
             tool_use_id: "tc1".into(),
             summary: "echo running".into(),
             status: ToolStatus::Running,
+            result_preview: None,
         });
         app.messages.push(ConversationEntry::ToolCall {
             tool_name: "read".into(),
             tool_use_id: "tc2".into(),
             summary: "file.txt".into(),
             status: ToolStatus::Success { duration_us: 150 },
+            result_preview: None,
         });
         app.messages.push(ConversationEntry::ToolCall {
             tool_name: "write".into(),
             tool_use_id: "tc3".into(),
             summary: "output.txt".into(),
             status: ToolStatus::Error { duration_us: 300 },
+            result_preview: None,
         });
         app.messages.push(ConversationEntry::TurnInfo {
             duration_us: 4523,
@@ -417,6 +434,7 @@ mod tests {
             tool_use_id: "tc1".into(),
             summary: "echo test".into(),
             status: ToolStatus::Running,
+            result_preview: None,
         });
         app.messages
             .push(ConversationEntry::Error("something failed".into()));

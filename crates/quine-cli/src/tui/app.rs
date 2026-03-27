@@ -110,6 +110,7 @@ pub enum ConversationEntry {
         tool_use_id: String,
         summary: String,
         status: ToolStatus,
+        result_preview: Option<String>,
     },
     PatchPreview(String),
     PlanProgress {
@@ -691,6 +692,7 @@ impl App {
                         tool_use_id,
                         summary,
                         status: ToolStatus::Running,
+                        result_preview: None,
                     });
                     if tool_name == "apply_patch" {
                         if let Some(preview) = build_apply_patch_preview(&arguments) {
@@ -714,10 +716,16 @@ impl App {
                         .get("duration_us")
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0);
+                    let content = params
+                        .get("content")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
                     for entry in self.messages.iter_mut().rev() {
                         if let ConversationEntry::ToolCall {
+                            tool_name,
                             tool_use_id: id,
                             status,
+                            result_preview,
                             ..
                         } = entry
                         {
@@ -727,6 +735,12 @@ impl App {
                                 } else {
                                     ToolStatus::Success { duration_us }
                                 };
+                                if tool_name == "plan" {
+                                    let trimmed = trim_blank_lines(content);
+                                    if !trimmed.is_empty() {
+                                        *result_preview = Some(trimmed);
+                                    }
+                                }
                                 break;
                             }
                         }
@@ -927,6 +941,46 @@ mod tests {
                 if preview.contains("apply_patch: src/main.rs")
                 && preview.contains("- old line")
                 && preview.contains("+ new line")
+        ));
+    }
+
+    #[test]
+    fn plan_tool_result_is_attached_to_tool_call() {
+        let mut app = App::new("test".into(), false);
+        let request = make_notif(
+            notifications::TOOL_REQUEST,
+            serde_json::json!({
+                "tool_name": "plan",
+                "tool_use_id": "toolu_plan",
+                "arguments": {
+                    "operation": "create_plan",
+                    "title": "Example plan",
+                    "actions": []
+                }
+            }),
+        );
+        app.apply_notification(&request);
+
+        let result = make_notif(
+            notifications::TOOL_RESULT,
+            serde_json::json!({
+                "tool_use_id": "toolu_plan",
+                "tool_name": "plan",
+                "content": "Plan: Example plan (2 actions)\n\n  [a1] First task                     (ready)\n  [a2] Second task                    (blocked by: a1)",
+                "is_error": false,
+                "duration_us": 42
+            }),
+        );
+        app.apply_notification(&result);
+
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::ToolCall {
+                tool_name,
+                status: ToolStatus::Success { duration_us: 42 },
+                result_preview: Some(preview),
+                ..
+            }) if tool_name == "plan" && preview.contains("[a1]") && preview.contains("[a2]")
         ));
     }
 

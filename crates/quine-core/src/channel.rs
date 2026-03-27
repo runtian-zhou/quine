@@ -179,6 +179,7 @@ pub enum CoreOutput {
         session_id: SessionId,
         tool_use_id: String,
         tool_name: String,
+        content: String,
         is_error: bool,
         duration_us: u64,
     },
