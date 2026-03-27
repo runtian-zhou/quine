@@ -3,3 +3,4 @@
 .claude/settings.local.json
 target/
 .quine/
+.env_DONT_USE
