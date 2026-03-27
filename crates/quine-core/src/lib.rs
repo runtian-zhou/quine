@@ -18,7 +18,10 @@ pub use error::CoreError;
 pub use filesystem::{DirEntry, FsError, NullFilesystem, OverlayFilesystem, SessionFilesystem};
 pub use permission::{PermissionChecker, PermissionContext, PermissionDecision, PermissionError};
 pub use session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
-pub use skill::{FileSystemSkillLoader, Skill, SkillLoader, SkillMeta, SkillToolDef};
+pub use skill::{
+    default_skill_service, list_available_skills, load_skill, load_skills, DefaultSkillService,
+    FileSystemSkillLoader, Skill, SkillLoader, SkillMeta, SkillService, SkillToolDef,
+};
 pub use tool::{
     ExecutionContext, InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse,
     SelectOption, Tool, ToolError, ToolOutput, ToolRegistry,

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +52,17 @@ pub trait SkillLoader: Send + Sync {
     async fn load(&self, name: &str) -> anyhow::Result<Skill>;
 }
 
+/// Core-owned skill service API for discovery and loading.
+#[async_trait::async_trait]
+pub trait SkillService: Send + Sync {
+    /// List all available skills.
+    async fn list_skills(&self) -> anyhow::Result<Vec<SkillMeta>>;
+    /// Load a full skill by name.
+    async fn get_skill(&self, name: &str) -> anyhow::Result<Skill>;
+    /// Load multiple skills, preserving the requested order.
+    async fn load_skills(&self, names: &[String]) -> Vec<Skill>;
+}
+
 /// Filesystem-based skill loader that searches multiple directories.
 pub struct FileSystemSkillLoader {
     /// Directories to search, in priority order (first match wins).
@@ -60,6 +72,10 @@ pub struct FileSystemSkillLoader {
 impl FileSystemSkillLoader {
     pub fn new(search_paths: Vec<PathBuf>) -> Self {
         Self { search_paths }
+    }
+
+    pub fn search_paths(&self) -> &[PathBuf] {
+        &self.search_paths
     }
 
     /// Default search paths include native Quine skills plus legacy Claude/Codex locations.
@@ -161,6 +177,66 @@ impl SkillLoader for FileSystemSkillLoader {
         let content = tokio::fs::read_to_string(&path).await?;
         parse_skill(&content, path)
     }
+}
+
+/// Default `SkillService` backed by a `SkillLoader`.
+pub struct DefaultSkillService {
+    loader: Arc<dyn SkillLoader>,
+}
+
+impl DefaultSkillService {
+    pub fn new(loader: Arc<dyn SkillLoader>) -> Self {
+        Self { loader }
+    }
+
+    /// Build a filesystem-backed service using the standard skill search paths.
+    pub fn from_default_paths(project_root: &Path) -> Self {
+        Self::new(Arc::new(FileSystemSkillLoader::default_paths(project_root)))
+    }
+}
+
+#[async_trait::async_trait]
+impl SkillService for DefaultSkillService {
+    async fn list_skills(&self) -> anyhow::Result<Vec<SkillMeta>> {
+        self.loader.list().await
+    }
+
+    async fn get_skill(&self, name: &str) -> anyhow::Result<Skill> {
+        self.loader.load(name).await
+    }
+
+    async fn load_skills(&self, names: &[String]) -> Vec<Skill> {
+        let mut skills = Vec::new();
+
+        for name in names {
+            match self.loader.load(name).await {
+                Ok(skill) => skills.push(skill),
+                Err(_error) => {}
+            }
+        }
+
+        skills
+    }
+}
+
+/// Create the default filesystem-backed skill service for the given project root.
+pub fn default_skill_service(project_root: &Path) -> DefaultSkillService {
+    DefaultSkillService::from_default_paths(project_root)
+}
+
+/// List skills using the standard default skill search paths.
+pub async fn list_available_skills(project_root: &Path) -> anyhow::Result<Vec<SkillMeta>> {
+    default_skill_service(project_root).list_skills().await
+}
+
+/// Load a single skill using the standard default skill search paths.
+pub async fn load_skill(project_root: &Path, name: &str) -> anyhow::Result<Skill> {
+    default_skill_service(project_root).get_skill(name).await
+}
+
+/// Load multiple skills using the standard default skill search paths.
+pub async fn load_skills(project_root: &Path, names: &[String]) -> Vec<Skill> {
+    default_skill_service(project_root).load_skills(names).await
 }
 
 fn parse_skill_meta(

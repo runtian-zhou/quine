@@ -6,8 +6,6 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
-use quine_core::SkillLoader;
-
 use crate::protocol::{
     error_codes, methods, notifications, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest,
     JsonRpcResponse,
@@ -829,8 +827,7 @@ async fn handle_request(
 
         methods::LIST_SKILLS => {
             let project_root = std::env::current_dir().unwrap_or_default();
-            let loader = quine_core::FileSystemSkillLoader::default_paths(&project_root);
-            match loader.list().await {
+            match quine_core::list_available_skills(&project_root).await {
                 Ok(skills) => {
                     let resp = JsonRpcResponse::success(
                         id,
@@ -856,8 +853,7 @@ async fn handle_request(
             match skill_name {
                 Some(name) => {
                     let project_root = std::env::current_dir().unwrap_or_default();
-                    let loader = quine_core::FileSystemSkillLoader::default_paths(&project_root);
-                    match loader.load(name).await {
+                    match quine_core::load_skill(&project_root, name).await {
                         Ok(skill) => {
                             let result = serde_json::json!({
                                 "name": skill.meta.name,

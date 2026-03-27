@@ -3,9 +3,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use quine_core::{
-    create_channels, ChannelConfig, CoreInput, CoreOutput, FileSystemSkillLoader, HarnessHandle,
+    create_channels, load_skills, ChannelConfig, CoreInput, CoreOutput, HarnessHandle,
     InheritanceFlags, InteractionResponse, PermissionChecker, SessionId, SessionSignal, Skill,
-    SkillLoader,
 };
 use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, oneshot, Mutex};
@@ -91,29 +90,14 @@ impl LocalHarness {
     }
 }
 
-/// Load skills by name using the filesystem skill loader.
-///
-/// Uses the current working directory as the project root for default paths.
-/// Logs warnings for skills that fail to load but does not fail the session.
+/// Load skills by name using `quine-core` default skill support.
 async fn load_skills_from_config(skill_names: &[String]) -> Vec<Skill> {
     if skill_names.is_empty() {
         return Vec::new();
     }
 
     let project_root = std::env::current_dir().unwrap_or_default();
-    let loader = FileSystemSkillLoader::default_paths(&project_root);
-    let mut skills = Vec::new();
-
-    for name in skill_names {
-        match loader.load(name).await {
-            Ok(skill) => skills.push(skill),
-            Err(e) => {
-                tracing::warn!("failed to load skill '{name}': {e}");
-            }
-        }
-    }
-
-    skills
+    load_skills(&project_root, skill_names).await
 }
 
 #[async_trait]
