@@ -4,7 +4,7 @@ mod ui;
 use std::path::Path;
 use std::time::Duration;
 
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers, MouseEventKind};
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -58,7 +58,6 @@ pub async fn run_tui_chat(
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     stdout.execute(EnterAlternateScreen)?;
-    stdout.execute(crossterm::event::EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -67,7 +66,6 @@ pub async fn run_tui_chat(
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = std::io::stdout().execute(crossterm::event::DisableMouseCapture);
         let _ = std::io::stdout().execute(LeaveAlternateScreen);
         original_hook(info);
     }));
@@ -87,9 +85,6 @@ pub async fn run_tui_chat(
 
     // Restore terminal.
     disable_raw_mode()?;
-    terminal
-        .backend_mut()
-        .execute(crossterm::event::DisableMouseCapture)?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     terminal.show_cursor()?;
 
@@ -280,17 +275,7 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 _ => None,
             }
         }
-        Event::Mouse(mouse) => match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                app.scroll_up(3);
-                None
-            }
-            MouseEventKind::ScrollDown => {
-                app.scroll_down(3);
-                None
-            }
-            _ => None,
-        },
+        Event::Mouse(_) => None,
         Event::Resize(_, _) => None, // ratatui redraws on next frame.
         _ => None,
     }
