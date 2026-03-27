@@ -63,6 +63,7 @@ Rules:
 - **Serialization**: serde + serde_json for all data interchange.
 - **CLI parsing**: clap 4 with derive macros.
 - **Tool pattern**: Each tool implements the `Tool` trait. One file per tool under `quine-core/src/tool/`.
+- **Skill discovery**: Load native Quine skills from `.quine/skills/` and preserve compatibility with legacy `.claude/commands/` markdown prompts plus Codex-style `<skill>/SKILL.md` directories.
 - **Tests**: Unit tests in the same file (`#[cfg(test)] mod tests`). Integration tests in `crates/<crate>/tests/`.
 - **Naming**: snake_case for files/modules, PascalCase for types. No abbreviations in public APIs.
 - **Visibility**: Minimize `pub`. Expose crate APIs through `lib.rs` re-exports.

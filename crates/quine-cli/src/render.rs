@@ -6,6 +6,9 @@ use async_trait::async_trait;
 /// without writing to an actual terminal.
 #[async_trait]
 pub trait Renderer: Send + Sync {
+    /// Print a streaming reasoning delta (partial hidden-thought token).
+    async fn render_reasoning_delta(&mut self, delta: &str) -> anyhow::Result<()>;
+
     /// Print a streaming text delta (partial token).
     async fn render_delta(&mut self, delta: &str) -> anyhow::Result<()>;
 
@@ -47,6 +50,14 @@ impl Default for TerminalRenderer {
 
 #[async_trait]
 impl Renderer for TerminalRenderer {
+    async fn render_reasoning_delta(&mut self, delta: &str) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let msg = format!("[reasoning] {delta}");
+        self.writer.write_all(msg.as_bytes()).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
     async fn render_delta(&mut self, delta: &str) -> anyhow::Result<()> {
         use tokio::io::AsyncWriteExt;
         self.writer.write_all(delta.as_bytes()).await?;
@@ -107,6 +118,11 @@ mod tests {
 
     #[async_trait]
     impl Renderer for TestRenderer {
+        async fn render_reasoning_delta(&mut self, delta: &str) -> anyhow::Result<()> {
+            self.buffer.push_str(&format!("[reasoning]{delta}"));
+            Ok(())
+        }
+
         async fn render_delta(&mut self, delta: &str) -> anyhow::Result<()> {
             self.buffer.push_str(delta);
             Ok(())

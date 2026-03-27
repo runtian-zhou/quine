@@ -124,6 +124,7 @@ pub mod methods {
 
 /// Notification method names.
 pub mod notifications {
+    pub const REASONING_DELTA: &str = "reasoning_delta";
     pub const STREAM_DELTA: &str = "stream_delta";
     pub const TEXT_COMPLETE: &str = "text_complete";
     pub const TOOL_REQUEST: &str = "tool_request";

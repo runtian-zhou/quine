@@ -215,6 +215,14 @@ async fn call_llm(
 
     while let Some(event_result) = stream.next().await {
         match event_result {
+            Ok(LlmEvent::ReasoningDelta { text }) => {
+                let _ = output
+                    .send(CoreOutput::ReasoningDelta {
+                        session_id,
+                        delta: text,
+                    })
+                    .await;
+            }
             Ok(LlmEvent::TextDelta { text }) => {
                 full_text.push_str(&text);
                 let _ = output

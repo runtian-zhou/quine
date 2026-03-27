@@ -62,11 +62,26 @@ impl FileSystemSkillLoader {
         Self { search_paths }
     }
 
-    /// Default search paths: .quine/skills/ (project), ~/.quine/skills/ (user).
+    /// Default search paths include native Quine skills plus legacy Claude/Codex locations.
     pub fn default_paths(project_root: &Path) -> Self {
-        let mut paths = vec![project_root.join(".quine").join("skills")];
+        let mut paths = vec![
+            project_root.join(".quine").join("skills"),
+            project_root.join(".claude").join("commands"),
+            project_root.join(".codex").join("skills"),
+            project_root.join(".codex").join("skills").join(".system"),
+        ];
         if let Some(home) = dirs_home() {
             paths.push(home.join(".quine").join("skills"));
+            paths.push(home.join(".claude").join("commands"));
+            paths.push(home.join(".codex").join("skills"));
+            paths.push(home.join(".codex").join("skills").join(".system"));
+            paths.push(
+                home.join(".codex")
+                    .join("vendor_imports")
+                    .join("skills")
+                    .join("skills")
+                    .join(".curated"),
+            );
         }
         Self::new(paths)
     }
@@ -75,9 +90,14 @@ impl FileSystemSkillLoader {
     fn find_skill_path(&self, name: &str) -> Option<PathBuf> {
         let filename = format!("{name}.md");
         for dir in &self.search_paths {
-            let path = dir.join(&filename);
-            if path.is_file() {
-                return Some(path);
+            let file_path = dir.join(&filename);
+            if file_path.is_file() {
+                return Some(file_path);
+            }
+
+            let directory_path = dir.join(name).join("SKILL.md");
+            if directory_path.is_file() {
+                return Some(directory_path);
             }
         }
         None
@@ -102,13 +122,28 @@ impl SkillLoader for FileSystemSkillLoader {
             let mut entries = tokio::fs::read_dir(dir).await?;
             while let Some(entry) = entries.next_entry().await? {
                 let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("md") {
-                    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        if seen.insert(stem.to_string()) {
-                            let content = tokio::fs::read_to_string(&path).await?;
-                            if let Ok(meta) = parse_frontmatter(&content) {
-                                results.push(meta);
-                            }
+                let candidate = if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|stem| (stem.to_string(), path.clone()))
+                } else if path.is_dir() {
+                    let skill_path = path.join("SKILL.md");
+                    if skill_path.is_file() {
+                        path.file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|name| (name.to_string(), skill_path))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some((name, skill_path)) = candidate {
+                    if seen.insert(name.clone()) {
+                        let content = tokio::fs::read_to_string(&skill_path).await?;
+                        if let Ok(meta) = parse_skill_meta(&content, &skill_path, &name) {
+                            results.push(meta);
                         }
                     }
                 }
@@ -126,6 +161,31 @@ impl SkillLoader for FileSystemSkillLoader {
         let content = tokio::fs::read_to_string(&path).await?;
         parse_skill(&content, path)
     }
+}
+
+fn parse_skill_meta(
+    content: &str,
+    source_path: &Path,
+    default_name: &str,
+) -> anyhow::Result<SkillMeta> {
+    parse_frontmatter(content)
+        .or_else(|_| legacy_claude_command_meta(source_path, content, default_name))
+}
+
+fn legacy_claude_command_meta(
+    source_path: &Path,
+    content: &str,
+    default_name: &str,
+) -> anyhow::Result<SkillMeta> {
+    if !is_claude_command_path(source_path) {
+        anyhow::bail!("missing YAML frontmatter");
+    }
+
+    Ok(SkillMeta {
+        name: default_name.to_string(),
+        description: legacy_description(content, default_name),
+        version: default_version(),
+    })
 }
 
 /// Parse YAML frontmatter from a markdown string.
@@ -175,7 +235,35 @@ pub fn parse_frontmatter(content: &str) -> anyhow::Result<SkillMeta> {
 
 /// Parse a full skill file into a `Skill`.
 pub fn parse_skill(content: &str, source_path: PathBuf) -> anyhow::Result<Skill> {
-    let meta = parse_frontmatter(content)?;
+    let meta = match parse_frontmatter(content) {
+        Ok(meta) => meta,
+        Err(_) if is_claude_command_path(&source_path) => SkillMeta {
+            name: source_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("legacy-command")
+                .to_string(),
+            description: legacy_description(
+                content,
+                source_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("legacy-command"),
+            ),
+            version: default_version(),
+        },
+        Err(err) => return Err(err),
+    };
+
+    if is_claude_command_path(&source_path) && !content.trim_start().starts_with("---") {
+        return Ok(Skill {
+            meta,
+            system_prompt: Some(content.trim().to_string()),
+            tool_definitions: Vec::new(),
+            raw_source: content.to_string(),
+            source_path,
+        });
+    }
 
     // Find the body after the second `---`.
     let trimmed = content.trim_start();
@@ -200,6 +288,33 @@ pub fn parse_skill(content: &str, source_path: PathBuf) -> anyhow::Result<Skill>
         raw_source: content.to_string(),
         source_path,
     })
+}
+
+fn is_claude_command_path(path: &Path) -> bool {
+    path.parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some("commands")
+}
+
+fn legacy_description(content: &str, default_name: &str) -> String {
+    content
+        .lines()
+        .map(str::trim)
+        .find_map(|line| {
+            if line.is_empty() {
+                None
+            } else {
+                Some(
+                    line.trim_start_matches('#')
+                        .trim()
+                        .trim_end_matches('.')
+                        .to_string(),
+                )
+            }
+        })
+        .filter(|line| !line.is_empty())
+        .unwrap_or_else(|| format!("Legacy Claude command '{default_name}'"))
 }
 
 /// Extract the content of a `## <heading>` section from markdown body.
@@ -525,5 +640,49 @@ Say hello!
         let loader = FileSystemSkillLoader::new(vec![PathBuf::from("/nonexistent/path")]);
         let result = loader.load("missing").await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn filesystem_loader_loads_directory_skill() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills_dir = dir.path().join("skills");
+        let doc_dir = skills_dir.join("doc");
+        std::fs::create_dir_all(&doc_dir).unwrap();
+        std::fs::write(doc_dir.join("SKILL.md"), MINIMAL_SKILL).unwrap();
+
+        let loader = FileSystemSkillLoader::new(vec![skills_dir]);
+        let skills = loader.list().await.unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "greeter");
+
+        let skill = loader.load("doc").await.unwrap();
+        assert_eq!(skill.meta.name, "greeter");
+        assert!(skill.system_prompt.unwrap().contains("Say hello!"));
+    }
+
+    #[tokio::test]
+    async fn filesystem_loader_loads_legacy_claude_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let commands_dir = dir.path().join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("qa.md"),
+            "You are running QA tests for the quine project.\n\nFollow this workflow exactly.\n",
+        )
+        .unwrap();
+
+        let loader = FileSystemSkillLoader::new(vec![commands_dir]);
+        let skills = loader.list().await.unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "qa");
+        assert!(skills[0].description.contains("QA tests"));
+
+        let skill = loader.load("qa").await.unwrap();
+        assert_eq!(skill.meta.name, "qa");
+        assert!(skill
+            .system_prompt
+            .unwrap()
+            .contains("Follow this workflow exactly."));
+        assert!(skill.tool_definitions.is_empty());
     }
 }

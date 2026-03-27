@@ -98,6 +98,12 @@ pub enum ToolOutcome {
 /// Events the core sends out to the harness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CoreOutput {
+    /// A partial reasoning token from the LLM stream.
+    ReasoningDelta {
+        session_id: SessionId,
+        delta: String,
+    },
+
     /// A partial text token from the LLM stream.
     StreamDelta {
         session_id: SessionId,
