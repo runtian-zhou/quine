@@ -4,6 +4,8 @@ mod client;
 mod log;
 mod render;
 mod run;
+mod session;
+mod slash_command;
 mod test_runner;
 mod tui;
 

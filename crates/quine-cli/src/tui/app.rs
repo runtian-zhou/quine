@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
+use crate::slash_command::parse_slash_command;
 use quine_harness::protocol::{notifications, JsonRpcNotification};
 
 /// Spinner braille frames for the waiting animation.
@@ -190,6 +191,10 @@ pub struct OptionSelectState {
 /// Actions the event loop should perform after handling an event.
 pub enum AppAction {
     SendMessage(String),
+    EnterPlanMode {
+        request: String,
+        was_plan_mode: bool,
+    },
     SubmitInteraction(String),
     Cancel,
     Quit,
@@ -425,6 +430,29 @@ impl App {
         self.auto_scroll();
     }
 
+    /// Reset state for a newly created session.
+    pub fn reset_for_new_session(
+        &mut self,
+        session_id: String,
+        plan_mode: bool,
+        max_context_window: Option<u64>,
+    ) {
+        self.messages.clear();
+        self.reasoning_buffer.clear();
+        self.streaming_buffer.clear();
+        self.scroll_offset = 0;
+        self.user_scrolled = false;
+        self.interaction_queue.clear();
+        self.phase = AgentPhase::Idle;
+        self.spinner_frame = 0;
+        self.session_id = session_id;
+        self.last_turn_usage = None;
+        self.max_context_window = max_context_window;
+        self.option_select = None;
+        self.plan_mode = plan_mode;
+        self.auto_scroll();
+    }
+
     /// Advance the spinner animation frame.
     pub fn tick_spinner(&mut self) {
         if self.phase != AgentPhase::Idle {
@@ -524,10 +552,48 @@ impl App {
             Some(AppAction::SubmitInteraction(response))
         } else {
             self.input_history.push(text.clone());
-            self.messages.push(ConversationEntry::User(text.clone()));
-            self.phase = AgentPhase::Thinking;
-            self.auto_scroll();
-            Some(AppAction::SendMessage(text))
+            if let Some(command) = parse_slash_command(&text) {
+                match command.name.as_str() {
+                    "quit" => {
+                        self.should_quit = true;
+                        Some(AppAction::Quit)
+                    }
+                    "plan" => {
+                        if command.arguments.is_empty() {
+                            self.messages
+                                .push(ConversationEntry::Error("Usage: /plan <request>".into()));
+                            self.auto_scroll();
+                            None
+                        } else {
+                            let was_plan_mode = self.plan_mode;
+                            if was_plan_mode {
+                                self.messages
+                                    .push(ConversationEntry::User(command.arguments.clone()));
+                                self.phase = AgentPhase::Thinking;
+                                self.auto_scroll();
+                                Some(AppAction::SendMessage(command.arguments))
+                            } else {
+                                Some(AppAction::EnterPlanMode {
+                                    request: command.arguments,
+                                    was_plan_mode,
+                                })
+                            }
+                        }
+                    }
+                    other => {
+                        self.messages.push(ConversationEntry::Error(format!(
+                            "Unknown slash command: /{other}"
+                        )));
+                        self.auto_scroll();
+                        None
+                    }
+                }
+            } else {
+                self.messages.push(ConversationEntry::User(text.clone()));
+                self.phase = AgentPhase::Thinking;
+                self.auto_scroll();
+                Some(AppAction::SendMessage(text))
+            }
         }
     }
 
@@ -1111,5 +1177,99 @@ mod tests {
         assert!(app.streaming_buffer.is_empty());
         assert!(app.interaction_queue.is_empty());
         assert!(app.option_select.is_none());
+    }
+
+    #[test]
+    fn submit_input_plan_command_enters_plan_mode() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/plan audit slash commands");
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::EnterPlanMode {
+                request,
+                was_plan_mode: false
+            }) if request == "audit slash commands"
+        ));
+        assert!(!app.plan_mode);
+        assert_eq!(app.input_label(), "> ");
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn reset_for_new_session_clears_old_transcript_and_buffers() {
+        let mut app = App::new("old".into(), false, Some(1024));
+        app.messages.push(ConversationEntry::User("stale".into()));
+        app.reasoning_buffer = "thinking".into();
+        app.streaming_buffer = "partial".into();
+        app.scroll_offset = 5;
+        app.user_scrolled = true;
+        app.interaction_queue.push_back(PendingInteraction {
+            prompt: "pick".into(),
+            kind: InteractionKind::AskUser,
+            options: Vec::new(),
+            allow_freeform: true,
+            source_label: None,
+        });
+        app.phase = AgentPhase::Thinking;
+        app.spinner_frame = 2;
+        app.last_turn_usage = Some(quine_llm::TokenUsage {
+            input_tokens: 1,
+            output_tokens: 2,
+        });
+        app.option_select = Some(OptionSelectState {
+            options: vec!["a".into()],
+            cursor: 0,
+            selected: HashSet::new(),
+            multi_select: false,
+            allow_freeform: false,
+        });
+
+        app.reset_for_new_session("new".into(), true, Some(2048));
+
+        assert!(app.messages.is_empty());
+        assert!(app.reasoning_buffer.is_empty());
+        assert!(app.streaming_buffer.is_empty());
+        assert!(app.interaction_queue.is_empty());
+        assert!(app.option_select.is_none());
+        assert_eq!(app.phase, AgentPhase::Idle);
+        assert_eq!(app.spinner_frame, 0);
+        assert_eq!(app.session_id, "new");
+        assert_eq!(app.max_context_window, Some(2048));
+        assert!(app.last_turn_usage.is_none());
+        assert!(app.plan_mode);
+        assert_eq!(app.scroll_offset, 0);
+        assert!(!app.user_scrolled);
+    }
+
+    #[test]
+    fn submit_input_plan_without_arguments_is_local_only() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/plan");
+
+        let action = app.submit_input();
+
+        assert!(action.is_none());
+        assert!(!app.plan_mode);
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::Error(text)) if text == "Usage: /plan <request>"
+        ));
+    }
+
+    #[test]
+    fn submit_input_unknown_slash_command_is_local_error() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/does-not-exist");
+
+        let action = app.submit_input();
+
+        assert!(action.is_none());
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::Error(text)) if text == "Unknown slash command: /does-not-exist"
+        ));
     }
 }
