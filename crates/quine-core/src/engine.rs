@@ -111,16 +111,29 @@ struct SessionContext {
     cancel_tx: Option<tokio::sync::watch::Sender<bool>>,
 }
 
+struct SessionInit {
+    system_prompt: Option<String>,
+    skills: Vec<Skill>,
+    working_directory: PathBuf,
+    plan_mode: bool,
+    initial_messages: Vec<Message>,
+    auto_approve_permissions: bool,
+}
+
 impl SessionContext {
     async fn new(
-        system_prompt: Option<String>,
-        skills: Vec<Skill>,
-        working_directory: PathBuf,
+        init: SessionInit,
         provider: &Arc<dyn LlmProvider>,
         permission_checker: &Option<Arc<dyn PermissionChecker>>,
-        plan_mode: bool,
-        auto_approve_permissions: bool,
     ) -> Result<Self, CoreError> {
+        let SessionInit {
+            system_prompt,
+            skills,
+            working_directory,
+            plan_mode,
+            initial_messages,
+            auto_approve_permissions,
+        } = init;
         let filesystem = Arc::new(
             OverlayFilesystem::new(working_directory.clone(), working_directory.clone())
                 .await
@@ -198,6 +211,7 @@ impl SessionContext {
         if let Some(prompt) = &combined_prompt {
             history.push(Message::system(prompt.clone()));
         }
+        history.extend(initial_messages);
 
         Ok(Self {
             state: SessionState::Idle,
@@ -410,13 +424,16 @@ async fn start_child_session(
     let work_dir_display = work_dir.display().to_string();
 
     let ctx = SessionContext::new(
-        system_prompt,
-        Vec::new(),
-        work_dir,
+        SessionInit {
+            system_prompt,
+            skills: Vec::new(),
+            working_directory: work_dir,
+            plan_mode: false,
+            initial_messages: Vec::new(),
+            auto_approve_permissions: false,
+        },
         engine.provider,
         engine.permission_checker,
-        false,
-        false,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1404,6 +1421,7 @@ pub async fn run_core_loop(
                 skills,
                 plan_mode,
                 auto_approve_permissions,
+                initial_messages,
                 reply,
             } => {
                 debug_log_session(
@@ -1425,13 +1443,16 @@ pub async fn run_core_loop(
                 let work_dir_display = work_dir.display().to_string();
 
                 match SessionContext::new(
-                    system_prompt,
-                    skills,
-                    work_dir,
+                    SessionInit {
+                        system_prompt,
+                        skills,
+                        working_directory: work_dir,
+                        plan_mode,
+                        initial_messages,
+                        auto_approve_permissions,
+                    },
                     &provider,
                     &permission_checker,
-                    plan_mode,
-                    auto_approve_permissions,
                 )
                 .await
                 {
@@ -1783,13 +1804,16 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
-            None,
-            Vec::new(),
-            std::env::current_dir().unwrap_or_default(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                auto_approve_permissions: false,
+            },
             &provider,
             &permission_checker,
-            false,
-            false,
         )
         .await
         .unwrap();
@@ -1837,13 +1861,16 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
-            None,
-            Vec::new(),
-            std::env::current_dir().unwrap_or_default(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                auto_approve_permissions: false,
+            },
             &provider,
             &permission_checker,
-            false,
-            false,
         )
         .await
         .unwrap();
@@ -1904,13 +1931,16 @@ mod tests {
         let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session_id = SessionId::new();
         let session = SessionContext::new(
-            None,
-            Vec::new(),
-            std::env::current_dir().unwrap_or_default(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                auto_approve_permissions: false,
+            },
             &provider,
             &permission_checker,
-            false,
-            false,
         )
         .await
         .unwrap();
@@ -1987,6 +2017,7 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 auto_approve_permissions: false,
+                initial_messages: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2046,6 +2077,7 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 auto_approve_permissions: false,
+                initial_messages: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2102,6 +2134,7 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 auto_approve_permissions: false,
+                initial_messages: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2118,6 +2151,7 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 auto_approve_permissions: false,
+                initial_messages: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2147,6 +2181,7 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 auto_approve_permissions: false,
+                initial_messages: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2255,6 +2290,7 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 auto_approve_permissions: false,
+                initial_messages: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2364,6 +2400,7 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 auto_approve_permissions: true,
+                initial_messages: Vec::new(),
                 reply: reply_tx,
             })
             .await
@@ -2403,6 +2440,36 @@ mod tests {
             "auto-approve session should not prompt"
         );
         assert!(saw_turn_complete, "turn should complete successfully");
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_session_seeds_initial_messages_after_system_prompt() {
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let provider = Arc::new(MockProvider::empty());
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        let seeded_message = Message::assistant("final plan summary");
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: Some("base prompt".into()),
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                auto_approve_permissions: false,
+                initial_messages: vec![seeded_message.clone()],
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        assert!(reply_rx.await.unwrap().is_ok());
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();

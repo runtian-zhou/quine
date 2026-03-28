@@ -14,9 +14,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::client::IpcClient;
-use crate::session::create_session;
+use crate::session::{create_session, create_session_with_initial_messages};
 use app::{AgentPhase, AppAction};
-use quine_harness::protocol::methods;
+use quine_harness::protocol::{methods, notifications};
+use quine_llm::Message;
 
 /// Run the TUI chat interface.
 ///
@@ -112,7 +113,31 @@ async fn run_event_loop(
             maybe_notif = client.recv_notification() => {
                 match maybe_notif {
                     Some(notif) => {
+                        let should_exit_plan_mode = if app.plan_mode
+                            && notif.method == notifications::TURN_COMPLETE
+                        {
+                            app.messages.iter().rev().find_map(|entry| match entry {
+                                app::ConversationEntry::AssistantText(text)
+                                    if !text.trim().is_empty() =>
+                                {
+                                    Some(text.clone())
+                                }
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        };
                         app.apply_notification(&notif);
+                        if let Some(final_plan) = should_exit_plan_mode {
+                            execute_action(
+                                app,
+                                client,
+                                skills,
+                                auto_approve_permissions,
+                                AppAction::ExitPlanMode { final_plan },
+                            )
+                            .await?;
+                        }
                     }
                     None => {
                         app.messages.push(app::ConversationEntry::Error(
@@ -311,6 +336,35 @@ async fn execute_action(
                 app.phase = AgentPhase::Idle;
             }
         },
+        AppAction::ExitPlanMode { final_plan } => {
+            match create_session_with_initial_messages(
+                client,
+                skills,
+                false,
+                auto_approve_permissions,
+                &[Message::assistant(final_plan)],
+            )
+            .await
+            {
+                Ok(session) => {
+                    app.reset_for_new_session(
+                        session.session_id,
+                        false,
+                        session.max_context_window,
+                    );
+                    app.messages.push(app::ConversationEntry::AssistantText(
+                        "Plan complete. Started a fresh normal session with the final plan carried over."
+                            .into(),
+                    ));
+                    app.auto_scroll();
+                }
+                Err(e) => {
+                    app.messages
+                        .push(app::ConversationEntry::Error(e.to_string()));
+                    app.phase = AgentPhase::Idle;
+                }
+            }
+        }
         AppAction::SubmitInteraction(response) => {
             let params = serde_json::json!({
                 "session_id": app.session_id,

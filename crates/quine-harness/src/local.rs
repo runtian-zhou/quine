@@ -201,6 +201,7 @@ impl LocalHarness {
                         skills,
                         plan_mode: config.plan_mode,
                         auto_approve_permissions: config.auto_approve_permissions,
+                        initial_messages: config.initial_messages,
                         reply: core_reply_tx,
                     })
                     .await

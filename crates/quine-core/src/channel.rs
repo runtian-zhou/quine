@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use quine_llm::Message;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -24,6 +25,8 @@ pub enum CoreInput {
         plan_mode: bool,
         /// Whether bash permission prompts should be auto-approved.
         auto_approve_permissions: bool,
+        /// Seed the new session with these messages after the system prompt.
+        initial_messages: Vec<Message>,
         /// Acknowledges session creation.
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -306,6 +309,7 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 auto_approve_permissions: false,
+                initial_messages: Vec::new(),
                 reply: reply_tx,
             })
             .await
