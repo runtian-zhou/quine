@@ -251,10 +251,26 @@ async fn run_subagent_inner(
             return Ok(full_text);
         }
 
-        // Record any text before tool calls.
-        if !full_text.is_empty() {
-            history.push(Message::assistant(&full_text));
-        }
+        // Record the assistant tool-use message before executing tools so the
+        // next LLM request includes the required tool-call IDs.
+        let tool_use_requests: Vec<quine_llm::ToolUseRequest> = tool_calls
+            .iter()
+            .map(
+                |(tool_use_id, tool_name, arguments)| quine_llm::ToolUseRequest {
+                    tool_use_id: tool_use_id.clone(),
+                    tool_name: tool_name.clone(),
+                    arguments: arguments.clone(),
+                },
+            )
+            .collect();
+        history.push(Message::assistant_tool_use(
+            if full_text.is_empty() {
+                None
+            } else {
+                Some(full_text.clone())
+            },
+            tool_use_requests,
+        ));
 
         // Execute each tool call.
         for (tool_use_id, tool_name, arguments) in &tool_calls {
@@ -333,6 +349,10 @@ mod tests {
     use crate::filesystem::OverlayFilesystem;
     use quine_llm::ToolDefinition;
     use std::pin::Pin;
+    use std::sync::{
+        atomic::{AtomicU32, Ordering},
+        Arc,
+    };
     use tempfile::TempDir;
 
     async fn make_context() -> (TempDir, TempDir, ExecutionContext) {
@@ -386,7 +406,7 @@ mod tests {
 
     /// Mock provider that issues a bash tool call on first send, then returns text.
     struct ToolThenTextProvider {
-        call_count: std::sync::atomic::AtomicU32,
+        call_count: AtomicU32,
     }
 
     #[async_trait]
@@ -397,9 +417,8 @@ mod tests {
             _tools: &[ToolDefinition],
         ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
         {
-            let count = self
-                .call_count
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+
             let events = if count == 0 {
                 vec![
                     Ok(LlmEvent::ToolCall {
@@ -439,7 +458,7 @@ mod tests {
     #[tokio::test]
     async fn subagent_with_tool_use() {
         let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenTextProvider {
-            call_count: std::sync::atomic::AtomicU32::new(0),
+            call_count: AtomicU32::new(0),
         });
         let tool = SubagentTool::new(provider, None);
         let (_base, _session, ctx) = make_context().await;
@@ -534,7 +553,7 @@ mod tests {
 
         /// Mock provider that calls ask_user on first send, then returns the answer.
         struct AskUserProvider {
-            call_count: std::sync::atomic::AtomicU32,
+            call_count: AtomicU32,
         }
 
         #[async_trait]
@@ -545,9 +564,8 @@ mod tests {
                 _tools: &[ToolDefinition],
             ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
             {
-                let count = self
-                    .call_count
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+
                 let events = if count == 0 {
                     vec![
                         Ok(LlmEvent::ToolCall {
@@ -599,7 +617,7 @@ mod tests {
         };
 
         let provider: Arc<dyn LlmProvider> = Arc::new(AskUserProvider {
-            call_count: std::sync::atomic::AtomicU32::new(0),
+            call_count: AtomicU32::new(0),
         });
         let tool = SubagentTool::new(provider, None);
 
@@ -656,6 +674,76 @@ mod tests {
 
         assert!(!result.is_error);
         assert!(result.content.contains("NO_CHANNEL_RESULT"));
+    }
+
+    #[tokio::test]
+    async fn subagent_records_assistant_tool_use_before_tool_result() {
+        struct ProtocolCheckingProvider {
+            call_count: AtomicU32,
+        }
+
+        #[async_trait]
+        impl LlmProvider for ProtocolCheckingProvider {
+            async fn send(
+                &self,
+                messages: &[Message],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+            {
+                let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+                let events = if count == 0 {
+                    vec![
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_protocol_1".into(),
+                            tool_name: "bash".into(),
+                            arguments: serde_json::json!({"command": "echo protocol_ok"}),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else {
+                    let assistant_tool_use_index = messages.iter().position(|message| {
+                        matches!(
+                            &message.content,
+                            quine_llm::MessageContent::ToolUse { tool_calls, .. }
+                                if message.role == quine_llm::Role::Assistant
+                                    && tool_calls.iter().any(|call| call.tool_use_id == "tc_protocol_1")
+                        )
+                    });
+                    let tool_result_index = messages.iter().position(|message| {
+                        matches!(
+                            &message.content,
+                            quine_llm::MessageContent::ToolResult { tool_use_id, .. }
+                                if message.role == quine_llm::Role::Tool && tool_use_id == "tc_protocol_1"
+                        )
+                    });
+
+                    assert_eq!(assistant_tool_use_index, Some(messages.len() - 2));
+                    assert_eq!(tool_result_index, Some(messages.len() - 1));
+
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            text: "protocol preserved".into(),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(ProtocolCheckingProvider {
+            call_count: AtomicU32::new(0),
+        });
+        let tool = SubagentTool::new(provider, None);
+        let (_base, _session, ctx) = make_context().await;
+
+        let result = tool
+            .execute(serde_json::json!({"task": "delegate with bash"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(!result.is_error);
+        assert_eq!(result.content, "protocol preserved");
     }
 
     #[tokio::test]

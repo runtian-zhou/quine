@@ -106,3 +106,101 @@ impl Tool for SpawnTool {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::filesystem::OverlayFilesystem;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    async fn make_context_with_core_input() -> (
+        TempDir,
+        TempDir,
+        mpsc::Receiver<CoreInput>,
+        ExecutionContext,
+    ) {
+        let base = TempDir::new().unwrap();
+        let session_dir = TempDir::new().unwrap();
+        let fs =
+            OverlayFilesystem::new(base.path().to_path_buf(), session_dir.path().to_path_buf())
+                .await
+                .unwrap();
+        let (core_input_tx, core_input_rx) = mpsc::channel(1);
+        let ctx = ExecutionContext {
+            session_id: SessionId::new(),
+            filesystem: Arc::new(fs),
+            working_directory: base.path().to_path_buf(),
+            interaction_channel: None,
+            plan_store: crate::tool::plan::new_plan_store(),
+            core_input: Some(core_input_tx),
+            cancellation: crate::tool::CancellationChannel::never(),
+        };
+        (base, session_dir, core_input_rx, ctx)
+    }
+
+    #[tokio::test]
+    async fn spawn_returns_child_session_id_when_core_input_available() {
+        let tool = SpawnTool;
+        let (_base, _session, mut core_input_rx, ctx) = make_context_with_core_input().await;
+        let session_id = ctx.session_id;
+
+        let exec = tokio::spawn(async move {
+            tool.execute(serde_json::json!({"task": "delegate this"}), &ctx)
+                .await
+                .unwrap()
+        });
+
+        let (child_id, reply_tx) = match core_input_rx.recv().await.unwrap() {
+            CoreInput::SpawnSession {
+                parent_id,
+                child_id,
+                task,
+                system_prompt,
+                inheritance,
+                reply,
+            } => {
+                assert_eq!(parent_id, session_id);
+                assert_eq!(task, "delegate this");
+                assert!(system_prompt.is_none());
+                assert!(!inheritance.history);
+                assert!(inheritance.filesystem);
+                (child_id, reply)
+            }
+            other => panic!("expected SpawnSession, got {other:?}"),
+        };
+        reply_tx.send(Ok(())).unwrap();
+
+        let output = exec.await.unwrap();
+        assert!(!output.is_error);
+        assert_eq!(output.content, format!("{child_id:?}"));
+    }
+
+    #[tokio::test]
+    async fn spawn_errors_without_core_input_channel() {
+        let tool = SpawnTool;
+        let base = TempDir::new().unwrap();
+        let session_dir = TempDir::new().unwrap();
+        let fs =
+            OverlayFilesystem::new(base.path().to_path_buf(), session_dir.path().to_path_buf())
+                .await
+                .unwrap();
+        let ctx = ExecutionContext {
+            session_id: SessionId::new(),
+            filesystem: Arc::new(fs),
+            working_directory: base.path().to_path_buf(),
+            interaction_channel: None,
+            plan_store: crate::tool::plan::new_plan_store(),
+            core_input: None,
+            cancellation: crate::tool::CancellationChannel::never(),
+        };
+
+        let err = tool
+            .execute(serde_json::json!({"task": "delegate this"}), &ctx)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ToolError::Internal { .. }));
+        assert!(err.to_string().contains("no core_input channel available"));
+    }
+}
