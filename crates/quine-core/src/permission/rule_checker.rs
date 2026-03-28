@@ -57,7 +57,6 @@ impl RuleBasedChecker {
         {
             return false;
         }
-
         self.rules
             .iter()
             .any(|rule| rule.risk_level == RiskLevel::Low && rule.pattern.is_match(&command))
