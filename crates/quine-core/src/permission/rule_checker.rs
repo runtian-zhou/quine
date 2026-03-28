@@ -39,6 +39,17 @@ impl RuleBasedChecker {
         }
     }
 
+    /// Returns true when the command matches a manual low-risk allowlist rule.
+    pub fn is_manually_allowlisted(&self, tool_name: &str, arguments: &serde_json::Value) -> bool {
+        let Some(command) = Self::extract_command(tool_name, arguments) else {
+            return false;
+        };
+
+        self.rules
+            .iter()
+            .any(|rule| rule.risk_level == RiskLevel::Low && rule.pattern.is_match(&command))
+    }
+
     /// Add a custom deny pattern.
     pub fn add_deny_pattern(&mut self, pattern: &str, description: &str) {
         if let Ok(regex) = Regex::new(pattern) {
@@ -345,7 +356,6 @@ impl PermissionChecker for RuleBasedChecker {
                 let segments: Vec<&str> = command.split('|').collect();
                 let all_safe = segments.iter().all(|seg| {
                     let seg = seg.trim();
-                    // Check if this segment (before any redirect) matches a low-risk rule.
                     let seg_cmd = seg.split('>').next().unwrap_or(seg).trim();
                     self.rules.iter().any(|rule| {
                         rule.risk_level == RiskLevel::Low && rule.pattern.is_match(seg_cmd)
@@ -606,6 +616,13 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(decision, PermissionDecision::Allow));
+    }
+
+    #[test]
+    fn detects_manual_allowlist_match() {
+        let checker = RuleBasedChecker::new();
+        assert!(checker.is_manually_allowlisted("bash", &bash_args("ls -la")));
+        assert!(!checker.is_manually_allowlisted("bash", &bash_args("curl https://example.com")));
     }
 
     #[tokio::test]
