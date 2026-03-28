@@ -29,6 +29,22 @@ using the tools available to you. Each message from the user is a new request â€
 respond to it directly. Use tools when needed to read files, run commands, or \
 write code. Be concise and accurate.";
 
+fn debug_enabled() -> bool {
+    std::env::var("QUINE_DEBUG").is_ok()
+}
+
+fn debug_log(message: impl AsRef<str>) {
+    if debug_enabled() {
+        eprintln!("[core] {}", message.as_ref());
+    }
+}
+
+fn debug_log_session(session_id: SessionId, message: impl AsRef<str>) {
+    if debug_enabled() {
+        eprintln!("[core][session={session_id:?}] {}", message.as_ref());
+    }
+}
+
 /// System prompt prepended in plan mode to restrict the agent to read-only exploration.
 const PLAN_MODE_SYSTEM_PROMPT: &str = "\
 You are a software architect and planning specialist. Your role is to explore the \
@@ -301,6 +317,13 @@ struct PermissionWait<'a> {
     cancellation: &'a CancellationChannel,
 }
 
+struct CoreIo<'a> {
+    output: &'a mpsc::Sender<CoreOutput>,
+    input: &'a mut mpsc::Receiver<CoreInput>,
+    input_tx: &'a mpsc::Sender<CoreInput>,
+    deferred_inputs: &'a mut VecDeque<CoreInput>,
+}
+
 /// Check permissions for a tool call, optionally requesting user confirmation.
 ///
 /// Returns `Ok(())` if the tool is allowed to proceed, or `Err(ToolOutcome)` with
@@ -317,6 +340,15 @@ async fn check_permission(
         working_directory: session.working_directory.clone(),
     };
 
+    debug_log_session(
+        session_id,
+        format!(
+            "permission check requested for tool `{}` with args {}",
+            call.tool_name,
+            serde_json::to_string(&call.arguments).unwrap_or_default()
+        ),
+    );
+
     let decision = match checker
         .check(&call.tool_name, &call.arguments, &context)
         .await
@@ -332,11 +364,30 @@ async fn check_permission(
     };
 
     match decision {
-        PermissionDecision::Allow => Ok(()),
-        PermissionDecision::Deny { reason } => Err(ToolOutcome::Error {
-            message: format!("permission denied: {reason}"),
-        }),
+        PermissionDecision::Allow => {
+            debug_log_session(
+                session_id,
+                format!("permission allowed for tool `{}`", call.tool_name),
+            );
+            Ok(())
+        }
+        PermissionDecision::Deny { reason } => {
+            debug_log_session(
+                session_id,
+                format!("permission denied for tool `{}`: {reason}", call.tool_name),
+            );
+            Err(ToolOutcome::Error {
+                message: format!("permission denied: {reason}"),
+            })
+        }
         PermissionDecision::RequiresConfirmation { risk_score, reason } => {
+            debug_log_session(
+                session_id,
+                format!(
+                    "permission confirmation required for tool `{}` (risk {:.1}): {}",
+                    call.tool_name, risk_score, reason
+                ),
+            );
             let prompt = format!(
                 "Tool `{}` with args `{}` scored {:.1} risk: {}. Allow? [y/N]",
                 call.tool_name,
@@ -365,6 +416,7 @@ async fn check_permission(
             loop {
                 tokio::select! {
                     _ = wait.cancellation.cancelled() => {
+                        debug_log_session(session_id, "permission check cancelled");
                         return Err(ToolOutcome::Cancelled);
                     }
                     recv = tokio::time::timeout_at(deadline, wait.input.recv()) => {
@@ -375,8 +427,16 @@ async fn check_permission(
                             })) if resp_sid == session_id => {
                                 let answer = response.response.trim().to_lowercase();
                                 if answer == "y" || answer == "yes" {
+                                    debug_log_session(
+                                        session_id,
+                                        format!("permission confirmed by user for tool `{}`", call.tool_name),
+                                    );
                                     return Ok(());
                                 }
+                                debug_log_session(
+                                    session_id,
+                                    format!("permission rejected by user for tool `{}`", call.tool_name),
+                                );
                                 return Err(ToolOutcome::Error {
                                     message: format!("permission denied by user: {reason}"),
                                 });
@@ -384,6 +444,7 @@ async fn check_permission(
                             Ok(Some(CoreInput::Cancel {
                                 session_id: cancel_sid,
                             })) if cancel_sid == session_id => {
+                                debug_log_session(session_id, "permission check interrupted by cancel input");
                                 return Err(ToolOutcome::Cancelled);
                             }
                             Ok(Some(other)) => {
@@ -391,11 +452,13 @@ async fn check_permission(
                                 continue;
                             }
                             Ok(None) => {
+                                debug_log_session(session_id, "permission check failed: input channel closed");
                                 return Err(ToolOutcome::Error {
                                     message: "input channel closed during permission check".into(),
                                 });
                             }
                             Err(_) => {
+                                debug_log_session(session_id, "permission check timed out waiting for response");
                                 return Err(ToolOutcome::Error {
                                     message: format!(
                                         "permission check timed out (no response within 30s): {reason}"
@@ -418,13 +481,15 @@ async fn execute_tool_call(
     call: &PendingToolCall,
     session: &mut SessionContext,
     session_id: SessionId,
-    output: &mpsc::Sender<CoreOutput>,
-    input: &mut mpsc::Receiver<CoreInput>,
-    deferred_inputs: &mut VecDeque<CoreInput>,
+    io: &mut CoreIo<'_>,
     permission_checker: Option<&dyn PermissionChecker>,
 ) -> ToolOutcome {
     let (cancel_tx, cancellation) = CancellationChannel::new_pair();
     session.cancel_tx = Some(cancel_tx.clone());
+    debug_log_session(
+        session_id,
+        format!("starting tool execution for `{}`", call.tool_name),
+    );
 
     // Only check permissions for bash tool â€” other tools are safe by design.
     if call.tool_name == "bash" {
@@ -435,9 +500,9 @@ async fn execute_tool_call(
                 session,
                 session_id,
                 PermissionWait {
-                    output,
-                    input,
-                    deferred_inputs,
+                    output: io.output,
+                    input: io.input,
+                    deferred_inputs: io.deferred_inputs,
                     cancellation: &cancellation,
                 },
             )
@@ -452,6 +517,10 @@ async fn execute_tool_call(
     let tool = match session.tool_registry.get(&call.tool_name) {
         Some(t) => Arc::clone(t),
         None => {
+            debug_log_session(
+                session_id,
+                format!("tool lookup failed for `{}`", call.tool_name),
+            );
             return ToolOutcome::Error {
                 message: format!("unknown tool: {}", call.tool_name),
             };
@@ -473,14 +542,14 @@ async fn execute_tool_call(
             working_directory: session.working_directory.clone(),
             interaction_channel: Some(channel),
             plan_store: session.plan_store.clone(),
-            core_input: None,
+            core_input: Some(io.input_tx.clone()),
             cancellation: cancellation.clone(),
         };
 
         let args = call.arguments.clone();
         let mut tool_handle = tokio::spawn(async move { tool.execute(args, &ctx).await });
 
-        let output_clone = output.clone();
+        let output_clone = io.output.clone();
         let sid = session_id;
 
         let outcome = 'tool_loop: loop {
@@ -488,17 +557,44 @@ async fn execute_tool_call(
                 result = &mut tool_handle => {
                     break 'tool_loop match result {
                         Ok(Ok(tool_output)) => {
+                            debug_log_session(
+                                session_id,
+                                format!(
+                                    "interactive tool `{}` completed (error={})",
+                                    call.tool_name, tool_output.is_error
+                                ),
+                            );
                             if tool_output.is_error {
-                                ToolOutcome::Error { message: tool_output.content }
+                                ToolOutcome::Error {
+                                    message: tool_output.content,
+                                }
                             } else {
-                                ToolOutcome::Success { output: tool_output.content }
+                                ToolOutcome::Success {
+                                    output: tool_output.content,
+                                }
                             }
                         }
-                        Ok(Err(ToolError::Cancelled)) => ToolOutcome::Cancelled,
+                        Ok(Err(ToolError::Cancelled)) => {
+                            debug_log_session(
+                                session_id,
+                                format!("interactive tool `{}` cancelled", call.tool_name),
+                            );
+                            ToolOutcome::Cancelled
+                        }
                         Ok(Err(tool_err)) => {
-                            ToolOutcome::Error { message: tool_err.to_string() }
+                            debug_log_session(
+                                session_id,
+                                format!("interactive tool `{}` errored: {}", call.tool_name, tool_err),
+                            );
+                            ToolOutcome::Error {
+                                message: tool_err.to_string(),
+                            }
                         }
                         Err(join_err) => {
+                            debug_log_session(
+                                session_id,
+                                format!("interactive tool `{}` panicked: {join_err}", call.tool_name),
+                            );
                             ToolOutcome::Error {
                                 message: format!("tool task panicked: {join_err}"),
                             }
@@ -507,27 +603,46 @@ async fn execute_tool_call(
                 }
                 interaction = req_rx.recv() => {
                     if let Some((request, reply_tx)) = interaction {
+                        debug_log_session(
+                            session_id,
+                            format!(
+                                "interactive tool `{}` requested interaction: kind={:?} prompt={}",
+                                call.tool_name, request.kind, request.prompt
+                            ),
+                        );
                         let _ = output_clone.send(CoreOutput::InteractionNeeded {
                             session_id: sid,
                             request,
                         }).await;
 
                         loop {
-                            match input.recv().await {
+                            match io.input.recv().await {
                                 Some(CoreInput::InteractionResponse { session_id: resp_sid, response }) if resp_sid == sid => {
+                                    debug_log_session(
+                                        session_id,
+                                        format!("interactive tool `{}` received interaction response", call.tool_name),
+                                    );
                                     let _ = reply_tx.send(response);
                                     break;
                                 }
                                 Some(CoreInput::Cancel { session_id: cancel_sid }) if cancel_sid == sid => {
+                                    debug_log_session(
+                                        session_id,
+                                        format!("interactive tool `{}` cancelled while awaiting interaction", call.tool_name),
+                                    );
                                     let _ = cancel_tx.send(true);
                                     drop(reply_tx);
                                     break 'tool_loop ToolOutcome::Cancelled;
                                 }
                                 Some(other) => {
-                                    deferred_inputs.push_back(other);
+                                    io.deferred_inputs.push_back(other);
                                     continue;
                                 }
                                 None => {
+                                    debug_log_session(
+                                        session_id,
+                                        format!("interactive tool `{}` failed: input channel closed", call.tool_name),
+                                    );
                                     break 'tool_loop ToolOutcome::Error {
                                         message: "input channel closed".into(),
                                     };
@@ -550,7 +665,7 @@ async fn execute_tool_call(
             working_directory: session.working_directory.clone(),
             interaction_channel: None,
             plan_store: session.plan_store.clone(),
-            core_input: None,
+            core_input: Some(io.input_tx.clone()),
             cancellation: cancellation.clone(),
         };
 
@@ -561,6 +676,10 @@ async fn execute_tool_call(
                 result = &mut tool_future => {
                     break match result {
                         Ok(tool_output) => {
+                            debug_log_session(
+                                session_id,
+                                format!("tool `{}` completed (error={})", call.tool_name, tool_output.is_error),
+                            );
                             if tool_output.is_error {
                                 ToolOutcome::Error {
                                     message: tool_output.content,
@@ -571,23 +690,43 @@ async fn execute_tool_call(
                                 }
                             }
                         }
-                        Err(ToolError::Cancelled) => ToolOutcome::Cancelled,
-                        Err(tool_err) => ToolOutcome::Error {
-                            message: tool_err.to_string(),
-                        },
+                        Err(ToolError::Cancelled) => {
+                            debug_log_session(
+                                session_id,
+                                format!("tool `{}` cancelled", call.tool_name),
+                            );
+                            ToolOutcome::Cancelled
+                        }
+                        Err(tool_err) => {
+                            debug_log_session(
+                                session_id,
+                                format!("tool `{}` errored: {}", call.tool_name, tool_err),
+                            );
+                            ToolOutcome::Error {
+                                message: tool_err.to_string(),
+                            }
+                        }
                     };
                 }
-                maybe_input = input.recv() => {
+                maybe_input = io.input.recv() => {
                     match maybe_input {
                         Some(CoreInput::Cancel { session_id: cancel_sid }) if cancel_sid == session_id => {
+                            debug_log_session(
+                                session_id,
+                                format!("tool `{}` cancelled by core input", call.tool_name),
+                            );
                             let _ = cancel_tx.send(true);
                             break ToolOutcome::Cancelled;
                         }
                         Some(other) => {
-                            deferred_inputs.push_back(other);
+                            io.deferred_inputs.push_back(other);
                             continue;
                         }
                         None => {
+                            debug_log_session(
+                                session_id,
+                                format!("tool `{}` failed: input channel closed during execution", call.tool_name),
+                            );
                             let _ = cancel_tx.send(true);
                             break ToolOutcome::Error { message: "input channel closed".into() };
                         }
@@ -685,16 +824,21 @@ async fn handle_llm_turn(
     provider: &dyn LlmProvider,
     session: &mut SessionContext,
     session_id: SessionId,
-    output: &mpsc::Sender<CoreOutput>,
-    input: &mut mpsc::Receiver<CoreInput>,
-    deferred_inputs: &mut VecDeque<CoreInput>,
+    io: &mut CoreIo<'_>,
     permission_checker: Option<&dyn PermissionChecker>,
 ) {
     let turn_start = std::time::Instant::now();
     let mut accumulated_usage: Option<quine_llm::TokenUsage> = None;
+    debug_log_session(
+        session_id,
+        format!(
+            "starting LLM turn with {} history messages",
+            session.history.len()
+        ),
+    );
 
     loop {
-        match call_llm(provider, session, session_id, output).await {
+        match call_llm(provider, session, session_id, io.output).await {
             Ok(LlmCallResult {
                 turn: LlmTurnResult::Text(full_text),
                 usage,
@@ -707,8 +851,16 @@ async fn handle_llm_turn(
                 }
 
                 session.history.push(Message::assistant(&full_text));
+                debug_log_session(
+                    session_id,
+                    format!(
+                        "LLM turn completed with text output ({} chars)",
+                        full_text.len()
+                    ),
+                );
 
-                let _ = output
+                let _ = io
+                    .output
                     .send(CoreOutput::TextComplete {
                         session_id,
                         full_text,
@@ -717,7 +869,8 @@ async fn handle_llm_turn(
 
                 session.state = SessionState::Idle;
                 let duration_us = turn_start.elapsed().as_micros() as u64;
-                let _ = output
+                let _ = io
+                    .output
                     .send(CoreOutput::TurnComplete {
                         session_id,
                         duration_us,
@@ -739,7 +892,12 @@ async fn handle_llm_turn(
 
                 // Flush any text that preceded the tool calls to the TUI.
                 if let Some(ref text) = text_before {
-                    let _ = output
+                    debug_log_session(
+                        session_id,
+                        format!("LLM emitted pre-tool text ({} chars)", text.len()),
+                    );
+                    let _ = io
+                        .output
                         .send(CoreOutput::TextComplete {
                             session_id,
                             full_text: text.clone(),
@@ -761,21 +919,29 @@ async fn handle_llm_turn(
                     tool_use_requests,
                 ));
 
-                let debug = std::env::var("QUINE_DEBUG").is_ok();
+                let debug = debug_enabled();
+                debug_log_session(
+                    session_id,
+                    format!("LLM requested {} tool call(s)", calls.len()),
+                );
 
                 // Execute each tool call directly
                 for call in &calls {
                     if debug {
-                        eprintln!(
-                            "[tool] calling {} (id={}) args={}",
-                            call.tool_name,
-                            call.tool_use_id,
-                            serde_json::to_string(&call.arguments).unwrap_or_default()
+                        debug_log_session(
+                            session_id,
+                            format!(
+                                "calling tool `{}` (id={}) args={}",
+                                call.tool_name,
+                                call.tool_use_id,
+                                serde_json::to_string(&call.arguments).unwrap_or_default()
+                            ),
                         );
                     }
 
                     // Emit ToolRequest for informational purposes
-                    let _ = output
+                    let _ = io
+                        .output
                         .send(CoreOutput::ToolRequest {
                             session_id,
                             tool_use_id: call.tool_use_id.clone(),
@@ -785,16 +951,8 @@ async fn handle_llm_turn(
                         .await;
 
                     let tool_start = std::time::Instant::now();
-                    let result = execute_tool_call(
-                        call,
-                        session,
-                        session_id,
-                        output,
-                        input,
-                        deferred_inputs,
-                        permission_checker,
-                    )
-                    .await;
+                    let result =
+                        execute_tool_call(call, session, session_id, io, permission_checker).await;
                     let tool_duration_us = tool_start.elapsed().as_micros() as u64;
 
                     // Append tool result to history
@@ -807,7 +965,8 @@ async fn handle_llm_turn(
                     };
 
                     // Emit ToolResult with timing info
-                    let _ = output
+                    let _ = io
+                        .output
                         .send(CoreOutput::ToolResult {
                             session_id,
                             tool_use_id: call.tool_use_id.clone(),
@@ -825,7 +984,10 @@ async fn handle_llm_turn(
                         } else {
                             tool_output.clone()
                         };
-                        eprintln!("[tool] {} result ({}): {}", call.tool_name, status, preview);
+                        debug_log_session(
+                            session_id,
+                            format!("tool `{}` result ({status}): {}", call.tool_name, preview),
+                        );
                     }
 
                     session.history.push(Message::tool_result(
@@ -835,10 +997,15 @@ async fn handle_llm_turn(
                     ));
 
                     if matches!(result, ToolOutcome::Cancelled) {
+                        debug_log_session(
+                            session_id,
+                            "LLM turn aborted because tool execution was cancelled",
+                        );
                         session.cancel_tx = None;
                         session.state = SessionState::Idle;
                         let duration_us = turn_start.elapsed().as_micros() as u64;
-                        let _ = output
+                        let _ = io
+                            .output
                             .send(CoreOutput::TurnComplete {
                                 session_id,
                                 duration_us,
@@ -864,7 +1031,7 @@ async fn handle_llm_turn(
                                     handle_plan_progress(
                                         session,
                                         session_id,
-                                        output,
+                                        io.output,
                                         plan_id_str,
                                         action_id_str,
                                     )
@@ -876,11 +1043,14 @@ async fn handle_llm_turn(
                 }
 
                 // Call LLM again with tool results
+                debug_log_session(session_id, "continuing LLM turn after tool results");
                 continue;
             }
             Err(error) => {
+                debug_log_session(session_id, format!("LLM turn failed: {error}"));
                 session.state = SessionState::Idle;
-                let _ = output
+                let _ = io
+                    .output
                     .send(CoreOutput::SessionError { session_id, error })
                     .await;
                 break;
@@ -900,6 +1070,7 @@ pub async fn run_core_loop(
 ) {
     let mut sessions: HashMap<SessionId, SessionContext> = HashMap::new();
     let mut deferred_inputs = VecDeque::new();
+    debug_log("core event loop started");
 
     loop {
         let input = match deferred_inputs.pop_front() {
@@ -919,6 +1090,15 @@ pub async fn run_core_loop(
                 auto_approve_permissions,
                 reply,
             } => {
+                debug_log_session(
+                    session_id,
+                    format!(
+                        "received CreateSession (plan_mode={}, auto_approve_permissions={}, skills={})",
+                        plan_mode,
+                        auto_approve_permissions,
+                        skills.len()
+                    ),
+                );
                 if sessions.contains_key(&session_id) {
                     let _ = reply.send(Err("session already exists".into()));
                     continue;
@@ -926,6 +1106,7 @@ pub async fn run_core_loop(
 
                 let work_dir = working_directory
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                let work_dir_display = work_dir.display().to_string();
 
                 match SessionContext::new(
                     system_prompt,
@@ -939,6 +1120,13 @@ pub async fn run_core_loop(
                 .await
                 {
                     Ok(ctx) => {
+                        debug_log_session(
+                            session_id,
+                            format!(
+                                "session created with working_directory={}",
+                                work_dir_display
+                            ),
+                        );
                         sessions.insert(session_id, ctx);
                         let _ = handle
                             .output
@@ -950,6 +1138,7 @@ pub async fn run_core_loop(
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
+                        debug_log_session(session_id, format!("session creation failed: {e}"));
                         let _ = reply.send(Err(format!("failed to create session: {e}")));
                     }
                 }
@@ -959,6 +1148,10 @@ pub async fn run_core_loop(
                 session_id,
                 content,
             } => {
+                debug_log_session(
+                    session_id,
+                    format!("received UserMessage ({} chars)", content.len()),
+                );
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.state = SessionState::Streaming;
                     let _ = handle
@@ -971,17 +1164,22 @@ pub async fn run_core_loop(
 
                     session.history.push(Message::user(&content));
 
+                    let mut io = CoreIo {
+                        output: &handle.output,
+                        input: &mut handle.input,
+                        input_tx: &handle.input_tx,
+                        deferred_inputs: &mut deferred_inputs,
+                    };
                     handle_llm_turn(
                         &*provider,
                         session,
                         session_id,
-                        &handle.output,
-                        &mut handle.input,
-                        &mut deferred_inputs,
+                        &mut io,
                         permission_checker.as_deref(),
                     )
                     .await;
                 } else {
+                    debug_log_session(session_id, "user message targeted unknown session");
                     let _ = handle
                         .output
                         .send(CoreOutput::SessionError {
@@ -997,6 +1195,10 @@ pub async fn run_core_loop(
                 tool_use_id,
                 result,
             } => {
+                debug_log_session(
+                    session_id,
+                    format!("received external ToolResult for tool_use_id={tool_use_id}"),
+                );
                 // Legacy path: the harness sent a tool result.
                 // With the new architecture, tools are executed in-core,
                 // but we still accept external tool results for backward compat.
@@ -1035,13 +1237,17 @@ pub async fn run_core_loop(
                             })
                             .await;
 
+                        let mut io = CoreIo {
+                            output: &handle.output,
+                            input: &mut handle.input,
+                            input_tx: &handle.input_tx,
+                            deferred_inputs: &mut deferred_inputs,
+                        };
                         handle_llm_turn(
                             &*provider,
                             session,
                             session_id,
-                            &handle.output,
-                            &mut handle.input,
-                            &mut deferred_inputs,
+                            &mut io,
                             permission_checker.as_deref(),
                         )
                         .await;
@@ -1058,11 +1264,13 @@ pub async fn run_core_loop(
             }
 
             CoreInput::InteractionResponse { .. } => {
+                debug_log("received unhandled InteractionResponse at top-level core loop");
                 // Interaction responses are handled within execute_tool_call.
                 // If we get one here, it means no tool is waiting for it.
             }
 
             CoreInput::Cancel { session_id } => {
+                debug_log_session(session_id, "received Cancel");
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.state = SessionState::Idle;
                     if let Some(cancel_tx) = &session.cancel_tx {
@@ -1080,7 +1288,10 @@ pub async fn run_core_loop(
                 }
             }
 
-            CoreInput::Shutdown => break,
+            CoreInput::Shutdown => {
+                debug_log("received Shutdown; exiting core event loop");
+                break;
+            }
 
             CoreInput::SpawnSession {
                 parent_id: _,
@@ -1090,12 +1301,17 @@ pub async fn run_core_loop(
                 inheritance: _,
                 reply,
             } => {
+                debug_log_session(
+                    child_id,
+                    format!("received SpawnSession for task ({} chars)", task.len()),
+                );
                 if sessions.contains_key(&child_id) {
                     let _ = reply.send(Err("session already exists".into()));
                     continue;
                 }
 
                 let work_dir = std::env::current_dir().unwrap_or_default();
+                let work_dir_display = work_dir.display().to_string();
 
                 match SessionContext::new(
                     system_prompt,
@@ -1109,6 +1325,13 @@ pub async fn run_core_loop(
                 .await
                 {
                     Ok(ctx) => {
+                        debug_log_session(
+                            child_id,
+                            format!(
+                                "child session created with working_directory={}",
+                                work_dir_display
+                            ),
+                        );
                         sessions.insert(child_id, ctx);
                         let _ = handle
                             .output
@@ -1118,6 +1341,7 @@ pub async fn run_core_loop(
                             })
                             .await;
                         let _ = reply.send(Ok(()));
+                        debug_log_session(child_id, "spawn acknowledged to caller");
 
                         // Send the task as the first user message.
                         let session = sessions.get_mut(&child_id).unwrap();
@@ -1131,24 +1355,32 @@ pub async fn run_core_loop(
                             })
                             .await;
 
+                        let mut io = CoreIo {
+                            output: &handle.output,
+                            input: &mut handle.input,
+                            input_tx: &handle.input_tx,
+                            deferred_inputs: &mut deferred_inputs,
+                        };
                         handle_llm_turn(
                             &*provider,
                             session,
                             child_id,
-                            &handle.output,
-                            &mut handle.input,
-                            &mut deferred_inputs,
+                            &mut io,
                             permission_checker.as_deref(),
                         )
                         .await;
                     }
                     Err(e) => {
+                        debug_log_session(child_id, format!("child session creation failed: {e}"));
                         let _ = reply.send(Err(e.to_string()));
                     }
                 }
             }
-            CoreInput::Signal { .. } | CoreInput::SendMessage { .. } => {}
+            CoreInput::Signal { .. } | CoreInput::SendMessage { .. } => {
+                debug_log("received Signal or SendMessage; no-op in current core loop");
+            }
             CoreInput::WaitSession { reply, .. } => {
+                debug_log("received WaitSession; returning None in current implementation");
                 let _ = reply.send(None);
             }
         }
@@ -1249,16 +1481,13 @@ mod tests {
             .await
             .unwrap();
 
-        let result = execute_tool_call(
-            &call,
-            &mut session,
-            session_id,
-            &output_tx,
-            &mut input_rx,
-            &mut deferred_inputs,
-            None,
-        )
-        .await;
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let result = execute_tool_call(&call, &mut session, session_id, &mut io, None).await;
 
         assert!(matches!(result, ToolOutcome::Cancelled));
         assert!(session.cancel_tx.is_none());
@@ -1305,16 +1534,13 @@ mod tests {
             .await
             .unwrap();
 
-        let result = execute_tool_call(
-            &call,
-            &mut session,
-            session_id,
-            &output_tx,
-            &mut input_rx,
-            &mut deferred_inputs,
-            None,
-        )
-        .await;
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let result = execute_tool_call(&call, &mut session, session_id, &mut io, None).await;
 
         assert!(matches!(result, ToolOutcome::Cancelled));
         assert!(matches!(

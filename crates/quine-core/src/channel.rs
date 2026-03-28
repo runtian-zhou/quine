@@ -219,6 +219,8 @@ pub struct HarnessHandle {
 
 /// The channel endpoints the core event loop holds.
 pub struct CoreHandle {
+    /// Send operations back into the core event loop.
+    pub input_tx: mpsc::Sender<CoreInput>,
     /// Receive operations from the harness.
     pub input: mpsc::Receiver<CoreInput>,
     /// Send events to the harness.
@@ -231,11 +233,12 @@ pub fn create_channels(config: ChannelConfig) -> (HarnessHandle, CoreHandle) {
     let (output_tx, output_rx) = mpsc::channel(config.output_buffer);
 
     let harness = HarnessHandle {
-        input: input_tx,
+        input: input_tx.clone(),
         output: output_rx,
     };
 
     let core = CoreHandle {
+        input_tx: input_tx.clone(),
         input: input_rx,
         output: output_tx,
     };
