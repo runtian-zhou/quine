@@ -461,6 +461,19 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 mod tests {
     use super::*;
 
+    fn buffer_lines(backend: &ratatui::backend::TestBackend) -> Vec<String> {
+        let buffer = backend.buffer();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
     #[test]
     fn format_token_usage_compacts_values() {
         let usage = quine_llm::TokenUsage {
@@ -537,6 +550,51 @@ mod tests {
         let backend = ratatui::backend::TestBackend::new(80, 24);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
+
+    #[test]
+    fn draw_renders_single_blank_line_between_entries() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::User("hello".into()));
+        app.messages
+            .push(ConversationEntry::AssistantText("hi there".into()));
+
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        let hello_index = lines
+            .iter()
+            .position(|line| line.contains("You: hello"))
+            .unwrap();
+        let reply_index = lines
+            .iter()
+            .position(|line| line.contains("  hi there"))
+            .unwrap();
+
+        assert_eq!(reply_index - hello_index, 2);
+        assert!(lines[hello_index + 1].is_empty());
+    }
+
+    #[test]
+    fn draw_trims_leading_blank_lines_from_streaming_buffer() {
+        let mut app = App::new("test".into(), false, None);
+        app.streaming_buffer = "\n\npartial output".into();
+        app.phase = AgentPhase::Streaming;
+
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        let partial_index = lines
+            .iter()
+            .position(|line| line.contains("partial output"))
+            .unwrap();
+
+        assert_eq!(partial_index, 1);
+        assert!(!lines[partial_index - 1].contains("partial output"));
     }
 
     #[test]
