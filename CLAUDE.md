@@ -111,17 +111,28 @@ The `status` field tracks progress:
 - `in-progress` — an agent is actively working on it
 - `done` — implemented and merged
 
+Each feature request should also have two planning docs under `features/plans/`:
+- `<NNN>-<name>-implementation.md` — implementation plan owned by an implementor agent
+- `<NNN>-<name>-qa.md` — QA plan owned by a QA agent
+
+When creating a new feature request, spawn those two agents with empty context. They may inspect the repo independently, but the only information they share with each other must flow through the two plan docs. Do not commit the feature request PR until both plan docs record mutual agreement and all open questions are resolved.
+
 **Agent workflow for feature requests:**
 
-1. Scan `features/` for files with `status: pending`.
-2. Pick a feature, update its status to `in-progress`.
-3. Create a git worktree (`git worktree add`) for an isolated workspace.
-4. Implement the feature in the worktree on a feature branch.
-5. Run all checks (`cargo build`, `cargo test`, `cargo clippy`, `cargo fmt`).
-6. Use `/review` to review the code, create a PR, and merge when CI passes.
-7. Run `/qa` to verify the new feature works end-to-end (spawns daemon, sends messages, checks output).
-8. Update the feature file status to `done`.
-9. Clean up the worktree (`git worktree remove`).
+1. Draft the feature request in `features/` and the two planning docs in `features/plans/`.
+2. Spawn an implementor agent and a QA agent with empty context.
+3. Have the implementor own the implementation plan and review the QA plan.
+4. Have the QA agent own the QA plan and review the implementation plan.
+5. Do not create the feature-request PR until both planning docs record agreement.
+6. Scan `features/` for files with `status: pending`.
+7. Pick a feature, update its status to `in-progress`.
+8. Create a git worktree (`git worktree add`) for an isolated workspace.
+9. Implement the feature in the worktree on a feature branch.
+10. Run all checks (`cargo build`, `cargo test`, `cargo clippy`, `cargo fmt`).
+11. Use `/review` to review the code, create a PR, and merge when CI passes.
+12. Run `/qa` to verify the new feature works end-to-end (spawns daemon, sends messages, checks output).
+13. Update the feature file status to `done`.
+14. Clean up the worktree (`git worktree remove`).
 
 ### QA Reports
 
