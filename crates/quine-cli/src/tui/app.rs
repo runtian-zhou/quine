@@ -924,6 +924,61 @@ mod tests {
     }
 
     #[test]
+    fn trim_blank_lines_strips_edges_and_preserves_internal_blank_lines() {
+        assert_eq!(
+            trim_blank_lines("\n\n  first line\n\nsecond line\n\n"),
+            "  first line\n\nsecond line"
+        );
+        assert_eq!(trim_blank_lines("\n \n\t\n"), "");
+    }
+
+    #[test]
+    fn text_complete_stores_trimmed_assistant_text() {
+        let mut app = App::new("test".into(), false, None);
+        let notif = make_notif(
+            notifications::TEXT_COMPLETE,
+            serde_json::json!({
+                "full_text": "\n\nhello\n\nworld\n\n"
+            }),
+        );
+
+        app.apply_notification(&notif);
+
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::AssistantText(text)) if text == "hello\n\nworld"
+        ));
+    }
+
+    #[test]
+    fn turn_complete_flushes_trimmed_streaming_buffer() {
+        let mut app = App::new("test".into(), false, None);
+        app.streaming_buffer = "\n\nhello\n\nworld\n\n".into();
+
+        let notif = make_notif(
+            notifications::TURN_COMPLETE,
+            serde_json::json!({
+                "duration_us": 12
+            }),
+        );
+
+        app.apply_notification(&notif);
+
+        assert!(matches!(
+            app.messages.first(),
+            Some(ConversationEntry::AssistantText(text)) if text == "hello\n\nworld"
+        ));
+        assert!(matches!(
+            app.messages.get(1),
+            Some(ConversationEntry::TurnInfo {
+                duration_us: 12,
+                ..
+            })
+        ));
+        assert!(app.streaming_buffer.is_empty());
+    }
+
+    #[test]
     fn tool_request_for_apply_patch_adds_preview() {
         let mut app = App::new("test".into(), false, None);
         let notif = make_notif(
