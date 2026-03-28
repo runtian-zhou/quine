@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use futures::StreamExt;
-use quine_llm::{LlmEvent, LlmProvider, Message, ToolDefinition};
+use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, ToolDefinition};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::channel::{CoreHandle, CoreInput, CoreOutput, ToolOutcome};
@@ -11,7 +11,8 @@ use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
 use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision};
 use crate::planner::scheduler::{get_ready_actions, render_plan};
-use crate::session::{SessionId, SessionState};
+use crate::session::{ExitStatus, SessionId, SessionState};
+use crate::session_tree::SessionTree;
 use crate::skill::Skill;
 use crate::tool::{
     ask_user::AskUserTool, bash::BashTool, find::FindTool, plan::PlanTool, read::ReadTool,
@@ -324,6 +325,179 @@ struct CoreIo<'a> {
     deferred_inputs: &'a mut VecDeque<CoreInput>,
 }
 
+enum TurnOutcome {
+    Completed(Option<String>),
+    Failed(String),
+    Cancelled,
+}
+
+fn session_output(session: &SessionContext) -> Option<String> {
+    session.history.iter().rev().find_map(|message| {
+        if message.role != quine_llm::Role::Assistant {
+            return None;
+        }
+
+        match &message.content {
+            MessageContent::Text(text) => Some(text.clone()),
+            MessageContent::ToolUse { text, .. } => text.clone(),
+            MessageContent::ToolResult { .. } => None,
+        }
+    })
+}
+
+async fn finalize_child_session(
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    session_tree: &mut SessionTree,
+    session_id: SessionId,
+    turn_outcome: TurnOutcome,
+    output: &mpsc::Sender<CoreOutput>,
+) {
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return;
+    };
+    session.state = SessionState::Destroyed;
+    let status = match turn_outcome {
+        TurnOutcome::Completed(text) => ExitStatus::Success {
+            output: text.or_else(|| session_output(session)).unwrap_or_default(),
+        },
+        TurnOutcome::Failed(error) => ExitStatus::Failed { error },
+        TurnOutcome::Cancelled => ExitStatus::Cancelled,
+    };
+
+    let parent_id = session_tree.parent_of(session_id);
+    session_tree.record_exit(session_id, status.clone());
+
+    let _ = output
+        .send(CoreOutput::SessionStateChanged {
+            session_id,
+            state: SessionState::Destroyed,
+        })
+        .await;
+
+    if let Some(parent_id) = parent_id {
+        let _ = output
+            .send(CoreOutput::ChildExited {
+                parent_id,
+                child_id: session_id,
+                status,
+            })
+            .await;
+    }
+
+    sessions.remove(&session_id);
+}
+
+async fn start_child_session(
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    session_tree: &mut SessionTree,
+    provider: &Arc<dyn LlmProvider>,
+    permission_checker: &Option<Arc<dyn PermissionChecker>>,
+    parent_id: SessionId,
+    child_id: SessionId,
+    task: String,
+    system_prompt: Option<String>,
+    output: &mpsc::Sender<CoreOutput>,
+    input: &mut mpsc::Receiver<CoreInput>,
+    input_tx: &mpsc::Sender<CoreInput>,
+    deferred_inputs: &mut VecDeque<CoreInput>,
+) -> Result<(), String> {
+    if sessions.contains_key(&child_id) {
+        return Err("session already exists".into());
+    }
+
+    let work_dir = std::env::current_dir().unwrap_or_default();
+    let work_dir_display = work_dir.display().to_string();
+
+    let ctx = SessionContext::new(
+        system_prompt,
+        Vec::new(),
+        work_dir,
+        provider,
+        permission_checker,
+        false,
+        false,
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+
+    debug_log_session(
+        child_id,
+        format!(
+            "child session created with working_directory={}",
+            work_dir_display
+        ),
+    );
+
+    session_tree.add_child(parent_id, child_id);
+    sessions.insert(child_id, ctx);
+
+    let _ = output
+        .send(CoreOutput::ChildSpawned {
+            parent_id,
+            child_id,
+        })
+        .await;
+    let _ = output
+        .send(CoreOutput::SessionStateChanged {
+            session_id: child_id,
+            state: SessionState::Idle,
+        })
+        .await;
+
+    let turn_outcome = {
+        let session = sessions
+            .get_mut(&child_id)
+            .expect("child session inserted before starting turn");
+        session.state = SessionState::Streaming;
+        session.history.push(Message::user(&task));
+        let _ = output
+            .send(CoreOutput::SessionStateChanged {
+                session_id: child_id,
+                state: SessionState::Streaming,
+            })
+            .await;
+
+        let mut io = CoreIo {
+            output,
+            input,
+            input_tx,
+            deferred_inputs,
+        };
+        handle_llm_turn(
+            provider,
+            sessions,
+            child_id,
+            &mut io,
+            permission_checker.as_deref(),
+            permission_checker,
+            session_tree,
+        )
+        .await
+    };
+
+    finalize_child_session(sessions, session_tree, child_id, turn_outcome, output).await;
+    Ok(())
+}
+
+async fn wait_on_child_session(
+    session_tree: &mut SessionTree,
+    parent_id: SessionId,
+    child_id: SessionId,
+    non_blocking: bool,
+) -> Option<ExitStatus> {
+    if session_tree.parent_of(child_id) != Some(parent_id) {
+        return None;
+    }
+
+    let (reply_tx, reply_rx) = oneshot::channel();
+    let already_exited = session_tree.register_waiter(child_id, reply_tx);
+    if already_exited || !non_blocking {
+        reply_rx.await.ok()
+    } else {
+        None
+    }
+}
+
 /// Check permissions for a tool call, optionally requesting user confirmation.
 ///
 /// Returns `Ok(())` if the tool is allowed to proceed, or `Err(ToolOutcome)` with
@@ -479,11 +653,19 @@ async fn check_permission(
 /// Returns the tool result as a `ToolOutcome`.
 async fn execute_tool_call(
     call: &PendingToolCall,
-    session: &mut SessionContext,
+    sessions: &mut HashMap<SessionId, SessionContext>,
     session_id: SessionId,
     io: &mut CoreIo<'_>,
+    provider: &Arc<dyn LlmProvider>,
+    permission_checker_owned: &Option<Arc<dyn PermissionChecker>>,
     permission_checker: Option<&dyn PermissionChecker>,
+    session_tree: &mut SessionTree,
 ) -> ToolOutcome {
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return ToolOutcome::Error {
+            message: "session not found".into(),
+        };
+    };
     let (cancel_tx, cancellation) = CancellationChannel::new_pair();
     session.cancel_tx = Some(cancel_tx.clone());
     debug_log_session(
@@ -514,17 +696,120 @@ async fn execute_tool_call(
         }
     }
 
-    let tool = match session.tool_registry.get(&call.tool_name) {
-        Some(t) => Arc::clone(t),
-        None => {
-            debug_log_session(
-                session_id,
-                format!("tool lookup failed for `{}`", call.tool_name),
-            );
+    if call.tool_name == "spawn" {
+        let task = match call.arguments.get("task").and_then(|v| v.as_str()) {
+            Some(task) => task.to_string(),
+            None => {
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.cancel_tx = None;
+                }
+                return ToolOutcome::Error {
+                    message: "invalid arguments: missing required parameter: task".into(),
+                };
+            }
+        };
+        let system_prompt = call
+            .arguments
+            .get("system_prompt")
+            .and_then(|v| v.as_str())
+            .map(ToOwned::to_owned);
+        let child_id = SessionId::new();
+        match Box::pin(start_child_session(
+            sessions,
+            session_tree,
+            provider,
+            permission_checker_owned,
+            session_id,
+            child_id,
+            task,
+            system_prompt,
+            io.output,
+            io.input,
+            io.input_tx,
+            io.deferred_inputs,
+        ))
+        .await
+        {
+            Ok(()) => {
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.cancel_tx = None;
+                }
+                return ToolOutcome::Success {
+                    output: format!("{child_id:?}"),
+                };
+            }
+            Err(error) => {
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.cancel_tx = None;
+                }
+                return ToolOutcome::Error {
+                    message: format!("failed to spawn: {error}"),
+                };
+            }
+        }
+    }
+
+    if call.tool_name == "wait_child" {
+        let child_id_str = match call.arguments.get("child_id").and_then(|v| v.as_str()) {
+            Some(child_id) => child_id,
+            None => {
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.cancel_tx = None;
+                }
+                return ToolOutcome::Error {
+                    message: "invalid arguments: missing required parameter: child_id".into(),
+                };
+            }
+        };
+        let non_blocking = call
+            .arguments
+            .get("non_blocking")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let child_id = match crate::tool::wait_child::parse_session_id(child_id_str) {
+            Some(child_id) => child_id,
+            None => {
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.cancel_tx = None;
+                }
+                return ToolOutcome::Error {
+                    message: format!("invalid arguments: invalid child_id: {child_id_str}"),
+                };
+            }
+        };
+
+        let status = wait_on_child_session(session_tree, session_id, child_id, non_blocking).await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.cancel_tx = None;
+        }
+        return match status {
+            Some(status) => ToolOutcome::Success {
+                output: serde_json::to_string(&status).unwrap_or_else(|_| "unknown".into()),
+            },
+            None => ToolOutcome::Success {
+                output: "null".into(),
+            },
+        };
+    }
+
+    let (tool, filesystem, working_directory, plan_store, cancellation) = {
+        let Some(session) = sessions.get(&session_id) else {
+            return ToolOutcome::Error {
+                message: "session not found".into(),
+            };
+        };
+        let Some(tool) = session.tool_registry.get(&call.tool_name) else {
             return ToolOutcome::Error {
                 message: format!("unknown tool: {}", call.tool_name),
             };
-        }
+        };
+        (
+            Arc::clone(tool),
+            Arc::clone(&session.filesystem),
+            session.working_directory.clone(),
+            session.plan_store.clone(),
+            cancellation.clone(),
+        )
     };
 
     if tool.is_interactive() {
@@ -538,10 +823,10 @@ async fn execute_tool_call(
 
         let ctx = ExecutionContext {
             session_id,
-            filesystem: Arc::clone(&session.filesystem),
-            working_directory: session.working_directory.clone(),
+            filesystem,
+            working_directory,
             interaction_channel: Some(channel),
-            plan_store: session.plan_store.clone(),
+            plan_store,
             core_input: Some(io.input_tx.clone()),
             cancellation: cancellation.clone(),
         };
@@ -630,7 +915,11 @@ async fn execute_tool_call(
                                         session_id,
                                         format!("interactive tool `{}` cancelled while awaiting interaction", call.tool_name),
                                     );
-                                    let _ = cancel_tx.send(true);
+                                    if let Some(session) = sessions.get_mut(&session_id) {
+                                        if let Some(cancel_tx) = session.cancel_tx.as_ref() {
+                                            let _ = cancel_tx.send(true);
+                                        }
+                                    }
                                     drop(reply_tx);
                                     break 'tool_loop ToolOutcome::Cancelled;
                                 }
@@ -654,17 +943,21 @@ async fn execute_tool_call(
             }
         };
 
-        let _ = cancel_tx.send(true);
-        session.cancel_tx = None;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            if let Some(cancel_tx) = session.cancel_tx.as_ref() {
+                let _ = cancel_tx.send(true);
+            }
+            session.cancel_tx = None;
+        }
         outcome
     } else {
         // Non-interactive tool: execute directly
         let ctx = ExecutionContext {
             session_id,
-            filesystem: Arc::clone(&session.filesystem),
-            working_directory: session.working_directory.clone(),
+            filesystem,
+            working_directory,
             interaction_channel: None,
-            plan_store: session.plan_store.clone(),
+            plan_store,
             core_input: Some(io.input_tx.clone()),
             cancellation: cancellation.clone(),
         };
@@ -715,7 +1008,11 @@ async fn execute_tool_call(
                                 session_id,
                                 format!("tool `{}` cancelled by core input", call.tool_name),
                             );
-                            let _ = cancel_tx.send(true);
+                            if let Some(session) = sessions.get_mut(&session_id) {
+                                if let Some(cancel_tx) = session.cancel_tx.as_ref() {
+                                    let _ = cancel_tx.send(true);
+                                }
+                            }
                             break ToolOutcome::Cancelled;
                         }
                         Some(other) => {
@@ -727,7 +1024,11 @@ async fn execute_tool_call(
                                 session_id,
                                 format!("tool `{}` failed: input channel closed during execution", call.tool_name),
                             );
-                            let _ = cancel_tx.send(true);
+                            if let Some(session) = sessions.get_mut(&session_id) {
+                                if let Some(cancel_tx) = session.cancel_tx.as_ref() {
+                                    let _ = cancel_tx.send(true);
+                                }
+                            }
                             break ToolOutcome::Error { message: "input channel closed".into() };
                         }
                     }
@@ -735,8 +1036,12 @@ async fn execute_tool_call(
             }
         };
 
-        let _ = cancel_tx.send(true);
-        session.cancel_tx = None;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            if let Some(cancel_tx) = session.cancel_tx.as_ref() {
+                let _ = cancel_tx.send(true);
+            }
+            session.cancel_tx = None;
+        }
         result
     }
 }
@@ -821,24 +1126,32 @@ async fn handle_plan_progress(
 /// This function handles the tool execution loop: when the LLM requests tools,
 /// it executes them and calls the LLM again until the LLM produces text.
 async fn handle_llm_turn(
-    provider: &dyn LlmProvider,
-    session: &mut SessionContext,
+    provider: &Arc<dyn LlmProvider>,
+    sessions: &mut HashMap<SessionId, SessionContext>,
     session_id: SessionId,
     io: &mut CoreIo<'_>,
     permission_checker: Option<&dyn PermissionChecker>,
-) {
+    permission_checker_owned: &Option<Arc<dyn PermissionChecker>>,
+    session_tree: &mut SessionTree,
+) -> TurnOutcome {
     let turn_start = std::time::Instant::now();
     let mut accumulated_usage: Option<quine_llm::TokenUsage> = None;
     debug_log_session(
         session_id,
         format!(
             "starting LLM turn with {} history messages",
-            session.history.len()
+            sessions
+                .get(&session_id)
+                .map(|session| session.history.len())
+                .unwrap_or(0)
         ),
     );
 
     loop {
-        match call_llm(provider, session, session_id, io.output).await {
+        let Some(session) = sessions.get(&session_id) else {
+            return TurnOutcome::Failed("session not found".into());
+        };
+        match call_llm(&**provider, session, session_id, io.output).await {
             Ok(LlmCallResult {
                 turn: LlmTurnResult::Text(full_text),
                 usage,
@@ -850,7 +1163,9 @@ async fn handle_llm_turn(
                     acc.output_tokens += u.output_tokens;
                 }
 
-                session.history.push(Message::assistant(&full_text));
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.history.push(Message::assistant(&full_text));
+                }
                 debug_log_session(
                     session_id,
                     format!(
@@ -863,11 +1178,13 @@ async fn handle_llm_turn(
                     .output
                     .send(CoreOutput::TextComplete {
                         session_id,
-                        full_text,
+                        full_text: full_text.clone(),
                     })
                     .await;
 
-                session.state = SessionState::Idle;
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.state = SessionState::Idle;
+                }
                 let duration_us = turn_start.elapsed().as_micros() as u64;
                 let _ = io
                     .output
@@ -877,7 +1194,7 @@ async fn handle_llm_turn(
                         usage: accumulated_usage,
                     })
                     .await;
-                break;
+                return TurnOutcome::Completed(Some(full_text));
             }
             Ok(LlmCallResult {
                 turn: LlmTurnResult::ToolCalls { text_before, calls },
@@ -914,10 +1231,12 @@ async fn handle_llm_turn(
                         arguments: c.arguments.clone(),
                     })
                     .collect();
-                session.history.push(Message::assistant_tool_use(
-                    text_before.clone(),
-                    tool_use_requests,
-                ));
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.history.push(Message::assistant_tool_use(
+                        text_before.clone(),
+                        tool_use_requests,
+                    ));
+                }
 
                 let debug = debug_enabled();
                 debug_log_session(
@@ -951,8 +1270,17 @@ async fn handle_llm_turn(
                         .await;
 
                     let tool_start = std::time::Instant::now();
-                    let result =
-                        execute_tool_call(call, session, session_id, io, permission_checker).await;
+                    let result = execute_tool_call(
+                        call,
+                        sessions,
+                        session_id,
+                        io,
+                        provider,
+                        permission_checker_owned,
+                        permission_checker,
+                        session_tree,
+                    )
+                    .await;
                     let tool_duration_us = tool_start.elapsed().as_micros() as u64;
 
                     // Append tool result to history
@@ -990,19 +1318,23 @@ async fn handle_llm_turn(
                         );
                     }
 
-                    session.history.push(Message::tool_result(
-                        &call.tool_use_id,
-                        &tool_output,
-                        is_error,
-                    ));
+                    if let Some(session) = sessions.get_mut(&session_id) {
+                        session.history.push(Message::tool_result(
+                            &call.tool_use_id,
+                            &tool_output,
+                            is_error,
+                        ));
+                    }
 
                     if matches!(result, ToolOutcome::Cancelled) {
                         debug_log_session(
                             session_id,
                             "LLM turn aborted because tool execution was cancelled",
                         );
-                        session.cancel_tx = None;
-                        session.state = SessionState::Idle;
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.cancel_tx = None;
+                            session.state = SessionState::Idle;
+                        }
                         let duration_us = turn_start.elapsed().as_micros() as u64;
                         let _ = io
                             .output
@@ -1012,7 +1344,7 @@ async fn handle_llm_turn(
                                 usage: accumulated_usage.clone(),
                             })
                             .await;
-                        return;
+                        return TurnOutcome::Cancelled;
                     }
 
                     // Plan execution integration: after update_plan, emit
@@ -1029,7 +1361,9 @@ async fn handle_llm_turn(
                                     call.arguments.get("action_id").and_then(|v| v.as_str())
                                 {
                                     handle_plan_progress(
-                                        session,
+                                        sessions
+                                            .get_mut(&session_id)
+                                            .expect("session should exist"),
                                         session_id,
                                         io.output,
                                         plan_id_str,
@@ -1048,12 +1382,14 @@ async fn handle_llm_turn(
             }
             Err(error) => {
                 debug_log_session(session_id, format!("LLM turn failed: {error}"));
-                session.state = SessionState::Idle;
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.state = SessionState::Idle;
+                }
                 let _ = io
                     .output
                     .send(CoreOutput::SessionError { session_id, error })
                     .await;
-                break;
+                return TurnOutcome::Failed("session error".into());
             }
         }
     }
@@ -1069,6 +1405,7 @@ pub async fn run_core_loop(
     permission_checker: Option<Arc<dyn PermissionChecker>>,
 ) {
     let mut sessions: HashMap<SessionId, SessionContext> = HashMap::new();
+    let mut session_tree = SessionTree::new();
     let mut deferred_inputs = VecDeque::new();
     debug_log("core event loop started");
 
@@ -1152,8 +1489,12 @@ pub async fn run_core_loop(
                     session_id,
                     format!("received UserMessage ({} chars)", content.len()),
                 );
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    session.state = SessionState::Streaming;
+                if sessions.contains_key(&session_id) {
+                    {
+                        let session = sessions.get_mut(&session_id).unwrap();
+                        session.state = SessionState::Streaming;
+                        session.history.push(Message::user(&content));
+                    }
                     let _ = handle
                         .output
                         .send(CoreOutput::SessionStateChanged {
@@ -1161,23 +1502,32 @@ pub async fn run_core_loop(
                             state: SessionState::Streaming,
                         })
                         .await;
-
-                    session.history.push(Message::user(&content));
-
                     let mut io = CoreIo {
                         output: &handle.output,
                         input: &mut handle.input,
                         input_tx: &handle.input_tx,
                         deferred_inputs: &mut deferred_inputs,
                     };
-                    handle_llm_turn(
-                        &*provider,
-                        session,
+                    let turn_outcome = handle_llm_turn(
+                        &provider,
+                        &mut sessions,
                         session_id,
                         &mut io,
                         permission_checker.as_deref(),
+                        &permission_checker,
+                        &mut session_tree,
                     )
                     .await;
+                    if session_tree.parent_of(session_id).is_some() {
+                        finalize_child_session(
+                            &mut sessions,
+                            &mut session_tree,
+                            session_id,
+                            turn_outcome,
+                            &handle.output,
+                        )
+                        .await;
+                    }
                 } else {
                     debug_log_session(session_id, "user message targeted unknown session");
                     let _ = handle
@@ -1202,15 +1552,15 @@ pub async fn run_core_loop(
                 // Legacy path: the harness sent a tool result.
                 // With the new architecture, tools are executed in-core,
                 // but we still accept external tool results for backward compat.
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    if session.state != SessionState::AwaitingToolResult {
+                if let Some(actual_state) = sessions.get(&session_id).map(|s| s.state) {
+                    if actual_state != SessionState::AwaitingToolResult {
                         let _ = handle
                             .output
                             .send(CoreOutput::SessionError {
                                 session_id,
                                 error: CoreError::InvalidState {
                                     expected: SessionState::AwaitingToolResult,
-                                    actual: session.state,
+                                    actual: actual_state,
                                 },
                             })
                             .await;
@@ -1222,13 +1572,15 @@ pub async fn run_core_loop(
                                 ("Tool execution was cancelled".to_string(), true)
                             }
                         };
-                        session.history.push(Message::tool_result(
-                            &tool_use_id,
-                            &output_text,
-                            is_error,
-                        ));
-
-                        session.state = SessionState::Streaming;
+                        {
+                            let session = sessions.get_mut(&session_id).unwrap();
+                            session.history.push(Message::tool_result(
+                                &tool_use_id,
+                                &output_text,
+                                is_error,
+                            ));
+                            session.state = SessionState::Streaming;
+                        }
                         let _ = handle
                             .output
                             .send(CoreOutput::SessionStateChanged {
@@ -1243,14 +1595,26 @@ pub async fn run_core_loop(
                             input_tx: &handle.input_tx,
                             deferred_inputs: &mut deferred_inputs,
                         };
-                        handle_llm_turn(
-                            &*provider,
-                            session,
+                        let turn_outcome = handle_llm_turn(
+                            &provider,
+                            &mut sessions,
                             session_id,
                             &mut io,
                             permission_checker.as_deref(),
+                            &permission_checker,
+                            &mut session_tree,
                         )
                         .await;
+                        if session_tree.parent_of(session_id).is_some() {
+                            finalize_child_session(
+                                &mut sessions,
+                                &mut session_tree,
+                                session_id,
+                                turn_outcome,
+                                &handle.output,
+                            )
+                            .await;
+                        }
                     }
                 } else {
                     let _ = handle
@@ -1294,13 +1658,23 @@ pub async fn run_core_loop(
             }
 
             CoreInput::SpawnSession {
-                parent_id: _,
+                parent_id,
                 child_id,
                 task,
                 system_prompt,
-                inheritance: _,
+                inheritance,
                 reply,
             } => {
+                debug_log_session(
+                    parent_id,
+                    format!(
+                        "received SpawnSession for child={child_id:?} (task_len={}, inherit_history={}, inherit_filesystem={}, has_system_prompt={})",
+                        task.len(),
+                        inheritance.history,
+                        inheritance.filesystem,
+                        system_prompt.is_some()
+                    ),
+                );
                 debug_log_session(
                     child_id,
                     format!("received SpawnSession for task ({} chars)", task.len()),
@@ -1310,78 +1684,53 @@ pub async fn run_core_loop(
                     continue;
                 }
 
-                let work_dir = std::env::current_dir().unwrap_or_default();
-                let work_dir_display = work_dir.display().to_string();
-
-                match SessionContext::new(
-                    system_prompt,
-                    Vec::new(),
-                    work_dir,
+                let result = start_child_session(
+                    &mut sessions,
+                    &mut session_tree,
                     &provider,
                     &permission_checker,
-                    false,
-                    false,
+                    parent_id,
+                    child_id,
+                    task,
+                    system_prompt,
+                    &handle.output,
+                    &mut handle.input,
+                    &handle.input_tx,
+                    &mut deferred_inputs,
                 )
-                .await
-                {
-                    Ok(ctx) => {
+                .await;
+                match result {
+                    Ok(()) => {
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
                         debug_log_session(
-                            child_id,
+                            parent_id,
                             format!(
-                                "child session created with working_directory={}",
-                                work_dir_display
+                                "child session creation failed for child={child_id:?}: {error}"
                             ),
                         );
-                        sessions.insert(child_id, ctx);
-                        let _ = handle
-                            .output
-                            .send(CoreOutput::SessionStateChanged {
-                                session_id: child_id,
-                                state: SessionState::Idle,
-                            })
-                            .await;
-                        let _ = reply.send(Ok(()));
-                        debug_log_session(child_id, "spawn acknowledged to caller");
-
-                        // Send the task as the first user message.
-                        let session = sessions.get_mut(&child_id).unwrap();
-                        session.state = SessionState::Streaming;
-                        session.history.push(Message::user(&task));
-                        let _ = handle
-                            .output
-                            .send(CoreOutput::SessionStateChanged {
-                                session_id: child_id,
-                                state: SessionState::Streaming,
-                            })
-                            .await;
-
-                        let mut io = CoreIo {
-                            output: &handle.output,
-                            input: &mut handle.input,
-                            input_tx: &handle.input_tx,
-                            deferred_inputs: &mut deferred_inputs,
-                        };
-                        handle_llm_turn(
-                            &*provider,
-                            session,
+                        debug_log_session(
                             child_id,
-                            &mut io,
-                            permission_checker.as_deref(),
-                        )
-                        .await;
-                    }
-                    Err(e) => {
-                        debug_log_session(child_id, format!("child session creation failed: {e}"));
-                        let _ = reply.send(Err(e.to_string()));
+                            format!("child session creation failed: {error}"),
+                        );
+                        let _ = reply.send(Err(error));
                     }
                 }
             }
             CoreInput::Signal { .. } | CoreInput::SendMessage { .. } => {
                 debug_log("received Signal or SendMessage; no-op in current core loop");
             }
-            CoreInput::WaitSession { reply, .. } => {
-                debug_log("received WaitSession; returning None in current implementation");
-                let _ = reply.send(None);
+            CoreInput::WaitSession {
+                parent_id,
+                child_id,
+                reply,
+                non_blocking,
+            } => {
+                let result =
+                    wait_on_child_session(&mut session_tree, parent_id, child_id, non_blocking)
+                        .await;
+                let _ = reply.send(result);
             }
         }
     }
@@ -1454,7 +1803,7 @@ mod tests {
     async fn execute_tool_call_consumes_cancel_for_non_interactive_tool() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
-        let mut session = SessionContext::new(
+        let session = SessionContext::new(
             None,
             Vec::new(),
             std::env::current_dir().unwrap_or_default(),
@@ -1487,10 +1836,24 @@ mod tests {
             input_tx: &input_tx,
             deferred_inputs: &mut deferred_inputs,
         };
-        let result = execute_tool_call(&call, &mut session, session_id, &mut io, None).await;
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let mut session_tree = SessionTree::new();
+        let result = execute_tool_call(
+            &call,
+            &mut sessions,
+            session_id,
+            &mut io,
+            &provider,
+            &permission_checker,
+            None,
+            &mut session_tree,
+        )
+        .await;
 
         assert!(matches!(result, ToolOutcome::Cancelled));
-        assert!(session.cancel_tx.is_none());
+        assert!(sessions
+            .get(&session_id)
+            .is_some_and(|session| session.cancel_tx.is_none()));
         assert!(deferred_inputs.is_empty());
     }
 
@@ -1498,7 +1861,7 @@ mod tests {
     async fn execute_tool_call_buffers_unrelated_input_while_waiting_for_cancel() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
-        let mut session = SessionContext::new(
+        let session = SessionContext::new(
             None,
             Vec::new(),
             std::env::current_dir().unwrap_or_default(),
@@ -1540,7 +1903,19 @@ mod tests {
             input_tx: &input_tx,
             deferred_inputs: &mut deferred_inputs,
         };
-        let result = execute_tool_call(&call, &mut session, session_id, &mut io, None).await;
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let mut session_tree = SessionTree::new();
+        let result = execute_tool_call(
+            &call,
+            &mut sessions,
+            session_id,
+            &mut io,
+            &provider,
+            &permission_checker,
+            None,
+            &mut session_tree,
+        )
+        .await;
 
         assert!(matches!(result, ToolOutcome::Cancelled));
         assert!(matches!(
@@ -1550,6 +1925,91 @@ mod tests {
                 content
             }) if session_id == other_session_id && content == "hello"
         ));
+    }
+
+    #[tokio::test]
+    async fn spawn_and_wait_child_complete_without_core_ack_deadlock() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new("73"));
+        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
+        let session_id = SessionId::new();
+        let session = SessionContext::new(
+            None,
+            Vec::new(),
+            std::env::current_dir().unwrap_or_default(),
+            &provider,
+            &permission_checker,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let spawn_call = PendingToolCall {
+            tool_use_id: "toolu_spawn".into(),
+            tool_name: "spawn".into(),
+            arguments: serde_json::json!({
+                "task": "Reply with exactly one integer. No explanation."
+            }),
+        };
+
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(16);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let mut session_tree = SessionTree::new();
+
+        let spawn_result = execute_tool_call(
+            &spawn_call,
+            &mut sessions,
+            session_id,
+            &mut io,
+            &provider,
+            &permission_checker,
+            None,
+            &mut session_tree,
+        )
+        .await;
+
+        let child_id = match spawn_result {
+            ToolOutcome::Success { output } => output,
+            other => panic!("expected successful spawn, got {other:?}"),
+        };
+
+        let wait_call = PendingToolCall {
+            tool_use_id: "toolu_wait".into(),
+            tool_name: "wait_child".into(),
+            arguments: serde_json::json!({
+                "child_id": child_id,
+            }),
+        };
+
+        let wait_result = execute_tool_call(
+            &wait_call,
+            &mut sessions,
+            session_id,
+            &mut io,
+            &provider,
+            &permission_checker,
+            None,
+            &mut session_tree,
+        )
+        .await;
+
+        match wait_result {
+            ToolOutcome::Success { output } => {
+                assert!(
+                    output.contains("73"),
+                    "expected child output in wait result: {output}"
+                );
+            }
+            other => panic!("expected successful wait_child, got {other:?}"),
+        }
     }
 
     #[tokio::test]

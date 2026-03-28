@@ -1,5 +1,22 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use tokio::sync::oneshot;
+
+const SPAWN_ACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn debug_enabled() -> bool {
+    std::env::var("QUINE_DEBUG").is_ok()
+}
+
+fn debug_log_spawn(session_id: SessionId, child_id: SessionId, message: impl AsRef<str>) {
+    if debug_enabled() {
+        eprintln!(
+            "[core][session={session_id:?}][spawn child={child_id:?}] {}",
+            message.as_ref()
+        );
+    }
+}
 
 use super::{ExecutionContext, Tool, ToolError, ToolOutput};
 use crate::channel::CoreInput;
@@ -81,6 +98,18 @@ impl Tool for SpawnTool {
         let child_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
 
+        debug_log_spawn(
+            context.session_id,
+            child_id,
+            format!(
+                "dispatching SpawnSession (task_len={}, inherit_history={}, inherit_filesystem={}, has_system_prompt={})",
+                task.len(),
+                inherit_history,
+                inherit_filesystem,
+                system_prompt.is_some()
+            ),
+        );
+
         core_input
             .send(CoreInput::SpawnSession {
                 parent_id: context.session_id,
@@ -99,10 +128,63 @@ impl Tool for SpawnTool {
                 message: "core_input channel closed".into(),
             })?;
 
-        match reply_rx.await {
-            Ok(Ok(())) => Ok(ToolOutput::success(format!("{child_id:?}"))),
-            Ok(Err(e)) => Ok(ToolOutput::error(format!("failed to spawn: {e}"))),
-            Err(_) => Ok(ToolOutput::error("spawn reply channel dropped")),
+        debug_log_spawn(
+            context.session_id,
+            child_id,
+            "SpawnSession dispatched; awaiting reply",
+        );
+
+        tokio::select! {
+            _ = context.cancellation.cancelled() => {
+                debug_log_spawn(
+                    context.session_id,
+                    child_id,
+                    "spawn cancelled while awaiting acknowledgement",
+                );
+                Err(ToolError::Cancelled)
+            }
+            reply = tokio::time::timeout(SPAWN_ACK_TIMEOUT, reply_rx) => {
+                match reply {
+                    Ok(Ok(Ok(()))) => {
+                        debug_log_spawn(
+                            context.session_id,
+                            child_id,
+                            "spawn acknowledged successfully",
+                        );
+                        Ok(ToolOutput::success(format!("{child_id:?}")))
+                    }
+                    Ok(Ok(Err(e))) => {
+                        debug_log_spawn(
+                            context.session_id,
+                            child_id,
+                            format!("spawn acknowledged with error: {e}"),
+                        );
+                        Ok(ToolOutput::error(format!("failed to spawn: {e}")))
+                    }
+                    Ok(Err(_)) => {
+                        debug_log_spawn(
+                            context.session_id,
+                            child_id,
+                            "spawn reply channel dropped before acknowledgement",
+                        );
+                        Ok(ToolOutput::error("spawn reply channel dropped"))
+                    }
+                    Err(_) => {
+                        debug_log_spawn(
+                            context.session_id,
+                            child_id,
+                            format!(
+                                "spawn acknowledgement timed out after {}s",
+                                SPAWN_ACK_TIMEOUT.as_secs()
+                            ),
+                        );
+                        Ok(ToolOutput::error(format!(
+                            "spawn timed out waiting for core acknowledgement after {}s",
+                            SPAWN_ACK_TIMEOUT.as_secs()
+                        )))
+                    }
+                }
+            }
         }
     }
 }
@@ -202,5 +284,23 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, ToolError::Internal { .. }));
         assert!(err.to_string().contains("no core_input channel available"));
+    }
+
+    #[tokio::test]
+    async fn spawn_returns_timeout_error_when_core_never_acknowledges() {
+        let tool = SpawnTool;
+        let (_base, _session, _core_input_rx, ctx) = make_context_with_core_input().await;
+
+        let started = std::time::Instant::now();
+        let output = tool
+            .execute(serde_json::json!({"task": "delegate this"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(output.is_error);
+        assert!(output
+            .content
+            .contains("spawn timed out waiting for core acknowledgement"));
+        assert!(started.elapsed() >= SPAWN_ACK_TIMEOUT);
     }
 }
