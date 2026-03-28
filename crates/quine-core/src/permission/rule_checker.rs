@@ -45,6 +45,18 @@ impl RuleBasedChecker {
             return false;
         };
 
+        // Never allow shell composition through the manual override path.
+        if command.contains("&&")
+            || command.contains("||")
+            || command.contains(';')
+            || command.contains('|')
+            || command.contains('>')
+            || command.contains('<')
+            || command.contains("$(")
+            || command.contains('`')
+        {
+            return false;
+        }
         self.rules
             .iter()
             .any(|rule| rule.risk_level == RiskLevel::Low && rule.pattern.is_match(&command))
@@ -623,6 +635,9 @@ mod tests {
         let checker = RuleBasedChecker::new();
         assert!(checker.is_manually_allowlisted("bash", &bash_args("ls -la")));
         assert!(!checker.is_manually_allowlisted("bash", &bash_args("curl https://example.com")));
+        assert!(
+            !checker.is_manually_allowlisted("bash", &bash_args("ls && curl https://example.com"))
+        );
     }
 
     #[tokio::test]
