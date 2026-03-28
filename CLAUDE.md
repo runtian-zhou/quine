@@ -77,7 +77,7 @@ Rules:
 4. Commits co-authored: `Co-Authored-By: Claude Opus 4.6 (1M context) <noreply@anthropic.com>`
 5. Keep PRs focused — one logical change per PR.
 6. Design docs go in `docs/design/` with conversation transcripts attached.
-7. At the end of each implementation, use the built-in `/review` skill to review the code, then create a PR and merge once all code is reviewed and CI passes.
+7. At the end of each implementation, use the built-in `/review` skill to review the code. Before merging a feature PR, spawn a separate QA agent to execute the relevant QA plan extensively. Do not merge until that QA agent reports success, the required QA evidence is recorded, and the feature has passed both code review and CI.
 
 ### Parallel Agent Work
 
@@ -111,28 +111,19 @@ The `status` field tracks progress:
 - `in-progress` — an agent is actively working on it
 - `done` — implemented and merged
 
-Each feature request should also have two planning docs under `features/plans/`:
+Each feature request must also have two planning docs under `features/plans/`:
 - `<NNN>-<name>-implementation.md` — implementation plan owned by an implementor agent
 - `<NNN>-<name>-qa.md` — QA plan owned by a QA agent
 
-When creating a new feature request, spawn those two agents with empty context. They may inspect the repo independently, but the only information they share with each other must flow through the two plan docs. Do not commit the feature request PR until both plan docs record mutual agreement and all open questions are resolved.
+Use the dedicated feature-request command doc in `.claude/commands/feature-request.md` for the detailed feature-request workflow, document format, agent coordination rules, and PR steps.
 
-**Agent workflow for feature requests:**
+High-level policy:
 
-1. Draft the feature request in `features/` and the two planning docs in `features/plans/`.
-2. Spawn an implementor agent and a QA agent with empty context.
-3. Have the implementor own the implementation plan and review the QA plan.
-4. Have the QA agent own the QA plan and review the implementation plan.
-5. Do not create the feature-request PR until both planning docs record agreement.
-6. Scan `features/` for files with `status: pending`.
-7. Pick a feature, update its status to `in-progress`.
-8. Create a git worktree (`git worktree add`) for an isolated workspace.
-9. Implement the feature in the worktree on a feature branch.
-10. Run all checks (`cargo build`, `cargo test`, `cargo clippy`, `cargo fmt`).
-11. Use `/review` to review the code, create a PR, and merge when CI passes.
-12. Run `/qa` to verify the new feature works end-to-end (spawns daemon, sends messages, checks output).
-13. Update the feature file status to `done`.
-14. Clean up the worktree (`git worktree remove`).
+1. Do not create a feature-request PR until the implementation and QA planning docs both record agreement and there are no unresolved open questions.
+2. Implement feature work in an isolated worktree on a feature branch.
+3. Before merging a feature PR, use `/review` and spawn a separate QA agent to execute the feature's QA plan extensively.
+4. Do not merge until QA evidence is recorded, code review is complete, and CI passes.
+5. Update the feature file status to `done` only after the PR is merged.
 
 ### QA Reports
 
