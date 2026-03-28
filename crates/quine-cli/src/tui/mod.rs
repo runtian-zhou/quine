@@ -289,8 +289,11 @@ async fn execute_action(
             was_plan_mode,
         } => match create_session(client, skills, true, auto_approve_permissions).await {
             Ok(session) => {
-                app.session_id = session.session_id;
-                app.max_context_window = session.max_context_window;
+                app.reset_for_new_session(session.session_id, true, session.max_context_window);
+                app.messages
+                    .push(app::ConversationEntry::User(request.clone()));
+                app.phase = AgentPhase::Thinking;
+                app.auto_scroll();
                 let params = serde_json::json!({
                     "session_id": app.session_id,
                     "content": request,
