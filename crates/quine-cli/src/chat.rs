@@ -4,12 +4,43 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::IpcClient;
 use crate::render::{Renderer, TerminalRenderer};
+use crate::session::create_session;
+use crate::slash_command::parse_slash_command;
 use quine_harness::protocol::{methods, notifications};
 
 /// Shut down the daemon if we spawned it.
 async fn shutdown_if_spawned(client: &mut IpcClient, daemon_spawned: bool) {
     if daemon_spawned {
         let _ = client.call(methods::SHUTDOWN, None).await;
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ChatCommandAction {
+    Quit,
+    ShowError(String),
+    SendMessage(String),
+    EnterPlanModeAndSend(String),
+}
+
+fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
+    let trimmed = input.trim();
+    if let Some(command) = parse_slash_command(trimmed) {
+        match command.name.as_str() {
+            "quit" => ChatCommandAction::Quit,
+            "plan" => {
+                if command.arguments.is_empty() {
+                    ChatCommandAction::ShowError("Usage: /plan <request>".to_string())
+                } else if plan_mode {
+                    ChatCommandAction::SendMessage(command.arguments)
+                } else {
+                    ChatCommandAction::EnterPlanModeAndSend(command.arguments)
+                }
+            }
+            other => ChatCommandAction::ShowError(format!("Unknown slash command: /{other}")),
+        }
+    } else {
+        ChatCommandAction::SendMessage(trimmed.to_string())
     }
 }
 
@@ -27,37 +58,11 @@ pub async fn run_chat(
     let mut renderer = TerminalRenderer::new();
 
     // Create a session.
-    let mut session_params = serde_json::json!({});
-    if !skills.is_empty() {
-        session_params["skills"] = serde_json::json!(skills);
-    }
-    if plan_mode {
-        session_params["plan_mode"] = serde_json::json!(true);
-    }
-    if auto_approve_permissions {
-        session_params["auto_approve_permissions"] = serde_json::json!(true);
-    }
-    let params = if session_params.as_object().unwrap().is_empty() {
-        None
-    } else {
-        Some(session_params)
-    };
-    let result = client.call(methods::CREATE_SESSION, params).await?;
-    let session_id = match result {
-        Ok(value) => value
-            .as_str()
-            .map(str::to_string)
-            .or_else(|| {
-                value
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string)
-            })
-            .ok_or_else(|| anyhow::anyhow!("expected string session_id"))?,
-        Err(e) => anyhow::bail!("failed to create session: {e}"),
-    };
+    let mut session =
+        create_session(&mut client, skills, plan_mode, auto_approve_permissions).await?;
+    let mut session_in_plan_mode = plan_mode;
 
-    eprintln!("Session created: {session_id}");
+    eprintln!("Session created: {}", session.session_id);
     eprintln!("Type /quit or Ctrl-D to exit.\n");
 
     let stdin = tokio::io::stdin();
@@ -76,14 +81,32 @@ pub async fn run_chat(
                         if trimmed.is_empty() {
                             continue;
                         }
-                        if trimmed == "/quit" {
-                            break;
-                        }
+
+                        let content = match handle_chat_command(trimmed, session_in_plan_mode) {
+                            ChatCommandAction::Quit => break,
+                            ChatCommandAction::ShowError(message) => {
+                                renderer.render_error(&message).await?;
+                                continue;
+                            }
+                            ChatCommandAction::SendMessage(content) => content,
+                            ChatCommandAction::EnterPlanModeAndSend(content) => {
+                                session = create_session(
+                                    &mut client,
+                                    skills,
+                                    true,
+                                    auto_approve_permissions,
+                                )
+                                .await?;
+                                session_in_plan_mode = true;
+                                eprintln!("Switched to plan mode: {}", session.session_id);
+                                content
+                            }
+                        };
 
                         // Send message.
                         let params = serde_json::json!({
-                            "session_id": session_id,
-                            "content": trimmed,
+                            "session_id": session.session_id,
+                            "content": content,
                         });
                         let result = client.call(methods::SEND_MESSAGE, Some(params)).await?;
                         if let Err(e) = result {
@@ -98,7 +121,7 @@ pub async fn run_chat(
                                     match notif {
                                         Some(notif) => {
                                             if notif.method == notifications::INTERACTION_NEEDED {
-                                                handle_interaction(&notif, &mut client, &session_id).await?;
+                                                handle_interaction(&notif, &mut client, &session.session_id).await?;
                                                 continue;
                                             }
                                             let handled = handle_notification(&notif, &mut renderer).await?;
@@ -282,5 +305,47 @@ async fn handle_notification(
             Ok(true)
         }
         _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_command_plan_switches_to_plan_mode_when_needed() {
+        assert_eq!(
+            handle_chat_command("/plan do thing", false),
+            ChatCommandAction::EnterPlanModeAndSend("do thing".into())
+        );
+    }
+
+    #[test]
+    fn chat_command_plan_reuses_existing_plan_mode_session() {
+        assert_eq!(
+            handle_chat_command("/plan do thing", true),
+            ChatCommandAction::SendMessage("do thing".into())
+        );
+    }
+
+    #[test]
+    fn chat_command_plan_without_arguments_is_local_error() {
+        assert_eq!(
+            handle_chat_command("/plan", false),
+            ChatCommandAction::ShowError("Usage: /plan <request>".into())
+        );
+    }
+
+    #[test]
+    fn chat_command_unknown_slash_command_is_local_error() {
+        assert_eq!(
+            handle_chat_command("/does-not-exist", false),
+            ChatCommandAction::ShowError("Unknown slash command: /does-not-exist".into())
+        );
+    }
+
+    #[test]
+    fn chat_command_preserves_quit_behavior() {
+        assert_eq!(handle_chat_command("/quit", false), ChatCommandAction::Quit);
     }
 }

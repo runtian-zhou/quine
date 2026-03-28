@@ -14,6 +14,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::client::IpcClient;
+use crate::session::create_session;
 use app::{AgentPhase, AppAction};
 use quine_harness::protocol::methods;
 
@@ -30,38 +31,7 @@ pub async fn run_tui_chat(
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
     // Create session.
-    let mut session_params = serde_json::json!({});
-    if !skills.is_empty() {
-        session_params["skills"] = serde_json::json!(skills);
-    }
-    if plan_mode {
-        session_params["plan_mode"] = serde_json::json!(true);
-    }
-    if auto_approve_permissions {
-        session_params["auto_approve_permissions"] = serde_json::json!(true);
-    }
-    let params = if session_params.as_object().unwrap().is_empty() {
-        None
-    } else {
-        Some(session_params)
-    };
-    let result = client.call(methods::CREATE_SESSION, params).await?;
-    let (session_id, max_context_window) = match result {
-        Ok(value) => {
-            if let Some(session_id) = value.as_str() {
-                (session_id.to_string(), None)
-            } else {
-                let session_id = value
-                    .get("session_id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow::anyhow!("expected string session_id"))?
-                    .to_string();
-                let max_context_window = value.get("max_context_window").and_then(|v| v.as_u64());
-                (session_id, max_context_window)
-            }
-        }
-        Err(e) => anyhow::bail!("failed to create session: {e}"),
-    };
+    let session = create_session(&mut client, skills, plan_mode, auto_approve_permissions).await?;
 
     // Setup terminal.
     enable_raw_mode()?;
@@ -79,7 +49,7 @@ pub async fn run_tui_chat(
         original_hook(info);
     }));
 
-    let mut app = app::App::new(session_id.clone(), plan_mode, max_context_window);
+    let mut app = app::App::new(session.session_id, plan_mode, session.max_context_window);
     let mut event_stream = EventStream::new();
     let mut spinner_interval = tokio::time::interval(Duration::from_millis(80));
 
@@ -87,6 +57,8 @@ pub async fn run_tui_chat(
         &mut terminal,
         &mut app,
         &mut client,
+        skills,
+        auto_approve_permissions,
         &mut event_stream,
         &mut spinner_interval,
     )
@@ -110,6 +82,8 @@ async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut app::App,
     client: &mut IpcClient,
+    skills: &[String],
+    auto_approve_permissions: bool,
     event_stream: &mut EventStream,
     spinner_interval: &mut tokio::time::Interval,
 ) -> anyhow::Result<()> {
@@ -127,7 +101,7 @@ async fn run_event_loop(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if let Some(action) = handle_terminal_event(app, event) {
-                            execute_action(app, client, action).await?;
+                            execute_action(app, client, skills, auto_approve_permissions, action).await?;
                         }
                     }
                     Some(Err(_)) | None => {
@@ -294,6 +268,8 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
 async fn execute_action(
     app: &mut app::App,
     client: &mut IpcClient,
+    skills: &[String],
+    auto_approve_permissions: bool,
     action: AppAction,
 ) -> anyhow::Result<()> {
     match action {
@@ -308,6 +284,30 @@ async fn execute_action(
                 app.phase = AgentPhase::Idle;
             }
         }
+        AppAction::EnterPlanMode {
+            request,
+            was_plan_mode,
+        } => match create_session(client, skills, true, auto_approve_permissions).await {
+            Ok(session) => {
+                app.session_id = session.session_id;
+                app.max_context_window = session.max_context_window;
+                let params = serde_json::json!({
+                    "session_id": app.session_id,
+                    "content": request,
+                });
+                if let Err(e) = client.call(methods::SEND_MESSAGE, Some(params)).await {
+                    app.messages
+                        .push(app::ConversationEntry::Error(e.to_string()));
+                    app.phase = AgentPhase::Idle;
+                }
+            }
+            Err(e) => {
+                app.plan_mode = was_plan_mode;
+                app.messages
+                    .push(app::ConversationEntry::Error(e.to_string()));
+                app.phase = AgentPhase::Idle;
+            }
+        },
         AppAction::SubmitInteraction(response) => {
             let params = serde_json::json!({
                 "session_id": app.session_id,

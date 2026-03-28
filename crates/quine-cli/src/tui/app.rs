@@ -1,6 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
+use crate::slash_command::parse_slash_command;
 use quine_harness::protocol::{notifications, JsonRpcNotification};
 
 /// Spinner braille frames for the waiting animation.
@@ -190,6 +191,10 @@ pub struct OptionSelectState {
 /// Actions the event loop should perform after handling an event.
 pub enum AppAction {
     SendMessage(String),
+    EnterPlanMode {
+        request: String,
+        was_plan_mode: bool,
+    },
     SubmitInteraction(String),
     Cancel,
     Quit,
@@ -524,10 +529,49 @@ impl App {
             Some(AppAction::SubmitInteraction(response))
         } else {
             self.input_history.push(text.clone());
-            self.messages.push(ConversationEntry::User(text.clone()));
-            self.phase = AgentPhase::Thinking;
-            self.auto_scroll();
-            Some(AppAction::SendMessage(text))
+            if let Some(command) = parse_slash_command(&text) {
+                match command.name.as_str() {
+                    "quit" => {
+                        self.should_quit = true;
+                        Some(AppAction::Quit)
+                    }
+                    "plan" => {
+                        if command.arguments.is_empty() {
+                            self.messages
+                                .push(ConversationEntry::Error("Usage: /plan <request>".into()));
+                            self.auto_scroll();
+                            None
+                        } else {
+                            let was_plan_mode = self.plan_mode;
+                            self.plan_mode = true;
+                            self.messages
+                                .push(ConversationEntry::User(command.arguments.clone()));
+                            self.phase = AgentPhase::Thinking;
+                            self.auto_scroll();
+                            if was_plan_mode {
+                                Some(AppAction::SendMessage(command.arguments))
+                            } else {
+                                Some(AppAction::EnterPlanMode {
+                                    request: command.arguments,
+                                    was_plan_mode,
+                                })
+                            }
+                        }
+                    }
+                    other => {
+                        self.messages.push(ConversationEntry::Error(format!(
+                            "Unknown slash command: /{other}"
+                        )));
+                        self.auto_scroll();
+                        None
+                    }
+                }
+            } else {
+                self.messages.push(ConversationEntry::User(text.clone()));
+                self.phase = AgentPhase::Thinking;
+                self.auto_scroll();
+                Some(AppAction::SendMessage(text))
+            }
         }
     }
 
@@ -1056,5 +1100,56 @@ mod tests {
         assert!(app.streaming_buffer.is_empty());
         assert!(app.interaction_queue.is_empty());
         assert!(app.option_select.is_none());
+    }
+
+    #[test]
+    fn submit_input_plan_command_enters_plan_mode() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/plan audit slash commands");
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::EnterPlanMode {
+                request,
+                was_plan_mode: false
+            }) if request == "audit slash commands"
+        ));
+        assert!(app.plan_mode);
+        assert_eq!(app.input_label(), "[plan] > ");
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::User(text)) if text == "audit slash commands"
+        ));
+    }
+
+    #[test]
+    fn submit_input_plan_without_arguments_is_local_only() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/plan");
+
+        let action = app.submit_input();
+
+        assert!(action.is_none());
+        assert!(!app.plan_mode);
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::Error(text)) if text == "Usage: /plan <request>"
+        ));
+    }
+
+    #[test]
+    fn submit_input_unknown_slash_command_is_local_error() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/does-not-exist");
+
+        let action = app.submit_input();
+
+        assert!(action.is_none());
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::Error(text)) if text == "Unknown slash command: /does-not-exist"
+        ));
     }
 }
