@@ -12,6 +12,8 @@ use std::io::IsTerminal;
 use clap::{Parser, Subcommand};
 use quine_harness::default_socket_path;
 
+const GIT_HASH: &str = env!("QUINE_GIT_HASH");
+
 #[derive(Parser)]
 #[command(name = "quine", about = "Quine AI coding agent CLI")]
 struct Cli {
@@ -403,7 +405,7 @@ async fn main() -> anyhow::Result<()> {
             test_runner::run_test(&scenario, socket, json).await?;
         }
         Commands::Version => {
-            println!("quine {}", env!("CARGO_PKG_VERSION"));
+            println!("quine {} ({GIT_HASH})", env!("CARGO_PKG_VERSION"));
         }
     }
 
