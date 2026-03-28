@@ -325,6 +325,12 @@ struct CoreIo<'a> {
     deferred_inputs: &'a mut VecDeque<CoreInput>,
 }
 
+struct EngineState<'a> {
+    provider: &'a Arc<dyn LlmProvider>,
+    permission_checker: &'a Option<Arc<dyn PermissionChecker>>,
+    session_tree: &'a mut SessionTree,
+}
+
 enum TurnOutcome {
     Completed(Option<String>),
     Failed(String),
@@ -389,17 +395,12 @@ async fn finalize_child_session(
 
 async fn start_child_session(
     sessions: &mut HashMap<SessionId, SessionContext>,
-    session_tree: &mut SessionTree,
-    provider: &Arc<dyn LlmProvider>,
-    permission_checker: &Option<Arc<dyn PermissionChecker>>,
+    io: &mut CoreIo<'_>,
+    engine: &mut EngineState<'_>,
     parent_id: SessionId,
     child_id: SessionId,
     task: String,
     system_prompt: Option<String>,
-    output: &mpsc::Sender<CoreOutput>,
-    input: &mut mpsc::Receiver<CoreInput>,
-    input_tx: &mpsc::Sender<CoreInput>,
-    deferred_inputs: &mut VecDeque<CoreInput>,
 ) -> Result<(), String> {
     if sessions.contains_key(&child_id) {
         return Err("session already exists".into());
@@ -412,8 +413,8 @@ async fn start_child_session(
         system_prompt,
         Vec::new(),
         work_dir,
-        provider,
-        permission_checker,
+        engine.provider,
+        engine.permission_checker,
         false,
         false,
     )
@@ -428,16 +429,18 @@ async fn start_child_session(
         ),
     );
 
-    session_tree.add_child(parent_id, child_id);
+    engine.session_tree.add_child(parent_id, child_id);
     sessions.insert(child_id, ctx);
 
-    let _ = output
+    let _ = io
+        .output
         .send(CoreOutput::ChildSpawned {
             parent_id,
             child_id,
         })
         .await;
-    let _ = output
+    let _ = io
+        .output
         .send(CoreOutput::SessionStateChanged {
             session_id: child_id,
             state: SessionState::Idle,
@@ -450,32 +453,24 @@ async fn start_child_session(
             .expect("child session inserted before starting turn");
         session.state = SessionState::Streaming;
         session.history.push(Message::user(&task));
-        let _ = output
+        let _ = io
+            .output
             .send(CoreOutput::SessionStateChanged {
                 session_id: child_id,
                 state: SessionState::Streaming,
             })
             .await;
-
-        let mut io = CoreIo {
-            output,
-            input,
-            input_tx,
-            deferred_inputs,
-        };
-        handle_llm_turn(
-            provider,
-            sessions,
-            child_id,
-            &mut io,
-            permission_checker.as_deref(),
-            permission_checker,
-            session_tree,
-        )
-        .await
+        handle_llm_turn(sessions, child_id, io, engine).await
     };
 
-    finalize_child_session(sessions, session_tree, child_id, turn_outcome, output).await;
+    finalize_child_session(
+        sessions,
+        engine.session_tree,
+        child_id,
+        turn_outcome,
+        io.output,
+    )
+    .await;
     Ok(())
 }
 
@@ -656,10 +651,7 @@ async fn execute_tool_call(
     sessions: &mut HashMap<SessionId, SessionContext>,
     session_id: SessionId,
     io: &mut CoreIo<'_>,
-    provider: &Arc<dyn LlmProvider>,
-    permission_checker_owned: &Option<Arc<dyn PermissionChecker>>,
-    permission_checker: Option<&dyn PermissionChecker>,
-    session_tree: &mut SessionTree,
+    engine: &mut EngineState<'_>,
 ) -> ToolOutcome {
     let Some(session) = sessions.get_mut(&session_id) else {
         return ToolOutcome::Error {
@@ -675,7 +667,11 @@ async fn execute_tool_call(
 
     // Only check permissions for bash tool — other tools are safe by design.
     if call.tool_name == "bash" {
-        if let Some(checker) = permission_checker.filter(|_| !session.auto_approve_permissions) {
+        if let Some(checker) = engine
+            .permission_checker
+            .as_deref()
+            .filter(|_| !session.auto_approve_permissions)
+        {
             if let Err(outcome) = check_permission(
                 checker,
                 call,
@@ -716,17 +712,12 @@ async fn execute_tool_call(
         let child_id = SessionId::new();
         match Box::pin(start_child_session(
             sessions,
-            session_tree,
-            provider,
-            permission_checker_owned,
+            io,
+            engine,
             session_id,
             child_id,
             task,
             system_prompt,
-            io.output,
-            io.input,
-            io.input_tx,
-            io.deferred_inputs,
         ))
         .await
         {
@@ -778,7 +769,8 @@ async fn execute_tool_call(
             }
         };
 
-        let status = wait_on_child_session(session_tree, session_id, child_id, non_blocking).await;
+        let status =
+            wait_on_child_session(engine.session_tree, session_id, child_id, non_blocking).await;
         if let Some(session) = sessions.get_mut(&session_id) {
             session.cancel_tx = None;
         }
@@ -1126,13 +1118,10 @@ async fn handle_plan_progress(
 /// This function handles the tool execution loop: when the LLM requests tools,
 /// it executes them and calls the LLM again until the LLM produces text.
 async fn handle_llm_turn(
-    provider: &Arc<dyn LlmProvider>,
     sessions: &mut HashMap<SessionId, SessionContext>,
     session_id: SessionId,
     io: &mut CoreIo<'_>,
-    permission_checker: Option<&dyn PermissionChecker>,
-    permission_checker_owned: &Option<Arc<dyn PermissionChecker>>,
-    session_tree: &mut SessionTree,
+    engine: &mut EngineState<'_>,
 ) -> TurnOutcome {
     let turn_start = std::time::Instant::now();
     let mut accumulated_usage: Option<quine_llm::TokenUsage> = None;
@@ -1151,7 +1140,7 @@ async fn handle_llm_turn(
         let Some(session) = sessions.get(&session_id) else {
             return TurnOutcome::Failed("session not found".into());
         };
-        match call_llm(&**provider, session, session_id, io.output).await {
+        match call_llm(&**engine.provider, session, session_id, io.output).await {
             Ok(LlmCallResult {
                 turn: LlmTurnResult::Text(full_text),
                 usage,
@@ -1270,17 +1259,7 @@ async fn handle_llm_turn(
                         .await;
 
                     let tool_start = std::time::Instant::now();
-                    let result = execute_tool_call(
-                        call,
-                        sessions,
-                        session_id,
-                        io,
-                        provider,
-                        permission_checker_owned,
-                        permission_checker,
-                        session_tree,
-                    )
-                    .await;
+                    let result = execute_tool_call(call, sessions, session_id, io, engine).await;
                     let tool_duration_us = tool_start.elapsed().as_micros() as u64;
 
                     // Append tool result to history
@@ -1508,16 +1487,13 @@ pub async fn run_core_loop(
                         input_tx: &handle.input_tx,
                         deferred_inputs: &mut deferred_inputs,
                     };
-                    let turn_outcome = handle_llm_turn(
-                        &provider,
-                        &mut sessions,
-                        session_id,
-                        &mut io,
-                        permission_checker.as_deref(),
-                        &permission_checker,
-                        &mut session_tree,
-                    )
-                    .await;
+                    let mut engine = EngineState {
+                        provider: &provider,
+                        permission_checker: &permission_checker,
+                        session_tree: &mut session_tree,
+                    };
+                    let turn_outcome =
+                        handle_llm_turn(&mut sessions, session_id, &mut io, &mut engine).await;
                     if session_tree.parent_of(session_id).is_some() {
                         finalize_child_session(
                             &mut sessions,
@@ -1595,16 +1571,13 @@ pub async fn run_core_loop(
                             input_tx: &handle.input_tx,
                             deferred_inputs: &mut deferred_inputs,
                         };
-                        let turn_outcome = handle_llm_turn(
-                            &provider,
-                            &mut sessions,
-                            session_id,
-                            &mut io,
-                            permission_checker.as_deref(),
-                            &permission_checker,
-                            &mut session_tree,
-                        )
-                        .await;
+                        let mut engine = EngineState {
+                            provider: &provider,
+                            permission_checker: &permission_checker,
+                            session_tree: &mut session_tree,
+                        };
+                        let turn_outcome =
+                            handle_llm_turn(&mut sessions, session_id, &mut io, &mut engine).await;
                         if session_tree.parent_of(session_id).is_some() {
                             finalize_child_session(
                                 &mut sessions,
@@ -1684,19 +1657,25 @@ pub async fn run_core_loop(
                     continue;
                 }
 
+                let mut io = CoreIo {
+                    output: &handle.output,
+                    input: &mut handle.input,
+                    input_tx: &handle.input_tx,
+                    deferred_inputs: &mut deferred_inputs,
+                };
+                let mut engine = EngineState {
+                    provider: &provider,
+                    permission_checker: &permission_checker,
+                    session_tree: &mut session_tree,
+                };
                 let result = start_child_session(
                     &mut sessions,
-                    &mut session_tree,
-                    &provider,
-                    &permission_checker,
+                    &mut io,
+                    &mut engine,
                     parent_id,
                     child_id,
                     task,
                     system_prompt,
-                    &handle.output,
-                    &mut handle.input,
-                    &handle.input_tx,
-                    &mut deferred_inputs,
                 )
                 .await;
                 match result {
@@ -1838,17 +1817,13 @@ mod tests {
         };
         let mut sessions = HashMap::from([(session_id, session)]);
         let mut session_tree = SessionTree::new();
-        let result = execute_tool_call(
-            &call,
-            &mut sessions,
-            session_id,
-            &mut io,
-            &provider,
-            &permission_checker,
-            None,
-            &mut session_tree,
-        )
-        .await;
+        let mut engine = EngineState {
+            provider: &provider,
+            permission_checker: &permission_checker,
+            session_tree: &mut session_tree,
+        };
+        let result =
+            execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine).await;
 
         assert!(matches!(result, ToolOutcome::Cancelled));
         assert!(sessions
@@ -1905,17 +1880,13 @@ mod tests {
         };
         let mut sessions = HashMap::from([(session_id, session)]);
         let mut session_tree = SessionTree::new();
-        let result = execute_tool_call(
-            &call,
-            &mut sessions,
-            session_id,
-            &mut io,
-            &provider,
-            &permission_checker,
-            None,
-            &mut session_tree,
-        )
-        .await;
+        let mut engine = EngineState {
+            provider: &provider,
+            permission_checker: &permission_checker,
+            session_tree: &mut session_tree,
+        };
+        let result =
+            execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine).await;
 
         assert!(matches!(result, ToolOutcome::Cancelled));
         assert!(matches!(
@@ -1963,18 +1934,14 @@ mod tests {
         };
         let mut sessions = HashMap::from([(session_id, session)]);
         let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            permission_checker: &permission_checker,
+            session_tree: &mut session_tree,
+        };
 
-        let spawn_result = execute_tool_call(
-            &spawn_call,
-            &mut sessions,
-            session_id,
-            &mut io,
-            &provider,
-            &permission_checker,
-            None,
-            &mut session_tree,
-        )
-        .await;
+        let spawn_result =
+            execute_tool_call(&spawn_call, &mut sessions, session_id, &mut io, &mut engine).await;
 
         let child_id = match spawn_result {
             ToolOutcome::Success { output } => output,
@@ -1989,17 +1956,8 @@ mod tests {
             }),
         };
 
-        let wait_result = execute_tool_call(
-            &wait_call,
-            &mut sessions,
-            session_id,
-            &mut io,
-            &provider,
-            &permission_checker,
-            None,
-            &mut session_tree,
-        )
-        .await;
+        let wait_result =
+            execute_tool_call(&wait_call, &mut sessions, session_id, &mut io, &mut engine).await;
 
         match wait_result {
             ToolOutcome::Success { output } => {
