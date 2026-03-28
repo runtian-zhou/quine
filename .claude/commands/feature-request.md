@@ -83,6 +83,15 @@ The QA plan must also include:
 - `## Required Evidence`
 - `## Implementation Feedback`
 
+**Rules for the QA plan:**
+- The QA agent must come up with concrete executable test scenarios, not only abstract validation bullets.
+- Prefer scenarios that run against a real local daemon.
+- For each scenario, specify:
+  - how to start or use the local daemon
+  - the exact one-off CLI invocation or message to send
+  - the expected result, or the expected multi-round conversation when the scenario spans multiple interactions
+- Scenarios should be concrete enough that another agent can execute them without inventing missing details.
+
 ## Step 4: Spawn Two Empty-Context Agents
 
 After the docs exist, spawn exactly two agents:
@@ -110,20 +119,23 @@ After the docs exist, spawn exactly two agents:
 - Review the implementation plan and leave concrete feedback in that file's `## QA Feedback` section
 - Update the QA doc's `## Agreement Status` section with either `pending` or `agreed`
 
-## Step 5: Drive Agreement
+## Step 5: Check Agent Agreement and Drive It to Completion
 
-Iterate until both agents agree with each other's plans.
+Explicitly check whether the two agents agreed with each other by reading both planning docs and, if needed, the agents' latest outputs.
+
+Do not proceed until agreement is complete.
 
 Agreement is complete only when:
 - The implementation doc says the QA plan is agreed
 - The QA doc says the implementation plan is agreed
 - Neither doc has unresolved open questions
+- The current document state shows both agents are aligned on the same plan
 
-If either agent raises a gap, have that agent update its doc and let the other agent review again. Keep the coordination loop going through the docs until both are agreed.
+If either agent raises a gap, wait for that agent to update its doc, then have the other agent review again. Keep the coordination loop going through the docs until both are agreed.
 
 ## Step 6: Create a PR
 
-Only after Step 5 is complete:
+Only after Step 5 is complete and both agents have agreed with each other:
 
 1. Create a feature branch: `feature-request-<name>`
 2. Stage only the three markdown files:
@@ -132,11 +144,13 @@ Only after Step 5 is complete:
    - `features/plans/<NNN>-<name>-qa.md`
 3. Commit with message: `Add feature request: <title>`
 4. Verify the commit only contains the three markdown docs: `git diff --stat HEAD~1`
-5. Push and create a PR with title `Feature request: <title>` and a brief summary body that mentions both agreed planning docs
+5. Push and create a PR with title `Feature request: <title>` and a brief summary body that mentions both agreed planning docs and states that agent agreement was verified before PR creation
 
 ## Step 7: Merge
+
+Only after the PR is created from the agreed docs:
 
 1. Merge the PR via `gh pr merge <number> --merge`
 2. Switch back to main and pull.
 
-**CRITICAL: Do not commit or create a PR until both planning docs record agreement. The PR must contain only the feature request markdown and the two planning markdown docs. No code changes, no Cargo.lock updates, no other files. If `git status` shows unrelated modified files, do not stage them.**
+**CRITICAL: Do not commit, create a PR, or merge anything until you have explicitly checked that both planning docs record agreement and that the two agents agreed with each other. Wait until agreement is visible in the docs before proceeding. The PR must contain only the feature request markdown and the two planning markdown docs. No code changes, no Cargo.lock updates, no other files. If `git status` shows unrelated modified files, do not stage them.**

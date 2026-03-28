@@ -1,5 +1,5 @@
 ---
-status: pending
+status: in-progress
 ---
 
 # Enter Plan Mode on `/plan` Command
