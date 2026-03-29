@@ -1,4 +1,4 @@
-use ratatui::layout::{Alignment, Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
@@ -141,6 +141,55 @@ fn plan_status_style(status_line: &str) -> Style {
     }
 }
 
+fn render_plan_box(lines: &mut Vec<Line<'_>>, plan: &str, width: u16) {
+    let inner_width = usize::from(width.saturating_sub(8)).max(1);
+    let top = format!("    ┌{}┐", "─".repeat(inner_width + 2));
+    let bottom = format!("    └{}┘", "─".repeat(inner_width + 2));
+    lines.push(Line::from(Span::styled(
+        top,
+        Style::default().fg(Color::Cyan),
+    )));
+
+    for raw_line in plan.lines() {
+        let line = if raw_line.is_empty() { " " } else { raw_line };
+        let mut current = String::new();
+        let mut current_width = 0usize;
+
+        for ch in line.chars() {
+            if current_width >= inner_width {
+                let padded = format!("    │ {:<width$} │", current, width = inner_width);
+                let style = if current.trim_start().starts_with("Plan:") {
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    plan_status_style(current.trim_start())
+                };
+                lines.push(Line::from(Span::styled(padded, style)));
+                current.clear();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += 1;
+        }
+
+        let padded = format!("    │ {:<width$} │", current, width = inner_width);
+        let style = if current.trim_start().starts_with("Plan:") {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            plan_status_style(current.trim_start())
+        };
+        lines.push(Line::from(Span::styled(padded, style)));
+    }
+
+    lines.push(Line::from(Span::styled(
+        bottom,
+        Style::default().fg(Color::Cyan),
+    )));
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mode = if app.plan_mode { "plan" } else { "chat" };
     let phase = match &app.phase {
@@ -177,7 +226,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 }
 
 /// Render the scrollable conversation view.
-fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Rect) {
+fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     for (i, entry) in app.messages.iter().enumerate() {
@@ -266,6 +315,9 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: ratatui::layout::Re
                         Span::styled(line.to_string(), style),
                     ]));
                 }
+            }
+            ConversationEntry::PlanBox(plan) => {
+                render_plan_box(&mut lines, plan, area.width);
             }
             ConversationEntry::PlanProgress {
                 action_id,
@@ -460,6 +512,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::ConversationEntry;
 
     fn buffer_lines(backend: &ratatui::backend::TestBackend) -> Vec<String> {
         let buffer = backend.buffer();
@@ -575,6 +628,24 @@ mod tests {
 
         assert_eq!(reply_index - hello_index, 2);
         assert!(lines[hello_index + 1].is_empty());
+    }
+
+    #[test]
+    fn draw_renders_plan_box_entry() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::PlanBox(
+            "Plan: Demo\n🟢 [a1] First task\n✅ [a2] Done task".into(),
+        ));
+
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("┌")));
+        assert!(lines.iter().any(|line| line.contains("Plan: Demo")));
+        assert!(lines.iter().any(|line| line.contains("[a1] First task")));
+        assert!(lines.iter().any(|line| line.contains("└")));
     }
 
     #[test]

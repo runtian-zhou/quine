@@ -342,7 +342,7 @@ async fn execute_action(
                 skills,
                 false,
                 auto_approve_permissions,
-                &[Message::assistant(final_plan)],
+                &[Message::assistant(final_plan.clone())],
             )
             .await
             {
@@ -356,6 +356,8 @@ async fn execute_action(
                         "Plan complete. Started a fresh normal session with the final plan carried over."
                             .into(),
                     ));
+                    app.messages
+                        .push(app::ConversationEntry::PlanBox(final_plan));
                     app.auto_scroll();
                 }
                 Err(e) => {

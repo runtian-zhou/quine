@@ -114,6 +114,7 @@ pub enum ConversationEntry {
         result_preview: Option<String>,
     },
     PatchPreview(String),
+    PlanBox(String),
     PlanProgress {
         action_id: String,
         status: String,
