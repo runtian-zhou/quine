@@ -86,6 +86,10 @@ The QA plan must also include:
 **Rules for the QA plan:**
 - The QA agent must come up with concrete executable test scenarios, not only abstract validation bullets.
 - Prefer scenarios that run against a real local daemon.
+- When a scenario uses the one-off chat daemon or one-off chat CLI flow, the QA plan must explicitly list:
+  - the exact command or commands to start the daemon and run the scenario
+  - the exact text, prompt, or sequence of messages to send
+  - the expected output for each command or interaction, including any expected final response text, status text, or error text
 - For each scenario, specify:
   - how to start or use the local daemon
   - the exact one-off CLI invocation or message to send
