@@ -5,8 +5,10 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::IpcClient;
 use crate::render::{Renderer, TerminalRenderer};
-use crate::session::{create_session, create_session_with_initial_messages};
-use crate::slash_command::parse_slash_command;
+use crate::session::{
+    create_session, create_session_with_initial_messages, create_slash_skill_session,
+};
+use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{methods, notifications};
 
 /// Shut down the daemon if we spawned it.
@@ -27,6 +29,7 @@ enum ChatCommandAction {
     ShowError(String),
     SendMessage(String),
     EnterPlanModeAndSend(String),
+    StartSkillSession { skill_name: String, request: String },
 }
 
 async fn maybe_exit_plan_mode(
@@ -65,18 +68,27 @@ async fn maybe_exit_plan_mode(
 fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
     let trimmed = input.trim();
     if let Some(command) = parse_slash_command(trimmed) {
-        match command.name.as_str() {
-            "quit" => ChatCommandAction::Quit,
-            "plan" => {
-                if command.arguments.is_empty() {
-                    ChatCommandAction::ShowError("Usage: /plan <request>".to_string())
-                } else if plan_mode {
-                    ChatCommandAction::SendMessage(command.arguments)
-                } else {
-                    ChatCommandAction::EnterPlanModeAndSend(command.arguments)
+        match command {
+            SlashCommand::BuiltIn { name, arguments } => match name.as_str() {
+                "quit" => ChatCommandAction::Quit,
+                "plan" => {
+                    if arguments.is_empty() {
+                        ChatCommandAction::ShowError("Usage: /plan <request>".to_string())
+                    } else if plan_mode {
+                        ChatCommandAction::SendMessage(arguments)
+                    } else {
+                        ChatCommandAction::EnterPlanModeAndSend(arguments)
+                    }
                 }
-            }
-            other => ChatCommandAction::ShowError(format!("Unknown slash command: /{other}")),
+                "loop" => ChatCommandAction::ShowError(
+                    "`/loop` is only supported in the TUI right now".to_string(),
+                ),
+                other => ChatCommandAction::ShowError(format!("Unknown slash command: /{other}")),
+            },
+            SlashCommand::Skill { name, arguments } => ChatCommandAction::StartSkillSession {
+                skill_name: name,
+                request: arguments,
+            },
         }
     } else {
         ChatCommandAction::SendMessage(trimmed.to_string())
@@ -139,6 +151,26 @@ pub async fn run_chat(
                                 session_in_plan_mode = true;
                                 eprintln!("Switched to plan mode: {}", session.session_id);
                                 content
+                            }
+                            ChatCommandAction::StartSkillSession { skill_name, request } => {
+                                session = create_slash_skill_session(
+                                    &mut client,
+                                    &skill_name,
+                                    &request,
+                                    auto_approve_permissions,
+                                )
+                                .await?;
+                                session_in_plan_mode = false;
+                                renderer
+                                    .render_info(&format!("Started skill session: /{skill_name}"))
+                                    .await?;
+                                if request.is_empty() {
+                                    renderer
+                                        .render_info("Enter a prompt to continue.")
+                                        .await?;
+                                    continue;
+                                }
+                                request
                             }
                         };
 
@@ -403,15 +435,21 @@ mod tests {
     }
 
     #[test]
-    fn chat_command_unknown_slash_command_is_local_error() {
+    fn chat_command_skill_starts_new_session() {
         assert_eq!(
-            handle_chat_command("/does-not-exist", false),
-            ChatCommandAction::ShowError("Unknown slash command: /does-not-exist".into())
+            handle_chat_command("/review audit this", false),
+            ChatCommandAction::StartSkillSession {
+                skill_name: "review".into(),
+                request: "audit this".into(),
+            }
         );
     }
 
     #[test]
-    fn chat_command_preserves_quit_behavior() {
-        assert_eq!(handle_chat_command("/quit", false), ChatCommandAction::Quit);
+    fn chat_command_loop_is_tui_only_error() {
+        assert_eq!(
+            handle_chat_command("/loop every 5m check logs", false),
+            ChatCommandAction::ShowError("`/loop` is only supported in the TUI right now".into())
+        );
     }
 }

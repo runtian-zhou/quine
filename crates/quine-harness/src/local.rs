@@ -549,6 +549,57 @@ impl HarnessService for LocalHarness {
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)?
     }
+
+    async fn schedule_agent(
+        &self,
+        parent_id: Option<SessionId>,
+        task: String,
+        system_prompt: Option<String>,
+        delay: Duration,
+        cadence: Option<Duration>,
+    ) -> Result<(), HarnessError> {
+        let scheduler_tx = self.scheduler_tx.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if let Some(cadence) = cadence {
+                loop {
+                    let child_id = SessionId::new();
+                    let (reply_tx, _reply_rx) = oneshot::channel();
+                    if scheduler_tx
+                        .send(ScheduledCommand::immediate(
+                            ScheduledAction::SpawnChildSession {
+                                parent_id: parent_id.unwrap_or_default(),
+                                child_id,
+                                task: task.clone(),
+                                system_prompt: system_prompt.clone(),
+                                reply: reply_tx,
+                            },
+                        ))
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                    tokio::time::sleep(cadence).await;
+                }
+            } else {
+                let child_id = SessionId::new();
+                let (reply_tx, _reply_rx) = oneshot::channel();
+                let _ = scheduler_tx
+                    .send(ScheduledCommand::immediate(
+                        ScheduledAction::SpawnChildSession {
+                            parent_id: parent_id.unwrap_or_default(),
+                            child_id,
+                            task,
+                            system_prompt,
+                            reply: reply_tx,
+                        },
+                    ))
+                    .await;
+            }
+        });
+        Ok(())
+    }
 }
 
 struct ScheduledCommand {
@@ -608,6 +659,7 @@ impl PartialOrd for QueuedCommand {
     }
 }
 
+#[allow(dead_code)]
 enum ScheduledAction {
     CreateSession {
         session_id: SessionId,
@@ -656,6 +708,7 @@ enum ScheduledAction {
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
     RecvIpcMessage {
+        #[allow(dead_code)]
         source: String,
         reply: oneshot::Sender<Result<Option<String>, HarnessError>>,
     },
@@ -749,6 +802,33 @@ mod tests {
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    #[tokio::test]
+    async fn local_harness_schedule_agent_one_shot() {
+        let harness = LocalHarness::new(Arc::new(MockProvider), None);
+        harness
+            .schedule_agent(None, "do work".into(), None, Duration::from_secs(1), None)
+            .await
+            .unwrap();
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_harness_recvs_ipc_message() {
+        let harness = LocalHarness::new(Arc::new(MockProvider), None);
+        harness
+            .send_ipc_message("worker".into(), "payload".into())
+            .await
+            .unwrap();
+
+        let message = harness
+            .recv_ipc_message("worker".into(), false)
+            .await
+            .unwrap();
+
+        assert_eq!(message.as_deref(), Some("payload"));
+        harness.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]

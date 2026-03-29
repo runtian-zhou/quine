@@ -836,14 +836,81 @@ async fn handle_request(
             }
         }
 
+        methods::SCHEDULE_AGENT => {
+            let params = request.params.as_ref();
+            let task = params
+                .and_then(|p| p.get("task"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let system_prompt = params
+                .and_then(|p| p.get("system_prompt"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let parent_id = params
+                .and_then(|p| p.get("parent_id"))
+                .and_then(|v| v.as_str())
+                .and_then(|s| {
+                    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+                });
+            let delay_secs = params
+                .and_then(|p| p.get("delay_secs"))
+                .and_then(|v| v.as_u64());
+            let cadence_secs = params
+                .and_then(|p| p.get("cadence_secs"))
+                .and_then(|v| v.as_u64());
+
+            match (task, delay_secs) {
+                (Some(task), Some(delay_secs)) => {
+                    match service
+                        .schedule_agent(
+                            parent_id,
+                            task,
+                            system_prompt,
+                            tokio::time::Duration::from_secs(delay_secs),
+                            cadence_secs.map(tokio::time::Duration::from_secs),
+                        )
+                        .await
+                    {
+                        Ok(()) => {
+                            let resp = JsonRpcResponse::success(id, "ok");
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                _ => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing task or delay_secs",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
         methods::LIST_SKILLS => {
             let project_root = std::env::current_dir().unwrap_or_default();
             match quine_core::list_available_skills(&project_root).await {
                 Ok(skills) => {
-                    let resp = JsonRpcResponse::success(
-                        id,
-                        serde_json::to_value(&skills).unwrap_or_default(),
-                    );
+                    let result = skills
+                        .into_iter()
+                        .map(|skill| {
+                            serde_json::json!({
+                                "name": skill.name,
+                                "description": skill.description,
+                                "version": skill.version,
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let resp = JsonRpcResponse::success(id, result);
                     Some(serde_json::to_string(&resp).unwrap_or_default())
                 }
                 Err(e) => {

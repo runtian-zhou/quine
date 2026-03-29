@@ -25,6 +25,9 @@ pub trait Renderer: Send + Sync {
     /// Render an error message.
     async fn render_error(&mut self, message: &str) -> anyhow::Result<()>;
 
+    /// Render an informational message.
+    async fn render_info(&mut self, message: &str) -> anyhow::Result<()>;
+
     /// Render the turn-complete marker (e.g., a newline or prompt).
     async fn render_turn_complete(&mut self) -> anyhow::Result<()>;
 }
@@ -93,6 +96,14 @@ impl Renderer for TerminalRenderer {
         Ok(())
     }
 
+    async fn render_info(&mut self, message: &str) -> anyhow::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        let msg = format!("{message}\n");
+        self.writer.write_all(msg.as_bytes()).await?;
+        self.writer.flush().await?;
+        Ok(())
+    }
+
     async fn render_turn_complete(&mut self) -> anyhow::Result<()> {
         // No extra output needed; the prompt will be printed by the REPL.
         Ok(())
@@ -144,6 +155,11 @@ mod tests {
 
         async fn render_error(&mut self, message: &str) -> anyhow::Result<()> {
             self.buffer.push_str(&format!("ERR: {message}"));
+            Ok(())
+        }
+
+        async fn render_info(&mut self, message: &str) -> anyhow::Result<()> {
+            self.buffer.push_str(&format!("INFO: {message}"));
             Ok(())
         }
 
