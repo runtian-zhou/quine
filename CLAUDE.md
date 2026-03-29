@@ -115,7 +115,7 @@ Each feature request must also have two planning docs under `features/plans/`:
 - `<NNN>-<name>-implementation.md` — implementation plan owned by an implementor agent
 - `<NNN>-<name>-qa.md` — QA plan owned by a QA agent
 
-Use the dedicated feature-request command doc in `.claude/commands/feature-request.md` for the detailed feature-request workflow, document format, agent coordination rules, and PR steps.
+Use the dedicated feature-planning command doc in `.claude/commands/feature-planning.md` for the detailed planning-doc workflow, document format, agent coordination rules, and PR steps.
 
 High-level policy:
 
