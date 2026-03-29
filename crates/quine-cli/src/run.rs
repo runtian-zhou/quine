@@ -38,7 +38,18 @@ pub struct ToolCallRecord {
     pub tool_use_id: String,
 }
 
-/// Run a one-shot message: connect to daemon, send message, collect response, exit.
+pub async fn fetch_available_skills(client: &mut IpcClient) -> anyhow::Result<Vec<String>> {
+    let result = client.call(methods::LIST_SKILLS, None).await?;
+    let value = result.map_err(|message| anyhow::anyhow!(message))?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|skill| skill.get("name").and_then(|name| name.as_str()))
+        .map(ToString::to_string)
+        .collect())
+}
+
 ///
 /// If `session_id` is `None`, creates a new session. If `json_output` is true,
 /// prints structured JSON to stdout. Otherwise prints the text response to stdout

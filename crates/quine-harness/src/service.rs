@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use quine_core::{CoreOutput, InteractionResponse, SessionId, SessionSignal};
 use tokio::sync::broadcast;
+use tokio::time::Duration;
 
 use crate::config::SessionConfig;
 use crate::error::HarnessError;
@@ -96,6 +97,20 @@ pub trait HarnessService: Send + Sync {
         _source: String,
         _non_blocking: bool,
     ) -> Result<Option<String>, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    /// Schedule a future or recurring child-agent spawn.
+    async fn schedule_agent(
+        &self,
+        _parent_id: Option<SessionId>,
+        _task: String,
+        _system_prompt: Option<String>,
+        _delay: Duration,
+        _cadence: Option<Duration>,
+    ) -> Result<(), HarnessError> {
         Err(HarnessError::Internal {
             message: "not implemented".into(),
         })

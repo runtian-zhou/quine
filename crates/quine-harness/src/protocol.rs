@@ -120,6 +120,7 @@ pub mod methods {
     pub const RECV_IPC_MESSAGE: &str = "recv_ipc_message";
     pub const LIST_SKILLS: &str = "list_skills";
     pub const GET_SKILL: &str = "get_skill";
+    pub const SCHEDULE_AGENT: &str = "schedule_agent";
 }
 
 /// Notification method names.
