@@ -195,6 +195,9 @@ pub enum AppAction {
         request: String,
         was_plan_mode: bool,
     },
+    ExitPlanMode {
+        final_plan: String,
+    },
     SubmitInteraction(String),
     Cancel,
     Quit,

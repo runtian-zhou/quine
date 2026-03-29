@@ -356,6 +356,16 @@ async fn handle_request(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            let initial_messages = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("initial_messages"))
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .unwrap_or_default()
+                .unwrap_or_default();
+
             let auto_approve_permissions = request
                 .params
                 .as_ref()
@@ -369,6 +379,7 @@ async fn handle_request(
                 skills,
                 plan_mode,
                 auto_approve_permissions,
+                initial_messages,
             };
 
             match service.create_session(config).await {

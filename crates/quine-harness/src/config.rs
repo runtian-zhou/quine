@@ -8,6 +8,7 @@ use quine_core::PermissionChecker;
 use quine_llm::anthropic::AnthropicConfig;
 use quine_llm::config::ProviderConfig;
 use quine_llm::openai_compat::OpenAiCompatConfig;
+use quine_llm::Message;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for a single agent session.
@@ -23,6 +24,9 @@ pub struct SessionConfig {
     /// Whether this session operates in read-only plan mode.
     #[serde(default)]
     pub plan_mode: bool,
+    /// Seed the session with these messages after the system prompt.
+    #[serde(default)]
+    pub initial_messages: Vec<Message>,
     /// Whether bash permission prompts should be auto-approved for this session.
     #[serde(default)]
     pub auto_approve_permissions: bool,
@@ -200,6 +204,7 @@ mod tests {
             working_directory: None,
             skills: Vec::new(),
             plan_mode: false,
+            initial_messages: Vec::new(),
             auto_approve_permissions: true,
         };
         let json = serde_json::to_string(&config).unwrap();
