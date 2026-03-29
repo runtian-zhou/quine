@@ -14,7 +14,10 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::client::IpcClient;
-use crate::session::{create_session, create_session_with_initial_messages};
+use crate::run::fetch_available_skills;
+use crate::session::{
+    create_session, create_session_with_initial_messages, create_slash_skill_session,
+};
 use app::{AgentPhase, AppAction};
 use quine_harness::protocol::{methods, notifications};
 use quine_llm::Message;
@@ -30,6 +33,7 @@ pub async fn run_tui_chat(
     auto_approve_permissions: bool,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
+    let available_skills = fetch_available_skills(&mut client).await?;
 
     // Create session.
     let session = create_session(&mut client, skills, plan_mode, auto_approve_permissions).await?;
@@ -59,6 +63,7 @@ pub async fn run_tui_chat(
         &mut app,
         &mut client,
         skills,
+        &available_skills,
         auto_approve_permissions,
         &mut event_stream,
         &mut spinner_interval,
@@ -79,11 +84,13 @@ pub async fn run_tui_chat(
 }
 
 /// The main event loop: select over terminal events, daemon notifications, and spinner ticks.
+#[allow(clippy::too_many_arguments)]
 async fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut app::App,
     client: &mut IpcClient,
     skills: &[String],
+    available_skills: &[String],
     auto_approve_permissions: bool,
     event_stream: &mut EventStream,
     spinner_interval: &mut tokio::time::Interval,
@@ -102,7 +109,7 @@ async fn run_event_loop(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if let Some(action) = handle_terminal_event(app, event) {
-                            execute_action(app, client, skills, auto_approve_permissions, action).await?;
+                            execute_action(app, client, skills, available_skills, auto_approve_permissions, action).await?;
                         }
                     }
                     Some(Err(_)) | None => {
@@ -133,6 +140,7 @@ async fn run_event_loop(
                                 app,
                                 client,
                                 skills,
+                                available_skills,
                                 auto_approve_permissions,
                                 AppAction::ExitPlanMode { final_plan },
                             )
@@ -294,6 +302,7 @@ async fn execute_action(
     app: &mut app::App,
     client: &mut IpcClient,
     skills: &[String],
+    available_skills: &[String],
     auto_approve_permissions: bool,
     action: AppAction,
 ) -> anyhow::Result<()> {
@@ -308,6 +317,81 @@ async fn execute_action(
                     .push(app::ConversationEntry::Error(e.to_string()));
                 app.phase = AgentPhase::Idle;
             }
+        }
+        AppAction::SendSlashSkillMessage {
+            skill_name,
+            request,
+        } => {
+            if !available_skills
+                .iter()
+                .any(|candidate| candidate == &skill_name)
+            {
+                app.messages.push(app::ConversationEntry::Error(format!(
+                    "Unknown slash command: /{skill_name}"
+                )));
+                app.phase = AgentPhase::Idle;
+                app.auto_scroll();
+            } else {
+                match create_slash_skill_session(
+                    client,
+                    &skill_name,
+                    &request,
+                    auto_approve_permissions,
+                )
+                .await
+                {
+                    Ok(session) => {
+                        app.reset_for_new_session(
+                            session.session_id,
+                            false,
+                            session.max_context_window,
+                        );
+                        app.messages
+                            .push(app::ConversationEntry::AssistantText(format!(
+                                "Started skill session: /{skill_name}"
+                            )));
+                        app.messages
+                            .push(app::ConversationEntry::User(if request.is_empty() {
+                                format!("/{skill_name}")
+                            } else {
+                                format!("/{skill_name} {request}")
+                            }));
+                        app.phase = AgentPhase::Thinking;
+                        app.auto_scroll();
+                        let params = serde_json::json!({
+                            "session_id": app.session_id,
+                            "content": request,
+                        });
+                        if let Err(e) = client.call(methods::SEND_MESSAGE, Some(params)).await {
+                            app.messages
+                                .push(app::ConversationEntry::Error(e.to_string()));
+                            app.phase = AgentPhase::Idle;
+                        }
+                    }
+                    Err(e) => {
+                        app.messages
+                            .push(app::ConversationEntry::Error(e.to_string()));
+                        app.phase = AgentPhase::Idle;
+                    }
+                }
+            }
+        }
+        AppAction::ScheduleLoop {
+            request,
+            delay,
+            cadence,
+        } => {
+            let params = serde_json::json!({
+                "parent_id": app.session_id,
+                "task": request,
+                "delay_secs": delay.as_secs(),
+                "cadence_secs": cadence.map(|value| value.as_secs()),
+            });
+            if let Err(e) = client.call(methods::SCHEDULE_AGENT, Some(params)).await {
+                app.messages
+                    .push(app::ConversationEntry::Error(e.to_string()));
+            }
+            app.phase = AgentPhase::Idle;
         }
         AppAction::EnterPlanMode {
             request,

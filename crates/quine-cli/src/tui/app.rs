@@ -1,7 +1,9 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
-use crate::slash_command::parse_slash_command;
+use std::time::Duration;
+
+use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{notifications, JsonRpcNotification};
 
 /// Spinner braille frames for the waiting animation.
@@ -192,6 +194,15 @@ pub struct OptionSelectState {
 /// Actions the event loop should perform after handling an event.
 pub enum AppAction {
     SendMessage(String),
+    SendSlashSkillMessage {
+        skill_name: String,
+        request: String,
+    },
+    ScheduleLoop {
+        request: String,
+        delay: Duration,
+        cadence: Option<Duration>,
+    },
     EnterPlanMode {
         request: String,
         was_plan_mode: bool,
@@ -399,6 +410,72 @@ pub struct App {
     pub last_view_height: u32,
 }
 
+struct LoopCommand {
+    request: String,
+    delay: Duration,
+    cadence: Option<Duration>,
+}
+
+impl LoopCommand {
+    fn description(&self) -> String {
+        match self.cadence {
+            Some(cadence) => format!("every {}s: {}", cadence.as_secs(), self.request),
+            None => format!("in {}s: {}", self.delay.as_secs(), self.request),
+        }
+    }
+}
+
+fn parse_loop_arguments(arguments: &str) -> Result<LoopCommand, String> {
+    let trimmed = arguments.trim();
+    let mut parts = trimmed.split_whitespace();
+    let mode = parts.next().ok_or_else(|| {
+        "Usage: /loop every <duration> <message> | /loop in <duration> <message>".to_string()
+    })?;
+    let duration_text = parts.next().ok_or_else(|| {
+        "Usage: /loop every <duration> <message> | /loop in <duration> <message>".to_string()
+    })?;
+    let request = parts.collect::<Vec<_>>().join(" ");
+    if request.is_empty() {
+        return Err(
+            "Usage: /loop every <duration> <message> | /loop in <duration> <message>".into(),
+        );
+    }
+    let duration = parse_duration(duration_text)?;
+    match mode {
+        "every" => Ok(LoopCommand {
+            request,
+            delay: duration,
+            cadence: Some(duration),
+        }),
+        "in" => Ok(LoopCommand {
+            request,
+            delay: duration,
+            cadence: None,
+        }),
+        _ => Err("Usage: /loop every <duration> <message> | /loop in <duration> <message>".into()),
+    }
+}
+
+fn parse_duration(input: &str) -> Result<Duration, String> {
+    if input.is_empty() {
+        return Err("Duration cannot be empty".into());
+    }
+    let split_at = input
+        .find(|c: char| !c.is_ascii_digit())
+        .ok_or_else(|| "Duration must include a unit like s, m, h, or d".to_string())?;
+    let (value, unit) = input.split_at(split_at);
+    let amount = value
+        .parse::<u64>()
+        .map_err(|_| format!("Invalid duration value: {input}"))?;
+    match unit {
+        "s" => Ok(Duration::from_secs(amount)),
+        "m" => Ok(Duration::from_secs(amount * 60)),
+        "h" => Ok(Duration::from_secs(amount * 60 * 60)),
+        "d" => Ok(Duration::from_secs(amount * 60 * 60 * 24)),
+        _ => Err(format!("Unsupported duration unit: {unit}")),
+    }
+}
+
 impl App {
     pub fn new(session_id: String, plan_mode: bool, max_context_window: Option<u64>) -> Self {
         Self {
@@ -557,39 +634,70 @@ impl App {
         } else {
             self.input_history.push(text.clone());
             if let Some(command) = parse_slash_command(&text) {
-                match command.name.as_str() {
-                    "quit" => {
-                        self.should_quit = true;
-                        Some(AppAction::Quit)
-                    }
-                    "plan" => {
-                        if command.arguments.is_empty() {
-                            self.messages
-                                .push(ConversationEntry::Error("Usage: /plan <request>".into()));
-                            self.auto_scroll();
-                            None
-                        } else {
-                            let was_plan_mode = self.plan_mode;
-                            if was_plan_mode {
-                                self.messages
-                                    .push(ConversationEntry::User(command.arguments.clone()));
-                                self.phase = AgentPhase::Thinking;
+                match command {
+                    SlashCommand::BuiltIn { name, arguments } => match name.as_str() {
+                        "quit" => {
+                            self.should_quit = true;
+                            Some(AppAction::Quit)
+                        }
+                        "plan" => {
+                            if arguments.is_empty() {
+                                self.messages.push(ConversationEntry::Error(
+                                    "Usage: /plan <request>".into(),
+                                ));
                                 self.auto_scroll();
-                                Some(AppAction::SendMessage(command.arguments))
+                                None
                             } else {
-                                Some(AppAction::EnterPlanMode {
-                                    request: command.arguments,
-                                    was_plan_mode,
-                                })
+                                let was_plan_mode = self.plan_mode;
+                                if was_plan_mode {
+                                    self.messages
+                                        .push(ConversationEntry::User(arguments.clone()));
+                                    self.phase = AgentPhase::Thinking;
+                                    self.auto_scroll();
+                                    Some(AppAction::SendMessage(arguments))
+                                } else {
+                                    Some(AppAction::EnterPlanMode {
+                                        request: arguments,
+                                        was_plan_mode,
+                                    })
+                                }
                             }
                         }
-                    }
-                    other => {
-                        self.messages.push(ConversationEntry::Error(format!(
-                            "Unknown slash command: /{other}"
-                        )));
+                        "loop" => match parse_loop_arguments(&arguments) {
+                            Ok(loop_command) => {
+                                self.messages.push(ConversationEntry::AssistantText(format!(
+                                    "Scheduled loop: {}",
+                                    loop_command.description()
+                                )));
+                                self.auto_scroll();
+                                Some(AppAction::ScheduleLoop {
+                                    request: loop_command.request,
+                                    delay: loop_command.delay,
+                                    cadence: loop_command.cadence,
+                                })
+                            }
+                            Err(message) => {
+                                self.messages.push(ConversationEntry::Error(message));
+                                self.auto_scroll();
+                                None
+                            }
+                        },
+                        other => {
+                            self.messages.push(ConversationEntry::Error(format!(
+                                "Unknown slash command: /{other}"
+                            )));
+                            self.auto_scroll();
+                            None
+                        }
+                    },
+                    SlashCommand::Skill { name, arguments } => {
+                        self.messages.push(ConversationEntry::User(text.clone()));
+                        self.phase = AgentPhase::Thinking;
                         self.auto_scroll();
-                        None
+                        Some(AppAction::SendSlashSkillMessage {
+                            skill_name: name,
+                            request: arguments,
+                        })
                     }
                 }
             } else {
@@ -1264,16 +1372,71 @@ mod tests {
     }
 
     #[test]
-    fn submit_input_unknown_slash_command_is_local_error() {
+    fn submit_input_unknown_slash_command_is_skill_session_handoff() {
         let mut app = App::new("test".into(), false, None);
-        app.input.set_from_string("/does-not-exist");
+        app.input.set_from_string("/review audit this");
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::SendSlashSkillMessage { skill_name, request })
+                if skill_name == "review" && request == "audit this"
+        ));
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::User(text)) if text == "/review audit this"
+        ));
+        assert!(matches!(app.phase, AgentPhase::Thinking));
+    }
+
+    #[test]
+    fn submit_input_bare_skill_command_is_skill_session_handoff() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/feature-planning");
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::SendSlashSkillMessage { skill_name, request })
+                if skill_name == "feature-planning" && request.is_empty()
+        ));
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::User(text)) if text == "/feature-planning"
+        ));
+        assert!(matches!(app.phase, AgentPhase::Thinking));
+    }
+
+    #[test]
+    fn submit_input_loop_command_schedules_work() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/loop every 5m check logs");
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::ScheduleLoop { request, delay, cadence })
+                if request == "check logs"
+                    && delay == Duration::from_secs(300)
+                    && cadence == Some(Duration::from_secs(300))
+        ));
+    }
+
+    #[test]
+    fn submit_input_invalid_loop_is_local_error() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/loop every nope check logs");
 
         let action = app.submit_input();
 
         assert!(action.is_none());
         assert!(matches!(
             app.messages.last(),
-            Some(ConversationEntry::Error(text)) if text == "Unknown slash command: /does-not-exist"
+            Some(ConversationEntry::Error(text)) if text.contains("Invalid duration")
+                || text.contains("Unsupported duration")
         ));
     }
 }
