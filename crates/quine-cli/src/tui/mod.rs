@@ -311,6 +311,27 @@ async fn execute_action(
                 app.phase = AgentPhase::Idle;
             }
         }
+        AppAction::CompactSession => {
+            let params = serde_json::json!({
+                "session_id": app.session_id,
+            });
+            match client.call(methods::COMPACT_SESSION, Some(params)).await {
+                Ok(Ok(_)) => {
+                    app.messages.push(app::ConversationEntry::AssistantText(
+                        "Context compacted.".into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    app.messages.push(app::ConversationEntry::Error(error));
+                }
+                Err(error) => {
+                    app.messages
+                        .push(app::ConversationEntry::Error(error.to_string()));
+                }
+            }
+            app.phase = AgentPhase::Idle;
+            app.auto_scroll();
+        }
         AppAction::SendSlashSkillMessage {
             skill_name,
             request,

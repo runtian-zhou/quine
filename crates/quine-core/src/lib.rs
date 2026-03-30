@@ -1,4 +1,5 @@
 pub mod channel;
+mod compaction;
 pub mod engine;
 pub mod error;
 pub mod filesystem;
@@ -13,7 +14,7 @@ pub mod tool;
 pub use channel::{
     create_channels, ChannelConfig, CoreHandle, CoreInput, CoreOutput, HarnessHandle, ToolOutcome,
 };
-pub use engine::run_core_loop;
+pub use engine::{run_core_loop, run_core_loop_with_compaction};
 pub use error::CoreError;
 pub use filesystem::{DirEntry, FsError, NullFilesystem, OverlayFilesystem, SessionFilesystem};
 pub use permission::{PermissionChecker, PermissionContext, PermissionDecision, PermissionError};

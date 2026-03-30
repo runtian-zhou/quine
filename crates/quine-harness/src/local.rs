@@ -12,7 +12,7 @@ use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::{Duration, Instant};
 
-use crate::config::SessionConfig;
+use crate::config::{default_state_dir, max_context_window_from_env, SessionConfig};
 use crate::error::HarnessError;
 use crate::service::HarnessService;
 
@@ -39,6 +39,14 @@ impl LocalHarness {
         provider: Arc<dyn LlmProvider>,
         permission_checker: Option<Arc<dyn PermissionChecker>>,
     ) -> Self {
+        Self::with_archive_root(provider, permission_checker, None)
+    }
+
+    pub fn with_archive_root(
+        provider: Arc<dyn LlmProvider>,
+        permission_checker: Option<Arc<dyn PermissionChecker>>,
+        archive_root: Option<std::path::PathBuf>,
+    ) -> Self {
         let (harness_handle, core_handle) = create_channels(ChannelConfig::default());
 
         let HarnessHandle { input, output } = harness_handle;
@@ -49,11 +57,16 @@ impl LocalHarness {
         let event_tx_clone = event_tx.clone();
         let (scheduler_tx, scheduler_rx) = mpsc::channel(256);
 
+        let archive_root = archive_root.unwrap_or_else(default_state_dir);
+        let max_context_window = max_context_window_from_env();
+
         // Spawn the core event loop.
-        let core_task = tokio::spawn(quine_core::run_core_loop(
+        let core_task = tokio::spawn(quine_core::run_core_loop_with_compaction(
             core_handle,
             provider,
             permission_checker,
+            archive_root,
+            max_context_window,
         ));
 
         let scheduler_task = tokio::spawn(Self::scheduler_loop(scheduler_input, scheduler_rx));
@@ -234,6 +247,26 @@ impl LocalHarness {
                 }
                 false
             }
+            ScheduledAction::CompactSession { session_id, reply } => {
+                let (core_reply_tx, core_reply_rx) = oneshot::channel();
+                let result = match harness_input
+                    .send(CoreInput::CompactSession {
+                        session_id,
+                        reply: core_reply_tx,
+                    })
+                    .await
+                {
+                    Ok(()) => core_reply_rx
+                        .await
+                        .map_err(|_| HarnessError::CoreChannelClosed)
+                        .and_then(|result| {
+                            result.map_err(|reason| HarnessError::Internal { message: reason })
+                        }),
+                    Err(_) => Err(HarnessError::CoreChannelClosed),
+                };
+                let _ = reply.send(result);
+                false
+            }
             ScheduledAction::SubmitToolResult {
                 session_id,
                 tool_use_id,
@@ -396,6 +429,20 @@ impl HarnessService for LocalHarness {
             content,
             reply: Some(reply_tx),
         }))
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?
+    }
+
+    async fn compact_session(&self, session_id: SessionId) -> Result<(), HarnessError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.enqueue(ScheduledCommand::immediate(
+            ScheduledAction::CompactSession {
+                session_id,
+                reply: reply_tx,
+            },
+        ))
         .await?;
         reply_rx
             .await
@@ -670,6 +717,10 @@ enum ScheduledAction {
         session_id: SessionId,
         content: String,
         reply: Option<oneshot::Sender<Result<(), HarnessError>>>,
+    },
+    CompactSession {
+        session_id: SessionId,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
     },
     SubmitToolResult {
         session_id: SessionId,

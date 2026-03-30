@@ -475,6 +475,53 @@ async fn handle_request(
             }
         }
 
+        methods::COMPACT_SESSION => {
+            let params = request.params.as_ref();
+            let session_id_str = params
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str());
+
+            match session_id_str {
+                Some(sid) => {
+                    let session_id: quine_core::SessionId =
+                        match serde_json::from_value(serde_json::Value::String(sid.to_string())) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                let resp = JsonRpcErrorResponse::new(
+                                    id,
+                                    error_codes::INVALID_PARAMS,
+                                    format!("invalid session_id: {e}"),
+                                );
+                                return Some(serde_json::to_string(&resp).unwrap_or_default());
+                            }
+                        };
+
+                    match service.compact_session(session_id).await {
+                        Ok(()) => {
+                            let resp = JsonRpcResponse::success(id, "ok");
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                None => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing session_id",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
         methods::SHUTDOWN => match service.shutdown().await {
             Ok(()) => {
                 let resp = JsonRpcResponse::success(id, "ok");

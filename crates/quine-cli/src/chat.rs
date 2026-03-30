@@ -49,6 +49,7 @@ enum ChatCommandAction {
     Quit,
     ShowError(String),
     SendMessage(String),
+    CompactSession,
     EnterPlanModeAndSend(String),
     StartSkillSession { skill_name: String, request: String },
 }
@@ -101,6 +102,13 @@ fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
         match command {
             SlashCommand::BuiltIn { name, arguments } => match name.as_str() {
                 "quit" => ChatCommandAction::Quit,
+                "compact" => {
+                    if arguments.is_empty() {
+                        ChatCommandAction::CompactSession
+                    } else {
+                        ChatCommandAction::ShowError("Usage: /compact".to_string())
+                    }
+                }
                 "plan" => {
                     if arguments.is_empty() {
                         ChatCommandAction::ShowError("Usage: /plan <request>".to_string())
@@ -167,6 +175,18 @@ pub async fn run_chat(
                             ChatCommandAction::Quit => break,
                             ChatCommandAction::ShowError(message) => {
                                 renderer.render_error(&message).await?;
+                                continue;
+                            }
+                            ChatCommandAction::CompactSession => {
+                                renderer.render_info("Compacting context...").await?;
+                                let params = serde_json::json!({
+                                    "session_id": session.session_id,
+                                });
+                                let result = client.call(methods::COMPACT_SESSION, Some(params)).await?;
+                                match result {
+                                    Ok(_) => renderer.render_info("Context compacted.").await?,
+                                    Err(error) => renderer.render_error(&error).await?,
+                                }
                                 continue;
                             }
                             ChatCommandAction::SendMessage(content) => content,
@@ -478,6 +498,14 @@ mod tests {
         assert_eq!(
             handle_chat_command("/plan", false),
             ChatCommandAction::ShowError("Usage: /plan <request>".into())
+        );
+    }
+
+    #[test]
+    fn chat_command_compact_uses_manual_compaction_path() {
+        assert_eq!(
+            handle_chat_command("/compact", false),
+            ChatCommandAction::CompactSession
         );
     }
 

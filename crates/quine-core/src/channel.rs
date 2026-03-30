@@ -37,6 +37,12 @@ pub enum CoreInput {
         content: String,
     },
 
+    /// Compact a session's stored context without sending a new user message.
+    CompactSession {
+        session_id: SessionId,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+
     /// Return the result of a tool invocation the core previously requested.
     ToolResult {
         session_id: SessionId,
