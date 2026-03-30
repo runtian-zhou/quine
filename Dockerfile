@@ -17,10 +17,11 @@ WORKDIR /workspace
 ENV CARGO_HOME=/usr/local/cargo
 ENV HOME=/root
 ENV XDG_RUNTIME_DIR=/tmp/xdg-runtime
+ENV XDG_STATE_HOME=/root/.quine
 
 RUN rustup component add clippy rustfmt
 
-RUN mkdir -p /tmp/xdg-runtime
+RUN mkdir -p /tmp/xdg-runtime /root/.quine/state
 
 ENTRYPOINT ["cargo", "run", "--bin", "quine", "--"]
 CMD ["chat"]

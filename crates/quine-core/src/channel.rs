@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::CoreError;
+use crate::persistence::CoreCheckpoint;
 use crate::session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 use crate::skill::Skill;
 use crate::tool;
@@ -199,6 +200,9 @@ pub enum CoreOutput {
         duration_us: u64,
         usage: Option<quine_llm::TokenUsage>,
     },
+
+    /// A stable checkpoint was requested after a committed state transition.
+    CheckpointRequested { checkpoint: CoreCheckpoint },
 }
 
 /// Configuration for channel buffer sizes.

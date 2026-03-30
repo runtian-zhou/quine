@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use chrono::Utc;
 use futures::StreamExt;
 use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, ToolDefinition};
 use tokio::sync::{mpsc, oneshot};
@@ -11,6 +12,9 @@ use crate::compaction::{self, CompactionTrigger};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
 use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision};
+use crate::persistence::{
+    CoreCheckpoint, PersistedSession, PersistedSessionConfig, PersistedSessionState,
+};
 use crate::planner::scheduler::{get_ready_actions, render_plan};
 use crate::session::{ExitStatus, SessionId, SessionSignal, SessionState};
 use crate::session_tree::SessionTree;
@@ -120,6 +124,10 @@ struct SessionContext {
     max_context_window: Option<u64>,
     /// Archive generation counter for this session.
     compaction_generation: u64,
+    /// Serializable creation-time configuration needed for restore.
+    persisted_config: PersistedSessionConfig,
+    /// Stable creation timestamp used for checkpoint listings.
+    created_at: chrono::DateTime<Utc>,
 }
 
 struct SessionInit {
@@ -133,12 +141,29 @@ struct SessionInit {
     max_context_window: Option<u64>,
 }
 
+impl SessionInit {
+    fn to_persisted_config(&self) -> PersistedSessionConfig {
+        PersistedSessionConfig {
+            system_prompt: self.system_prompt.clone(),
+            skill_names: self
+                .skills
+                .iter()
+                .map(|skill| skill.meta.name.clone())
+                .collect(),
+            working_directory: self.working_directory.clone(),
+            plan_mode: self.plan_mode,
+            auto_approve_permissions: self.auto_approve_permissions,
+        }
+    }
+}
+
 impl SessionContext {
     async fn new(
         init: SessionInit,
         provider: &Arc<dyn LlmProvider>,
         permission_checker: &Option<Arc<dyn PermissionChecker>>,
     ) -> Result<Self, CoreError> {
+        let persisted_config = init.to_persisted_config();
         let SessionInit {
             system_prompt,
             skills,
@@ -245,6 +270,92 @@ impl SessionContext {
             archive_root,
             max_context_window,
             compaction_generation: 0,
+            persisted_config,
+            created_at: Utc::now(),
+        })
+    }
+
+    async fn from_persisted(
+        persisted: PersistedSession,
+        provider: &Arc<dyn LlmProvider>,
+        permission_checker: &Option<Arc<dyn PermissionChecker>>,
+        archive_root: PathBuf,
+        max_context_window: Option<u64>,
+    ) -> Result<(SessionId, Self), CoreError> {
+        let PersistedSession {
+            session_id,
+            created_at,
+            state,
+            config,
+            history,
+            plan_store,
+        } = persisted;
+        let skills =
+            crate::skill::load_skills(&config.working_directory, &config.skill_names).await;
+        let mut session = Self::new(
+            SessionInit {
+                system_prompt: config.system_prompt.clone(),
+                skills,
+                working_directory: config.working_directory.clone(),
+                plan_mode: config.plan_mode,
+                initial_messages: Vec::new(),
+                auto_approve_permissions: config.auto_approve_permissions,
+                archive_root,
+                max_context_window,
+            },
+            provider,
+            permission_checker,
+        )
+        .await?;
+        session.state = state.into();
+        session.history = history;
+        session.plan_store = crate::tool::plan::restore_plan_store(plan_store).await;
+        session.tool_registry = {
+            let mut registry = ToolRegistry::new();
+            registry.register(Arc::new(ReadTool));
+            registry.register(Arc::new(BashTool));
+            registry.register(Arc::new(FindTool));
+            registry.register(Arc::new(AskUserTool));
+            registry.register(Arc::new(PlanTool::new(session.plan_store.clone())));
+            if !session.persisted_config.plan_mode {
+                registry.register(Arc::new(WriteTool));
+                registry.register(Arc::new(SubagentTool::new(
+                    Arc::clone(provider),
+                    permission_checker.clone(),
+                )));
+                registry.register(Arc::new(SpawnTool));
+                registry.register(Arc::new(WaitChildTool));
+                registry.register(Arc::new(SignalTool));
+                registry.register(Arc::new(SendMessageTool));
+                registry.register(Arc::new(RecvMessageTool));
+            }
+            for skill in &crate::skill::load_skills(
+                &session.persisted_config.working_directory,
+                &session.persisted_config.skill_names,
+            )
+            .await
+            {
+                for tool_def in &skill.tool_definitions {
+                    registry.register(Arc::new(SkillTemplateTool::new(tool_def.clone())));
+                }
+            }
+            registry
+        };
+        session.tools = session.tool_registry.tool_definitions();
+        session.persisted_config = config;
+        session.created_at = created_at;
+        Ok((session_id, session))
+    }
+
+    async fn snapshot(&self, session_id: SessionId) -> Option<PersistedSession> {
+        let state = PersistedSessionState::from_runtime(self.state)?;
+        Some(PersistedSession {
+            session_id,
+            created_at: self.created_at,
+            state,
+            config: self.persisted_config.clone(),
+            history: self.history.clone(),
+            plan_store: crate::tool::plan::snapshot_plan_store(&self.plan_store).await,
         })
     }
 }
@@ -732,6 +843,30 @@ async fn archive_old_tool_results_in_history(
     Ok(())
 }
 
+async fn snapshot_sessions(
+    sessions: &HashMap<SessionId, SessionContext>,
+    session_tree: &SessionTree,
+) -> CoreCheckpoint {
+    let mut persisted_sessions = Vec::new();
+    for (session_id, session) in sessions {
+        if let Some(persisted) = session.snapshot(*session_id).await {
+            persisted_sessions.push(persisted);
+        }
+    }
+    CoreCheckpoint::new(persisted_sessions, session_tree.snapshot())
+}
+
+async fn emit_checkpoint_request(
+    sessions: &HashMap<SessionId, SessionContext>,
+    session_tree: &SessionTree,
+    output: &mpsc::Sender<CoreOutput>,
+) {
+    let checkpoint = snapshot_sessions(sessions, session_tree).await;
+    let _ = output
+        .send(CoreOutput::CheckpointRequested { checkpoint })
+        .await;
+}
+
 async fn finalize_child_session(
     sessions: &mut HashMap<SessionId, SessionContext>,
     session_tree: &mut SessionTree,
@@ -772,6 +907,7 @@ async fn finalize_child_session(
     }
 
     sessions.remove(&session_id);
+    emit_checkpoint_request(sessions, session_tree, output).await;
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -835,6 +971,8 @@ async fn start_child_session(
             state: SessionState::Idle,
         })
         .await;
+    emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
+
     // Schedule the child's first task for the next core-loop iteration so
     // `spawn` can acknowledge immediately instead of blocking on child completion.
     io.deferred_inputs.push_back(CoreInput::UserMessage {
@@ -1687,6 +1825,7 @@ async fn handle_llm_turn(
                         usage: accumulated_usage,
                     })
                     .await;
+                emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
                 return TurnOutcome::Completed(Some(full_text));
             }
             Ok(Some(LlmCallResult {
@@ -1891,6 +2030,7 @@ async fn handle_llm_turn(
                                 usage: accumulated_usage.clone(),
                             })
                             .await;
+                        emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
                         return TurnOutcome::Cancelled;
                     }
 
@@ -1950,11 +2090,13 @@ pub async fn run_core_loop(
     handle: CoreHandle,
     provider: Arc<dyn LlmProvider>,
     permission_checker: Option<Arc<dyn PermissionChecker>>,
+    restored_checkpoint: Option<CoreCheckpoint>,
 ) {
     run_core_loop_with_compaction(
         handle,
         provider,
         permission_checker,
+        restored_checkpoint,
         std::env::temp_dir().join("quine-core-compactions"),
         None,
     )
@@ -1965,6 +2107,7 @@ pub async fn run_core_loop_with_compaction(
     mut handle: CoreHandle,
     provider: Arc<dyn LlmProvider>,
     permission_checker: Option<Arc<dyn PermissionChecker>>,
+    restored_checkpoint: Option<CoreCheckpoint>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
 ) {
@@ -1972,6 +2115,35 @@ pub async fn run_core_loop_with_compaction(
     let mut session_tree = SessionTree::new();
     let mut deferred_inputs = VecDeque::new();
     debug_log("core event loop started");
+
+    if let Some(checkpoint) = restored_checkpoint {
+        session_tree = SessionTree::restore(checkpoint.session_tree);
+        for persisted_session in checkpoint.sessions {
+            match SessionContext::from_persisted(
+                persisted_session,
+                &provider,
+                &permission_checker,
+                archive_root.clone(),
+                max_context_window,
+            )
+            .await
+            {
+                Ok((session_id, session)) => {
+                    let state = session.state;
+                    sessions.insert(session_id, session);
+                    let _ = handle
+                        .output
+                        .send(CoreOutput::SessionStateChanged { session_id, state })
+                        .await;
+                }
+                Err(error) => {
+                    debug_log(format!(
+                        "failed to restore session from checkpoint: {error}"
+                    ));
+                }
+            }
+        }
+    }
 
     loop {
         let input = match deferred_inputs.pop_front() {
@@ -2042,6 +2214,7 @@ pub async fn run_core_loop_with_compaction(
                                 state: SessionState::Idle,
                             })
                             .await;
+                        emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
                         let _ = reply.send(Ok(()));
                     }
                     Err(e) => {
@@ -2174,10 +2347,7 @@ pub async fn run_core_loop_with_compaction(
                                 Err(error) => {
                                     let _ = handle
                                         .output
-                                        .send(CoreOutput::SessionError {
-                                            session_id,
-                                            error,
-                                        })
+                                        .send(CoreOutput::SessionError { session_id, error })
                                         .await;
                                     continue;
                                 }
@@ -2252,6 +2422,7 @@ pub async fn run_core_loop_with_compaction(
                             state: SessionState::Idle,
                         })
                         .await;
+                    emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
                 }
             }
 
@@ -2713,7 +2884,9 @@ mod tests {
         assert!(output.contains("archive="));
         assert!(output.contains("[... elided ...]"));
 
-        let archived_dir = archive_root.join("tool-results").join(session_id_string(session_id));
+        let archived_dir = archive_root
+            .join("tool-results")
+            .join(session_id_string(session_id));
         let entries = std::fs::read_dir(&archived_dir)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
@@ -2730,7 +2903,7 @@ mod tests {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new("73"));
-        let loop_handle = tokio::spawn(run_core_loop(core, provider, None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider, None, None));
 
         let parent_id = SessionId::new();
         let (create_reply_tx, create_reply_rx) = oneshot::channel();
@@ -2803,7 +2976,12 @@ mod tests {
     async fn create_session_and_shutdown() {
         let (harness, core) = create_channels(ChannelConfig::default());
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(
+            core,
+            Arc::new(MockProvider::empty()),
+            None,
+            None,
+        ));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2833,7 +3011,12 @@ mod tests {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(
+            core,
+            Arc::new(MockProvider::empty()),
+            None,
+            None,
+        ));
 
         let session_id = SessionId::new();
         harness
@@ -2863,7 +3046,12 @@ mod tests {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(
+            core,
+            Arc::new(MockProvider::empty()),
+            None,
+            None,
+        ));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2883,7 +3071,8 @@ mod tests {
             .unwrap();
         reply_rx.await.unwrap().unwrap();
 
-        // Drain the SessionStateChanged from creation
+        // Drain the SessionStateChanged from creation and checkpoint request.
+        let _ = output.recv().await.unwrap();
         let _ = output.recv().await.unwrap();
 
         harness
@@ -2919,7 +3108,12 @@ mod tests {
     async fn duplicate_session_id_returns_error() {
         let (harness, core) = create_channels(ChannelConfig::default());
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(
+            core,
+            Arc::new(MockProvider::empty()),
+            None,
+            None,
+        ));
 
         let session_id = SessionId::new();
 
@@ -2967,7 +3161,7 @@ mod tests {
         let mut output = harness.output;
 
         let provider = MockProvider::new("Hello from the LLM!");
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None, None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -2987,6 +3181,7 @@ mod tests {
             .unwrap();
         reply_rx.await.unwrap().unwrap();
 
+        let _ = output.recv().await.unwrap();
         let _ = output.recv().await.unwrap();
 
         harness
@@ -3076,7 +3271,7 @@ mod tests {
         let provider = ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
         };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None, None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -3199,7 +3394,7 @@ mod tests {
             call_count: std::sync::atomic::AtomicU32::new(0),
             marker_path: marker_path.clone(),
         };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None, None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -3325,7 +3520,8 @@ mod tests {
         let provider = ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
         };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), Some(checker)));
+        let loop_handle =
+            tokio::spawn(run_core_loop(core, Arc::new(provider), Some(checker), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -3387,7 +3583,7 @@ mod tests {
     async fn create_session_seeds_initial_messages_after_system_prompt() {
         let (harness, core) = create_channels(ChannelConfig::default());
         let provider = Arc::new(MockProvider::empty());
-        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None, None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();

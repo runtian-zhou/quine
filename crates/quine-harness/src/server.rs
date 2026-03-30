@@ -293,6 +293,9 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
             "message_received",
             serde_json::json!({"from": from, "content": content}),
         ),
+        quine_core::CoreOutput::CheckpointRequested { .. } => {
+            return;
+        }
     };
 
     let entry = SessionLogEntry {
@@ -642,7 +645,7 @@ async fn handle_request(
             }
         }
 
-        methods::LIST_SESSIONS => match session_log::list_sessions().await {
+        methods::LIST_SESSIONS => match service.list_sessions().await {
             Ok(summaries) => {
                 let resp = JsonRpcResponse::success(
                     id,
@@ -1190,6 +1193,9 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
                 "content": content,
             })),
         ),
+        quine_core::CoreOutput::CheckpointRequested { .. } => {
+            JsonRpcNotification::new("internal/checkpoint_requested", None)
+        }
     }
 }
 

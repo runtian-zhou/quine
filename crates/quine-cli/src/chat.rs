@@ -7,6 +7,7 @@ use crate::client::IpcClient;
 use crate::render::{Renderer, TerminalRenderer};
 use crate::session::{
     create_session, create_session_with_initial_messages, create_slash_skill_session,
+    resolve_resume_target,
 };
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{methods, notifications};
@@ -42,6 +43,19 @@ async fn confirm_plan_exit(
             None => return Ok(false),
         }
     }
+}
+
+fn print_resume_command(socket_path: &Path, session_id: &str) {
+    eprintln!(
+        "Resume from this checkpoint with: `quine run --session {} --socket {} \"<message>\"`",
+        session_id,
+        socket_path.display()
+    );
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlanExitHandoff {
+    final_plan: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,13 +156,21 @@ pub async fn run_chat(
     skills: &[String],
     plan_mode: bool,
     auto_approve_permissions: bool,
+    resume_checkpoint: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let mut renderer = TerminalRenderer::new();
 
-    // Create a session.
-    let mut session =
-        create_session(&mut client, skills, plan_mode, auto_approve_permissions).await?;
+    let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
+
+    // Create or resume a session.
+    let mut session = match resumed {
+        Some(target) => crate::session::CreatedSession {
+            session_id: target.session_id,
+            max_context_window: None,
+        },
+        None => create_session(&mut client, skills, plan_mode, auto_approve_permissions).await?,
+    };
     let mut session_in_plan_mode = plan_mode;
 
     eprintln!("Session created: {}", session.session_id);
@@ -302,6 +324,7 @@ pub async fn run_chat(
                                 }
                                 _ = tokio::signal::ctrl_c() => {
                                     eprintln!("\nInterrupted.");
+                                    print_resume_command(socket_path, &session.session_id);
                                     shutdown_if_spawned(&mut client, daemon_spawned).await;
                                     return Ok(());
                                 }
@@ -311,12 +334,14 @@ pub async fn run_chat(
                     None => {
                         // EOF (Ctrl-D).
                         eprintln!("\nGoodbye!");
+                        print_resume_command(socket_path, &session.session_id);
                         break;
                     }
                 }
             }
             _ = tokio::signal::ctrl_c() => {
                 eprintln!("\nInterrupted.");
+                print_resume_command(socket_path, &session.session_id);
                 shutdown_if_spawned(&mut client, daemon_spawned).await;
                 return Ok(());
             }

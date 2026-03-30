@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use tokio::sync::oneshot;
 
+use crate::persistence::PersistedSessionTree;
 use crate::session::{ExitStatus, SessionId};
 
 /// Tracks parent-child relationships between agent sessions.
@@ -69,6 +70,23 @@ impl SessionTree {
         } else {
             self.waiters.entry(session).or_default().push(waiter);
             false
+        }
+    }
+
+    pub fn snapshot(&self) -> PersistedSessionTree {
+        PersistedSessionTree {
+            parents: self.parents.clone(),
+            children: self.children.clone(),
+            exit_statuses: self.exit_statuses.clone(),
+        }
+    }
+
+    pub fn restore(snapshot: PersistedSessionTree) -> Self {
+        Self {
+            parents: snapshot.parents,
+            children: snapshot.children,
+            exit_statuses: snapshot.exit_statuses,
+            waiters: HashMap::new(),
         }
     }
 }
