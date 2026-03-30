@@ -18,7 +18,7 @@ use crate::run::fetch_available_skills;
 use crate::session::{
     create_session, create_session_with_initial_messages, create_slash_skill_session,
 };
-use app::{AgentPhase, AppAction};
+use app::{AgentPhase, AppAction, PendingPlanExit};
 use quine_harness::protocol::{methods, notifications};
 use quine_llm::Message;
 
@@ -120,14 +120,16 @@ async fn run_event_loop(
             maybe_notif = client.recv_notification() => {
                 match maybe_notif {
                     Some(notif) => {
-                        let should_exit_plan_mode = if app.plan_mode
+                        let pending_plan_exit = if app.plan_mode
                             && notif.method == notifications::TURN_COMPLETE
                         {
                             app.messages.iter().rev().find_map(|entry| match entry {
                                 app::ConversationEntry::AssistantText(text)
                                     if !text.trim().is_empty() =>
                                 {
-                                    Some(text.clone())
+                                    Some(PendingPlanExit::FinalPlan {
+                                        final_plan: text.clone(),
+                                    })
                                 }
                                 _ => None,
                             })
@@ -135,16 +137,8 @@ async fn run_event_loop(
                             None
                         };
                         app.apply_notification(&notif);
-                        if let Some(final_plan) = should_exit_plan_mode {
-                            execute_action(
-                                app,
-                                client,
-                                skills,
-                                available_skills,
-                                auto_approve_permissions,
-                                AppAction::ExitPlanMode { final_plan },
-                            )
-                            .await?;
+                        if let Some(pending_exit) = pending_plan_exit {
+                            app.request_plan_exit_confirmation(pending_exit);
                         }
                     }
                     None => {
