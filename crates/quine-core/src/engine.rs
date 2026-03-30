@@ -463,31 +463,12 @@ async fn start_child_session(
             state: SessionState::Idle,
         })
         .await;
-
-    let turn_outcome = {
-        let session = sessions
-            .get_mut(&child_id)
-            .expect("child session inserted before starting turn");
-        session.state = SessionState::Streaming;
-        session.history.push(Message::user(&task));
-        let _ = io
-            .output
-            .send(CoreOutput::SessionStateChanged {
-                session_id: child_id,
-                state: SessionState::Streaming,
-            })
-            .await;
-        handle_llm_turn(sessions, child_id, io, engine).await
-    };
-
-    finalize_child_session(
-        sessions,
-        engine.session_tree,
-        child_id,
-        turn_outcome,
-        io.output,
-    )
-    .await;
+    // Schedule the child's first task for the next core-loop iteration so
+    // `spawn` can acknowledge immediately instead of blocking on child completion.
+    io.deferred_inputs.push_back(CoreInput::UserMessage {
+        session_id: child_id,
+        content: task,
+    });
     Ok(())
 }
 
@@ -1741,6 +1722,7 @@ mod tests {
     use super::*;
     use crate::channel::{create_channels, ChannelConfig};
     use crate::permission::PermissionError;
+    use crate::session::{ExitStatus, InheritanceFlags};
     use std::pin::Pin;
     use tokio::sync::oneshot;
 
@@ -1927,77 +1909,73 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_and_wait_child_complete_without_core_ack_deadlock() {
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new("73"));
-        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
-        let session_id = SessionId::new();
-        let session = SessionContext::new(
-            SessionInit {
+        let loop_handle = tokio::spawn(run_core_loop(core, provider, None));
+
+        let parent_id = SessionId::new();
+        let (create_reply_tx, create_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id: parent_id,
                 system_prompt: None,
+                working_directory: None,
                 skills: Vec::new(),
-                working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
-                initial_messages: Vec::new(),
                 auto_approve_permissions: false,
-            },
-            &provider,
-            &permission_checker,
-        )
-        .await
-        .unwrap();
+                initial_messages: Vec::new(),
+                reply: create_reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(create_reply_rx.await.unwrap().is_ok());
+        let _ = output.recv().await.unwrap();
 
-        let spawn_call = PendingToolCall {
-            tool_use_id: "toolu_spawn".into(),
-            tool_name: "spawn".into(),
-            arguments: serde_json::json!({
-                "task": "Reply with exactly one integer. No explanation."
-            }),
-        };
+        let child_id = SessionId::new();
+        let (spawn_reply_tx, spawn_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::SpawnSession {
+                parent_id,
+                child_id,
+                task: "Reply with exactly one integer. No explanation.".into(),
+                system_prompt: None,
+                inheritance: InheritanceFlags::default(),
+                reply: spawn_reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(spawn_reply_rx.await.unwrap().is_ok());
 
-        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(16);
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(16);
-        let mut deferred_inputs = VecDeque::new();
-        let mut io = CoreIo {
-            output: &output_tx,
-            input: &mut input_rx,
-            input_tx: &input_tx,
-            deferred_inputs: &mut deferred_inputs,
-        };
-        let mut sessions = HashMap::from([(session_id, session)]);
-        let mut session_tree = SessionTree::new();
-        let mut engine = EngineState {
-            provider: &provider,
-            permission_checker: &permission_checker,
-            session_tree: &mut session_tree,
-        };
+        let (wait_reply_tx, wait_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::WaitSession {
+                parent_id,
+                child_id,
+                reply: wait_reply_tx,
+                non_blocking: false,
+            })
+            .await
+            .unwrap();
 
-        let spawn_result =
-            execute_tool_call(&spawn_call, &mut sessions, session_id, &mut io, &mut engine).await;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), wait_reply_rx)
+            .await
+            .expect("wait_child should not deadlock")
+            .unwrap()
+            .expect("child should exit successfully");
 
-        let child_id = match spawn_result {
-            ToolOutcome::Success { output } => output,
-            other => panic!("expected successful spawn, got {other:?}"),
-        };
-
-        let wait_call = PendingToolCall {
-            tool_use_id: "toolu_wait".into(),
-            tool_name: "wait_child".into(),
-            arguments: serde_json::json!({
-                "child_id": child_id,
-            }),
-        };
-
-        let wait_result =
-            execute_tool_call(&wait_call, &mut sessions, session_id, &mut io, &mut engine).await;
-
-        match wait_result {
-            ToolOutcome::Success { output } => {
-                assert!(
-                    output.contains("73"),
-                    "expected child output in wait result: {output}"
-                );
+        match status {
+            ExitStatus::Success { output } => {
+                assert!(output.contains("73"), "expected child output in wait result: {output}");
             }
-            other => panic!("expected successful wait_child, got {other:?}"),
+            other => panic!("expected completed exit status, got {other:?}"),
         }
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
     }
 
     #[tokio::test]
