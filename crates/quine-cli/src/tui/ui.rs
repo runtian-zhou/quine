@@ -3,6 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthStr;
 
 use super::app::{AgentPhase, App, ConversationEntry, InputBuffer, ToolStatus};
 
@@ -68,11 +69,15 @@ fn wrapped_rows(width: usize, area_width: u16) -> u16 {
     width.max(1).div_ceil(area_width) as u16
 }
 
+fn display_width(text: &str) -> usize {
+    text.width()
+}
+
 fn input_content_rows(input: &InputBuffer, label: &str, area_width: u16) -> u16 {
     let total_rows: u16 = (0..input.line_count())
         .map(|index| {
-            let prefix_width = if index == 0 { label.chars().count() } else { 0 };
-            wrapped_rows(prefix_width + input.line(index).chars().count(), area_width)
+            let prefix_width = if index == 0 { display_width(label) } else { 0 };
+            wrapped_rows(prefix_width + display_width(input.line(index)), area_width)
         })
         .sum();
 
@@ -96,12 +101,12 @@ fn input_cursor_position(input: &InputBuffer, label: &str, area_width: u16) -> (
 
     let mut row = 0u16;
     for index in 0..input.row() {
-        let prefix_width = if index == 0 { label.chars().count() } else { 0 };
-        row += wrapped_rows(prefix_width + input.line(index).chars().count(), area_width);
+        let prefix_width = if index == 0 { display_width(label) } else { 0 };
+        row += wrapped_rows(prefix_width + display_width(input.line(index)), area_width);
     }
 
     let prefix_width = if input.row() == 0 {
-        label.chars().count()
+        display_width(label)
     } else {
         0
     };
@@ -728,5 +733,14 @@ mod tests {
         input.set_from_string("abc\ndefghijklmnop");
 
         assert_eq!(input_cursor_position(&input, "> ", 8), (2, 5));
+    }
+
+    #[test]
+    fn input_cursor_position_uses_display_width_for_wide_wrap_boundary() {
+        let mut input = InputBuffer::new();
+        input.set_from_string("1234567界");
+
+        assert_eq!(input_cursor_position(&input, "> ", 10), (1, 1));
+        assert_eq!(input_content_rows(&input, "> ", 10), 2);
     }
 }
