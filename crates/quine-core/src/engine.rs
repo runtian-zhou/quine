@@ -715,6 +715,23 @@ async fn prepare_tool_result_for_history(
     ))
 }
 
+async fn archive_old_tool_results_in_history(
+    session: &mut SessionContext,
+    session_id: SessionId,
+) -> Result<(), CoreError> {
+    let session_id_str = session_id_string(session_id);
+    session.history = compaction::archive_old_tool_results(
+        &session.archive_root,
+        &session_id_str,
+        &session.history,
+    )
+    .await
+    .map_err(|error| CoreError::Internal {
+        message: format!("failed to archive old tool results: {error}"),
+    })?;
+    Ok(())
+}
+
 async fn finalize_child_session(
     sessions: &mut HashMap<SessionId, SessionContext>,
     session_tree: &mut SessionTree,
@@ -1541,6 +1558,18 @@ async fn handle_llm_turn(
     );
 
     loop {
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return TurnOutcome::Failed("session not found".into());
+        };
+        if let Err(error) = archive_old_tool_results_in_history(session, session_id).await {
+            let _ = io
+                .output
+                .send(CoreOutput::SessionError { session_id, error })
+                .await;
+            session.state = SessionState::Idle;
+            return TurnOutcome::Failed("session error".into());
+        }
+
         let Some(should_auto_compact) = sessions.get(&session_id).map(|session| {
             compaction::should_auto_compact(session.max_context_window, session.last_input_tokens)
         }) else {

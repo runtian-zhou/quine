@@ -185,6 +185,51 @@ pub async fn archive_tool_result(
     Ok(path)
 }
 
+pub async fn archive_old_tool_results(
+    archive_root: &Path,
+    session_id: &str,
+    history: &[Message],
+) -> std::io::Result<Vec<Message>> {
+    let preserve_from = live_tail_start(history).unwrap_or(history.len());
+    let tool_names = tool_name_map(history);
+    let mut remapped = Vec::with_capacity(history.len());
+
+    for (index, message) in history.iter().enumerate() {
+        let rewritten = match &message.content {
+            MessageContent::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+            } if index < preserve_from && !output.starts_with("[tool result archived:") => {
+                let archived = archive_tool_result(archive_root, session_id, tool_use_id, output).await?;
+                let archive_ref = archived.display().to_string();
+                let tool_name = tool_names
+                    .get(tool_use_id)
+                    .map(String::as_str)
+                    .unwrap_or("unknown");
+                Message {
+                    role: message.role.clone(),
+                    content: MessageContent::ToolResult {
+                        tool_use_id: tool_use_id.clone(),
+                        output: render_archived_tool_result(
+                            tool_name,
+                            tool_use_id,
+                            *is_error,
+                            output,
+                            &archive_ref,
+                        ),
+                        is_error: *is_error,
+                    },
+                }
+            }
+            _ => message.clone(),
+        };
+        remapped.push(rewritten);
+    }
+
+    Ok(remapped)
+}
+
 pub fn render_archived_tool_result(
     tool_name: &str,
     tool_use_id: &str,
@@ -317,6 +362,7 @@ fn role_label(role: Role) -> &'static str {
 mod tests {
     use super::*;
     use quine_llm::ToolUseRequest;
+    use uuid::Uuid;
 
     #[test]
     fn micro_compact_replaces_old_tool_results() {
@@ -380,5 +426,49 @@ mod tests {
         let (prefix, tail) = split_history_for_compaction(&history);
         assert_eq!(prefix.len(), 3);
         assert_eq!(tail.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn archive_old_tool_results_rewrites_only_non_live_results() {
+        let history = vec![
+            Message::assistant_tool_use(
+                None,
+                vec![ToolUseRequest {
+                    tool_use_id: "id-1".into(),
+                    tool_name: "bash".into(),
+                    arguments: serde_json::json!({"cmd": "pwd"}),
+                }],
+            ),
+            Message::tool_result("id-1", "old output", false),
+            Message::assistant_tool_use(
+                None,
+                vec![ToolUseRequest {
+                    tool_use_id: "id-2".into(),
+                    tool_name: "bash".into(),
+                    arguments: serde_json::json!({"cmd": "ls"}),
+                }],
+            ),
+            Message::tool_result("id-2", "live output", false),
+        ];
+        let archive_root = std::env::temp_dir().join(format!("quine-core-compaction-{}", Uuid::new_v4()));
+
+        let rewritten = archive_old_tool_results(&archive_root, "session-1", &history)
+            .await
+            .unwrap();
+
+        match &rewritten[1].content {
+            MessageContent::ToolResult { output, .. } => {
+                assert!(output.starts_with("[tool result archived: bash, ok"));
+            }
+            _ => panic!("expected archived old tool result"),
+        }
+        match &rewritten[3].content {
+            MessageContent::ToolResult { output, .. } => {
+                assert_eq!(output, "live output");
+            }
+            _ => panic!("expected live tool result"),
+        }
+
+        let _ = std::fs::remove_dir_all(archive_root);
     }
 }
