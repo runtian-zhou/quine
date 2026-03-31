@@ -1219,6 +1219,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "quine-sdk"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "futures",
+ "quine-core",
+ "quine-harness",
+ "quine-llm",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "quote"
 version = "1.0.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"

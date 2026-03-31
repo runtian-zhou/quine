@@ -27,6 +27,7 @@ crates/
   quine-core/       # agent harness library
   quine-harness/    # local daemon service
   quine-llm/        # LLM provider adapter
+  quine-sdk/        # Rust client SDK for harness connections
 features/           # feature request markdown files
 ```
 
@@ -38,8 +39,9 @@ features/           # feature request markdown files
 | **quine-core** | Agent harness library. Orchestrates agent execution: state machine, tool dispatch, conversation management, permissions, replay. Owns core orchestration traits. |
 | **quine-harness** | Local daemon service wrapping quine-core. Manages multiple concurrent agent sessions, background agents, and shared state (permissions, logs, tool registries). |
 | **quine-llm** | LLM provider adapter. Unified interface over multiple providers (Anthropic, OpenAI, etc.) with streaming support. |
+| **quine-sdk** | Rust-first client SDK for connecting to `quine-harness` over the existing Unix domain socket JSON-RPC transport. Keeps transport internals crate-private and exposes a small connection-oriented API. |
 
-**Dependency flow:** `quine-cli` -> `quine-harness` (via IPC/API) -> `quine-core` -> `quine-llm`
+**Dependency flow:** `quine-cli` -> `quine-harness` (via IPC/API) -> `quine-core` -> `quine-llm`; `quine-sdk` is an external-facing client crate that may depend on the harness protocol surface but is not depended on by the other workspace crates.
 
 ## Engineering Principles — Traits as Interfaces
 
