@@ -37,7 +37,7 @@ pub struct SessionConfig {
 pub struct HarnessConfig {
     /// Path to the Unix domain socket for IPC.
     pub socket_path: PathBuf,
-    /// Root directory for durable harness state such as compacted transcripts.
+    /// Root directory for durable harness state such as checkpoints and compacted transcripts.
     pub state_dir: PathBuf,
 }
 
@@ -66,12 +66,9 @@ pub fn default_socket_path() -> PathBuf {
 /// Returns the default path for durable harness state.
 pub fn default_state_dir() -> PathBuf {
     if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
-        PathBuf::from(state_home).join("quine")
+        PathBuf::from(state_home).join("state")
     } else if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home)
-            .join(".local")
-            .join("state")
-            .join("quine")
+        PathBuf::from(home).join(".quine").join("state")
     } else {
         PathBuf::from("/tmp").join("quine-state")
     }
@@ -232,6 +229,17 @@ mod tests {
             Some("You are helpful.")
         );
         assert!(deserialized.auto_approve_permissions);
+    }
+
+    #[test]
+    fn default_state_dir_prefers_quine_home_layout() {
+        std::env::remove_var("XDG_STATE_HOME");
+        std::env::set_var("HOME", "/tmp/quine-home");
+        assert_eq!(
+            default_state_dir(),
+            PathBuf::from("/tmp/quine-home/.quine/state")
+        );
+        std::env::remove_var("HOME");
     }
 
     #[test]

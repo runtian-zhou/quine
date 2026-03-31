@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use tokio::sync::Mutex;
 
 use super::{ExecutionContext, Tool, ToolError, ToolOutput};
+use crate::persistence::PersistedPlanStore;
 use crate::planner::scheduler::{render_plan, skip_dependents, validate_dag};
 use crate::planner::{Action, ActionId, ActionPlan, ActionStatus, PlanId};
 
@@ -14,6 +15,22 @@ pub type PlanStore = Arc<Mutex<HashMap<PlanId, ActionPlan>>>;
 /// Create a new empty plan store.
 pub fn new_plan_store() -> PlanStore {
     Arc::new(Mutex::new(HashMap::new()))
+}
+
+pub async fn snapshot_plan_store(plan_store: &PlanStore) -> PersistedPlanStore {
+    let store = plan_store.lock().await;
+    PersistedPlanStore::from_plans(store.values().cloned())
+}
+
+pub async fn restore_plan_store(snapshot: PersistedPlanStore) -> PlanStore {
+    let store = new_plan_store();
+    {
+        let mut locked = store.lock().await;
+        for plan in snapshot.plans {
+            locked.insert(plan.plan_id, plan);
+        }
+    }
+    store
 }
 
 /// Tool for creating and updating action plans.

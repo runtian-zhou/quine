@@ -3,6 +3,11 @@ use quine_harness::protocol::methods;
 use quine_llm::Message;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResumeTarget {
+    pub(crate) session_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CreatedSession {
     pub(crate) session_id: String,
     pub(crate) max_context_window: Option<u64>,
@@ -62,6 +67,49 @@ fn slash_skill_arguments_overlay(request: &str) -> Option<String> {
          If the loaded skill refers to `$ARGUMENTS`, `the argument`, or `the user's feature description`, \
          treat that as the following text:\n\n{trimmed}"
     ))
+}
+
+pub(crate) async fn resolve_resume_target(
+    client: &mut IpcClient,
+    checkpoint: Option<&str>,
+) -> anyhow::Result<Option<ResumeTarget>> {
+    let Some(checkpoint) = checkpoint else {
+        return Ok(None);
+    };
+
+    let result = client.call(methods::LIST_SESSIONS, None).await?;
+    let value = result.map_err(|message| anyhow::anyhow!(message))?;
+    let sessions = value.as_array().cloned().unwrap_or_default();
+
+    let target = if checkpoint == "latest" {
+        sessions
+            .iter()
+            .max_by_key(|session| {
+                session
+                    .get("first_event")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .cloned()
+    } else {
+        sessions
+            .iter()
+            .find(|session| {
+                session.get("session_id").and_then(|value| value.as_str()) == Some(checkpoint)
+            })
+            .cloned()
+    };
+
+    match target {
+        Some(session) => Ok(Some(ResumeTarget {
+            session_id: session
+                .get("session_id")
+                .and_then(|value| value.as_str())
+                .ok_or_else(|| anyhow::anyhow!("checkpoint session missing session_id"))?
+                .to_string(),
+        })),
+        None => anyhow::bail!("checkpoint not found: {checkpoint}"),
+    }
 }
 
 pub(crate) async fn create_session(
@@ -188,6 +236,29 @@ mod tests {
     #[test]
     fn slash_skill_arguments_overlay_is_omitted_for_empty_request() {
         assert_eq!(slash_skill_arguments_overlay("   "), None);
+    }
+
+    #[test]
+    fn resolve_resume_target_picks_latest() {
+        let sessions = serde_json::json!([
+            {"session_id": "older", "first_event": "2024-01-01T00:00:00Z"},
+            {"session_id": "newer", "first_event": "2024-01-02T00:00:00Z"}
+        ]);
+        let picked = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .max_by_key(|session| {
+                session
+                    .get("first_event")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap();
+        assert_eq!(
+            picked.get("session_id").and_then(|v| v.as_str()),
+            Some("newer")
+        );
     }
 
     #[test]

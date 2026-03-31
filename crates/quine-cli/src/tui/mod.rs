@@ -17,10 +17,19 @@ use crate::client::IpcClient;
 use crate::run::fetch_available_skills;
 use crate::session::{
     create_session, create_session_with_initial_messages, create_slash_skill_session,
+    resolve_resume_target,
 };
 use app::{AgentPhase, AppAction, PendingPlanExit};
 use quine_harness::protocol::{methods, notifications};
 use quine_llm::Message;
+
+fn print_resume_command(socket_path: &Path, session_id: &str) {
+    eprintln!(
+        "Resume from this checkpoint with: `quine run --session {} --socket {} \"<message>\"`",
+        session_id,
+        socket_path.display()
+    );
+}
 
 /// Run the TUI chat interface.
 ///
@@ -31,12 +40,21 @@ pub async fn run_tui_chat(
     skills: &[String],
     plan_mode: bool,
     auto_approve_permissions: bool,
+    resume_checkpoint: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let available_skills = fetch_available_skills(&mut client).await?;
 
-    // Create session.
-    let session = create_session(&mut client, skills, plan_mode, auto_approve_permissions).await?;
+    let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
+
+    // Create or resume session.
+    let session = match resumed {
+        Some(target) => crate::session::CreatedSession {
+            session_id: target.session_id,
+            max_context_window: None,
+        },
+        None => create_session(&mut client, skills, plan_mode, auto_approve_permissions).await?,
+    };
 
     // Setup terminal.
     enable_raw_mode()?;
@@ -78,6 +96,10 @@ pub async fn run_tui_chat(
     // Shutdown daemon if we spawned it.
     if daemon_spawned {
         let _ = client.call(methods::SHUTDOWN, None).await;
+    }
+
+    if let Some(session_id) = result.as_ref().ok().map(|_| app.session_id.clone()) {
+        print_resume_command(socket_path, &session_id);
     }
 
     result

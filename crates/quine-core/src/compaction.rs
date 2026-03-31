@@ -201,7 +201,8 @@ pub async fn archive_old_tool_results(
                 output,
                 is_error,
             } if index < preserve_from && !output.starts_with("[tool result archived:") => {
-                let archived = archive_tool_result(archive_root, session_id, tool_use_id, output).await?;
+                let archived =
+                    archive_tool_result(archive_root, session_id, tool_use_id, output).await?;
                 let archive_ref = archived.display().to_string();
                 let tool_name = tool_names
                     .get(tool_use_id)
@@ -450,7 +451,8 @@ mod tests {
             ),
             Message::tool_result("id-2", "live output", false),
         ];
-        let archive_root = std::env::temp_dir().join(format!("quine-core-compaction-{}", Uuid::new_v4()));
+        let archive_root =
+            std::env::temp_dir().join(format!("quine-core-compaction-{}", Uuid::new_v4()));
 
         let rewritten = archive_old_tool_results(&archive_root, "session-1", &history)
             .await

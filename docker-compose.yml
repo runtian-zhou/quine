@@ -10,6 +10,7 @@ services:
       - host.docker.internal:host-gateway
     environment:
       XDG_RUNTIME_DIR: /tmp/xdg-runtime
+      XDG_STATE_HOME: /root/.quine
       GIT_CONFIG_GLOBAL: /root/.config/git/config
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8000/v1}

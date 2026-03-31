@@ -39,6 +39,9 @@ enum Commands {
         /// Auto-approve permission checks for this session.
         #[arg(long)]
         auto_approve: bool,
+        /// Resume a restored checkpoint by session ID, or use `latest`.
+        #[arg(long)]
+        resume: Option<String>,
     },
     /// Send a one-shot message to the agent and exit.
     Run {
@@ -47,6 +50,9 @@ enum Commands {
         /// Resume an existing session by ID.
         #[arg(long)]
         session: Option<String>,
+        /// Resume a restored checkpoint by session ID, or use `latest`.
+        #[arg(long)]
+        resume: Option<String>,
         /// Output structured JSON instead of plain text.
         #[arg(long)]
         json: bool,
@@ -235,19 +241,22 @@ async fn main() -> anyhow::Result<()> {
             skill,
             plan,
             auto_approve,
+            resume,
         } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(default_socket_path);
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                tui::run_tui_chat(&socket_path, &skill, plan, auto_approve).await?;
+                tui::run_tui_chat(&socket_path, &skill, plan, auto_approve, resume.as_deref())
+                    .await?;
             } else {
-                chat::run_chat(&socket_path, &skill, plan, auto_approve).await?;
+                chat::run_chat(&socket_path, &skill, plan, auto_approve, resume.as_deref()).await?;
             }
         }
         Commands::Run {
             message,
             session,
+            resume,
             json,
             socket,
             skill,
@@ -260,6 +269,7 @@ async fn main() -> anyhow::Result<()> {
                 &socket_path,
                 &message,
                 session.as_deref(),
+                resume.as_deref(),
                 json,
                 &skill,
                 auto_approve,
@@ -303,8 +313,9 @@ async fn main() -> anyhow::Result<()> {
                 let provider = quine_harness::create_provider_from_env();
                 let checker =
                     (!auto_approve).then(quine_harness::create_default_permission_checker);
-                let harness =
-                    std::sync::Arc::new(quine_harness::LocalHarness::new(provider, checker));
+                let harness = std::sync::Arc::new(
+                    quine_harness::LocalHarness::new(provider, checker, None).await?,
+                );
                 quine_harness::server::run_ipc_server(&socket_path, harness).await?;
             }
             DaemonCommands::Stop { socket } => {

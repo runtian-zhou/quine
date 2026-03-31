@@ -1,0 +1,145 @@
+use std::collections::HashMap;
+use std::path::PathBuf;
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+
+use crate::planner::ActionPlan;
+use crate::session::{ExitStatus, SessionId, SessionState};
+
+pub const CORE_CHECKPOINT_FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CoreCheckpoint {
+    pub format_version: u32,
+    pub sessions: Vec<PersistedSession>,
+    pub session_tree: PersistedSessionTree,
+}
+
+impl CoreCheckpoint {
+    pub fn new(sessions: Vec<PersistedSession>, session_tree: PersistedSessionTree) -> Self {
+        Self {
+            format_version: CORE_CHECKPOINT_FORMAT_VERSION,
+            sessions,
+            session_tree,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSession {
+    pub session_id: SessionId,
+    pub created_at: DateTime<Utc>,
+    pub state: PersistedSessionState,
+    pub config: PersistedSessionConfig,
+    pub history: Vec<quine_llm::Message>,
+    pub plan_store: PersistedPlanStore,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSessionConfig {
+    pub system_prompt: Option<String>,
+    pub skill_names: Vec<String>,
+    pub working_directory: PathBuf,
+    pub plan_mode: bool,
+    pub auto_approve_permissions: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PersistedSessionState {
+    Idle,
+    Paused,
+    Destroyed,
+}
+
+impl PersistedSessionState {
+    pub fn from_runtime(state: SessionState) -> Option<Self> {
+        match state {
+            SessionState::Idle => Some(Self::Idle),
+            SessionState::Paused => Some(Self::Paused),
+            SessionState::Destroyed => Some(Self::Destroyed),
+            SessionState::Streaming | SessionState::AwaitingToolResult => None,
+        }
+    }
+}
+
+impl From<PersistedSessionState> for SessionState {
+    fn from(value: PersistedSessionState) -> Self {
+        match value {
+            PersistedSessionState::Idle => SessionState::Idle,
+            PersistedSessionState::Paused => SessionState::Paused,
+            PersistedSessionState::Destroyed => SessionState::Destroyed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedSessionTree {
+    pub parents: HashMap<SessionId, SessionId>,
+    pub children: HashMap<SessionId, Vec<SessionId>>,
+    pub exit_statuses: HashMap<SessionId, ExitStatus>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersistedPlanStore {
+    pub plans: Vec<ActionPlan>,
+}
+
+impl PersistedPlanStore {
+    pub fn from_plans(plans: impl IntoIterator<Item = ActionPlan>) -> Self {
+        Self {
+            plans: plans.into_iter().collect(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planner::{Action, ActionId, ActionStatus, PlanId};
+
+    #[test]
+    fn unstable_runtime_states_are_not_persistable() {
+        assert_eq!(
+            PersistedSessionState::from_runtime(SessionState::Streaming),
+            None
+        );
+        assert_eq!(
+            PersistedSessionState::from_runtime(SessionState::AwaitingToolResult),
+            None
+        );
+    }
+
+    #[test]
+    fn stable_runtime_states_are_persistable() {
+        assert_eq!(
+            PersistedSessionState::from_runtime(SessionState::Idle),
+            Some(PersistedSessionState::Idle)
+        );
+        assert_eq!(
+            PersistedSessionState::from_runtime(SessionState::Paused),
+            Some(PersistedSessionState::Paused)
+        );
+    }
+
+    #[test]
+    fn plan_store_serializes() {
+        let store = PersistedPlanStore::from_plans([ActionPlan {
+            plan_id: PlanId::new(),
+            title: "plan".into(),
+            actions: vec![Action {
+                action_id: ActionId::new("a1"),
+                title: "title".into(),
+                description: "desc".into(),
+                depends_on: Vec::new(),
+                status: ActionStatus::Pending,
+                result: None,
+            }],
+        }]);
+
+        let json = serde_json::to_string(&store).unwrap();
+        let roundtrip: PersistedPlanStore = serde_json::from_str(&json).unwrap();
+        assert_eq!(roundtrip.plans.len(), 1);
+        assert_eq!(roundtrip.plans[0].title, "plan");
+    }
+}

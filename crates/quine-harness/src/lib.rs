@@ -5,6 +5,7 @@ pub mod protocol;
 pub mod server;
 pub mod service;
 pub mod session_log;
+pub mod storage;
 
 pub use config::{
     create_default_permission_checker, create_provider_from_env, default_socket_path,
@@ -20,3 +21,4 @@ pub use session_log::{
     default_log_dir, list_sessions, log_file_path, read_session_log, EventDirection,
     SessionLogEntry, SessionSummary,
 };
+pub use storage::StorageManager;

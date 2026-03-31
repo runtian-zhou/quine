@@ -5,6 +5,7 @@ pub mod error;
 pub mod filesystem;
 pub mod ipc;
 pub mod permission;
+pub mod persistence;
 pub mod planner;
 pub mod session;
 pub mod session_tree;
@@ -18,6 +19,10 @@ pub use engine::{run_core_loop, run_core_loop_with_compaction};
 pub use error::CoreError;
 pub use filesystem::{DirEntry, FsError, NullFilesystem, OverlayFilesystem, SessionFilesystem};
 pub use permission::{PermissionChecker, PermissionContext, PermissionDecision, PermissionError};
+pub use persistence::{
+    CoreCheckpoint, PersistedPlanStore, PersistedSession, PersistedSessionConfig,
+    PersistedSessionState, PersistedSessionTree, CORE_CHECKPOINT_FORMAT_VERSION,
+};
 pub use session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 pub use skill::{
     default_skill_service, list_available_skills, load_skill, load_skills, DefaultSkillService,

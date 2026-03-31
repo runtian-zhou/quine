@@ -3,7 +3,16 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::client::IpcClient;
+use crate::session::resolve_resume_target;
 use quine_harness::protocol::{methods, notifications};
+
+fn print_resume_command(socket_path: &Path, session_id: &str) {
+    eprintln!(
+        "Resume from this checkpoint with: `quine run --session {} --socket {} \"<message>\"`",
+        session_id,
+        socket_path.display()
+    );
+}
 
 /// Structured JSON output for one-shot mode.
 #[derive(Debug, Serialize, Deserialize)]
@@ -58,16 +67,20 @@ pub async fn run_oneshot(
     socket_path: &Path,
     message: &str,
     session_id: Option<&str>,
+    resume_checkpoint: Option<&str>,
     json_output: bool,
     skills: &[String],
     auto_approve_permissions: bool,
 ) -> anyhow::Result<()> {
     let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
+    let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
+
     // Create or reuse session.
-    let session_id = match session_id {
-        Some(sid) => sid.to_string(),
-        None => {
+    let session_id = match (session_id, resumed) {
+        (Some(sid), _) => sid.to_string(),
+        (None, Some(target)) => target.session_id,
+        (None, None) => {
             let mut session_params = serde_json::json!({});
             if !skills.is_empty() {
                 session_params["skills"] = serde_json::json!(skills);
@@ -194,6 +207,11 @@ pub async fn run_oneshot(
                             "prompt": prompt,
                             "response": partial,
                             "tool_calls": tool_calls,
+                            "resume_command": format!(
+                                "quine respond --session {} --socket {} \"<response>\"",
+                                session_id,
+                                socket_path.display()
+                            ),
                         });
                         if let Some(label) = source_label {
                             output["source_label"] = serde_json::Value::String(label.to_string());
@@ -201,12 +219,22 @@ pub async fn run_oneshot(
                         println!("{}", serde_json::to_string_pretty(&output)?);
                     } else if let Some(label) = source_label {
                         eprintln!("interaction needed [{label}]: {prompt}");
+                        eprintln!(
+                            "Resume with: `quine respond --session {} --socket {} \"<response>\"`",
+                            session_id,
+                            socket_path.display()
+                        );
                         // Print any partial response accumulated so far.
                         if !partial.is_empty() {
                             println!("{partial}");
                         }
                     } else {
                         eprintln!("interaction needed: {prompt}");
+                        eprintln!(
+                            "Resume with: `quine respond --session {} --socket {} \"<response>\"`",
+                            session_id,
+                            socket_path.display()
+                        );
                         // Print any partial response accumulated so far.
                         if !partial.is_empty() {
                             println!("{partial}");
@@ -261,6 +289,7 @@ pub async fn run_oneshot(
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
         println!("{full_response}");
+        print_resume_command(socket_path, &session_id);
     }
 
     Ok(())
@@ -553,6 +582,19 @@ pub async fn run_skills_show(socket_path: &Path, name: &str) -> anyhow::Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn print_resume_command_includes_session_flag() {
+        let session_id = "session-123";
+        let socket = std::path::Path::new("/tmp/quine.sock");
+        let command = format!(
+            "quine run --session {} --socket {} \"<message>\"",
+            session_id,
+            socket.display()
+        );
+        assert!(command.contains("--session session-123"));
+        assert!(command.contains("--socket /tmp/quine.sock"));
+    }
 
     #[test]
     fn oneshot_output_serialization() {
