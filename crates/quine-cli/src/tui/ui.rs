@@ -33,6 +33,18 @@ fn format_token_usage(usage: &quine_llm::TokenUsage, max_context_window: u64) ->
     )
 }
 
+fn format_context_status(
+    usage: Option<&quine_llm::TokenUsage>,
+    max_context_window: Option<u64>,
+) -> String {
+    match (usage, max_context_window) {
+        (Some(usage), Some(max_context_window)) => format_token_usage(usage, max_context_window),
+        (Some(usage), None) => format!("ctx {} used", usage.input_tokens + usage.output_tokens),
+        (None, Some(max_context_window)) => format!("ctx limit {max_context_window}"),
+        (None, None) => "ctx n/a".to_string(),
+    }
+}
+
 /// Render the entire TUI frame.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // Dynamic input box height: expand for option selection or multi-line input.
@@ -220,12 +232,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         AgentPhase::Streaming => format!("{} streaming", app.spinner_char()),
         AgentPhase::RunningTool(name) => format!("{} tool:{name}", app.spinner_char()),
     };
-    let usage = match (&app.last_turn_usage, app.max_context_window) {
-        (Some(usage), Some(max_context_window)) => format_token_usage(usage, max_context_window),
-        (Some(usage), None) => format!("ctx {} used", usage.input_tokens + usage.output_tokens),
-        (None, Some(max_context_window)) => format!("ctx --/{max_context_window}"),
-        (None, None) => "ctx --".to_string(),
-    };
+    let usage = format_context_status(app.last_turn_usage.as_ref(), app.max_context_window);
     let left = format!(" session:{} | {} | {} ", app.session_id, mode, phase);
     let right = format!(" {} ", usage);
 
@@ -561,6 +568,15 @@ mod tests {
         };
 
         assert_eq!(format_token_usage(&usage, 200_000), "ctx 1550/200000");
+    }
+
+    #[test]
+    fn format_context_status_avoids_placeholder_dashes() {
+        assert_eq!(
+            format_context_status(None, Some(200_000)),
+            "ctx limit 200000"
+        );
+        assert_eq!(format_context_status(None, None), "ctx n/a");
     }
 
     #[test]
