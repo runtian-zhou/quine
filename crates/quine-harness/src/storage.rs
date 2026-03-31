@@ -1,9 +1,266 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use quine_core::CoreCheckpoint;
+use chrono::{DateTime, Utc};
+use quine_core::{
+    built_in_tool_definitions,
+    planner::{ActionPlan, ActionStatus},
+    skill, CoreCheckpoint, PersistedSession, SessionId,
+};
+use quine_llm::{Message, MessageContent, Role, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanSnapshot {
+    pub plan_id: String,
+    pub title: String,
+    pub actions: Vec<PlanActionSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PlanActionSnapshot {
+    pub action_id: String,
+    pub title: String,
+    pub description: String,
+    pub depends_on: Vec<String>,
+    pub status: PlanActionStatusSnapshot,
+    pub result: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlanActionStatusSnapshot {
+    Pending,
+    InProgress,
+    Completed,
+    Failed { error: String },
+    Skipped { reason: String },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SkillSnapshot {
+    pub name: String,
+    pub description: String,
+    pub version: String,
+    pub system_prompt: Option<String>,
+    pub source_path: PathBuf,
+    pub tool_names: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SessionContextSnapshot {
+    pub session_id: String,
+    pub created_at: DateTime<Utc>,
+    pub state: String,
+    pub system_prompt: Option<String>,
+    pub skills: Vec<String>,
+    pub working_directory: PathBuf,
+    pub plan_mode: bool,
+    pub auto_approve_permissions: bool,
+    pub available_tools: Vec<ToolDefinition>,
+    pub loaded_skills: Vec<SkillSnapshot>,
+    pub plans: Vec<PlanSnapshot>,
+    pub history: Vec<HistoryEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum HistoryEntry {
+    Text {
+        role: String,
+        text: String,
+    },
+    ToolUse {
+        role: String,
+        text: Option<String>,
+        tool_calls: Vec<ToolCallEntry>,
+    },
+    ToolResult {
+        role: String,
+        tool_use_id: String,
+        output: String,
+        is_error: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ToolCallEntry {
+    pub tool_use_id: String,
+    pub tool_name: String,
+    pub arguments: serde_json::Value,
+}
+
+pub fn session_context_from_checkpoint(
+    checkpoint: &CoreCheckpoint,
+    session_id: SessionId,
+    live_states: &HashMap<SessionId, String>,
+) -> Option<SessionContextSnapshot> {
+    checkpoint
+        .sessions
+        .iter()
+        .find(|session| session.session_id == session_id)
+        .map(|session| snapshot_from_persisted(session, live_states))
+}
+
+fn snapshot_from_persisted(
+    session: &PersistedSession,
+    live_states: &HashMap<SessionId, String>,
+) -> SessionContextSnapshot {
+    SessionContextSnapshot {
+        session_id: serialize_session_id(session.session_id),
+        created_at: session.created_at,
+        state: live_states
+            .get(&session.session_id)
+            .cloned()
+            .unwrap_or_else(|| format!("{:?}", session.state).to_lowercase()),
+        system_prompt: session.config.system_prompt.clone(),
+        skills: session.config.skill_names.clone(),
+        working_directory: session.config.working_directory.clone(),
+        plan_mode: session.config.plan_mode,
+        auto_approve_permissions: session.config.auto_approve_permissions,
+        available_tools: build_available_tools(session),
+        loaded_skills: build_loaded_skills(session),
+        plans: session
+            .plan_store
+            .plans
+            .iter()
+            .map(plan_snapshot_from_action_plan)
+            .collect(),
+        history: session
+            .history
+            .iter()
+            .map(history_entry_from_message)
+            .collect(),
+    }
+}
+
+fn plan_snapshot_from_action_plan(plan: &ActionPlan) -> PlanSnapshot {
+    PlanSnapshot {
+        plan_id: plan.plan_id.to_string(),
+        title: plan.title.clone(),
+        actions: plan
+            .actions
+            .iter()
+            .map(|action| PlanActionSnapshot {
+                action_id: action.action_id.to_string(),
+                title: action.title.clone(),
+                description: action.description.clone(),
+                depends_on: action.depends_on.iter().map(ToString::to_string).collect(),
+                status: plan_status_snapshot(&action.status),
+                result: action.result.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn plan_status_snapshot(status: &ActionStatus) -> PlanActionStatusSnapshot {
+    match status {
+        ActionStatus::Pending => PlanActionStatusSnapshot::Pending,
+        ActionStatus::InProgress => PlanActionStatusSnapshot::InProgress,
+        ActionStatus::Completed => PlanActionStatusSnapshot::Completed,
+        ActionStatus::Failed { error } => PlanActionStatusSnapshot::Failed {
+            error: error.clone(),
+        },
+        ActionStatus::Skipped { reason } => PlanActionStatusSnapshot::Skipped {
+            reason: reason.clone(),
+        },
+    }
+}
+
+fn build_loaded_skills(session: &PersistedSession) -> Vec<SkillSnapshot> {
+    futures::executor::block_on(skill::load_skills(
+        &session.config.working_directory,
+        &session.config.skill_names,
+    ))
+    .into_iter()
+    .map(|skill| SkillSnapshot {
+        name: skill.meta.name,
+        description: skill.meta.description,
+        version: skill.meta.version,
+        system_prompt: skill.system_prompt,
+        source_path: skill.source_path,
+        tool_names: skill
+            .tool_definitions
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect(),
+    })
+    .collect()
+}
+
+fn build_available_tools(session: &PersistedSession) -> Vec<ToolDefinition> {
+    let mut tools = built_in_tool_definitions(session.config.plan_mode);
+
+    for skill in futures::executor::block_on(skill::load_skills(
+        &session.config.working_directory,
+        &session.config.skill_names,
+    )) {
+        tools.extend(
+            skill
+                .tool_definitions
+                .into_iter()
+                .map(|tool| ToolDefinition {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters,
+                }),
+        );
+    }
+
+    tools.sort_by(|left, right| left.name.cmp(&right.name));
+    tools.dedup_by(|left, right| left.name == right.name);
+    tools
+}
+
+fn history_entry_from_message(message: &Message) -> HistoryEntry {
+    match &message.content {
+        MessageContent::Text(text) => HistoryEntry::Text {
+            role: role_name(&message.role),
+            text: text.clone(),
+        },
+        MessageContent::ToolUse { text, tool_calls } => HistoryEntry::ToolUse {
+            role: role_name(&message.role),
+            text: text.clone(),
+            tool_calls: tool_calls
+                .iter()
+                .map(|call| ToolCallEntry {
+                    tool_use_id: call.tool_use_id.clone(),
+                    tool_name: call.tool_name.clone(),
+                    arguments: call.arguments.clone(),
+                })
+                .collect(),
+        },
+        MessageContent::ToolResult {
+            tool_use_id,
+            output,
+            is_error,
+        } => HistoryEntry::ToolResult {
+            role: role_name(&message.role),
+            tool_use_id: tool_use_id.clone(),
+            output: output.clone(),
+            is_error: *is_error,
+        },
+    }
+}
+
+fn role_name(role: &Role) -> String {
+    match role {
+        Role::System => "system",
+        Role::User => "user",
+        Role::Assistant => "assistant",
+        Role::Tool => "tool",
+    }
+    .to_string()
+}
+
+fn serialize_session_id(session_id: SessionId) -> String {
+    serde_json::to_value(session_id)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Clone)]
 pub struct StorageManager {
@@ -131,6 +388,8 @@ mod tests {
         StorageManager::new(root)
     }
 
+    use std::collections::HashMap;
+
     fn sample_checkpoint() -> CoreCheckpoint {
         CoreCheckpoint::new(
             vec![PersistedSession {
@@ -153,6 +412,45 @@ mod tests {
                 exit_statuses: Default::default(),
             },
         )
+    }
+
+    #[test]
+    fn session_context_snapshot_includes_skills_and_tool_history() {
+        let checkpoint = sample_checkpoint();
+        let session = &checkpoint.sessions[0];
+        let session_id = session.session_id;
+        let snapshot = super::session_context_from_checkpoint(
+            &checkpoint,
+            session_id,
+            &HashMap::from([(session_id, "streaming".to_string())]),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.skills, Vec::<String>::new());
+        assert_eq!(snapshot.state, "streaming");
+        assert!(!snapshot.available_tools.is_empty());
+        assert!(snapshot
+            .available_tools
+            .iter()
+            .any(|tool| tool.name == "read_file"));
+        assert!(snapshot
+            .available_tools
+            .iter()
+            .any(|tool| tool.name == "apply_patch"));
+        assert!(!snapshot
+            .available_tools
+            .iter()
+            .any(|tool| tool.name == "write_file"));
+        assert!(snapshot.loaded_skills.is_empty());
+        assert!(snapshot.plans.is_empty());
+        assert_eq!(snapshot.history.len(), 1);
+        match &snapshot.history[0] {
+            super::HistoryEntry::Text { role, text } => {
+                assert_eq!(role, "user");
+                assert_eq!(text, "hello");
+            }
+            other => panic!("expected text history entry, got {other:?}"),
+        }
     }
 
     #[tokio::test]

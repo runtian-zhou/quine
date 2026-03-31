@@ -2750,6 +2750,10 @@ pub async fn run_core_loop_with_compaction(
                     }
                 }
             }
+            CoreInput::RequestCheckpoint { reply } => {
+                emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
+                let _ = reply.send(());
+            }
             CoreInput::WaitSession {
                 parent_id,
                 child_id,

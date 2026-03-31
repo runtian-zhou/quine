@@ -13,7 +13,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     };
 
     match name {
-        "quit" | "plan" | "loop" | "compact" => Some(SlashCommand::BuiltIn {
+        "quit" | "plan" | "loop" | "compact" | "context" => Some(SlashCommand::BuiltIn {
             name: name.to_string(),
             arguments: arguments.to_string(),
         }),
@@ -90,6 +90,17 @@ mod tests {
             parse_slash_command("/compact"),
             Some(SlashCommand::BuiltIn {
                 name: "compact".into(),
+                arguments: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_context_command() {
+        assert_eq!(
+            parse_slash_command("/context"),
+            Some(SlashCommand::BuiltIn {
+                name: "context".into(),
                 arguments: String::new(),
             })
         );

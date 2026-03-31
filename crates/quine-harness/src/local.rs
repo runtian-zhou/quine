@@ -7,8 +7,9 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 
 use quine_core::{
-    create_channels, load_skills, ChannelConfig, CoreInput, CoreOutput, HarnessHandle,
-    InheritanceFlags, InteractionResponse, PermissionChecker, SessionId, SessionSignal, Skill,
+    create_channels, load_skills, ChannelConfig, CoreCheckpoint, CoreInput, CoreOutput,
+    HarnessHandle, InheritanceFlags, InteractionResponse, PermissionChecker, SessionId,
+    SessionSignal, Skill,
 };
 use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
@@ -17,7 +18,7 @@ use tokio::time::{Duration, Instant};
 use crate::config::{default_state_dir, max_context_window_from_env, SessionConfig};
 use crate::error::HarnessError;
 use crate::service::HarnessService;
-use crate::storage::StorageManager;
+use crate::storage::{session_context_from_checkpoint, StorageManager};
 
 /// Local in-process harness implementation.
 ///
@@ -359,6 +360,23 @@ impl LocalHarness {
                 let _ = reply.send(result);
                 false
             }
+            ScheduledAction::RequestCheckpoint { reply } => {
+                let (core_reply_tx, core_reply_rx) = oneshot::channel();
+                let result = match harness_input
+                    .send(CoreInput::RequestCheckpoint {
+                        reply: core_reply_tx,
+                    })
+                    .await
+                {
+                    Ok(()) => core_reply_rx
+                        .await
+                        .map(|_| ())
+                        .map_err(|_| HarnessError::CoreChannelClosed),
+                    Err(_) => Err(HarnessError::CoreChannelClosed),
+                };
+                let _ = reply.send(result);
+                false
+            }
             ScheduledAction::SubmitToolResult {
                 session_id,
                 tool_use_id,
@@ -636,6 +654,62 @@ impl HarnessService for LocalHarness {
         Ok(items)
     }
 
+    async fn get_session_context(
+        &self,
+        session_id: SessionId,
+    ) -> Result<CoreCheckpoint, HarnessError> {
+        let sessions = self.sessions.lock().await;
+        if !sessions.contains_key(&session_id) {
+            return Err(HarnessError::SessionNotFound {
+                session_id: serde_json::to_value(session_id)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            });
+        }
+        drop(sessions);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.enqueue(ScheduledCommand::immediate(
+            ScheduledAction::RequestCheckpoint { reply: reply_tx },
+        ))
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)??;
+
+        let checkpoint = self
+            ._storage
+            .load_latest_checkpoint()
+            .await
+            .map_err(|error| HarnessError::Internal {
+                message: format!("failed to load checkpoint: {error}"),
+            })?
+            .ok_or_else(|| HarnessError::SessionNotFound {
+                session_id: serde_json::to_value(session_id)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            })?;
+
+        let sessions = self.sessions.lock().await;
+        let live_states = sessions
+            .iter()
+            .map(|(id, session)| (*id, format!("{:?}", session.state).to_lowercase()))
+            .collect();
+
+        if session_context_from_checkpoint(&checkpoint, session_id, &live_states).is_none() {
+            return Err(HarnessError::SessionNotFound {
+                session_id: serde_json::to_value(session_id)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            });
+        }
+
+        Ok(checkpoint)
+    }
+
     async fn spawn_child_session(
         &self,
         parent_id: Option<SessionId>,
@@ -838,6 +912,9 @@ enum ScheduledAction {
     },
     CompactSession {
         session_id: SessionId,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    },
+    RequestCheckpoint {
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
     SubmitToolResult {

@@ -14,9 +14,12 @@ pub mod write;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::stream;
+use quine_llm::{LlmEvent, LlmProvider};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -305,6 +308,42 @@ impl Default for ToolRegistry {
     }
 }
 
+struct NoopProvider;
+
+#[async_trait]
+impl LlmProvider for NoopProvider {
+    async fn send(
+        &self,
+        _messages: &[quine_llm::Message],
+        _tools: &[quine_llm::ToolDefinition],
+    ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>> {
+        Ok(Box::pin(stream::empty()))
+    }
+}
+
+/// Build the built-in tool definitions for a session mode.
+pub fn built_in_tool_definitions(plan_mode: bool) -> Vec<quine_llm::ToolDefinition> {
+    let mut registry = ToolRegistry::new();
+    registry.register(Arc::new(ask_user::AskUserTool));
+    registry.register(Arc::new(bash::BashTool));
+    registry.register(Arc::new(find::FindTool));
+    registry.register(Arc::new(plan::PlanTool::new(plan::new_plan_store())));
+    registry.register(Arc::new(read::ReadTool));
+    if !plan_mode {
+        registry.register(Arc::new(write::WriteTool));
+        registry.register(Arc::new(subagent::SubagentTool::new(
+            Arc::new(NoopProvider),
+            None,
+        )));
+        registry.register(Arc::new(spawn::SpawnTool));
+        registry.register(Arc::new(wait_child::WaitChildTool));
+        registry.register(Arc::new(signal::SignalTool));
+        registry.register(Arc::new(send_message::SendMessageTool));
+        registry.register(Arc::new(recv_message::RecvMessageTool));
+    }
+    registry.tool_definitions()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,6 +427,14 @@ mod tests {
         let defs = registry.tool_definitions();
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "dummy");
+    }
+
+    #[test]
+    fn built_in_tool_definitions_match_runtime_tool_names() {
+        let defs = built_in_tool_definitions(false);
+        assert!(defs.iter().any(|tool| tool.name == "apply_patch"));
+        assert!(!defs.iter().any(|tool| tool.name == "write_file"));
+        assert!(defs.iter().any(|tool| tool.name == "recv_message"));
     }
 
     #[test]

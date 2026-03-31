@@ -1,6 +1,7 @@
 mod agent_ctl;
 mod chat;
 mod client;
+mod context_debug;
 mod log;
 mod render;
 mod run;

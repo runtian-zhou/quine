@@ -4,9 +4,10 @@ mod ui;
 use std::path::Path;
 use std::time::Duration;
 
+use crossterm::cursor::MoveTo;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
@@ -14,6 +15,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::client::IpcClient;
+use crate::context_debug::fetch_session_context;
 use crate::run::fetch_available_skills;
 use crate::session::{
     create_session, create_session_with_initial_messages, create_slash_skill_session,
@@ -67,8 +69,11 @@ pub async fn run_tui_chat(
     // Install panic hook to restore terminal.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let mut stdout = std::io::stdout();
         let _ = disable_raw_mode();
-        let _ = std::io::stdout().execute(LeaveAlternateScreen);
+        let _ = stdout.execute(LeaveAlternateScreen);
+        let _ = stdout.execute(Clear(ClearType::All));
+        let _ = stdout.execute(MoveTo(0, 0));
         original_hook(info);
     }));
 
@@ -85,12 +90,15 @@ pub async fn run_tui_chat(
         auto_approve_permissions,
         &mut event_stream,
         &mut spinner_interval,
+        socket_path,
     )
     .await;
 
     // Restore terminal.
     disable_raw_mode()?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
+    terminal.backend_mut().execute(Clear(ClearType::All))?;
+    terminal.backend_mut().execute(MoveTo(0, 0))?;
     terminal.show_cursor()?;
 
     // Shutdown daemon if we spawned it.
@@ -116,6 +124,7 @@ async fn run_event_loop(
     auto_approve_permissions: bool,
     event_stream: &mut EventStream,
     spinner_interval: &mut tokio::time::Interval,
+    socket_path: &Path,
 ) -> anyhow::Result<()> {
     loop {
         // Draw.
@@ -131,7 +140,7 @@ async fn run_event_loop(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if let Some(action) = handle_terminal_event(app, event) {
-                            execute_action(app, client, skills, available_skills, auto_approve_permissions, action).await?;
+                            execute_action(app, client, skills, available_skills, auto_approve_permissions, socket_path, action).await?;
                         }
                     }
                     Some(Err(_)) | None => {
@@ -184,6 +193,58 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
         Event::Key(KeyEvent {
             code, modifiers, ..
         }) => {
+            if app.context_explorer_active() {
+                return match code {
+                    KeyCode::Esc => {
+                        app.close_context_explorer();
+                        None
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        app.context_explorer_prev_tab();
+                        None
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        app.context_explorer_next_tab();
+                        None
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.context_explorer_move_up();
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.context_explorer_move_down();
+                        None
+                    }
+                    KeyCode::PageUp => {
+                        let step = if app.last_view_height > 2 {
+                            app.last_view_height.saturating_sub(2) as u16
+                        } else {
+                            10
+                        };
+                        app.context_explorer_scroll_up(step);
+                        None
+                    }
+                    KeyCode::PageDown => {
+                        let step = if app.last_view_height > 2 {
+                            app.last_view_height.saturating_sub(2) as u16
+                        } else {
+                            10
+                        };
+                        app.context_explorer_scroll_down(step);
+                        None
+                    }
+                    KeyCode::Home => {
+                        app.context_explorer_move_to_first();
+                        None
+                    }
+                    KeyCode::End => {
+                        app.context_explorer_move_to_last();
+                        None
+                    }
+                    _ => None,
+                };
+            }
+
             // Ctrl-C or Ctrl-D: quit.
             if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
                 app.should_quit = true;
@@ -318,6 +379,7 @@ async fn execute_action(
     skills: &[String],
     available_skills: &[String],
     auto_approve_permissions: bool,
+    _socket_path: &Path,
     action: AppAction,
 ) -> anyhow::Result<()> {
     match action {
@@ -332,6 +394,17 @@ async fn execute_action(
                     .push(app::ConversationEntry::Error(e.to_string()));
                 app.phase = AgentPhase::Idle;
             }
+        }
+        AppAction::ShowContext => {
+            match fetch_session_context(client, &app.session_id).await {
+                Ok(snapshot) => app.open_context_explorer(snapshot),
+                Err(error) => {
+                    app.messages
+                        .push(app::ConversationEntry::Error(error.to_string()));
+                    app.auto_scroll();
+                }
+            }
+            app.phase = AgentPhase::Idle;
         }
         AppAction::CompactSession => {
             let params = serde_json::json!({

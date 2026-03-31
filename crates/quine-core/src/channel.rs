@@ -100,6 +100,9 @@ pub enum CoreInput {
         reply: oneshot::Sender<Option<MailboxMessage>>,
     },
 
+    /// Persist and acknowledge a fresh checkpoint of the current core state.
+    RequestCheckpoint { reply: oneshot::Sender<()> },
+
     /// Graceful shutdown of the entire core event loop.
     Shutdown,
 }

@@ -1,11 +1,17 @@
+use std::collections::{BTreeMap, HashMap};
+
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
+use serde_json::to_string_pretty;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::app::{AgentPhase, App, ConversationEntry, InputBuffer, ToolStatus};
+use super::app::{
+    AgentPhase, App, ContextExplorerState, ContextExplorerTab, ConversationEntry, InputBuffer,
+    ToolStatus,
+};
 
 /// Format a duration in microseconds to a human-readable string.
 fn format_duration_us(us: u64) -> String {
@@ -73,6 +79,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_status_bar(frame, app, chunks[0]);
     draw_conversation(frame, app, chunks[1]);
     draw_input(frame, app, chunks[2]);
+    if let Some(explorer) = app.context_explorer.as_ref() {
+        draw_context_explorer(frame, chunks[1], explorer);
+    }
 }
 
 fn wrapped_rows(width: usize, area_width: u16) -> u16 {
@@ -503,6 +512,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 /// Render the scrollable conversation view.
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
+    frame.render_widget(Clear, area);
+
     let (lines, scroll) = if app.user_scrolled {
         let mut lines: Vec<Line<'static>> = Vec::new();
         for (i, entry) in app.messages.iter().enumerate() {
@@ -543,6 +554,545 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
 }
 
 /// Compute the number of visual rows a single line occupies when wrapped to `area_width`.
+fn format_context_entry_label(index: usize, explorer: &ContextExplorerState) -> String {
+    let entry_number = index + 1;
+    match explorer.snapshot.history.get(index) {
+        Some(crate::context_debug::HistoryEntry::Text { role, text }) => {
+            let first_line = text.lines().next().unwrap_or("").trim();
+            if first_line.is_empty() {
+                format!("{entry_number:>3}. {role}: <blank>")
+            } else {
+                format!("{entry_number:>3}. {role}: {first_line}")
+            }
+        }
+        Some(crate::context_debug::HistoryEntry::ToolUse {
+            role,
+            text,
+            tool_calls,
+        }) => {
+            let tool_summary = tool_calls
+                .first()
+                .map(|call| call.tool_name.as_str())
+                .unwrap_or("tool");
+            let suffix = text
+                .as_deref()
+                .and_then(|value| value.lines().next())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("");
+            if suffix.is_empty() {
+                format!("{entry_number:>3}. {role}: tool {tool_summary}")
+            } else {
+                format!("{entry_number:>3}. {role}: {suffix}")
+            }
+        }
+        Some(crate::context_debug::HistoryEntry::ToolResult {
+            tool_use_id,
+            is_error,
+            ..
+        }) => {
+            let status = if *is_error { "error" } else { "ok" };
+            format!("{entry_number:>3}. tool result {tool_use_id} ({status})")
+        }
+        None => format!("{entry_number:>3}. <missing>"),
+    }
+}
+
+fn format_tool_label(index: usize, explorer: &ContextExplorerState) -> String {
+    let item_number = index + 1;
+    match explorer.snapshot.available_tools.get(index) {
+        Some(tool) => format!("{item_number:>3}. {}", tool.name),
+        None => format!("{item_number:>3}. <missing>"),
+    }
+}
+
+fn format_tool_detail(explorer: &ContextExplorerState) -> String {
+    match explorer.selected_tool() {
+        Some(tool) => {
+            let parameters = serde_json::to_string_pretty(&tool.parameters)
+                .unwrap_or_else(|_| tool.parameters.to_string());
+            format!(
+                "name: {}\n\ndescription:\n{}\n\nparameters:\n{}",
+                tool.name, tool.description, parameters
+            )
+        }
+        None => "No tool selected.".to_string(),
+    }
+}
+
+fn format_skill_label(index: usize, explorer: &ContextExplorerState) -> String {
+    let item_number = index + 1;
+    match explorer.snapshot.loaded_skills.get(index) {
+        Some(skill) => format!("{item_number:>3}. {}", skill.name),
+        None => format!("{item_number:>3}. <missing>"),
+    }
+}
+
+fn format_skill_detail(explorer: &ContextExplorerState) -> String {
+    match explorer.selected_skill() {
+        Some(skill) => {
+            let tool_names = if skill.tool_names.is_empty() {
+                "<none>".to_string()
+            } else {
+                skill.tool_names.join(", ")
+            };
+            let system_prompt = skill.system_prompt.as_deref().unwrap_or("<none>");
+            format!(
+                "name: {}\nversion: {}\nsource: {}\n\ndescription:\n{}\n\nsystem_prompt:\n{}\n\ntools:\n{}",
+                skill.name,
+                skill.version,
+                skill.source_path.display(),
+                skill.description,
+                system_prompt,
+                tool_names
+            )
+        }
+        None => "No skill selected.".to_string(),
+    }
+}
+
+fn tool_usage_summary(explorer: &ContextExplorerState) -> String {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in &explorer.snapshot.history {
+        if let crate::context_debug::HistoryEntry::ToolUse { tool_calls, .. } = entry {
+            for call in tool_calls {
+                *counts.entry(call.tool_name.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    if counts.is_empty() {
+        return "tools [none]".to_string();
+    }
+
+    let tools = counts
+        .into_iter()
+        .map(|(name, count)| {
+            if count == 1 {
+                name
+            } else {
+                format!("{name} x{count}")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("tools [{tools}]")
+}
+
+fn tool_name_by_use_id(explorer: &ContextExplorerState) -> HashMap<&str, &str> {
+    let mut names = HashMap::new();
+    for entry in &explorer.snapshot.history {
+        if let crate::context_debug::HistoryEntry::ToolUse { tool_calls, .. } = entry {
+            for call in tool_calls {
+                names.insert(call.tool_use_id.as_str(), call.tool_name.as_str());
+            }
+        }
+    }
+    names
+}
+
+fn format_context_entry_detail(explorer: &ContextExplorerState) -> String {
+    let tool_names = tool_name_by_use_id(explorer);
+    match explorer.selected_entry() {
+        Some(crate::context_debug::HistoryEntry::Text { role, text }) => {
+            format!("kind: text\nrole: {role}\n\n{text}")
+        }
+        Some(crate::context_debug::HistoryEntry::ToolUse {
+            role,
+            text,
+            tool_calls,
+        }) => {
+            let mut detail = format!("kind: tool_use\nrole: {role}\n");
+            if let Some(text) = text {
+                detail.push_str("\ntext:\n");
+                detail.push_str(text);
+                detail.push('\n');
+            }
+            for (index, call) in tool_calls.iter().enumerate() {
+                detail.push_str(&format!(
+                    "\ntool_call {}\n- id: {}\n- name: {}\n- arguments:\n{}\n",
+                    index + 1,
+                    call.tool_use_id,
+                    call.tool_name,
+                    to_string_pretty(&call.arguments)
+                        .unwrap_or_else(|_| call.arguments.to_string())
+                ));
+            }
+            detail
+        }
+        Some(crate::context_debug::HistoryEntry::ToolResult {
+            role,
+            tool_use_id,
+            output,
+            is_error,
+        }) => {
+            let status = if *is_error { "error" } else { "ok" };
+            let tool_name = tool_names
+                .get(tool_use_id.as_str())
+                .copied()
+                .unwrap_or("<unknown>");
+            format!(
+                "kind: tool_result\nrole: {role}\ntool_use_id: {tool_use_id}\ntool_name: {tool_name}\nstatus: {status}\n\n{output}"
+            )
+        }
+        None => "No entry selected.".to_string(),
+    }
+}
+
+fn format_plan_status(status: &crate::context_debug::PlanActionStatusSnapshot) -> &str {
+    status.label()
+}
+
+fn format_plans_tab_lines(explorer: &ContextExplorerState) -> Vec<Line<'static>> {
+    if explorer.snapshot.plans.is_empty() {
+        return vec![Line::from("No plans recorded.")];
+    }
+
+    let mut lines = Vec::new();
+    for plan in &explorer.snapshot.plans {
+        lines.push(Line::from(vec![
+            Span::styled(
+                plan.title.clone(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                " — {} remaining / {} actions",
+                plan.actions
+                    .iter()
+                    .filter(|action| {
+                        !matches!(
+                            action.status,
+                            crate::context_debug::PlanActionStatusSnapshot::Completed
+                                | crate::context_debug::PlanActionStatusSnapshot::Failed { .. }
+                                | crate::context_debug::PlanActionStatusSnapshot::Skipped { .. }
+                        )
+                    })
+                    .count(),
+                plan.actions.len()
+            )),
+        ]));
+        lines.push(Line::from(format!("  id: {}", plan.plan_id)));
+        for action in &plan.actions {
+            lines.push(Line::from(format!(
+                "  - {} [{}] {}",
+                action.action_id,
+                format_plan_status(&action.status),
+                action.title
+            )));
+            if !action.description.is_empty() {
+                lines.push(Line::from(format!("      {}", action.description)));
+            }
+            if !action.depends_on.is_empty() {
+                let deps = action
+                    .depends_on
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(Line::from(format!("      depends_on: {deps}")));
+            }
+            if let Some(result) = &action.result {
+                for line in result.lines() {
+                    lines.push(Line::from(format!("      result: {line}")));
+                }
+            }
+        }
+        lines.push(Line::from(""));
+    }
+    lines
+}
+
+fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplorerState) {
+    let popup = centered_rect(90, 85, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Context Explorer ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Clear, inner);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(4),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let summary = vec![
+        Line::from(format!(
+            "session {} | state {} | {} entries",
+            explorer.snapshot.session_id,
+            explorer.snapshot.state,
+            explorer.snapshot.history.len()
+        )),
+        Line::from(format!(
+            "skills [{}] | {} | plan_mode {} | auto_approve {}",
+            explorer.snapshot.skills.join(", "),
+            tool_usage_summary(explorer),
+            explorer.snapshot.plan_mode,
+            explorer.snapshot.auto_approve_permissions,
+        )),
+        Line::from(format!(
+            "cwd {}",
+            explorer.snapshot.working_directory.display()
+        )),
+        Line::from(format!(
+            "created {} | system_prompt {}",
+            explorer.snapshot.created_at,
+            explorer
+                .snapshot
+                .system_prompt
+                .as_deref()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("<none>")
+        )),
+    ];
+    frame.render_widget(Clear, sections[0]);
+    frame.render_widget(
+        Paragraph::new(summary).wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    let tab_titles = ["History", "Tools", "Skills", "Plans"];
+    let tab_index = match explorer.active_tab {
+        ContextExplorerTab::History => 0,
+        ContextExplorerTab::Tools => 1,
+        ContextExplorerTab::Skills => 2,
+        ContextExplorerTab::Plans => 3,
+    };
+    let tabs = Tabs::new(tab_titles)
+        .select(tab_index)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_widget(Clear, sections[1]);
+    frame.render_widget(tabs, sections[1]);
+
+    match explorer.active_tab {
+        ContextExplorerTab::History => {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .split(sections[2]);
+
+            frame.render_widget(Clear, columns[0]);
+            frame.render_widget(Clear, columns[1]);
+
+            let list_items: Vec<ListItem> = explorer
+                .snapshot
+                .history
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let label = format!(
+                        "{}{}",
+                        if index == explorer.selected_index {
+                            "› "
+                        } else {
+                            "  "
+                        },
+                        format_context_entry_label(index, explorer)
+                    );
+                    ListItem::new(Line::from(label))
+                })
+                .collect();
+            let list_height = columns[0].height.saturating_sub(2) as usize;
+            let list_scroll = context_list_scroll(
+                explorer.selected_index,
+                explorer.snapshot.history.len(),
+                list_height,
+            );
+            let list = List::new(list_items)
+                .block(Block::default().title(" Entries ").borders(Borders::ALL))
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("");
+            let mut list_state = ListState::default().with_selected(Some(explorer.selected_index));
+            *list_state.offset_mut() = usize::from(list_scroll);
+            frame.render_stateful_widget(list, columns[0], &mut list_state);
+
+            let detail = Paragraph::new(format_context_entry_detail(explorer))
+                .block(Block::default().title(" Detail ").borders(Borders::ALL))
+                .wrap(Wrap { trim: false })
+                .scroll((explorer.scroll_offset, 0));
+            frame.render_widget(detail, columns[1]);
+        }
+        ContextExplorerTab::Tools => {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .split(sections[2]);
+
+            frame.render_widget(Clear, columns[0]);
+            frame.render_widget(Clear, columns[1]);
+
+            let list_items: Vec<ListItem> = explorer
+                .snapshot
+                .available_tools
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let label = format!(
+                        "{}{}",
+                        if index == explorer.selected_index {
+                            "› "
+                        } else {
+                            "  "
+                        },
+                        format_tool_label(index, explorer)
+                    );
+                    ListItem::new(Line::from(label))
+                })
+                .collect();
+            let list_height = columns[0].height.saturating_sub(2) as usize;
+            let list_scroll = context_list_scroll(
+                explorer.selected_index,
+                explorer.snapshot.available_tools.len(),
+                list_height,
+            );
+            let list = List::new(list_items)
+                .block(Block::default().title(" Tools ").borders(Borders::ALL))
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("");
+            let mut list_state = ListState::default().with_selected(Some(explorer.selected_index));
+            *list_state.offset_mut() = usize::from(list_scroll);
+            frame.render_stateful_widget(list, columns[0], &mut list_state);
+
+            let detail = Paragraph::new(format_tool_detail(explorer))
+                .block(
+                    Block::default()
+                        .title(" Tool Detail ")
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((explorer.scroll_offset, 0));
+            frame.render_widget(detail, columns[1]);
+        }
+        ContextExplorerTab::Skills => {
+            let columns = Layout::default()
+                .direction(Direction::Horizontal)
+                .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
+                .split(sections[2]);
+
+            frame.render_widget(Clear, columns[0]);
+            frame.render_widget(Clear, columns[1]);
+
+            let list_items: Vec<ListItem> = explorer
+                .snapshot
+                .loaded_skills
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let label = format!(
+                        "{}{}",
+                        if index == explorer.selected_index {
+                            "› "
+                        } else {
+                            "  "
+                        },
+                        format_skill_label(index, explorer)
+                    );
+                    ListItem::new(Line::from(label))
+                })
+                .collect();
+            let list_height = columns[0].height.saturating_sub(2) as usize;
+            let list_scroll = context_list_scroll(
+                explorer.selected_index,
+                explorer.snapshot.loaded_skills.len(),
+                list_height,
+            );
+            let list = List::new(list_items)
+                .block(Block::default().title(" Skills ").borders(Borders::ALL))
+                .highlight_style(
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+                .highlight_symbol("");
+            let mut list_state = ListState::default().with_selected(Some(explorer.selected_index));
+            *list_state.offset_mut() = usize::from(list_scroll);
+            frame.render_stateful_widget(list, columns[0], &mut list_state);
+
+            let detail = Paragraph::new(format_skill_detail(explorer))
+                .block(
+                    Block::default()
+                        .title(" Skill Detail ")
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: false })
+                .scroll((explorer.scroll_offset, 0));
+            frame.render_widget(detail, columns[1]);
+        }
+        ContextExplorerTab::Plans => {
+            frame.render_widget(Clear, sections[2]);
+            let plans = Paragraph::new(Text::from(format_plans_tab_lines(explorer)))
+                .block(Block::default().title(" Plans ").borders(Borders::ALL))
+                .wrap(Wrap { trim: false })
+                .scroll((explorer.scroll_offset, 0));
+            frame.render_widget(plans, sections[2]);
+        }
+    }
+
+    let footer = Paragraph::new("Esc close • ←→/h l tabs • ↑↓/j k navigate • PgUp/PgDn scroll")
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        );
+    frame.render_widget(Clear, sections[3]);
+    frame.render_widget(footer, sections[3]);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn context_list_scroll(selected_index: usize, entry_count: usize, visible_rows: usize) -> u16 {
+    if visible_rows == 0 || entry_count <= visible_rows {
+        return 0;
+    }
+    let max_scroll = entry_count.saturating_sub(visible_rows);
+    let preferred = selected_index.saturating_sub(visible_rows / 2);
+    preferred.min(max_scroll) as u16
+}
+
 #[cfg(test)]
 fn wrapped_line_count(line: &Line, area_width: u16) -> u16 {
     if area_width == 0 {
@@ -557,6 +1107,8 @@ fn wrapped_line_count(line: &Line, area_width: u16) -> u16 {
 
 /// Render the input box at the bottom.
 fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
+    frame.render_widget(Clear, area);
+
     if let Some(ref select) = app.option_select {
         let mut lines: Vec<Line> = Vec::new();
         let label = app.input_label();
@@ -616,6 +1168,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context_debug::{HistoryEntry, SessionContextSnapshot};
     use crate::tui::app::ConversationEntry;
     use ratatui::layout::Position;
 
@@ -659,6 +1212,348 @@ mod tests {
             "ctx limit 200000"
         );
         assert_eq!(format_context_status(None, None), "ctx n/a");
+    }
+
+    #[test]
+    fn draw_context_explorer_marks_selected_entry() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec![],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            auto_approve_permissions: true,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![],
+            history: vec![
+                HistoryEntry::Text {
+                    role: "user".into(),
+                    text: "first".into(),
+                },
+                HistoryEntry::Text {
+                    role: "assistant".into(),
+                    text: "second".into(),
+                },
+            ],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+        app.context_explorer_move_down();
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let selected = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == "›")
+            .count();
+        assert!(selected >= 1);
+    }
+
+    #[test]
+    fn draw_context_explorer_keeps_selected_marker_after_detail_scroll() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec![],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            auto_approve_permissions: true,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![],
+            history: vec![
+                HistoryEntry::Text {
+                    role: "user".into(),
+                    text: "first".into(),
+                },
+                HistoryEntry::Text {
+                    role: "assistant".into(),
+                    text: (0..80)
+                        .map(|index| format!("line {index}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                },
+            ],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+        app.context_explorer_move_down();
+        app.context_explorer_scroll_down(20);
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buffer = terminal.backend().buffer();
+        let selected = buffer
+            .content()
+            .iter()
+            .filter(|cell| cell.symbol() == "›" && cell.bg == Color::Yellow)
+            .count();
+        assert!(selected >= 1);
+    }
+
+    #[test]
+    fn closing_context_explorer_clears_overlay_content() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: Some("system prompt".into()),
+            skills: vec!["review".into()],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            auto_approve_permissions: true,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![],
+            history: vec![HistoryEntry::Text {
+                role: "user".into(),
+                text: "hello world".into(),
+            }],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.messages
+            .push(ConversationEntry::AssistantText("base conversation".into()));
+        app.open_context_explorer(snapshot);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.close_context_explorer();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(!lines.iter().any(|line| line.contains("Context Explorer")));
+        assert!(lines.iter().any(|line| line.contains("base conversation")));
+    }
+
+    #[test]
+    fn context_list_scroll_keeps_selected_item_visible() {
+        assert_eq!(context_list_scroll(0, 20, 5), 0);
+        assert_eq!(context_list_scroll(4, 20, 5), 2);
+        assert_eq!(context_list_scroll(19, 20, 5), 15);
+        assert_eq!(context_list_scroll(2, 3, 5), 0);
+    }
+
+    #[test]
+    fn draw_renders_context_explorer_overlay() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: Some("system prompt".into()),
+            skills: vec!["review".into(), "qa".into()],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            auto_approve_permissions: true,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![],
+            history: vec![
+                HistoryEntry::Text {
+                    role: "user".into(),
+                    text: "hello world".into(),
+                },
+                HistoryEntry::ToolResult {
+                    role: "tool".into(),
+                    tool_use_id: "call_1".into(),
+                    output: "done".into(),
+                    is_error: false,
+                },
+            ],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("Context Explorer")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("session session-1 | state idle | 2 entries")));
+        assert!(lines.iter().any(|line| line.contains("tools [none]")));
+        assert!(lines.iter().any(|line| line.contains("History")));
+        assert!(lines.iter().any(|line| line.contains("user: hello world")));
+        assert!(lines.iter().any(|line| line.contains("kind: text")));
+    }
+
+    #[test]
+    fn draw_context_explorer_shows_tool_info() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec!["review".into()],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            auto_approve_permissions: true,
+            available_tools: vec![quine_llm::ToolDefinition {
+                name: "bash".into(),
+                description: "Execute a shell command in the workspace.".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {"command": {"type": "string"}}}),
+            }],
+            loaded_skills: vec![],
+            plans: vec![],
+            history: vec![
+                HistoryEntry::ToolUse {
+                    role: "assistant".into(),
+                    text: Some("running tool".into()),
+                    tool_calls: vec![crate::context_debug::ToolCallEntry {
+                        tool_use_id: "call_1".into(),
+                        tool_name: "bash".into(),
+                        arguments: serde_json::json!({"command": "pwd"}),
+                    }],
+                },
+                HistoryEntry::ToolResult {
+                    role: "tool".into(),
+                    tool_use_id: "call_1".into(),
+                    output: "/tmp/project".into(),
+                    is_error: false,
+                },
+            ],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+        app.context_explorer_move_down();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("tools [bash]")));
+        assert!(lines.iter().any(|line| line.contains("tool_name: bash")));
+    }
+
+    #[test]
+    fn draw_context_explorer_renders_tools_tab() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec!["review".into()],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            auto_approve_permissions: true,
+            available_tools: vec![quine_llm::ToolDefinition {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            loaded_skills: vec![],
+            plans: vec![],
+            history: vec![],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+        app.context_explorer_next_tab();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("Tool Detail")));
+        assert!(lines.iter().any(|line| line.contains("read_file")));
+        assert!(lines.iter().any(|line| line.contains("description:")));
+    }
+
+    #[test]
+    fn draw_context_explorer_renders_skills_tab() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec!["review".into()],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            auto_approve_permissions: true,
+            available_tools: vec![],
+            loaded_skills: vec![crate::context_debug::SkillSnapshot {
+                name: "review".into(),
+                description: "Review changes".into(),
+                version: "1.0".into(),
+                system_prompt: Some("Review carefully".into()),
+                source_path: std::path::PathBuf::from("/tmp/project/.quine/skills/review.md"),
+                tool_names: vec!["read_file".into(), "bash".into()],
+            }],
+            plans: vec![],
+            history: vec![],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+        app.context_explorer_next_tab();
+        app.context_explorer_next_tab();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("Skill Detail")));
+        assert!(lines.iter().any(|line| line.contains("review")));
+        assert!(lines.iter().any(|line| line.contains("Review changes")));
+    }
+
+    #[test]
+    fn draw_context_explorer_renders_plans_tab() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec!["review".into()],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            auto_approve_permissions: true,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![crate::context_debug::PlanSnapshot {
+                plan_id: "plan-1".into(),
+                title: "Fix explorer".into(),
+                actions: vec![crate::context_debug::PlanActionSnapshot {
+                    action_id: "patch".into(),
+                    title: "Patch renderer".into(),
+                    description: "Update the context explorer rendering".into(),
+                    depends_on: vec![],
+                    status: crate::context_debug::PlanActionStatusSnapshot::InProgress,
+                    result: Some("Wiring tabs".into()),
+                }],
+            }],
+            history: vec![],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+        app.context_explorer_next_tab();
+        app.context_explorer_next_tab();
+        app.context_explorer_next_tab();
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("Plans")));
+        assert!(lines.iter().any(|line| line.contains("Fix explorer")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("patch [in-progress] Patch renderer")));
     }
 
     #[test]

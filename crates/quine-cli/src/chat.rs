@@ -4,6 +4,7 @@ use quine_llm::Message;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::IpcClient;
+use crate::context_debug::render_session_context;
 use crate::render::{Renderer, TerminalRenderer};
 use crate::session::{
     create_session, create_session_with_initial_messages, create_slash_skill_session,
@@ -57,6 +58,7 @@ fn print_resume_command(socket_path: &Path, session_id: &str) {
 enum ChatCommandAction {
     Quit,
     ShowError(String),
+    ShowContext,
     SendMessage(String),
     CompactSession,
     EnterPlanModeAndSend(String),
@@ -116,6 +118,13 @@ fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
                         ChatCommandAction::CompactSession
                     } else {
                         ChatCommandAction::ShowError("Usage: /compact".to_string())
+                    }
+                }
+                "context" => {
+                    if arguments.is_empty() {
+                        ChatCommandAction::ShowContext
+                    } else {
+                        ChatCommandAction::ShowError("Usage: /context".to_string())
                     }
                 }
                 "plan" => {
@@ -192,6 +201,11 @@ pub async fn run_chat(
                             ChatCommandAction::Quit => break,
                             ChatCommandAction::ShowError(message) => {
                                 renderer.render_error(&message).await?;
+                                continue;
+                            }
+                            ChatCommandAction::ShowContext => {
+                                render_session_context(&mut renderer, &mut client, &session.session_id)
+                                    .await?;
                                 continue;
                             }
                             ChatCommandAction::CompactSession => {
