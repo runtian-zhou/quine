@@ -11,7 +11,7 @@ use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
 use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision};
 use crate::planner::scheduler::{get_ready_actions, render_plan};
-use crate::session::{ExitStatus, SessionId, SessionState};
+use crate::session::{ExitStatus, SessionId, SessionSignal, SessionState};
 use crate::session_tree::SessionTree;
 use crate::skill::Skill;
 use crate::tool::{
@@ -109,6 +109,8 @@ struct SessionContext {
     plan_store: crate::tool::plan::PlanStore,
     /// Per-turn cancellation sender for the currently running tool or prompt.
     cancel_tx: Option<tokio::sync::watch::Sender<bool>>,
+    /// Latches an interrupt until the next user message resumes the session.
+    interrupted: bool,
 }
 
 struct SessionInit {
@@ -225,11 +227,13 @@ impl SessionContext {
             pending_interaction: None,
             plan_store,
             cancel_tx: None,
+            interrupted: false,
         })
     }
 }
 
 /// Send the current conversation to the LLM and stream the response.
+#[allow(dead_code)]
 async fn call_llm(
     provider: &dyn LlmProvider,
     session: &SessionContext,
@@ -305,6 +309,143 @@ async fn call_llm(
     Ok(LlmCallResult { turn, usage })
 }
 
+async fn call_llm_interruptible(
+    provider: &dyn LlmProvider,
+    history: Vec<Message>,
+    tools: Vec<ToolDefinition>,
+    session_id: SessionId,
+    io: &mut CoreIo<'_>,
+    sessions: &mut HashMap<SessionId, SessionContext>,
+) -> Result<Option<LlmCallResult>, CoreError> {
+    let send_future = provider.send(&history, &tools);
+    tokio::pin!(send_future);
+
+    let mut stream = loop {
+        tokio::select! {
+            stream_result = &mut send_future => {
+                break stream_result.map_err(|e| CoreError::LlmError {
+                    message: e.to_string(),
+                })?;
+            }
+            maybe_input = io.input.recv() => {
+                match maybe_input {
+                    Some(input) => {
+                        if matches!(
+                            handle_session_control_input(
+                                input,
+                                session_id,
+                                sessions,
+                                io.deferred_inputs,
+                            ),
+                            SessionControlFlow::Interrupted
+                        ) {
+                            debug_log_session(session_id, "LLM request interrupted before stream opened");
+                            return Ok(None);
+                        }
+                    }
+                    None => {
+                        return Err(CoreError::Internal {
+                            message: "input channel closed while awaiting LLM response".into(),
+                        });
+                    }
+                }
+            }
+        }
+    };
+
+    let mut full_text = String::new();
+    let mut tool_calls = Vec::new();
+    let mut usage = None;
+
+    loop {
+        tokio::select! {
+            event_result = stream.next() => {
+                let Some(event_result) = event_result else {
+                    break;
+                };
+                match event_result {
+                    Ok(LlmEvent::ReasoningDelta { text }) => {
+                        let _ = io
+                            .output
+                            .send(CoreOutput::ReasoningDelta {
+                                session_id,
+                                delta: text,
+                            })
+                            .await;
+                    }
+                    Ok(LlmEvent::TextDelta { text }) => {
+                        full_text.push_str(&text);
+                        let _ = io
+                            .output
+                            .send(CoreOutput::StreamDelta {
+                                session_id,
+                                delta: text,
+                            })
+                            .await;
+                    }
+                    Ok(LlmEvent::ToolCall {
+                        tool_use_id,
+                        tool_name,
+                        arguments,
+                    }) => {
+                        tool_calls.push(PendingToolCall {
+                            tool_use_id,
+                            tool_name,
+                            arguments,
+                        });
+                    }
+                    Ok(LlmEvent::Done { usage: u }) => {
+                        usage = u;
+                        break;
+                    }
+                    Err(e) => {
+                        return Err(CoreError::LlmError {
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            }
+            maybe_input = io.input.recv() => {
+                match maybe_input {
+                    Some(input) => {
+                        if matches!(
+                            handle_session_control_input(
+                                input,
+                                session_id,
+                                sessions,
+                                io.deferred_inputs,
+                            ),
+                            SessionControlFlow::Interrupted
+                        ) {
+                            debug_log_session(session_id, "LLM stream interrupted");
+                            return Ok(None);
+                        }
+                    }
+                    None => {
+                        return Err(CoreError::Internal {
+                            message: "input channel closed while streaming LLM response".into(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let turn = if tool_calls.is_empty() {
+        LlmTurnResult::Text(full_text)
+    } else {
+        LlmTurnResult::ToolCalls {
+            text_before: if full_text.is_empty() {
+                None
+            } else {
+                Some(full_text)
+            },
+            calls: tool_calls,
+        }
+    };
+    Ok(Some(LlmCallResult { turn, usage }))
+}
+
 struct PendingToolCall {
     tool_use_id: String,
     tool_name: String,
@@ -351,6 +492,11 @@ enum TurnOutcome {
     Cancelled,
 }
 
+enum SessionControlFlow {
+    Continue,
+    Interrupted,
+}
+
 fn session_output(session: &SessionContext) -> Option<String> {
     session.history.iter().rev().find_map(|message| {
         if message.role != quine_llm::Role::Assistant {
@@ -363,6 +509,65 @@ fn session_output(session: &SessionContext) -> Option<String> {
             MessageContent::ToolResult { .. } => None,
         }
     })
+}
+
+fn interrupt_session(
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    deferred_inputs: &mut VecDeque<CoreInput>,
+    session_id: SessionId,
+) {
+    if let Some(session) = sessions.get_mut(&session_id) {
+        session.state = SessionState::Idle;
+        session.interrupted = true;
+        if let Some(cancel_tx) = &session.cancel_tx {
+            let _ = cancel_tx.send(true);
+        }
+        session.cancel_tx = None;
+        session.pending_interaction.take();
+    }
+
+    deferred_inputs.retain(|input| {
+        !matches!(
+            input,
+            CoreInput::InteractionResponse { session_id: sid, .. }
+                | CoreInput::Cancel { session_id: sid }
+                | CoreInput::Signal { session_id: sid, .. }
+                | CoreInput::ToolResult { session_id: sid, .. }
+                if *sid == session_id
+        )
+    });
+}
+
+fn handle_session_control_input(
+    input: CoreInput,
+    session_id: SessionId,
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    deferred_inputs: &mut VecDeque<CoreInput>,
+) -> SessionControlFlow {
+    match input {
+        CoreInput::Cancel {
+            session_id: cancel_sid,
+        } if cancel_sid == session_id => {
+            interrupt_session(sessions, deferred_inputs, session_id);
+            SessionControlFlow::Interrupted
+        }
+        CoreInput::Signal {
+            session_id: signal_sid,
+            signal,
+        } if signal_sid == session_id
+            && matches!(
+                signal,
+                SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill
+            ) =>
+        {
+            interrupt_session(sessions, deferred_inputs, session_id);
+            SessionControlFlow::Interrupted
+        }
+        other => {
+            deferred_inputs.push_back(other);
+            SessionControlFlow::Continue
+        }
+    }
 }
 
 async fn finalize_child_session(
@@ -614,6 +819,13 @@ async fn check_permission(
                                 debug_log_session(session_id, "permission check interrupted by cancel input");
                                 return Err(ToolOutcome::Cancelled);
                             }
+                            Ok(Some(CoreInput::Signal { session_id: signal_sid, signal }))
+                                if signal_sid == session_id
+                                    && matches!(signal, SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill) =>
+                            {
+                                debug_log_session(session_id, "permission check interrupted by session signal");
+                                return Err(ToolOutcome::Cancelled);
+                            }
                             Ok(Some(other)) => {
                                 wait.deferred_inputs.push_back(other);
                                 continue;
@@ -651,13 +863,20 @@ async fn execute_tool_call(
     io: &mut CoreIo<'_>,
     engine: &mut EngineState<'_>,
 ) -> ToolOutcome {
-    let Some(session) = sessions.get_mut(&session_id) else {
-        return ToolOutcome::Error {
-            message: "session not found".into(),
-        };
-    };
     let (cancel_tx, cancellation) = CancellationChannel::new_pair();
-    session.cancel_tx = Some(cancel_tx.clone());
+    let auto_approve_permissions = {
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return ToolOutcome::Error {
+                message: "session not found".into(),
+            };
+        };
+        if session.interrupted {
+            return ToolOutcome::Cancelled;
+        }
+        let auto_approve_permissions = session.auto_approve_permissions;
+        session.cancel_tx = Some(cancel_tx.clone());
+        auto_approve_permissions
+    };
     debug_log_session(
         session_id,
         format!("starting tool execution for `{}`", call.tool_name),
@@ -668,23 +887,35 @@ async fn execute_tool_call(
         if let Some(checker) = engine
             .permission_checker
             .as_deref()
-            .filter(|_| !session.auto_approve_permissions)
+            .filter(|_| !auto_approve_permissions)
         {
-            if let Err(outcome) = check_permission(
-                checker,
-                call,
-                session,
-                session_id,
-                PermissionWait {
-                    output: io.output,
-                    input: io.input,
-                    deferred_inputs: io.deferred_inputs,
-                    cancellation: &cancellation,
-                },
-            )
-            .await
-            {
-                session.cancel_tx = None;
+            let permission_outcome = {
+                let Some(session) = sessions.get(&session_id) else {
+                    return ToolOutcome::Error {
+                        message: "session not found".into(),
+                    };
+                };
+                check_permission(
+                    checker,
+                    call,
+                    session,
+                    session_id,
+                    PermissionWait {
+                        output: io.output,
+                        input: io.input,
+                        deferred_inputs: io.deferred_inputs,
+                        cancellation: &cancellation,
+                    },
+                )
+                .await
+            };
+            if let Err(outcome) = permission_outcome {
+                if matches!(outcome, ToolOutcome::Cancelled) {
+                    interrupt_session(sessions, io.deferred_inputs, session_id);
+                }
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.cancel_tx = None;
+                }
                 return outcome;
             }
         }
@@ -905,11 +1136,19 @@ async fn execute_tool_call(
                                         session_id,
                                         format!("interactive tool `{}` cancelled while awaiting interaction", call.tool_name),
                                     );
-                                    if let Some(session) = sessions.get_mut(&session_id) {
-                                        if let Some(cancel_tx) = session.cancel_tx.as_ref() {
-                                            let _ = cancel_tx.send(true);
-                                        }
-                                    }
+                                    interrupt_session(sessions, io.deferred_inputs, session_id);
+                                    drop(reply_tx);
+                                    break 'tool_loop ToolOutcome::Cancelled;
+                                }
+                                Some(CoreInput::Signal { session_id: signal_sid, signal })
+                                    if signal_sid == sid
+                                        && matches!(signal, SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill) =>
+                                {
+                                    debug_log_session(
+                                        session_id,
+                                        format!("interactive tool `{}` interrupted while awaiting interaction", call.tool_name),
+                                    );
+                                    interrupt_session(sessions, io.deferred_inputs, session_id);
                                     drop(reply_tx);
                                     break 'tool_loop ToolOutcome::Cancelled;
                                 }
@@ -998,11 +1237,18 @@ async fn execute_tool_call(
                                 session_id,
                                 format!("tool `{}` cancelled by core input", call.tool_name),
                             );
-                            if let Some(session) = sessions.get_mut(&session_id) {
-                                if let Some(cancel_tx) = session.cancel_tx.as_ref() {
-                                    let _ = cancel_tx.send(true);
-                                }
-                            }
+                            interrupt_session(sessions, io.deferred_inputs, session_id);
+                            break ToolOutcome::Cancelled;
+                        }
+                        Some(CoreInput::Signal { session_id: signal_sid, signal })
+                            if signal_sid == session_id
+                                && matches!(signal, SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill) =>
+                        {
+                            debug_log_session(
+                                session_id,
+                                format!("tool `{}` interrupted by session signal", call.tool_name),
+                            );
+                            interrupt_session(sessions, io.deferred_inputs, session_id);
                             break ToolOutcome::Cancelled;
                         }
                         Some(other) => {
@@ -1138,11 +1384,51 @@ async fn handle_llm_turn(
         let Some(session) = sessions.get(&session_id) else {
             return TurnOutcome::Failed("session not found".into());
         };
-        match call_llm(&**engine.provider, session, session_id, io.output).await {
-            Ok(LlmCallResult {
+        if session.interrupted {
+            debug_log_session(
+                session_id,
+                "aborting LLM turn because session is interrupted",
+            );
+            let duration_us = turn_start.elapsed().as_micros() as u64;
+            let _ = io
+                .output
+                .send(CoreOutput::TurnComplete {
+                    session_id,
+                    duration_us,
+                    usage: accumulated_usage.clone(),
+                })
+                .await;
+            return TurnOutcome::Cancelled;
+        }
+        let history = session.history.clone();
+        let tools = session.tools.clone();
+        match call_llm_interruptible(&**engine.provider, history, tools, session_id, io, sessions)
+            .await
+        {
+            Ok(None) => {
+                debug_log_session(session_id, "LLM turn interrupted");
+                let duration_us = turn_start.elapsed().as_micros() as u64;
+                let _ = io
+                    .output
+                    .send(CoreOutput::SessionStateChanged {
+                        session_id,
+                        state: SessionState::Idle,
+                    })
+                    .await;
+                let _ = io
+                    .output
+                    .send(CoreOutput::TurnComplete {
+                        session_id,
+                        duration_us,
+                        usage: accumulated_usage.clone(),
+                    })
+                    .await;
+                return TurnOutcome::Cancelled;
+            }
+            Ok(Some(LlmCallResult {
                 turn: LlmTurnResult::Text(full_text),
                 usage,
-            }) => {
+            })) => {
                 // Accumulate usage from this LLM call.
                 if let Some(u) = usage {
                     let acc = accumulated_usage.get_or_insert(quine_llm::TokenUsage::default());
@@ -1183,10 +1469,10 @@ async fn handle_llm_turn(
                     .await;
                 return TurnOutcome::Completed(Some(full_text));
             }
-            Ok(LlmCallResult {
+            Ok(Some(LlmCallResult {
                 turn: LlmTurnResult::ToolCalls { text_before, calls },
                 usage,
-            }) => {
+            })) => {
                 // Accumulate usage from this LLM call.
                 if let Some(u) = usage {
                     let acc = accumulated_usage.get_or_insert(quine_llm::TokenUsage::default());
@@ -1233,6 +1519,32 @@ async fn handle_llm_turn(
 
                 // Execute each tool call directly
                 for call in &calls {
+                    if sessions
+                        .get(&session_id)
+                        .is_some_and(|session| session.interrupted)
+                    {
+                        debug_log_session(
+                            session_id,
+                            "skipping pending tool calls because session is interrupted",
+                        );
+                        let duration_us = turn_start.elapsed().as_micros() as u64;
+                        let _ = io
+                            .output
+                            .send(CoreOutput::SessionStateChanged {
+                                session_id,
+                                state: SessionState::Idle,
+                            })
+                            .await;
+                        let _ = io
+                            .output
+                            .send(CoreOutput::TurnComplete {
+                                session_id,
+                                duration_us,
+                                usage: accumulated_usage.clone(),
+                            })
+                            .await;
+                        return TurnOutcome::Cancelled;
+                    }
                     if debug {
                         debug_log_session(
                             session_id,
@@ -1473,6 +1785,7 @@ pub async fn run_core_loop(
                 if sessions.contains_key(&session_id) {
                     {
                         let session = sessions.get_mut(&session_id).unwrap();
+                        session.interrupted = false;
                         session.state = SessionState::Streaming;
                         session.history.push(Message::user(&content));
                     }
@@ -1610,13 +1923,8 @@ pub async fn run_core_loop(
 
             CoreInput::Cancel { session_id } => {
                 debug_log_session(session_id, "received Cancel");
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    session.state = SessionState::Idle;
-                    if let Some(cancel_tx) = &session.cancel_tx {
-                        let _ = cancel_tx.send(true);
-                    }
-                    session.cancel_tx = None;
-                    session.pending_interaction.take();
+                if sessions.contains_key(&session_id) {
+                    interrupt_session(&mut sessions, &mut deferred_inputs, session_id);
                     let _ = handle
                         .output
                         .send(CoreOutput::SessionStateChanged {
@@ -1699,8 +2007,40 @@ pub async fn run_core_loop(
                     }
                 }
             }
-            CoreInput::Signal { .. } | CoreInput::SendMessage { .. } => {
-                debug_log("received Signal or SendMessage; no-op in current core loop");
+            CoreInput::Signal { session_id, signal } => {
+                debug_log_session(session_id, format!("received Signal::{signal:?}"));
+                match signal {
+                    SessionSignal::Continue => {
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.interrupted = false;
+                            if session.state == SessionState::Paused {
+                                session.state = SessionState::Idle;
+                            }
+                            let _ = handle
+                                .output
+                                .send(CoreOutput::SessionStateChanged {
+                                    session_id,
+                                    state: session.state,
+                                })
+                                .await;
+                        }
+                    }
+                    SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill => {
+                        if sessions.contains_key(&session_id) {
+                            interrupt_session(&mut sessions, &mut deferred_inputs, session_id);
+                            let _ = handle
+                                .output
+                                .send(CoreOutput::SessionStateChanged {
+                                    session_id,
+                                    state: SessionState::Idle,
+                                })
+                                .await;
+                        }
+                    }
+                }
+            }
+            CoreInput::SendMessage { .. } => {
+                debug_log("received SendMessage; no-op in current core loop");
             }
             CoreInput::WaitSession {
                 parent_id,
@@ -1724,6 +2064,7 @@ mod tests {
     use crate::permission::PermissionError;
     use crate::session::{ExitStatus, InheritanceFlags};
     use std::pin::Pin;
+    use tempfile::TempDir;
     use tokio::sync::oneshot;
 
     /// A mock LLM provider that returns a fixed text response.
@@ -1905,6 +2246,66 @@ mod tests {
                 content
             }) if session_id == other_session_id && content == "hello"
         ));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_consumes_stop_signal_for_non_interactive_tool() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
+        let session = SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                auto_approve_permissions: false,
+            },
+            &provider,
+            &permission_checker,
+        )
+        .await
+        .unwrap();
+
+        let call = PendingToolCall {
+            tool_use_id: "toolu_signal_cancel".into(),
+            tool_name: "bash".into(),
+            arguments: serde_json::json!({"command": "sleep 5"}),
+        };
+
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(4);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let session_id = SessionId::new();
+        input_tx
+            .send(CoreInput::Signal {
+                session_id,
+                signal: SessionSignal::Stop,
+            })
+            .await
+            .unwrap();
+
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            permission_checker: &permission_checker,
+            session_tree: &mut session_tree,
+        };
+        let result =
+            execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine).await;
+
+        assert!(matches!(result, ToolOutcome::Cancelled));
+        assert!(sessions
+            .get(&session_id)
+            .is_some_and(|session| session.cancel_tx.is_none() && session.interrupted));
+        assert!(deferred_inputs.is_empty());
     }
 
     #[tokio::test]
@@ -2319,6 +2720,145 @@ mod tests {
         assert!(got_tool_request, "should have received ToolRequest");
         assert!(got_text_complete, "should have received TextComplete");
         assert!(got_turn_complete, "should have received TurnComplete");
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stop_signal_interrupts_running_tool_and_skips_remaining_tool_calls() {
+        struct TwoToolProvider {
+            call_count: std::sync::atomic::AtomicU32,
+            marker_path: std::path::PathBuf,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for TwoToolProvider {
+            async fn send(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+            {
+                let count = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let events = if count == 0 {
+                    vec![
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_sleep".into(),
+                            tool_name: "bash".into(),
+                            arguments: serde_json::json!({"command": "sleep 5"}),
+                        }),
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_marker".into(),
+                            tool_name: "bash".into(),
+                            arguments: serde_json::json!({
+                                "command": format!(
+                                    "python -c \"from pathlib import Path; Path(r#\\\"{}\\\"#).write_text('ran')\"",
+                                    self.marker_path.display()
+                                )
+                            }),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else {
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            text: "should not happen".into(),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let temp_dir = TempDir::new().unwrap();
+        let marker_path = temp_dir.path().join("interrupt-marker.txt");
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let provider = TwoToolProvider {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+            marker_path: marker_path.clone(),
+        };
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                auto_approve_permissions: false,
+                initial_messages: Vec::new(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        let _ = output.recv().await.unwrap();
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "run tools".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut saw_sleep_tool = false;
+        let mut saw_marker_tool = false;
+        let mut saw_turn_complete = false;
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
+                Ok(Some(CoreOutput::ToolRequest { tool_use_id, .. }))
+                    if tool_use_id == "tc_sleep" =>
+                {
+                    saw_sleep_tool = true;
+                    harness
+                        .input
+                        .send(CoreInput::Signal {
+                            session_id,
+                            signal: SessionSignal::Stop,
+                        })
+                        .await
+                        .unwrap();
+                }
+                Ok(Some(CoreOutput::ToolRequest { tool_use_id, .. }))
+                    if tool_use_id == "tc_marker" =>
+                {
+                    saw_marker_tool = true;
+                }
+                Ok(Some(CoreOutput::TurnComplete { .. })) => {
+                    saw_turn_complete = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timeout waiting for interrupt flow events"),
+            }
+        }
+
+        assert!(
+            saw_sleep_tool,
+            "expected first tool request before interrupt"
+        );
+        assert!(
+            !saw_marker_tool,
+            "second tool should not run after interrupt"
+        );
+        assert!(saw_turn_complete, "interrupted turn should still complete");
+        assert!(
+            !marker_path.exists(),
+            "remaining pending tool work should not run after interrupt"
+        );
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();
