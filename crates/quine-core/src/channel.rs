@@ -92,8 +92,30 @@ pub enum CoreInput {
         content: String,
     },
 
+    /// Receive an inter-session message.
+    RecvMessage {
+        session_id: SessionId,
+        source: MessageSource,
+        non_blocking: bool,
+        reply: oneshot::Sender<Option<MailboxMessage>>,
+    },
+
     /// Graceful shutdown of the entire core event loop.
     Shutdown,
+}
+
+/// Source filter for mailbox receive requests.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum MessageSource {
+    Any,
+    Session(SessionId),
+}
+
+/// A delivered inter-session mailbox message.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MailboxMessage {
+    pub from: SessionId,
+    pub content: String,
 }
 
 /// The outcome of a tool execution performed by the harness.
