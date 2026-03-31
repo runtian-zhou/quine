@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{notifications, JsonRpcNotification};
+use unicode_width::UnicodeWidthChar;
 
 /// Spinner braille frames for the waiting animation.
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -370,7 +371,11 @@ impl InputBuffer {
 
     /// Display width of the current line prefix up to `col` characters.
     pub fn line_prefix_width(&self, row: usize, col: usize) -> usize {
-        self.lines[row].chars().take(col).count()
+        self.lines[row]
+            .chars()
+            .take(col)
+            .map(|ch| ch.width().unwrap_or(0))
+            .sum()
     }
 
     /// Get the full content as a single string (lines joined by newlines).
