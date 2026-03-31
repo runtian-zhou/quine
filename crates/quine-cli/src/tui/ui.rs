@@ -3,9 +3,7 @@ use std::collections::{BTreeMap, HashMap};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{
-    Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap,
-};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap};
 use ratatui::Frame;
 use serde_json::to_string_pretty;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -729,7 +727,10 @@ fn format_context_entry_detail(explorer: &ContextExplorerState) -> String {
             is_error,
         }) => {
             let status = if *is_error { "error" } else { "ok" };
-            let tool_name = tool_names.get(tool_use_id.as_str()).copied().unwrap_or("<unknown>");
+            let tool_name = tool_names
+                .get(tool_use_id.as_str())
+                .copied()
+                .unwrap_or("<unknown>");
             format!(
                 "kind: tool_result\nrole: {role}\ntool_use_id: {tool_use_id}\ntool_name: {tool_name}\nstatus: {status}\n\n{output}"
             )
@@ -870,7 +871,11 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
     let tabs = Tabs::new(tab_titles)
         .select(tab_index)
         .style(Style::default().fg(Color::DarkGray))
-        .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD));
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
     frame.render_widget(Clear, sections[1]);
     frame.render_widget(tabs, sections[1]);
 
@@ -892,7 +897,11 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
                 .map(|(index, _)| {
                     let label = format!(
                         "{}{}",
-                        if index == explorer.selected_index { "› " } else { "  " },
+                        if index == explorer.selected_index {
+                            "› "
+                        } else {
+                            "  "
+                        },
                         format_context_entry_label(index, explorer)
                     );
                     ListItem::new(Line::from(label))
@@ -940,7 +949,11 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
                 .map(|(index, _)| {
                     let label = format!(
                         "{}{}",
-                        if index == explorer.selected_index { "› " } else { "  " },
+                        if index == explorer.selected_index {
+                            "› "
+                        } else {
+                            "  "
+                        },
                         format_tool_label(index, explorer)
                     );
                     ListItem::new(Line::from(label))
@@ -966,7 +979,11 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             frame.render_stateful_widget(list, columns[0], &mut list_state);
 
             let detail = Paragraph::new(format_tool_detail(explorer))
-                .block(Block::default().title(" Tool Detail ").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title(" Tool Detail ")
+                        .borders(Borders::ALL),
+                )
                 .wrap(Wrap { trim: false })
                 .scroll((explorer.scroll_offset, 0));
             frame.render_widget(detail, columns[1]);
@@ -988,7 +1005,11 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
                 .map(|(index, _)| {
                     let label = format!(
                         "{}{}",
-                        if index == explorer.selected_index { "› " } else { "  " },
+                        if index == explorer.selected_index {
+                            "› "
+                        } else {
+                            "  "
+                        },
                         format_skill_label(index, explorer)
                     );
                     ListItem::new(Line::from(label))
@@ -1014,7 +1035,11 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             frame.render_stateful_widget(list, columns[0], &mut list_state);
 
             let detail = Paragraph::new(format_skill_detail(explorer))
-                .block(Block::default().title(" Skill Detail ").borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title(" Skill Detail ")
+                        .borders(Borders::ALL),
+                )
                 .wrap(Wrap { trim: false })
                 .scroll((explorer.scroll_offset, 0));
             frame.render_widget(detail, columns[1]);
@@ -1252,7 +1277,10 @@ mod tests {
                 },
                 HistoryEntry::Text {
                     role: "assistant".into(),
-                    text: (0..80).map(|index| format!("line {index}")).collect::<Vec<_>>().join("\n"),
+                    text: (0..80)
+                        .map(|index| format!("line {index}"))
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                 },
             ],
         };
@@ -1294,7 +1322,8 @@ mod tests {
             }],
         };
         let mut app = App::new("test".into(), false, None);
-        app.messages.push(ConversationEntry::AssistantText("base conversation".into()));
+        app.messages
+            .push(ConversationEntry::AssistantText("base conversation".into()));
         app.open_context_explorer(snapshot);
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
@@ -1513,6 +1542,7 @@ mod tests {
         app.open_context_explorer(snapshot);
         app.context_explorer_next_tab();
         app.context_explorer_next_tab();
+        app.context_explorer_next_tab();
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1521,7 +1551,9 @@ mod tests {
         let lines = buffer_lines(terminal.backend());
         assert!(lines.iter().any(|line| line.contains("Plans")));
         assert!(lines.iter().any(|line| line.contains("Fix explorer")));
-        assert!(lines.iter().any(|line| line.contains("patch [in-progress] Patch renderer")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("patch [in-progress] Patch renderer")));
     }
 
     #[test]

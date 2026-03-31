@@ -967,7 +967,9 @@ impl App {
     pub fn context_explorer_move_up(&mut self) {
         if let Some(explorer) = self.context_explorer.as_mut() {
             match explorer.active_tab {
-                ContextExplorerTab::History | ContextExplorerTab::Tools | ContextExplorerTab::Skills => {
+                ContextExplorerTab::History
+                | ContextExplorerTab::Tools
+                | ContextExplorerTab::Skills => {
                     if explorer.selected_index > 0 {
                         explorer.selected_index -= 1;
                         explorer.scroll_offset = 0;
@@ -1013,7 +1015,9 @@ impl App {
             explorer.scroll_offset = 0;
             if matches!(
                 explorer.active_tab,
-                ContextExplorerTab::History | ContextExplorerTab::Tools | ContextExplorerTab::Skills
+                ContextExplorerTab::History
+                    | ContextExplorerTab::Tools
+                    | ContextExplorerTab::Skills
             ) {
                 explorer.selected_index = 0;
             }

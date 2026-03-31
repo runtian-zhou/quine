@@ -2,7 +2,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use quine_core::{planner::{ActionPlan, ActionStatus}, skill, CoreCheckpoint, PersistedSession, SessionId};
+use quine_core::{
+    built_in_tool_definitions,
+    planner::{ActionPlan, ActionStatus},
+    skill, CoreCheckpoint, PersistedSession, SessionId,
+};
 use quine_llm::{Message, MessageContent, Role, ToolDefinition};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
@@ -177,113 +181,32 @@ fn build_loaded_skills(session: &PersistedSession) -> Vec<SkillSnapshot> {
         version: skill.meta.version,
         system_prompt: skill.system_prompt,
         source_path: skill.source_path,
-        tool_names: skill.tool_definitions.into_iter().map(|tool| tool.name).collect(),
+        tool_names: skill
+            .tool_definitions
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect(),
     })
     .collect()
 }
 
 fn build_available_tools(session: &PersistedSession) -> Vec<ToolDefinition> {
-    let mut tools = vec![
-        ToolDefinition {
-            name: "ask_user".into(),
-            description: "Ask the user a question and wait for a response.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "question": { "type": "string" },
-                    "options": { "type": "array", "items": { "type": "string" } },
-                    "multi_select": { "type": "boolean" },
-                    "allow_freeform": { "type": "boolean" }
-                },
-                "required": ["question"]
-            }),
-        },
-        ToolDefinition {
-            name: "bash".into(),
-            description: "Execute a shell command in the workspace.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "command": { "type": "string" },
-                    "timeout": { "type": "integer" }
-                },
-                "required": ["command"]
-            }),
-        },
-        ToolDefinition {
-            name: "find".into(),
-            description: "Search for files and directories by pattern or content.".into(),
-            parameters: serde_json::json!({"type": "object"}),
-        },
-        ToolDefinition {
-            name: "plan".into(),
-            description: "Create or update an action plan.".into(),
-            parameters: serde_json::json!({"type": "object"}),
-        },
-        ToolDefinition {
-            name: "read_file".into(),
-            description: "Read the contents of a file.".into(),
-            parameters: serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "file_path": { "type": "string" },
-                    "offset": { "type": "integer" },
-                    "limit": { "type": "integer" }
-                },
-                "required": ["file_path"]
-            }),
-        },
-    ];
-
-    if !session.config.plan_mode {
-        tools.extend([
-            ToolDefinition {
-                name: "write_file".into(),
-                description: "Write or replace a file in the workspace.".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-            ToolDefinition {
-                name: "subagent".into(),
-                description: "Spawn a child agent and return its result.".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-            ToolDefinition {
-                name: "spawn".into(),
-                description: "Spawn a background child session.".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-            ToolDefinition {
-                name: "wait_child".into(),
-                description: "Wait for a child session to finish.".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-            ToolDefinition {
-                name: "signal".into(),
-                description: "Send a control signal to a session.".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-            ToolDefinition {
-                name: "send_message".into(),
-                description: "Send a mailbox message to another session.".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-            ToolDefinition {
-                name: "recv_message".into(),
-                description: "Receive a mailbox message from another session.".into(),
-                parameters: serde_json::json!({"type": "object"}),
-            },
-        ]);
-    }
+    let mut tools = built_in_tool_definitions(session.config.plan_mode);
 
     for skill in futures::executor::block_on(skill::load_skills(
         &session.config.working_directory,
         &session.config.skill_names,
     )) {
-        tools.extend(skill.tool_definitions.into_iter().map(|tool| ToolDefinition {
-            name: tool.name,
-            description: tool.description,
-            parameters: tool.parameters,
-        }));
+        tools.extend(
+            skill
+                .tool_definitions
+                .into_iter()
+                .map(|tool| ToolDefinition {
+                    name: tool.name,
+                    description: tool.description,
+                    parameters: tool.parameters,
+                }),
+        );
     }
 
     tools.sort_by(|left, right| left.name.cmp(&right.name));
@@ -506,7 +429,18 @@ mod tests {
         assert_eq!(snapshot.skills, Vec::<String>::new());
         assert_eq!(snapshot.state, "streaming");
         assert!(!snapshot.available_tools.is_empty());
-        assert!(snapshot.available_tools.iter().any(|tool| tool.name == "read_file"));
+        assert!(snapshot
+            .available_tools
+            .iter()
+            .any(|tool| tool.name == "read_file"));
+        assert!(snapshot
+            .available_tools
+            .iter()
+            .any(|tool| tool.name == "apply_patch"));
+        assert!(!snapshot
+            .available_tools
+            .iter()
+            .any(|tool| tool.name == "write_file"));
         assert!(snapshot.loaded_skills.is_empty());
         assert!(snapshot.plans.is_empty());
         assert_eq!(snapshot.history.len(), 1);

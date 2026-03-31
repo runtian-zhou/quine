@@ -360,6 +360,23 @@ impl LocalHarness {
                 let _ = reply.send(result);
                 false
             }
+            ScheduledAction::RequestCheckpoint { reply } => {
+                let (core_reply_tx, core_reply_rx) = oneshot::channel();
+                let result = match harness_input
+                    .send(CoreInput::RequestCheckpoint {
+                        reply: core_reply_tx,
+                    })
+                    .await
+                {
+                    Ok(()) => core_reply_rx
+                        .await
+                        .map(|_| ())
+                        .map_err(|_| HarnessError::CoreChannelClosed),
+                    Err(_) => Err(HarnessError::CoreChannelClosed),
+                };
+                let _ = reply.send(result);
+                false
+            }
             ScheduledAction::SubmitToolResult {
                 session_id,
                 tool_use_id,
@@ -641,6 +658,26 @@ impl HarnessService for LocalHarness {
         &self,
         session_id: SessionId,
     ) -> Result<CoreCheckpoint, HarnessError> {
+        let sessions = self.sessions.lock().await;
+        if !sessions.contains_key(&session_id) {
+            return Err(HarnessError::SessionNotFound {
+                session_id: serde_json::to_value(session_id)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            });
+        }
+        drop(sessions);
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.enqueue(ScheduledCommand::immediate(
+            ScheduledAction::RequestCheckpoint { reply: reply_tx },
+        ))
+        .await?;
+        reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)??;
+
         let checkpoint = self
             ._storage
             .load_latest_checkpoint()
@@ -656,15 +693,6 @@ impl HarnessService for LocalHarness {
             })?;
 
         let sessions = self.sessions.lock().await;
-        if !sessions.contains_key(&session_id) {
-            return Err(HarnessError::SessionNotFound {
-                session_id: serde_json::to_value(session_id)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_default(),
-            });
-        }
-
         let live_states = sessions
             .iter()
             .map(|(id, session)| (*id, format!("{:?}", session.state).to_lowercase()))
@@ -884,6 +912,9 @@ enum ScheduledAction {
     },
     CompactSession {
         session_id: SessionId,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    },
+    RequestCheckpoint {
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
     SubmitToolResult {
