@@ -3,6 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
 use super::app::{AgentPhase, App, ConversationEntry, InputBuffer, ToolStatus};
@@ -36,22 +37,23 @@ fn format_token_usage(usage: &quine_llm::TokenUsage, max_context_window: u64) ->
 /// Render the entire TUI frame.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // Dynamic input box height: expand for option selection or multi-line input.
-    let max_height = (frame.area().height / 2).min(12);
+    let max_height = frame.area().height.saturating_sub(2).min(12).max(1);
     let input_height = if let Some(ref select) = app.option_select {
-        // 2 for borders + 1 for label + option count, capped at half terminal
-        let content_rows = (select.options.len() as u16 + 1).min(frame.area().height / 2);
+        // 2 for borders + 1 for label + option count, capped to leave room for status and
+        // at least one conversation row.
+        let content_rows = (select.options.len() as u16 + 1).min(max_height.saturating_sub(2));
         content_rows + 2
     } else {
         let label = app.input_label();
         let content_rows =
             input_content_rows(&app.input, &label, frame.area().width.saturating_sub(2));
-        (content_rows + 2).max(3).min(max_height) // +2 for borders
+        (content_rows + 2).min(max_height) // +2 for borders
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),            // status bar
-            Constraint::Min(3),               // conversation view
+            Constraint::Min(1),               // conversation view
             Constraint::Length(input_height), // input box
         ])
         .split(frame.area());
@@ -85,12 +87,35 @@ fn input_content_rows(input: &InputBuffer, label: &str, area_width: u16) -> u16 
     total_rows.max(cursor_row + 1)
 }
 
-fn input_lines(input: &InputBuffer, label: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::with_capacity(input.line_count());
+fn wrap_input_lines(input: &InputBuffer, label: &str, area_width: u16) -> Vec<Line<'static>> {
+    let area_width = usize::from(area_width);
+    let mut lines = Vec::new();
+
     for index in 0..input.line_count() {
-        let prefix = if index == 0 { label } else { "" };
-        lines.push(Line::from(format!("{prefix}{}", input.line(index))));
+        let mut current = if index == 0 {
+            label.to_string()
+        } else {
+            String::new()
+        };
+        let mut current_width = display_width(&current);
+
+        for ch in input.line(index).chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            if area_width > 0 && current_width > 0 && current_width + ch_width > area_width {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+
+        lines.push(Line::from(current));
     }
+
+    if lines.is_empty() {
+        lines.push(Line::from(label.to_string()));
+    }
+
     lines
 }
 
@@ -501,9 +526,12 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let label = app.input_label();
-    let input_widget = Paragraph::new(Text::from(input_lines(&app.input, &label)))
-        .block(Block::default().borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
+    let input_widget = Paragraph::new(Text::from(wrap_input_lines(
+        &app.input,
+        &label,
+        area.width.saturating_sub(2),
+    )))
+    .block(Block::default().borders(Borders::ALL));
 
     frame.render_widget(input_widget, area);
 
@@ -518,6 +546,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 mod tests {
     use super::*;
     use crate::tui::app::ConversationEntry;
+    use ratatui::layout::Position;
 
     fn buffer_lines(backend: &ratatui::backend::TestBackend) -> Vec<String> {
         let buffer = backend.buffer();
@@ -742,5 +771,22 @@ mod tests {
 
         assert_eq!(input_cursor_position(&input, "> ", 10), (1, 1));
         assert_eq!(input_content_rows(&input, "> ", 10), 2);
+    }
+
+    #[test]
+    fn draw_places_cursor_on_wrapped_ascii_line() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("123456789");
+
+        let backend = ratatui::backend::TestBackend::new(10, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("> 123456")));
+        assert!(lines.iter().any(|line| line.contains("789")));
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(4, 4));
     }
 }
