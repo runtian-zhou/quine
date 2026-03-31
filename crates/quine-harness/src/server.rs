@@ -525,6 +525,84 @@ async fn handle_request(
             }
         }
 
+        methods::GET_SESSION_CONTEXT => {
+            let params = request.params.as_ref();
+            let session_id_str = params
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str());
+
+            match session_id_str {
+                Some(sid) => {
+                    let session_id: quine_core::SessionId =
+                        match serde_json::from_value(serde_json::Value::String(sid.to_string())) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                let resp = JsonRpcErrorResponse::new(
+                                    id,
+                                    error_codes::INVALID_PARAMS,
+                                    format!("invalid session_id: {e}"),
+                                );
+                                return Some(serde_json::to_string(&resp).unwrap_or_default());
+                            }
+                        };
+
+                    match service.get_session_context(session_id).await {
+                        Ok(checkpoint) => {
+                            let live_states = service
+                                .list_sessions()
+                                .await
+                                .unwrap_or_default()
+                                .into_iter()
+                                .filter_map(|value| {
+                                    Some((
+                                        serde_json::from_value(serde_json::Value::String(
+                                            value.get("session_id")?.as_str()?.to_string(),
+                                        ))
+                                        .ok()?,
+                                        value.get("status")?.as_str()?.to_string(),
+                                    ))
+                                })
+                                .collect();
+                            match crate::storage::session_context_from_checkpoint(
+                                &checkpoint,
+                                session_id,
+                                &live_states,
+                            ) {
+                                Some(snapshot) => {
+                                    let resp = JsonRpcResponse::success(id, snapshot);
+                                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                                }
+                                None => {
+                                    let resp = JsonRpcErrorResponse::new(
+                                        id,
+                                        error_codes::INTERNAL_ERROR,
+                                        "session context missing from checkpoint",
+                                    );
+                                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                None => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing session_id",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
         methods::SHUTDOWN => match service.shutdown().await {
             Ok(()) => {
                 let resp = JsonRpcResponse::success(id, "ok");

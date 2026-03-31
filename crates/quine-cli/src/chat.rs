@@ -1,9 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use quine_llm::Message;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::IpcClient;
+use crate::context_debug::render_session_context;
 use crate::render::{Renderer, TerminalRenderer};
 use crate::session::{
     create_session, create_session_with_initial_messages, create_slash_skill_session,
@@ -106,22 +107,6 @@ async fn maybe_exit_plan_mode(
     Ok(true)
 }
 
-fn build_context_debug_snapshot(
-    session: &crate::session::CreatedSession,
-    session_in_plan_mode: bool,
-    skills: &[String],
-    socket_path: &Path,
-) -> serde_json::Value {
-    serde_json::json!({
-        "session_id": session.session_id,
-        "plan_mode": session_in_plan_mode,
-        "skills": skills,
-        "max_context_window": session.max_context_window,
-        "socket_path": socket_path,
-        "cwd": std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    })
-}
-
 fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
     let trimmed = input.trim();
     if let Some(command) = parse_slash_command(trimmed) {
@@ -219,14 +204,8 @@ pub async fn run_chat(
                                 continue;
                             }
                             ChatCommandAction::ShowContext => {
-                                let snapshot = build_context_debug_snapshot(
-                                    &session,
-                                    session_in_plan_mode,
-                                    skills,
-                                    socket_path,
-                                );
-                                let pretty = serde_json::to_string_pretty(&snapshot)?;
-                                renderer.render_info(&pretty).await?;
+                                render_session_context(&mut renderer, &mut client, &session.session_id)
+                                    .await?;
                                 continue;
                             }
                             ChatCommandAction::CompactSession => {

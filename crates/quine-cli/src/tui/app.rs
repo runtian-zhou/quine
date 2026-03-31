@@ -3,6 +3,7 @@ use std::fmt;
 
 use std::time::Duration;
 
+use crate::context_debug::{HistoryEntry, SessionContextSnapshot};
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{notifications, JsonRpcNotification};
 use unicode_width::UnicodeWidthChar;
@@ -392,6 +393,62 @@ impl fmt::Display for InputBuffer {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextExplorerTab {
+    History,
+    Tools,
+    Skills,
+    Plans,
+}
+
+#[derive(Debug, Clone)]
+pub struct ContextExplorerState {
+    pub snapshot: SessionContextSnapshot,
+    pub active_tab: ContextExplorerTab,
+    pub selected_index: usize,
+    pub scroll_offset: u16,
+}
+
+impl ContextExplorerState {
+    fn new(snapshot: SessionContextSnapshot) -> Self {
+        Self {
+            snapshot,
+            active_tab: ContextExplorerTab::History,
+            selected_index: 0,
+            scroll_offset: 0,
+        }
+    }
+
+    fn entry_count(&self) -> usize {
+        self.snapshot.history.len()
+    }
+
+    fn tool_count(&self) -> usize {
+        self.snapshot.available_tools.len()
+    }
+
+    fn skill_count(&self) -> usize {
+        self.snapshot.loaded_skills.len()
+    }
+
+    fn reset_detail_state(&mut self) {
+        self.selected_index = 0;
+        self.scroll_offset = 0;
+    }
+
+    pub fn selected_entry(&self) -> Option<&HistoryEntry> {
+        self.snapshot.history.get(self.selected_index)
+    }
+
+    pub fn selected_tool(&self) -> Option<&quine_llm::ToolDefinition> {
+        self.snapshot.available_tools.get(self.selected_index)
+    }
+
+    pub fn selected_skill(&self) -> Option<&crate::context_debug::SkillSnapshot> {
+        self.snapshot.loaded_skills.get(self.selected_index)
+    }
+}
+
 /// The main application state.
 pub struct App {
     pub messages: Vec<ConversationEntry>,
@@ -424,6 +481,8 @@ pub struct App {
     pub pending_plan_exit: Option<PendingPlanExit>,
     /// Last known conversation view height (set during rendering for scroll step sizing).
     pub last_view_height: u32,
+    /// Interactive explorer for large `/context` snapshots in the TUI.
+    pub context_explorer: Option<ContextExplorerState>,
 }
 
 struct LoopCommand {
@@ -516,6 +575,7 @@ impl App {
             plan_mode,
             pending_plan_exit: None,
             last_view_height: 0,
+            context_explorer: None,
         }
     }
 
@@ -528,6 +588,7 @@ impl App {
         self.interaction_queue.clear();
         self.option_select = None;
         self.pending_plan_exit = None;
+        self.context_explorer = None;
         self.auto_scroll();
     }
 
@@ -553,6 +614,7 @@ impl App {
         self.option_select = None;
         self.plan_mode = plan_mode;
         self.pending_plan_exit = None;
+        self.context_explorer = None;
         self.auto_scroll();
     }
 
@@ -864,6 +926,134 @@ impl App {
     /// Check if we're in option selection mode.
     pub fn is_selecting_options(&self) -> bool {
         self.option_select.is_some()
+    }
+
+    pub fn context_explorer_active(&self) -> bool {
+        self.context_explorer.is_some()
+    }
+
+    pub fn open_context_explorer(&mut self, snapshot: SessionContextSnapshot) {
+        self.context_explorer = Some(ContextExplorerState::new(snapshot));
+    }
+
+    pub fn close_context_explorer(&mut self) {
+        self.context_explorer = None;
+    }
+
+    pub fn context_explorer_prev_tab(&mut self) {
+        if let Some(explorer) = self.context_explorer.as_mut() {
+            explorer.active_tab = match explorer.active_tab {
+                ContextExplorerTab::History => ContextExplorerTab::Plans,
+                ContextExplorerTab::Tools => ContextExplorerTab::History,
+                ContextExplorerTab::Skills => ContextExplorerTab::Tools,
+                ContextExplorerTab::Plans => ContextExplorerTab::Skills,
+            };
+            explorer.reset_detail_state();
+        }
+    }
+
+    pub fn context_explorer_next_tab(&mut self) {
+        if let Some(explorer) = self.context_explorer.as_mut() {
+            explorer.active_tab = match explorer.active_tab {
+                ContextExplorerTab::History => ContextExplorerTab::Tools,
+                ContextExplorerTab::Tools => ContextExplorerTab::Skills,
+                ContextExplorerTab::Skills => ContextExplorerTab::Plans,
+                ContextExplorerTab::Plans => ContextExplorerTab::History,
+            };
+            explorer.reset_detail_state();
+        }
+    }
+
+    pub fn context_explorer_move_up(&mut self) {
+        if let Some(explorer) = self.context_explorer.as_mut() {
+            match explorer.active_tab {
+                ContextExplorerTab::History | ContextExplorerTab::Tools | ContextExplorerTab::Skills => {
+                    if explorer.selected_index > 0 {
+                        explorer.selected_index -= 1;
+                        explorer.scroll_offset = 0;
+                    }
+                }
+                ContextExplorerTab::Plans => {
+                    explorer.scroll_offset = explorer.scroll_offset.saturating_sub(1);
+                }
+            }
+        }
+    }
+
+    pub fn context_explorer_move_down(&mut self) {
+        if let Some(explorer) = self.context_explorer.as_mut() {
+            match explorer.active_tab {
+                ContextExplorerTab::History => {
+                    if explorer.selected_index + 1 < explorer.entry_count() {
+                        explorer.selected_index += 1;
+                        explorer.scroll_offset = 0;
+                    }
+                }
+                ContextExplorerTab::Tools => {
+                    if explorer.selected_index + 1 < explorer.tool_count() {
+                        explorer.selected_index += 1;
+                        explorer.scroll_offset = 0;
+                    }
+                }
+                ContextExplorerTab::Skills => {
+                    if explorer.selected_index + 1 < explorer.skill_count() {
+                        explorer.selected_index += 1;
+                        explorer.scroll_offset = 0;
+                    }
+                }
+                ContextExplorerTab::Plans => {
+                    explorer.scroll_offset = explorer.scroll_offset.saturating_add(1);
+                }
+            }
+        }
+    }
+
+    pub fn context_explorer_move_to_first(&mut self) {
+        if let Some(explorer) = self.context_explorer.as_mut() {
+            explorer.scroll_offset = 0;
+            if matches!(
+                explorer.active_tab,
+                ContextExplorerTab::History | ContextExplorerTab::Tools | ContextExplorerTab::Skills
+            ) {
+                explorer.selected_index = 0;
+            }
+        }
+    }
+
+    pub fn context_explorer_move_to_last(&mut self) {
+        if let Some(explorer) = self.context_explorer.as_mut() {
+            match explorer.active_tab {
+                ContextExplorerTab::History => {
+                    if explorer.entry_count() > 0 {
+                        explorer.selected_index = explorer.entry_count() - 1;
+                    }
+                }
+                ContextExplorerTab::Tools => {
+                    if explorer.tool_count() > 0 {
+                        explorer.selected_index = explorer.tool_count() - 1;
+                    }
+                }
+                ContextExplorerTab::Skills => {
+                    if explorer.skill_count() > 0 {
+                        explorer.selected_index = explorer.skill_count() - 1;
+                    }
+                }
+                ContextExplorerTab::Plans => {}
+            }
+            explorer.scroll_offset = 0;
+        }
+    }
+
+    pub fn context_explorer_scroll_up(&mut self, rows: u16) {
+        if let Some(explorer) = self.context_explorer.as_mut() {
+            explorer.scroll_offset = explorer.scroll_offset.saturating_sub(rows);
+        }
+    }
+
+    pub fn context_explorer_scroll_down(&mut self, rows: u16) {
+        if let Some(explorer) = self.context_explorer.as_mut() {
+            explorer.scroll_offset = explorer.scroll_offset.saturating_add(rows);
+        }
     }
 
     /// Check if there is a pending interaction in the queue.
@@ -1218,6 +1408,7 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
 
     fn make_notif(method: &str, params: serde_json::Value) -> JsonRpcNotification {
         JsonRpcNotification {
@@ -1225,6 +1416,99 @@ mod tests {
             method: method.to_string(),
             params: Some(params),
         }
+    }
+
+    #[test]
+    fn context_explorer_navigation_resets_detail_scroll() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: Utc::now(),
+            state: "idle".into(),
+            system_prompt: Some("system".into()),
+            skills: vec!["review".into()],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            auto_approve_permissions: false,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![],
+            history: vec![
+                HistoryEntry::Text {
+                    role: "user".into(),
+                    text: "first".into(),
+                },
+                HistoryEntry::Text {
+                    role: "assistant".into(),
+                    text: "second".into(),
+                },
+            ],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+        app.context_explorer_scroll_down(8);
+        app.context_explorer_move_down();
+
+        let explorer = app.context_explorer.as_ref().expect("explorer open");
+        assert_eq!(explorer.selected_index, 1);
+        assert_eq!(explorer.scroll_offset, 0);
+
+        app.context_explorer_move_to_first();
+        let explorer = app.context_explorer.as_ref().expect("explorer open");
+        assert_eq!(explorer.selected_index, 0);
+    }
+
+    #[test]
+    fn context_explorer_tab_switch_resets_detail_state() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: Utc::now(),
+            state: "idle".into(),
+            system_prompt: Some("system".into()),
+            skills: vec!["review".into()],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            auto_approve_permissions: false,
+            available_tools: vec![quine_llm::ToolDefinition {
+                name: "read_file".into(),
+                description: "Read file".into(),
+                parameters: serde_json::json!({"type": "object"}),
+            }],
+            loaded_skills: vec![crate::context_debug::SkillSnapshot {
+                name: "review".into(),
+                description: "Review changes".into(),
+                version: "1.0".into(),
+                system_prompt: Some("Review carefully".into()),
+                source_path: std::path::PathBuf::from("/tmp/project/.quine/skills/review.md"),
+                tool_names: vec!["read_file".into()],
+            }],
+            plans: vec![],
+            history: vec![
+                HistoryEntry::Text {
+                    role: "user".into(),
+                    text: "first".into(),
+                },
+                HistoryEntry::Text {
+                    role: "assistant".into(),
+                    text: "second".into(),
+                },
+            ],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+        app.context_explorer_move_down();
+        app.context_explorer_scroll_down(8);
+        app.context_explorer_next_tab();
+
+        let explorer = app.context_explorer.as_ref().expect("explorer open");
+        assert_eq!(explorer.active_tab, ContextExplorerTab::Tools);
+        assert_eq!(explorer.selected_index, 0);
+        assert_eq!(explorer.scroll_offset, 0);
+
+        app.context_explorer_next_tab();
+        let explorer = app.context_explorer.as_ref().expect("explorer open");
+        assert_eq!(explorer.active_tab, ContextExplorerTab::Skills);
+        assert_eq!(explorer.selected_index, 0);
+        assert_eq!(explorer.scroll_offset, 0);
     }
 
     #[test]

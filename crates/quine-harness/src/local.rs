@@ -7,8 +7,9 @@ use std::collections::BinaryHeap;
 use std::collections::HashMap;
 
 use quine_core::{
-    create_channels, load_skills, ChannelConfig, CoreInput, CoreOutput, HarnessHandle,
-    InheritanceFlags, InteractionResponse, PermissionChecker, SessionId, SessionSignal, Skill,
+    create_channels, load_skills, ChannelConfig, CoreCheckpoint, CoreInput, CoreOutput,
+    HarnessHandle, InheritanceFlags, InteractionResponse, PermissionChecker, SessionId,
+    SessionSignal, Skill,
 };
 use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
@@ -17,7 +18,7 @@ use tokio::time::{Duration, Instant};
 use crate::config::{default_state_dir, max_context_window_from_env, SessionConfig};
 use crate::error::HarnessError;
 use crate::service::HarnessService;
-use crate::storage::StorageManager;
+use crate::storage::{session_context_from_checkpoint, StorageManager};
 
 /// Local in-process harness implementation.
 ///
@@ -634,6 +635,51 @@ impl HarnessService for LocalHarness {
                 .cmp(&left.get("first_event").and_then(|value| value.as_str()))
         });
         Ok(items)
+    }
+
+    async fn get_session_context(
+        &self,
+        session_id: SessionId,
+    ) -> Result<CoreCheckpoint, HarnessError> {
+        let checkpoint = self
+            ._storage
+            .load_latest_checkpoint()
+            .await
+            .map_err(|error| HarnessError::Internal {
+                message: format!("failed to load checkpoint: {error}"),
+            })?
+            .ok_or_else(|| HarnessError::SessionNotFound {
+                session_id: serde_json::to_value(session_id)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            })?;
+
+        let sessions = self.sessions.lock().await;
+        if !sessions.contains_key(&session_id) {
+            return Err(HarnessError::SessionNotFound {
+                session_id: serde_json::to_value(session_id)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            });
+        }
+
+        let live_states = sessions
+            .iter()
+            .map(|(id, session)| (*id, format!("{:?}", session.state).to_lowercase()))
+            .collect();
+
+        if session_context_from_checkpoint(&checkpoint, session_id, &live_states).is_none() {
+            return Err(HarnessError::SessionNotFound {
+                session_id: serde_json::to_value(session_id)
+                    .ok()
+                    .and_then(|value| value.as_str().map(str::to_owned))
+                    .unwrap_or_default(),
+            });
+        }
+
+        Ok(checkpoint)
     }
 
     async fn spawn_child_session(

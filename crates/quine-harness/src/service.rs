@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use quine_core::{CoreOutput, InteractionResponse, SessionId, SessionSignal};
+use quine_core::{CoreCheckpoint, CoreOutput, InteractionResponse, SessionId, SessionSignal};
 use tokio::sync::broadcast;
 use tokio::time::Duration;
 
@@ -55,6 +55,16 @@ pub trait HarnessService: Send + Sync {
 
     /// List all active sessions with metadata.
     async fn list_sessions(&self) -> Result<Vec<serde_json::Value>, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    /// Return a serialized snapshot of a session's current context.
+    async fn get_session_context(
+        &self,
+        _session_id: SessionId,
+    ) -> Result<CoreCheckpoint, HarnessError> {
         Err(HarnessError::Internal {
             message: "not implemented".into(),
         })

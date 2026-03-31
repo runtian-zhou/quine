@@ -1,12 +1,13 @@
 mod app;
 mod ui;
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
+use crossterm::cursor::MoveTo;
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
@@ -14,6 +15,7 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::client::IpcClient;
+use crate::context_debug::fetch_session_context;
 use crate::run::fetch_available_skills;
 use crate::session::{
     create_session, create_session_with_initial_messages, create_slash_skill_session,
@@ -29,23 +31,6 @@ fn print_resume_command(socket_path: &Path, session_id: &str) {
         session_id,
         socket_path.display()
     );
-}
-
-fn build_context_debug_snapshot(
-    session_id: &str,
-    plan_mode: bool,
-    skills: &[String],
-    socket_path: &Path,
-    max_context_window: Option<u64>,
-) -> serde_json::Value {
-    serde_json::json!({
-        "session_id": session_id,
-        "plan_mode": plan_mode,
-        "skills": skills,
-        "max_context_window": max_context_window,
-        "socket_path": socket_path,
-        "cwd": std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-    })
 }
 
 /// Run the TUI chat interface.
@@ -84,8 +69,11 @@ pub async fn run_tui_chat(
     // Install panic hook to restore terminal.
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let mut stdout = std::io::stdout();
         let _ = disable_raw_mode();
-        let _ = std::io::stdout().execute(LeaveAlternateScreen);
+        let _ = stdout.execute(LeaveAlternateScreen);
+        let _ = stdout.execute(Clear(ClearType::All));
+        let _ = stdout.execute(MoveTo(0, 0));
         original_hook(info);
     }));
 
@@ -109,6 +97,8 @@ pub async fn run_tui_chat(
     // Restore terminal.
     disable_raw_mode()?;
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
+    terminal.backend_mut().execute(Clear(ClearType::All))?;
+    terminal.backend_mut().execute(MoveTo(0, 0))?;
     terminal.show_cursor()?;
 
     // Shutdown daemon if we spawned it.
@@ -203,6 +193,58 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
         Event::Key(KeyEvent {
             code, modifiers, ..
         }) => {
+            if app.context_explorer_active() {
+                return match code {
+                    KeyCode::Esc => {
+                        app.close_context_explorer();
+                        None
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        app.context_explorer_prev_tab();
+                        None
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        app.context_explorer_next_tab();
+                        None
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.context_explorer_move_up();
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.context_explorer_move_down();
+                        None
+                    }
+                    KeyCode::PageUp => {
+                        let step = if app.last_view_height > 2 {
+                            app.last_view_height.saturating_sub(2) as u16
+                        } else {
+                            10
+                        };
+                        app.context_explorer_scroll_up(step);
+                        None
+                    }
+                    KeyCode::PageDown => {
+                        let step = if app.last_view_height > 2 {
+                            app.last_view_height.saturating_sub(2) as u16
+                        } else {
+                            10
+                        };
+                        app.context_explorer_scroll_down(step);
+                        None
+                    }
+                    KeyCode::Home => {
+                        app.context_explorer_move_to_first();
+                        None
+                    }
+                    KeyCode::End => {
+                        app.context_explorer_move_to_last();
+                        None
+                    }
+                    _ => None,
+                };
+            }
+
             // Ctrl-C or Ctrl-D: quit.
             if code == KeyCode::Char('c') && modifiers.contains(KeyModifiers::CONTROL) {
                 app.should_quit = true;
@@ -337,7 +379,7 @@ async fn execute_action(
     skills: &[String],
     available_skills: &[String],
     auto_approve_permissions: bool,
-    socket_path: &Path,
+    _socket_path: &Path,
     action: AppAction,
 ) -> anyhow::Result<()> {
     match action {
@@ -354,18 +396,15 @@ async fn execute_action(
             }
         }
         AppAction::ShowContext => {
-            let snapshot = build_context_debug_snapshot(
-                &app.session_id,
-                app.plan_mode,
-                skills,
-                socket_path,
-                app.max_context_window,
-            );
-            app.messages.push(app::ConversationEntry::AssistantText(
-                serde_json::to_string_pretty(&snapshot)?,
-            ));
+            match fetch_session_context(client, &app.session_id).await {
+                Ok(snapshot) => app.open_context_explorer(snapshot),
+                Err(error) => {
+                    app.messages
+                        .push(app::ConversationEntry::Error(error.to_string()));
+                    app.auto_scroll();
+                }
+            }
             app.phase = AgentPhase::Idle;
-            app.auto_scroll();
         }
         AppAction::CompactSession => {
             let params = serde_json::json!({
