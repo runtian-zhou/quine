@@ -3,6 +3,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{AgentPhase, App, ConversationEntry, InputBuffer, ToolStatus};
 
@@ -68,11 +69,15 @@ fn wrapped_rows(width: usize, area_width: u16) -> u16 {
     width.max(1).div_ceil(area_width) as u16
 }
 
+fn display_width(text: &str) -> usize {
+    text.width()
+}
+
 fn input_content_rows(input: &InputBuffer, label: &str, area_width: u16) -> u16 {
     let total_rows: u16 = (0..input.line_count())
         .map(|index| {
-            let prefix_width = if index == 0 { label.chars().count() } else { 0 };
-            wrapped_rows(prefix_width + input.line(index).chars().count(), area_width)
+            let prefix_width = if index == 0 { display_width(label) } else { 0 };
+            wrapped_rows(prefix_width + display_width(input.line(index)), area_width)
         })
         .sum();
 
@@ -80,11 +85,28 @@ fn input_content_rows(input: &InputBuffer, label: &str, area_width: u16) -> u16 
     total_rows.max(cursor_row + 1)
 }
 
-fn input_lines(input: &InputBuffer, label: &str) -> Vec<Line<'static>> {
-    let mut lines = Vec::with_capacity(input.line_count());
+fn wrap_input_lines(input: &InputBuffer, label: &str, area_width: u16) -> Vec<Line<'static>> {
+    let area_width = usize::from(area_width);
+    let mut lines = Vec::new();
     for index in 0..input.line_count() {
-        let prefix = if index == 0 { label } else { "" };
-        lines.push(Line::from(format!("{prefix}{}", input.line(index))));
+        let mut current = if index == 0 {
+            label.to_string()
+        } else {
+            String::new()
+        };
+        let mut current_width = display_width(&current);
+
+        for ch in input.line(index).chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            if area_width > 0 && current_width > 0 && current_width + ch_width > area_width {
+                lines.push(Line::from(std::mem::take(&mut current)));
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+
+        lines.push(Line::from(current));
     }
     lines
 }
@@ -96,12 +118,12 @@ fn input_cursor_position(input: &InputBuffer, label: &str, area_width: u16) -> (
 
     let mut row = 0u16;
     for index in 0..input.row() {
-        let prefix_width = if index == 0 { label.chars().count() } else { 0 };
-        row += wrapped_rows(prefix_width + input.line(index).chars().count(), area_width);
+        let prefix_width = if index == 0 { display_width(label) } else { 0 };
+        row += wrapped_rows(prefix_width + display_width(input.line(index)), area_width);
     }
 
     let prefix_width = if input.row() == 0 {
-        label.chars().count()
+        display_width(label)
     } else {
         0
     };
@@ -496,9 +518,12 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let label = app.input_label();
-    let input_widget = Paragraph::new(Text::from(input_lines(&app.input, &label)))
-        .block(Block::default().borders(Borders::ALL))
-        .wrap(Wrap { trim: false });
+    let input_widget = Paragraph::new(Text::from(wrap_input_lines(
+        &app.input,
+        &label,
+        area.width.saturating_sub(2),
+    )))
+    .block(Block::default().borders(Borders::ALL));
 
     frame.render_widget(input_widget, area);
 
@@ -513,6 +538,7 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 mod tests {
     use super::*;
     use crate::tui::app::ConversationEntry;
+    use ratatui::layout::Position;
 
     fn buffer_lines(backend: &ratatui::backend::TestBackend) -> Vec<String> {
         let buffer = backend.buffer();
@@ -728,5 +754,38 @@ mod tests {
         input.set_from_string("abc\ndefghijklmnop");
 
         assert_eq!(input_cursor_position(&input, "> ", 8), (2, 5));
+    }
+
+    #[test]
+    fn draw_places_cursor_at_end_of_wrapped_ascii_input_without_duplicate_text() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("123456789");
+
+        let backend = ratatui::backend::TestBackend::new(10, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("> 123456")));
+        assert!(lines.iter().any(|line| line.contains("789")));
+        assert_eq!(
+            lines
+                .iter()
+                .filter(|line| line.contains("123456789"))
+                .count(),
+            0
+        );
+        terminal
+            .backend_mut()
+            .assert_cursor_position(Position::new(4, 6));
+    }
+
+    #[test]
+    fn input_cursor_position_uses_display_width_for_wide_wrap_boundary() {
+        let mut input = InputBuffer::new();
+        input.set_from_string("1234567界");
+
+        assert_eq!(input_cursor_position(&input, "> ", 10), (1, 1));
+        assert_eq!(input_content_rows(&input, "> ", 10), 2);
     }
 }
