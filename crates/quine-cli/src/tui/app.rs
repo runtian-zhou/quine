@@ -1027,6 +1027,9 @@ impl App {
                                         *result_preview = Some(trimmed);
                                     }
                                 }
+                                if matches!(self.phase, AgentPhase::RunningTool(_)) {
+                                    self.phase = AgentPhase::Thinking;
+                                }
                                 break;
                             }
                         }
@@ -1325,6 +1328,7 @@ mod tests {
                 ..
             }) if tool_name == "plan" && preview.contains("[a1]") && preview.contains("[a2]")
         ));
+        assert_eq!(app.phase, AgentPhase::Thinking);
     }
 
     #[test]
