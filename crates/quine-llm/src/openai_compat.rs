@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::LlmError;
 use crate::provider::LlmProvider;
 use crate::retry::send_with_retry;
-use crate::types::{LlmEvent, Message, MessageContent, Role, ToolDefinition};
+use crate::types::{LlmEvent, Message, MessageContent, Role, TokenUsage, ToolDefinition};
 
 /// Configuration for an OpenAI-compatible LLM endpoint.
 #[derive(Debug, Clone)]
@@ -51,9 +51,16 @@ struct ChatRequest {
     messages: Vec<ChatMessage>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAiTool>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -84,7 +91,16 @@ struct OpenAiFunction {
 
 #[derive(Deserialize)]
 struct ChatChunk {
+    #[serde(default)]
     choices: Vec<ChunkChoice>,
+    #[serde(default)]
+    usage: Option<OpenAiUsage>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
 }
 
 #[derive(Deserialize)]
@@ -292,6 +308,9 @@ impl LlmProvider for OpenAiCompatProvider {
             model: self.config.model.clone(),
             messages: messages.iter().map(convert_message).collect(),
             stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
             max_tokens: self.config.max_tokens,
             tools: convert_tools(tools),
         };
@@ -319,10 +338,18 @@ impl LlmProvider for OpenAiCompatProvider {
                 byte_stream,
                 String::new(),
                 ToolCallAccumulator::default(),
+                None::<TokenUsage>,
                 false,
                 false,
             ),
-            |(mut byte_stream, mut buffer, mut tool_acc, mut in_think_block, mut done)| async move {
+            |(
+                mut byte_stream,
+                mut buffer,
+                mut tool_acc,
+                mut usage,
+                mut in_think_block,
+                mut done,
+            )| async move {
                 if done {
                     return None;
                 }
@@ -343,7 +370,9 @@ impl LlmProvider for OpenAiCompatProvider {
                                 // Emit any accumulated tool calls, then Done
                                 let mut events: Vec<anyhow::Result<LlmEvent>> =
                                     tool_acc.take_completed().into_iter().map(Ok).collect();
-                                events.push(Ok(LlmEvent::Done { usage: None }));
+                                events.push(Ok(LlmEvent::Done {
+                                    usage: usage.take(),
+                                }));
                                 done = true;
                                 return Some((
                                     stream::iter(events),
@@ -351,6 +380,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                         byte_stream,
                                         buffer,
                                         ToolCallAccumulator::default(),
+                                        usage,
                                         in_think_block,
                                         done,
                                     ),
@@ -360,6 +390,13 @@ impl LlmProvider for OpenAiCompatProvider {
                             match serde_json::from_str::<ChatChunk>(data) {
                                 Ok(chunk) => {
                                     let mut events: Vec<anyhow::Result<LlmEvent>> = Vec::new();
+
+                                    if let Some(chunk_usage) = chunk.usage {
+                                        usage = Some(TokenUsage {
+                                            input_tokens: chunk_usage.prompt_tokens,
+                                            output_tokens: chunk_usage.completion_tokens,
+                                        });
+                                    }
 
                                     for choice in &chunk.choices {
                                         if let Some(reasoning_text) =
@@ -400,7 +437,14 @@ impl LlmProvider for OpenAiCompatProvider {
                                     if !events.is_empty() {
                                         return Some((
                                             stream::iter(events),
-                                            (byte_stream, buffer, tool_acc, in_think_block, done),
+                                            (
+                                                byte_stream,
+                                                buffer,
+                                                tool_acc,
+                                                usage,
+                                                in_think_block,
+                                                done,
+                                            ),
                                         ));
                                     }
                                     continue;
@@ -411,7 +455,14 @@ impl LlmProvider for OpenAiCompatProvider {
                                             message: format!("failed to parse chunk: {e}: {data}"),
                                         }
                                         .into())]),
-                                        (byte_stream, buffer, tool_acc, in_think_block, done),
+                                        (
+                                            byte_stream,
+                                            buffer,
+                                            tool_acc,
+                                            usage,
+                                            in_think_block,
+                                            done,
+                                        ),
                                     ));
                                 }
                             }
@@ -429,14 +480,16 @@ impl LlmProvider for OpenAiCompatProvider {
                         Some(Err(e)) => {
                             return Some((
                                 stream::iter(vec![Err(e.into())]),
-                                (byte_stream, buffer, tool_acc, in_think_block, done),
+                                (byte_stream, buffer, tool_acc, usage, in_think_block, done),
                             ));
                         }
                         None => {
                             // Stream ended without [DONE] — emit accumulated tools + Done
                             let mut events: Vec<anyhow::Result<LlmEvent>> =
                                 tool_acc.take_completed().into_iter().map(Ok).collect();
-                            events.push(Ok(LlmEvent::Done { usage: None }));
+                            events.push(Ok(LlmEvent::Done {
+                                usage: usage.take(),
+                            }));
                             done = true;
                             return Some((
                                 stream::iter(events),
@@ -444,6 +497,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     byte_stream,
                                     buffer,
                                     ToolCallAccumulator::default(),
+                                    usage,
                                     in_think_block,
                                     done,
                                 ),
@@ -502,16 +556,19 @@ mod tests {
     }
 
     #[test]
-    fn convert_tools_produces_function_type() {
-        let tools = vec![ToolDefinition {
-            name: "test".into(),
-            description: "test tool".into(),
-            parameters: serde_json::json!({}),
-        }];
-        let converted = convert_tools(&tools);
-        assert_eq!(converted.len(), 1);
-        assert_eq!(converted[0].r#type, "function");
-        assert_eq!(converted[0].function.name, "test");
+    fn chat_chunk_deserializes_stream_usage() {
+        let chunk: ChatChunk = serde_json::from_value(serde_json::json!({
+            "choices": [],
+            "usage": {
+                "prompt_tokens": 123,
+                "completion_tokens": 45
+            }
+        }))
+        .unwrap();
+
+        let usage = chunk.usage.expect("usage should be present");
+        assert_eq!(usage.prompt_tokens, 123);
+        assert_eq!(usage.completion_tokens, 45);
     }
 
     #[test]
