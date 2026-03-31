@@ -390,6 +390,7 @@ pub struct App {
     pub messages: Vec<ConversationEntry>,
     pub reasoning_buffer: String,
     pub streaming_buffer: String,
+    pub current_turn_assistant_text: Option<String>,
     pub scroll_offset: u32,
     pub user_scrolled: bool,
     pub input: InputBuffer,
@@ -490,6 +491,7 @@ impl App {
             messages: Vec::new(),
             reasoning_buffer: String::new(),
             streaming_buffer: String::new(),
+            current_turn_assistant_text: None,
             scroll_offset: 0,
             user_scrolled: false,
             input: InputBuffer::new(),
@@ -515,6 +517,7 @@ impl App {
         self.phase = AgentPhase::Idle;
         self.reasoning_buffer.clear();
         self.streaming_buffer.clear();
+        self.current_turn_assistant_text = None;
         self.interaction_queue.clear();
         self.option_select = None;
         self.pending_plan_exit = None;
@@ -531,6 +534,7 @@ impl App {
         self.messages.clear();
         self.reasoning_buffer.clear();
         self.streaming_buffer.clear();
+        self.current_turn_assistant_text = None;
         self.scroll_offset = 0;
         self.user_scrolled = false;
         self.interaction_queue.clear();
@@ -789,6 +793,10 @@ impl App {
         self.auto_scroll();
     }
 
+    pub fn begin_turn(&mut self) {
+        self.current_turn_assistant_text = None;
+    }
+
     /// Move option selector cursor up.
     pub fn option_cursor_up(&mut self) {
         if let Some(ref mut select) = self.option_select {
@@ -927,6 +935,7 @@ impl App {
                 };
                 let text = trim_blank_lines(&text);
                 if !text.is_empty() {
+                    self.current_turn_assistant_text = Some(text.clone());
                     self.messages.push(ConversationEntry::AssistantText(text));
                 }
                 self.streaming_buffer.clear();
@@ -937,6 +946,7 @@ impl App {
                 if !self.streaming_buffer.trim().is_empty() {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
                     if !text.is_empty() {
+                        self.current_turn_assistant_text = Some(text.clone());
                         self.messages.push(ConversationEntry::AssistantText(text));
                     }
                 }
@@ -1023,6 +1033,7 @@ impl App {
                 if !self.streaming_buffer.trim().is_empty() {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
                     if !text.is_empty() {
+                        self.current_turn_assistant_text = Some(text.clone());
                         self.messages.push(ConversationEntry::AssistantText(text));
                     }
                 }

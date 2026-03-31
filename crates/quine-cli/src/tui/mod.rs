@@ -145,14 +145,12 @@ async fn run_event_loop(
 }
 
 fn request_plan_exit_confirmation_after_turn_complete(app: &mut app::App) {
-    let pending_plan_exit = app.messages.iter().rev().find_map(|entry| match entry {
-        app::ConversationEntry::AssistantText(text) if !text.trim().is_empty() => {
-            Some(PendingPlanExit::FinalPlan {
+    let pending_plan_exit =
+        app.current_turn_assistant_text
+            .as_ref()
+            .map(|text| PendingPlanExit::FinalPlan {
                 final_plan: text.clone(),
-            })
-        }
-        _ => None,
-    });
+            });
     if let Some(pending_exit) = pending_plan_exit {
         app.request_plan_exit_confirmation(pending_exit);
     }
@@ -302,6 +300,7 @@ async fn execute_action(
 ) -> anyhow::Result<()> {
     match action {
         AppAction::SendMessage(msg) => {
+            app.begin_turn();
             let params = serde_json::json!({
                 "session_id": app.session_id,
                 "content": msg,
@@ -352,6 +351,7 @@ async fn execute_action(
                             }));
                         app.phase = AgentPhase::Thinking;
                         app.auto_scroll();
+                        app.begin_turn();
                         let params = serde_json::json!({
                             "session_id": app.session_id,
                             "content": request,
@@ -397,6 +397,7 @@ async fn execute_action(
                     .push(app::ConversationEntry::User(request.clone()));
                 app.phase = AgentPhase::Thinking;
                 app.auto_scroll();
+                app.begin_turn();
                 let params = serde_json::json!({
                     "session_id": app.session_id,
                     "content": request,
@@ -517,6 +518,28 @@ mod tests {
             Some(app::ConversationEntry::InteractionQuestion { prompt, options })
                 if prompt.contains("start a normal session with this final plan")
                 && options == &vec!["Yes".to_string(), "No".to_string()]
+        ));
+    }
+
+    #[test]
+    fn turn_complete_does_not_reuse_stale_assistant_text() {
+        let mut app = app::App::new("test".into(), true, None);
+        app.messages.push(app::ConversationEntry::AssistantText(
+            "Old plan text".into(),
+        ));
+        let turn_complete = make_notif(
+            notifications::TURN_COMPLETE,
+            serde_json::json!({ "duration_us": 42 }),
+        );
+
+        app.begin_turn();
+        app.apply_notification(&turn_complete);
+        request_plan_exit_confirmation_after_turn_complete(&mut app);
+
+        assert!(app.pending_plan_exit.is_none());
+        assert!(matches!(
+            app.messages.last(),
+            Some(app::ConversationEntry::TurnInfo { .. })
         ));
     }
 }
