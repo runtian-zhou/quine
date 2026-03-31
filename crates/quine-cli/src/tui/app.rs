@@ -195,6 +195,7 @@ pub struct OptionSelectState {
 /// Actions the event loop should perform after handling an event.
 pub enum AppAction {
     SendMessage(String),
+    CompactSession,
     SendSlashSkillMessage {
         skill_name: String,
         request: String,
@@ -695,6 +696,21 @@ impl App {
                         "quit" => {
                             self.should_quit = true;
                             Some(AppAction::Quit)
+                        }
+                        "compact" => {
+                            if arguments.is_empty() {
+                                self.messages.push(ConversationEntry::AssistantText(
+                                    "Compacting context...".into(),
+                                ));
+                                self.phase = AgentPhase::Thinking;
+                                self.auto_scroll();
+                                Some(AppAction::CompactSession)
+                            } else {
+                                self.messages
+                                    .push(ConversationEntry::Error("Usage: /compact".into()));
+                                self.auto_scroll();
+                                None
+                            }
                         }
                         "plan" => {
                             if arguments.is_empty() {
@@ -1477,6 +1493,21 @@ mod tests {
             app.messages.last(),
             Some(ConversationEntry::Error(text)) if text == "Usage: /plan <request>"
         ));
+    }
+
+    #[test]
+    fn submit_input_compact_triggers_manual_compaction() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/compact");
+
+        let action = app.submit_input();
+
+        assert!(matches!(action, Some(AppAction::CompactSession)));
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::AssistantText(text)) if text == "Compacting context..."
+        ));
+        assert!(matches!(app.phase, AgentPhase::Thinking));
     }
 
     #[test]

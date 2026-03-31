@@ -23,6 +23,9 @@ pub trait HarnessService: Send + Sync {
         content: String,
     ) -> Result<(), HarnessError>;
 
+    /// Compact an existing session's conversation history.
+    async fn compact_session(&self, session_id: SessionId) -> Result<(), HarnessError>;
+
     /// Submit the result of a tool invocation requested by the core.
     async fn submit_tool_result(
         &self,

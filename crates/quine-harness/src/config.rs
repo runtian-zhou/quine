@@ -37,12 +37,15 @@ pub struct SessionConfig {
 pub struct HarnessConfig {
     /// Path to the Unix domain socket for IPC.
     pub socket_path: PathBuf,
+    /// Root directory for durable harness state such as compacted transcripts.
+    pub state_dir: PathBuf,
 }
 
 impl Default for HarnessConfig {
     fn default() -> Self {
         Self {
             socket_path: default_socket_path(),
+            state_dir: default_state_dir(),
         }
     }
 }
@@ -57,6 +60,20 @@ pub fn default_socket_path() -> PathBuf {
         dir.join("harness.sock")
     } else {
         PathBuf::from("/tmp/quine-harness.sock")
+    }
+}
+
+/// Returns the default path for durable harness state.
+pub fn default_state_dir() -> PathBuf {
+    if let Ok(state_home) = std::env::var("XDG_STATE_HOME") {
+        PathBuf::from(state_home).join("quine")
+    } else if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home)
+            .join(".local")
+            .join("state")
+            .join("quine")
+    } else {
+        PathBuf::from("/tmp").join("quine-state")
     }
 }
 
@@ -158,7 +175,7 @@ fn openai_compat_context_window(model: &str) -> Option<u64> {
     } else if normalized.starts_with("llama-3.1") || normalized.starts_with("llama3.1") {
         Some(128_000)
     } else {
-        None
+        Some(250_000)
     }
 }
 
@@ -189,6 +206,7 @@ mod tests {
     fn default_config_has_socket_path() {
         let config = HarnessConfig::default();
         assert!(!config.socket_path.as_os_str().is_empty());
+        assert!(!config.state_dir.as_os_str().is_empty());
     }
 
     #[test]
@@ -221,5 +239,10 @@ mod tests {
         std::env::set_var("LLM_CONTEXT_WINDOW", "65536");
         assert_eq!(max_context_window_from_env(), Some(65_536));
         std::env::remove_var("LLM_CONTEXT_WINDOW");
+    }
+
+    #[test]
+    fn default_state_dir_is_non_empty() {
+        assert!(!default_state_dir().as_os_str().is_empty());
     }
 }
