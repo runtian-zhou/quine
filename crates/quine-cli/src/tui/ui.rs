@@ -427,57 +427,29 @@ fn append_live_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     }
 }
 
-fn conversation_line_rows(line: &Line<'_>, area_width: u16) -> u32 {
-    if area_width == 0 {
-        return 1;
+fn build_conversation_lines(app: &App, area_width: u16) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+    for (i, entry) in app.messages.iter().enumerate() {
+        if i > 0 {
+            let is_tool_related = matches!(entry, ConversationEntry::ToolCall { .. });
+            if !is_tool_related {
+                lines.push(Line::from(""));
+            }
+        }
+        push_conversation_entry_lines(&mut lines, entry, area_width, app.max_context_window);
     }
-    let width = line.width() as u16;
-    if width == 0 {
-        return 1;
-    }
-    u32::from(width.div_ceil(area_width))
+    append_live_lines(&mut lines, app);
+    lines
 }
 
-fn build_tail_conversation_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
-    let mut tail_lines = Vec::new();
-    append_live_lines(&mut tail_lines, app);
-
-    let target_rows = u32::from(area.height).saturating_mul(2).max(1);
-    let mut used_rows: u32 = tail_lines
-        .iter()
-        .map(|line| conversation_line_rows(line, area.width))
-        .sum();
-
-    let mut newer_entry_is_tool_related = false;
-    let mut have_newer_entry = false;
-
-    for entry in app.messages.iter().rev() {
-        let mut entry_lines = Vec::new();
-        push_conversation_entry_lines(&mut entry_lines, entry, area.width, app.max_context_window);
-
-        let entry_rows: u32 = entry_lines
-            .iter()
-            .map(|line| conversation_line_rows(line, area.width))
-            .sum();
-        let needs_separator = have_newer_entry && !newer_entry_is_tool_related;
-        let separator_rows = u32::from(needs_separator);
-
-        if used_rows >= target_rows && entry_rows + separator_rows > 0 {
-            break;
-        }
-
-        if needs_separator {
-            tail_lines.insert(0, Line::from(""));
-        }
-        for line in entry_lines.into_iter().rev() {
-            tail_lines.insert(0, line);
-        }
-        used_rows += entry_rows + separator_rows;
-        newer_entry_is_tool_related = matches!(entry, ConversationEntry::ToolCall { .. });
-        have_newer_entry = true;
+fn conversation_content_height(lines: &[Line<'static>], area_width: u16) -> u32 {
+    if area_width == 0 {
+        return 0;
     }
 
-    tail_lines
+    Paragraph::new(Text::from(lines.to_vec()))
+        .wrap(Wrap { trim: false })
+        .line_count(area_width) as u32
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
@@ -514,41 +486,21 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
 
-    let (lines, scroll) = if app.user_scrolled {
-        let mut lines: Vec<Line<'static>> = Vec::new();
-        for (i, entry) in app.messages.iter().enumerate() {
-            if i > 0 {
-                let is_tool_related = matches!(entry, ConversationEntry::ToolCall { .. });
-                if !is_tool_related {
-                    lines.push(Line::from(""));
-                }
-            }
-            push_conversation_entry_lines(&mut lines, entry, area.width, app.max_context_window);
-        }
-        append_live_lines(&mut lines, app);
-        let content_height: u32 = lines
-            .iter()
-            .map(|line| conversation_line_rows(line, area.width))
-            .sum();
-        let view_height = area.height as u32;
-        app.last_view_height = view_height;
-        let max_scroll = content_height.saturating_sub(view_height);
-        let scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
-        (lines, scroll)
+    let lines = build_conversation_lines(app, area.width);
+    let content_height = conversation_content_height(&lines, area.width);
+    let view_height = area.height as u32;
+    app.last_view_height = view_height;
+    let max_scroll = content_height.saturating_sub(view_height);
+    let scroll = if app.user_scrolled {
+        max_scroll.saturating_sub(app.scroll_offset.min(max_scroll))
     } else {
-        let lines = build_tail_conversation_lines(app, area);
-        app.last_view_height = area.height as u32;
-        (lines, 0)
+        max_scroll
     };
 
     let text = Text::from(lines);
-    let conversation = Paragraph::new(text).wrap(Wrap { trim: false });
-
-    let view_height = area.height as u32;
-    app.last_view_height = view_height;
-
-    let scroll_u16 = scroll.min(u16::MAX as u32) as u16;
-    let conversation = conversation.scroll((scroll_u16, 0));
+    let conversation = Paragraph::new(text)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll.min(u16::MAX as u32) as u16, 0));
 
     frame.render_widget(conversation, area);
 }
@@ -1170,13 +1122,38 @@ mod tests {
     use super::*;
     use crate::context_debug::{HistoryEntry, SessionContextSnapshot};
     use crate::tui::app::ConversationEntry;
-    use ratatui::layout::Position;
+    use ratatui::layout::{Position, Rect};
 
     fn buffer_lines(backend: &ratatui::backend::TestBackend) -> Vec<String> {
         let buffer = backend.buffer();
         (0..buffer.area.height)
             .map(|y| {
                 (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    fn non_input_conversation_lines(
+        backend: &ratatui::backend::TestBackend,
+        app: &App,
+        terminal_width: u16,
+        terminal_height: u16,
+    ) -> Vec<String> {
+        let max_height = (terminal_height / 2).min(12);
+        let label = app.input_label();
+        let content_rows = input_content_rows(&app.input, &label, terminal_width.saturating_sub(2));
+        let input_height = (content_rows + 2).max(3).min(max_height);
+        let conversation_height = terminal_height.saturating_sub(1 + input_height);
+        let buffer = backend.buffer();
+        let conversation_area = Rect::new(0, 1, terminal_width, conversation_height);
+
+        (conversation_area.y..conversation_area.y + conversation_area.height)
+            .map(|y| {
+                (conversation_area.x..conversation_area.x + conversation_area.width)
                     .map(|x| buffer[(x, y)].symbol())
                     .collect::<String>()
                     .trim_end()
@@ -1747,6 +1724,64 @@ mod tests {
         input.set_from_string("abc\ndefghijklmnop");
 
         assert_eq!(input_cursor_position(&input, "> ", 8), (2, 5));
+    }
+
+    #[test]
+    fn draw_auto_follow_keeps_latest_long_assistant_output_visible_with_tall_input() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::User("prompt".into()));
+        app.messages.push(ConversationEntry::AssistantText(
+            (1..=20)
+                .map(|index| format!("line {index:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        app.input
+            .set_from_string("this input is intentionally long enough to wrap twice");
+
+        let terminal_width = 24;
+        let terminal_height = 10;
+        let backend = ratatui::backend::TestBackend::new(terminal_width, terminal_height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines =
+            non_input_conversation_lines(terminal.backend(), &app, terminal_width, terminal_height);
+
+        assert!(lines.iter().any(|line| line.contains("line 20")));
+        assert!(lines.iter().all(|line| !line.contains("line 01")));
+    }
+
+    #[test]
+    fn draw_auto_follow_keeps_final_turn_info_visible() {
+        let mut app = App::new("test".into(), false, Some(200_000));
+        app.messages.push(ConversationEntry::User("prompt".into()));
+        app.messages.push(ConversationEntry::AssistantText(
+            (1..=14)
+                .map(|index| format!("assistant line {index:02}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+        app.messages.push(ConversationEntry::TurnInfo {
+            duration_us: 4_523_000,
+            usage: Some(quine_llm::TokenUsage {
+                input_tokens: 120_000,
+                output_tokens: 30_000,
+            }),
+        });
+        app.input
+            .set_from_string("this input is intentionally long enough to wrap twice");
+
+        let terminal_width = 24;
+        let terminal_height = 10;
+        let backend = ratatui::backend::TestBackend::new(terminal_width, terminal_height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines =
+            non_input_conversation_lines(terminal.backend(), &app, terminal_width, terminal_height);
+
+        assert!(lines.iter().any(|line| line.contains("4.5s | ctx 75%")));
     }
 
     #[test]
