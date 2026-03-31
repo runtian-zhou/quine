@@ -54,11 +54,6 @@ fn print_resume_command(socket_path: &Path, session_id: &str) {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PlanExitHandoff {
-    final_plan: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 enum ChatCommandAction {
     Quit,
     ShowError(String),

@@ -7,7 +7,9 @@ use futures::StreamExt;
 use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, ToolDefinition};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::channel::{CoreHandle, CoreInput, CoreOutput, ToolOutcome};
+use crate::channel::{
+    CoreHandle, CoreInput, CoreOutput, MailboxMessage, MessageSource, ToolOutcome,
+};
 use crate::compaction::{self, CompactionTrigger};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
@@ -128,6 +130,10 @@ struct SessionContext {
     persisted_config: PersistedSessionConfig,
     /// Stable creation timestamp used for checkpoint listings.
     created_at: chrono::DateTime<Utc>,
+    /// Delivered mailbox messages that have not yet been consumed.
+    mailbox: VecDeque<MailboxMessage>,
+    /// Pending blocking mailbox receives waiting for a matching message.
+    pending_recv: Vec<(MessageSource, oneshot::Sender<Option<MailboxMessage>>)>,
 }
 
 struct SessionInit {
@@ -272,6 +278,8 @@ impl SessionContext {
             compaction_generation: 0,
             persisted_config,
             created_at: Utc::now(),
+            mailbox: VecDeque::new(),
+            pending_recv: Vec::new(),
         })
     }
 
@@ -357,6 +365,68 @@ impl SessionContext {
             history: self.history.clone(),
             plan_store: crate::tool::plan::snapshot_plan_store(&self.plan_store).await,
         })
+    }
+}
+
+fn mailbox_matches_source(message: &MailboxMessage, source: &MessageSource) -> bool {
+    match source {
+        MessageSource::Any => true,
+        MessageSource::Session(session_id) => message.from == *session_id,
+    }
+}
+
+fn pop_mailbox_message(
+    mailbox: &mut VecDeque<MailboxMessage>,
+    source: &MessageSource,
+) -> Option<MailboxMessage> {
+    let index = mailbox
+        .iter()
+        .position(|message| mailbox_matches_source(message, source))?;
+    mailbox.remove(index)
+}
+
+fn deliver_or_queue_message(
+    session: &mut SessionContext,
+    message: MailboxMessage,
+) -> Result<bool, MailboxMessage> {
+    if let Some(index) = session
+        .pending_recv
+        .iter()
+        .position(|(source, _)| mailbox_matches_source(&message, source))
+    {
+        let (_, reply) = session.pending_recv.remove(index);
+        if reply.send(Some(message.clone())).is_ok() {
+            return Ok(true);
+        }
+        return deliver_or_queue_message(session, message);
+    }
+
+    Err(message)
+}
+
+async fn handle_send_message_input(
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    output: &mpsc::Sender<CoreOutput>,
+    from: SessionId,
+    to: SessionId,
+    content: String,
+) {
+    debug_log_session(from, format!("received SendMessage to {to:?}"));
+    if let Some(target_session) = sessions.get_mut(&to) {
+        let message = MailboxMessage {
+            from,
+            content: content.clone(),
+        };
+        if deliver_or_queue_message(target_session, message.clone()).is_err() {
+            target_session.mailbox.push_back(message);
+        }
+        let _ = output
+            .send(CoreOutput::MessageReceived {
+                session_id: to,
+                from,
+                content,
+            })
+            .await;
     }
 }
 
@@ -1321,6 +1391,129 @@ async fn execute_tool_call(
         return match status {
             Some(status) => ToolOutcome::Success {
                 output: serde_json::to_string(&status).unwrap_or_else(|_| "unknown".into()),
+            },
+            None => ToolOutcome::Success {
+                output: "null".into(),
+            },
+        };
+    }
+
+    if call.tool_name == "recv_message" {
+        let source_str = match call.arguments.get("source").and_then(|v| v.as_str()) {
+            Some(source) => source,
+            None => {
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.cancel_tx = None;
+                }
+                return ToolOutcome::Error {
+                    message: "invalid arguments: missing required parameter: source".into(),
+                };
+            }
+        };
+        let non_blocking = call
+            .arguments
+            .get("non_blocking")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let source = if source_str == "any" {
+            MessageSource::Any
+        } else {
+            match crate::tool::wait_child::parse_session_id(source_str) {
+                Some(source_id) => MessageSource::Session(source_id),
+                None => {
+                    if let Some(session) = sessions.get_mut(&session_id) {
+                        session.cancel_tx = None;
+                    }
+                    return ToolOutcome::Error {
+                        message: format!(
+                            "invalid arguments: invalid source session_id: {source_str}"
+                        ),
+                    };
+                }
+            }
+        };
+
+        let message = if let Some(session) = sessions.get_mut(&session_id) {
+            pop_mailbox_message(&mut session.mailbox, &source)
+        } else {
+            None
+        };
+
+        let message = if let Some(message) = message {
+            Some(message)
+        } else if non_blocking {
+            None
+        } else {
+            'recv_loop: loop {
+                match io.input.recv().await {
+                    Some(CoreInput::Cancel {
+                        session_id: cancel_sid,
+                    }) if cancel_sid == session_id => {
+                        debug_log_session(session_id, "recv_message cancelled by core input");
+                        interrupt_session(sessions, io.deferred_inputs, session_id);
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.cancel_tx = None;
+                        }
+                        return ToolOutcome::Cancelled;
+                    }
+                    Some(CoreInput::Signal {
+                        session_id: signal_sid,
+                        signal,
+                    }) if signal_sid == session_id
+                        && matches!(
+                            signal,
+                            SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill
+                        ) =>
+                    {
+                        debug_log_session(session_id, "recv_message interrupted by session signal");
+                        interrupt_session(sessions, io.deferred_inputs, session_id);
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.cancel_tx = None;
+                        }
+                        return ToolOutcome::Cancelled;
+                    }
+                    Some(CoreInput::SendMessage { from, to, content }) => {
+                        handle_send_message_input(sessions, io.output, from, to, content).await;
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            if let Some(message) =
+                                pop_mailbox_message(&mut session.mailbox, &source)
+                            {
+                                break 'recv_loop Some(message);
+                            }
+                        }
+                    }
+                    Some(other) => {
+                        io.deferred_inputs.push_back(other);
+                    }
+                    None => {
+                        debug_log_session(
+                            session_id,
+                            "recv_message failed: input channel closed during execution",
+                        );
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            if let Some(cancel_tx) = session.cancel_tx.as_ref() {
+                                let _ = cancel_tx.send(true);
+                            }
+                            session.cancel_tx = None;
+                        }
+                        return ToolOutcome::Error {
+                            message: "input channel closed".into(),
+                        };
+                    }
+                }
+            }
+        };
+
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.cancel_tx = None;
+        }
+        return match message {
+            Some(MailboxMessage { from, content }) => ToolOutcome::Success {
+                output: serde_json::json!({
+                    "from": from,
+                    "content": content,
+                })
+                .to_string(),
             },
             None => ToolOutcome::Success {
                 output: "null".into(),
@@ -2532,8 +2725,30 @@ pub async fn run_core_loop_with_compaction(
                     }
                 }
             }
-            CoreInput::SendMessage { .. } => {
-                debug_log("received SendMessage; no-op in current core loop");
+            CoreInput::SendMessage { from, to, content } => {
+                handle_send_message_input(&mut sessions, &handle.output, from, to, content).await;
+            }
+            CoreInput::RecvMessage {
+                session_id,
+                source,
+                non_blocking,
+                reply,
+            } => {
+                debug_log_session(session_id, "received RecvMessage");
+                match sessions.get_mut(&session_id) {
+                    Some(session) => {
+                        if let Some(message) = pop_mailbox_message(&mut session.mailbox, &source) {
+                            let _ = reply.send(Some(message));
+                        } else if non_blocking {
+                            let _ = reply.send(None);
+                        } else {
+                            session.pending_recv.push((source, reply));
+                        }
+                    }
+                    None => {
+                        let _ = reply.send(None);
+                    }
+                }
             }
             CoreInput::WaitSession {
                 parent_id,
@@ -3604,6 +3819,232 @@ mod tests {
             .unwrap();
 
         assert!(reply_rx.await.unwrap().is_ok());
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn send_and_receive_mailbox_messages() {
+        let (mut harness, core) = create_channels(ChannelConfig::default());
+        let provider = Arc::new(MockProvider::empty());
+        let loop_handle = tokio::spawn(run_core_loop(core, provider, None, None));
+
+        let sender_id = SessionId::new();
+        let receiver_id = SessionId::new();
+
+        for session_id in [sender_id, receiver_id] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            harness
+                .input
+                .send(CoreInput::CreateSession {
+                    session_id,
+                    system_prompt: None,
+                    working_directory: None,
+                    skills: Vec::new(),
+                    plan_mode: false,
+                    auto_approve_permissions: false,
+                    initial_messages: Vec::new(),
+                    reply: reply_tx,
+                })
+                .await
+                .unwrap();
+            assert!(reply_rx.await.unwrap().is_ok());
+        }
+
+        harness
+            .input
+            .send(CoreInput::SendMessage {
+                from: sender_id,
+                to: receiver_id,
+                content: "hello".into(),
+            })
+            .await
+            .unwrap();
+
+        let event = loop {
+            let event =
+                tokio::time::timeout(std::time::Duration::from_secs(1), harness.output.recv())
+                    .await
+                    .expect("timeout waiting for mailbox event")
+                    .expect("missing mailbox event");
+            if matches!(event, CoreOutput::MessageReceived { .. }) {
+                break event;
+            }
+        };
+        match event {
+            CoreOutput::MessageReceived {
+                session_id,
+                from,
+                content,
+            } => {
+                assert_eq!(session_id, receiver_id);
+                assert_eq!(from, sender_id);
+                assert_eq!(content, "hello");
+            }
+            other => panic!("expected MessageReceived, got {other:?}"),
+        }
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::RecvMessage {
+                session_id: receiver_id,
+                source: MessageSource::Session(sender_id),
+                non_blocking: false,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        let message = tokio::time::timeout(std::time::Duration::from_secs(1), reply_rx)
+            .await
+            .expect("timeout waiting for recv reply")
+            .expect("recv reply dropped")
+            .expect("missing mailbox message");
+        assert_eq!(message.from, sender_id);
+        assert_eq!(message.content, "hello");
+
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::RecvMessage {
+                session_id: receiver_id,
+                source: MessageSource::Any,
+                non_blocking: true,
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(reply_rx.await.unwrap().is_none());
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn recv_message_tool_receives_mailbox_message_without_deadlock() {
+        struct RecvMessageProvider {
+            call_count: std::sync::atomic::AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for RecvMessageProvider {
+            async fn send(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+            {
+                let count = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let events = if count == 0 {
+                    vec![
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_recv".into(),
+                            tool_name: "recv_message".into(),
+                            arguments: serde_json::json!({"source": "any"}),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else {
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            text: "message received".into(),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let provider = RecvMessageProvider {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        };
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None, None));
+
+        let receiver_id = SessionId::new();
+        let sender_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id: receiver_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                auto_approve_permissions: false,
+                initial_messages: Vec::new(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        let _ = output.recv().await.unwrap();
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id: receiver_id,
+                content: "wait for a message".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut got_tool_request = false;
+        let mut got_message_received = false;
+        let mut got_text_complete = false;
+        let mut got_turn_complete = false;
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
+                Ok(Some(CoreOutput::ToolRequest { tool_name, .. }))
+                    if tool_name == "recv_message" =>
+                {
+                    got_tool_request = true;
+                    harness
+                        .input
+                        .send(CoreInput::SendMessage {
+                            from: sender_id,
+                            to: receiver_id,
+                            content: "hello".into(),
+                        })
+                        .await
+                        .unwrap();
+                }
+                Ok(Some(CoreOutput::MessageReceived {
+                    session_id,
+                    from,
+                    content,
+                })) => {
+                    assert_eq!(session_id, receiver_id);
+                    assert_eq!(from, sender_id);
+                    assert_eq!(content, "hello");
+                    got_message_received = true;
+                }
+                Ok(Some(CoreOutput::TextComplete { full_text, .. })) => {
+                    assert_eq!(full_text, "message received");
+                    got_text_complete = true;
+                }
+                Ok(Some(CoreOutput::TurnComplete { .. })) => {
+                    got_turn_complete = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timeout waiting for recv_message flow"),
+            }
+        }
+
+        assert!(got_tool_request, "expected recv_message tool request");
+        assert!(got_message_received, "expected mailbox event");
+        assert!(got_text_complete, "expected post-tool text completion");
+        assert!(got_turn_complete, "expected turn completion");
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();
