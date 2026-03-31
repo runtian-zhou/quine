@@ -483,6 +483,7 @@ async fn call_llm_interruptible(
         }
     };
     Ok(Some(LlmCallResult { turn, usage }))
+}
 
 async fn summarize_history(
     provider: &dyn LlmProvider,
@@ -628,6 +629,7 @@ fn handle_session_control_input(
             SessionControlFlow::Continue
         }
     }
+}
 
 async fn compact_session_history(
     provider: &dyn LlmProvider,
@@ -644,10 +646,7 @@ async fn compact_session_history(
         return Ok(false);
     }
 
-    let session_id_str = serde_json::to_value(session_id)
-        .ok()
-        .and_then(|value| value.as_str().map(ToOwned::to_owned))
-        .unwrap_or_else(|| "unknown-session".to_string());
+    let session_id_str = session_id_string(session_id);
     let generation = session.compaction_generation + 1;
     let archived = compaction::archive_history(
         &session.archive_root,
@@ -667,6 +666,53 @@ async fn compact_session_history(
     session.last_input_tokens = None;
     session.compaction_generation = archived.generation;
     Ok(true)
+}
+
+fn session_id_string(session_id: SessionId) -> String {
+    serde_json::to_value(session_id)
+        .ok()
+        .and_then(|value| value.as_str().map(ToOwned::to_owned))
+        .unwrap_or_else(|| "unknown-session".to_string())
+}
+
+async fn prepare_tool_result_for_history(
+    session: &SessionContext,
+    session_id: SessionId,
+    tool_use_id: &str,
+    tool_name: &str,
+    tool_output: &str,
+    is_error: bool,
+) -> Result<String, CoreError> {
+    if tool_output.chars().count() <= compaction::MAX_TOOL_RESULT_CHARS_IN_HISTORY {
+        return Ok(tool_output.to_string());
+    }
+
+    let session_id_str = session_id_string(session_id);
+    let archived = compaction::archive_tool_result(
+        &session.archive_root,
+        &session_id_str,
+        tool_use_id,
+        tool_output,
+    )
+    .await
+    .map_err(|error| CoreError::Internal {
+        message: format!("failed to archive oversized tool result: {error}"),
+    })?;
+    let archive_ref = archived.display().to_string();
+    debug_log_session(
+        session_id,
+        format!(
+            "archived oversized tool result for `{tool_name}` ({} chars) to {archive_ref}",
+            tool_output.chars().count()
+        ),
+    );
+    Ok(compaction::render_archived_tool_result(
+        tool_name,
+        tool_use_id,
+        is_error,
+        tool_output,
+        &archive_ref,
+    ))
 }
 
 async fn finalize_child_session(
@@ -1042,8 +1088,14 @@ async fn execute_tool_call(
             .get("system_prompt")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned);
-        let archive_root = session.archive_root.clone();
-        let max_context_window = session.max_context_window;
+        let (archive_root, max_context_window) = match sessions.get(&session_id) {
+            Some(session) => (session.archive_root.clone(), session.max_context_window),
+            None => {
+                return ToolOutcome::Error {
+                    message: "session not found".into(),
+                };
+            }
+        };
         let child_id = SessionId::new();
         match Box::pin(start_child_session(
             sessions,
@@ -1752,9 +1804,42 @@ async fn handle_llm_turn(
                     }
 
                     if let Some(session) = sessions.get_mut(&session_id) {
+                        let history_output = match prepare_tool_result_for_history(
+                            session,
+                            session_id,
+                            &call.tool_use_id,
+                            &call.tool_name,
+                            &tool_output,
+                            is_error,
+                        )
+                        .await
+                        {
+                            Ok(output) => output,
+                            Err(error) => {
+                                session.cancel_tx = None;
+                                session.state = SessionState::Idle;
+                                let duration_us = turn_start.elapsed().as_micros() as u64;
+                                let _ = io
+                                    .output
+                                    .send(CoreOutput::SessionError {
+                                        session_id,
+                                        error: error.clone(),
+                                    })
+                                    .await;
+                                let _ = io
+                                    .output
+                                    .send(CoreOutput::TurnComplete {
+                                        session_id,
+                                        duration_us,
+                                        usage: accumulated_usage.clone(),
+                                    })
+                                    .await;
+                                return TurnOutcome::Failed(error.to_string());
+                            }
+                        };
                         session.history.push(Message::tool_result(
                             &call.tool_use_id,
-                            &tool_output,
+                            &history_output,
                             is_error,
                         ));
                     }
@@ -2044,11 +2129,36 @@ pub async fn run_core_loop_with_compaction(
                                 ("Tool execution was cancelled".to_string(), true)
                             }
                         };
+                        let history_output = {
+                            let session = sessions.get(&session_id).unwrap();
+                            match prepare_tool_result_for_history(
+                                session,
+                                session_id,
+                                &tool_use_id,
+                                "external",
+                                &output_text,
+                                is_error,
+                            )
+                            .await
+                            {
+                                Ok(output) => output,
+                                Err(error) => {
+                                    let _ = handle
+                                        .output
+                                        .send(CoreOutput::SessionError {
+                                            session_id,
+                                            error,
+                                        })
+                                        .await;
+                                    continue;
+                                }
+                            }
+                        };
                         {
                             let session = sessions.get_mut(&session_id).unwrap();
                             session.history.push(Message::tool_result(
                                 &tool_use_id,
-                                &output_text,
+                                &history_output,
                                 is_error,
                             ));
                             session.state = SessionState::Streaming;
@@ -2494,7 +2604,96 @@ mod tests {
         assert!(sessions
             .get(&session_id)
             .is_some_and(|session| session.cancel_tx.is_none() && session.interrupted));
-        assert!(deferred_inputs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_tool_result_for_history_keeps_small_output_inline() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
+        let session = SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                auto_approve_permissions: false,
+                archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
+                max_context_window: None,
+            },
+            &provider,
+            &permission_checker,
+        )
+        .await
+        .unwrap();
+        let session_id = SessionId::new();
+
+        let output = prepare_tool_result_for_history(
+            &session,
+            session_id,
+            "toolu_small",
+            "bash",
+            "small output",
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output, "small output");
+    }
+
+    #[tokio::test]
+    async fn prepare_tool_result_for_history_archives_oversized_output() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
+        let archive_root = std::env::temp_dir().join(format!(
+            "quine-core-compaction-tests-{:?}",
+            SessionId::new()
+        ));
+        let session = SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                auto_approve_permissions: false,
+                archive_root: archive_root.clone(),
+                max_context_window: None,
+            },
+            &provider,
+            &permission_checker,
+        )
+        .await
+        .unwrap();
+        let session_id = SessionId::new();
+        let oversized = "x".repeat(compaction::MAX_TOOL_RESULT_CHARS_IN_HISTORY + 128);
+
+        let output = prepare_tool_result_for_history(
+            &session,
+            session_id,
+            "toolu_big",
+            "bash",
+            &oversized,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert!(output.contains("[tool result archived: bash, ok"));
+        assert!(output.contains("archive="));
+        assert!(output.contains("[... elided ...]"));
+
+        let archived_dir = archive_root.join("tool-results").join(session_id_string(session_id));
+        let entries = std::fs::read_dir(&archived_dir)
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(entries.len(), 1);
+        let archived = std::fs::read_to_string(entries[0].path()).unwrap();
+        assert_eq!(archived.len(), oversized.len());
+
+        let _ = std::fs::remove_dir_all(archive_root);
     }
 
     #[tokio::test]

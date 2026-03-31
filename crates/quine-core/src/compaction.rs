@@ -8,6 +8,9 @@ use tokio::fs;
 
 pub const AUTO_COMPACT_THRESHOLD_NUMERATOR: u64 = 3;
 pub const AUTO_COMPACT_THRESHOLD_DENOMINATOR: u64 = 5;
+pub const MAX_TOOL_RESULT_CHARS_IN_HISTORY: usize = 256_000;
+const TOOL_RESULT_PREVIEW_HEAD_CHARS: usize = 8_000;
+const TOOL_RESULT_PREVIEW_TAIL_CHARS: usize = 2_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionTrigger {
@@ -159,6 +162,53 @@ pub async fn archive_history(
     let payload = serde_json::to_vec_pretty(&archive)?;
     fs::write(&path, payload).await?;
     Ok(ArchivedTranscript { generation, path })
+}
+
+pub async fn archive_tool_result(
+    archive_root: &Path,
+    session_id: &str,
+    tool_use_id: &str,
+    output: &str,
+) -> std::io::Result<PathBuf> {
+    let session_dir = archive_root.join("tool-results").join(session_id);
+    fs::create_dir_all(&session_dir).await?;
+    let timestamp = Utc::now().format("%Y%m%dT%H%M%SZ");
+    let safe_tool_use_id: String = tool_use_id
+        .chars()
+        .map(|ch| match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '-' | '_' => ch,
+            _ => '_',
+        })
+        .collect();
+    let path = session_dir.join(format!("{timestamp}-{safe_tool_use_id}.txt"));
+    fs::write(&path, output).await?;
+    Ok(path)
+}
+
+pub fn render_archived_tool_result(
+    tool_name: &str,
+    tool_use_id: &str,
+    is_error: bool,
+    output: &str,
+    archive_ref: &str,
+) -> String {
+    let status = if is_error { "error" } else { "ok" };
+    let mut preview = output
+        .chars()
+        .take(TOOL_RESULT_PREVIEW_HEAD_CHARS)
+        .collect::<String>();
+    let total_chars = output.chars().count();
+    if total_chars > TOOL_RESULT_PREVIEW_HEAD_CHARS {
+        let tail = output
+            .chars()
+            .skip(total_chars.saturating_sub(TOOL_RESULT_PREVIEW_TAIL_CHARS))
+            .collect::<String>();
+        preview.push_str("\n\n[... elided ...]\n\n");
+        preview.push_str(&tail);
+    }
+    format!(
+        "[tool result archived: {tool_name}, {status}, {total_chars} chars, id={tool_use_id}, archive={archive_ref}]\n{preview}"
+    )
 }
 
 fn live_tail_start(history: &[Message]) -> Option<usize> {
