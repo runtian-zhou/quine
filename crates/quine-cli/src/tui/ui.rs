@@ -26,11 +26,13 @@ fn format_duration_us(us: u64) -> String {
 
 /// Format token usage in a compact, TUI-friendly form.
 fn format_token_usage(usage: &quine_llm::TokenUsage, max_context_window: u64) -> String {
-    format!(
-        "ctx {current}/{max}",
-        current = usage.input_tokens + usage.output_tokens,
-        max = max_context_window,
-    )
+    let current = usage.input_tokens + usage.output_tokens;
+    let percent = if max_context_window == 0 {
+        0
+    } else {
+        current.saturating_mul(100) / max_context_window
+    };
+    format!("ctx {percent}%", percent = percent.min(100),)
 }
 
 fn format_context_status(
@@ -633,11 +635,21 @@ mod tests {
     #[test]
     fn format_token_usage_compacts_values() {
         let usage = quine_llm::TokenUsage {
-            input_tokens: 1200,
-            output_tokens: 350,
+            input_tokens: 120_000,
+            output_tokens: 30_000,
         };
 
-        assert_eq!(format_token_usage(&usage, 200_000), "ctx 1550/200000");
+        assert_eq!(format_token_usage(&usage, 200_000), "ctx 75%");
+    }
+
+    #[test]
+    fn format_token_usage_clamps_to_full_context() {
+        let usage = quine_llm::TokenUsage {
+            input_tokens: 180_000,
+            output_tokens: 40_000,
+        };
+
+        assert_eq!(format_token_usage(&usage, 200_000), "ctx 100%");
     }
 
     #[test]
