@@ -120,25 +120,11 @@ async fn run_event_loop(
             maybe_notif = client.recv_notification() => {
                 match maybe_notif {
                     Some(notif) => {
-                        let pending_plan_exit = if app.plan_mode
-                            && notif.method == notifications::TURN_COMPLETE
-                        {
-                            app.messages.iter().rev().find_map(|entry| match entry {
-                                app::ConversationEntry::AssistantText(text)
-                                    if !text.trim().is_empty() =>
-                                {
-                                    Some(PendingPlanExit::FinalPlan {
-                                        final_plan: text.clone(),
-                                    })
-                                }
-                                _ => None,
-                            })
-                        } else {
-                            None
-                        };
+                        let should_check_plan_exit =
+                            app.plan_mode && notif.method == notifications::TURN_COMPLETE;
                         app.apply_notification(&notif);
-                        if let Some(pending_exit) = pending_plan_exit {
-                            app.request_plan_exit_confirmation(pending_exit);
+                        if should_check_plan_exit {
+                            request_plan_exit_confirmation_after_turn_complete(app);
                         }
                     }
                     None => {
@@ -156,6 +142,20 @@ async fn run_event_loop(
     }
 
     Ok(())
+}
+
+fn request_plan_exit_confirmation_after_turn_complete(app: &mut app::App) {
+    let pending_plan_exit = app.messages.iter().rev().find_map(|entry| match entry {
+        app::ConversationEntry::AssistantText(text) if !text.trim().is_empty() => {
+            Some(PendingPlanExit::FinalPlan {
+                final_plan: text.clone(),
+            })
+        }
+        _ => None,
+    });
+    if let Some(pending_exit) = pending_plan_exit {
+        app.request_plan_exit_confirmation(pending_exit);
+    }
 }
 
 /// Map a terminal event to an AppAction.
@@ -475,4 +475,48 @@ async fn execute_action(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use quine_harness::protocol::JsonRpcNotification;
+
+    fn make_notif(method: &str, params: serde_json::Value) -> JsonRpcNotification {
+        JsonRpcNotification {
+            jsonrpc: "2.0".to_string(),
+            method: method.to_string(),
+            params: Some(params),
+        }
+    }
+
+    #[test]
+    fn turn_complete_exit_confirmation_uses_text_flushed_from_streaming_buffer() {
+        let mut app = app::App::new("test".into(), true, None);
+        let stream = make_notif(
+            notifications::STREAM_DELTA,
+            serde_json::json!({ "delta": "Final plan from stream" }),
+        );
+        let turn_complete = make_notif(
+            notifications::TURN_COMPLETE,
+            serde_json::json!({ "duration_us": 42 }),
+        );
+
+        app.apply_notification(&stream);
+        assert!(app.pending_plan_exit.is_none());
+
+        app.apply_notification(&turn_complete);
+        request_plan_exit_confirmation_after_turn_complete(&mut app);
+
+        assert!(matches!(
+            app.pending_plan_exit,
+            Some(PendingPlanExit::FinalPlan { ref final_plan }) if final_plan == "Final plan from stream"
+        ));
+        assert!(matches!(
+            app.messages.last(),
+            Some(app::ConversationEntry::InteractionQuestion { prompt, options })
+                if prompt.contains("start a normal session with this final plan")
+                && options == &vec!["Yes".to_string(), "No".to_string()]
+        ));
+    }
 }
