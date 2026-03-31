@@ -18,9 +18,30 @@ async fn shutdown_if_spawned(client: &mut IpcClient, daemon_spawned: bool) {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct PlanExitHandoff {
-    final_plan: String,
+fn is_confirmed_plan_exit(response: &str) -> Option<bool> {
+    match response.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => Some(true),
+        "n" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+async fn confirm_plan_exit(
+    lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
+    prompt: &str,
+) -> anyhow::Result<bool> {
+    loop {
+        eprint!("{prompt} ");
+        match lines.next_line().await? {
+            Some(line) => {
+                if let Some(confirmed) = is_confirmed_plan_exit(&line) {
+                    return Ok(confirmed);
+                }
+                eprintln!("Please answer yes or no.");
+            }
+            None => return Ok(false),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -36,17 +57,28 @@ async fn maybe_exit_plan_mode(
     client: &mut IpcClient,
     skills: &[String],
     auto_approve_permissions: bool,
+    lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
     session_in_plan_mode: &mut bool,
     session: &mut crate::session::CreatedSession,
     completed_text: &str,
-) -> anyhow::Result<Option<PlanExitHandoff>> {
+) -> anyhow::Result<bool> {
     if !*session_in_plan_mode {
-        return Ok(None);
+        return Ok(false);
     }
 
     let final_plan = completed_text.trim();
     if final_plan.is_empty() {
-        return Ok(None);
+        return Ok(false);
+    }
+
+    if !confirm_plan_exit(
+        lines,
+        "Leave plan mode and start a normal session with this final plan? (y/n)",
+    )
+    .await?
+    {
+        eprintln!("Stayed in plan mode.");
+        return Ok(false);
     }
 
     let initial_messages = [Message::assistant(final_plan.to_string())];
@@ -60,9 +92,7 @@ async fn maybe_exit_plan_mode(
     .await?;
     *session_in_plan_mode = false;
 
-    Ok(Some(PlanExitHandoff {
-        final_plan: final_plan.to_string(),
-    }))
+    Ok(true)
 }
 
 fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
@@ -153,6 +183,18 @@ pub async fn run_chat(
                                 content
                             }
                             ChatCommandAction::StartSkillSession { skill_name, request } => {
+                                if session_in_plan_mode
+                                    && !confirm_plan_exit(
+                                        &mut lines,
+                                        &format!(
+                                            "Leave plan mode and start /{skill_name}? (y/n)"
+                                        ),
+                                    )
+                                    .await?
+                                {
+                                    eprintln!("Stayed in plan mode.");
+                                    continue;
+                                }
                                 session = create_slash_skill_session(
                                     &mut client,
                                     &skill_name,
@@ -208,10 +250,11 @@ pub async fn run_chat(
                                                 }
                                             }
                                             if handled {
-                                                if let Some(handoff) = maybe_exit_plan_mode(
+                                                if maybe_exit_plan_mode(
                                                     &mut client,
                                                     skills,
                                                     auto_approve_permissions,
+                                                    &mut lines,
                                                     &mut session_in_plan_mode,
                                                     &mut session,
                                                     &completed_text,
@@ -222,7 +265,11 @@ pub async fn run_chat(
                                                         "Plan complete; started normal session with final plan: {}",
                                                         session.session_id
                                                     );
-                                                    renderer.render_text_complete(&handoff.final_plan).await?;
+                                                    renderer
+                                                        .render_info(
+                                                            "Final plan carried over into the new session.",
+                                                        )
+                                                        .await?;
                                                 }
                                                 break;
                                             }
@@ -451,5 +498,14 @@ mod tests {
             handle_chat_command("/loop every 5m check logs", false),
             ChatCommandAction::ShowError("`/loop` is only supported in the TUI right now".into())
         );
+    }
+
+    #[test]
+    fn plan_exit_confirmation_accepts_yes_and_no() {
+        assert_eq!(is_confirmed_plan_exit("yes"), Some(true));
+        assert_eq!(is_confirmed_plan_exit("Y"), Some(true));
+        assert_eq!(is_confirmed_plan_exit("no"), Some(false));
+        assert_eq!(is_confirmed_plan_exit("n"), Some(false));
+        assert_eq!(is_confirmed_plan_exit("maybe"), None);
     }
 }

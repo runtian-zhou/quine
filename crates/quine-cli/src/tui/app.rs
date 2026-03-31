@@ -215,6 +215,12 @@ pub enum AppAction {
     Quit,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingPlanExit {
+    FinalPlan { final_plan: String },
+    StartSkillSession { skill_name: String, request: String },
+}
+
 /// Multi-line input buffer with cursor tracking.
 pub struct InputBuffer {
     lines: Vec<String>,
@@ -384,6 +390,7 @@ pub struct App {
     pub messages: Vec<ConversationEntry>,
     pub reasoning_buffer: String,
     pub streaming_buffer: String,
+    pub current_turn_assistant_text: Option<String>,
     pub scroll_offset: u32,
     pub user_scrolled: bool,
     pub input: InputBuffer,
@@ -406,6 +413,8 @@ pub struct App {
     pub option_select: Option<OptionSelectState>,
     /// Whether this session is in read-only plan mode.
     pub plan_mode: bool,
+    /// Pending local confirmation required before leaving plan mode.
+    pub pending_plan_exit: Option<PendingPlanExit>,
     /// Last known conversation view height (set during rendering for scroll step sizing).
     pub last_view_height: u32,
 }
@@ -482,6 +491,7 @@ impl App {
             messages: Vec::new(),
             reasoning_buffer: String::new(),
             streaming_buffer: String::new(),
+            current_turn_assistant_text: None,
             scroll_offset: 0,
             user_scrolled: false,
             input: InputBuffer::new(),
@@ -497,6 +507,7 @@ impl App {
             saved_input: String::new(),
             option_select: None,
             plan_mode,
+            pending_plan_exit: None,
             last_view_height: 0,
         }
     }
@@ -506,8 +517,10 @@ impl App {
         self.phase = AgentPhase::Idle;
         self.reasoning_buffer.clear();
         self.streaming_buffer.clear();
+        self.current_turn_assistant_text = None;
         self.interaction_queue.clear();
         self.option_select = None;
+        self.pending_plan_exit = None;
         self.auto_scroll();
     }
 
@@ -521,6 +534,7 @@ impl App {
         self.messages.clear();
         self.reasoning_buffer.clear();
         self.streaming_buffer.clear();
+        self.current_turn_assistant_text = None;
         self.scroll_offset = 0;
         self.user_scrolled = false;
         self.interaction_queue.clear();
@@ -531,6 +545,7 @@ impl App {
         self.max_context_window = max_context_window;
         self.option_select = None;
         self.plan_mode = plan_mode;
+        self.pending_plan_exit = None;
         self.auto_scroll();
     }
 
@@ -551,7 +566,9 @@ impl App {
     /// Permission prompts show a short label here — the full prompt is
     /// rendered in the conversation view instead.
     pub fn input_label(&self) -> String {
-        if let Some(interaction) = self.interaction_queue.front() {
+        if self.pending_plan_exit.is_some() {
+            "[plan] [confirm-exit] (y/n) > ".to_string()
+        } else if let Some(interaction) = self.interaction_queue.front() {
             let source = interaction.source_label.as_deref().unwrap_or("agent");
             let pending = self.interaction_queue.len();
             let badge = if pending > 1 {
@@ -616,6 +633,40 @@ impl App {
         self.input.clear();
         self.history_index = None;
         self.saved_input.clear();
+
+        if let Some(pending_exit) = self.pending_plan_exit.take() {
+            self.messages
+                .push(ConversationEntry::InteractionPrompt(text.clone()));
+            self.auto_scroll();
+            return match text.to_ascii_lowercase().as_str() {
+                "y" | "yes" => match pending_exit {
+                    PendingPlanExit::FinalPlan { final_plan } => {
+                        Some(AppAction::ExitPlanMode { final_plan })
+                    }
+                    PendingPlanExit::StartSkillSession {
+                        skill_name,
+                        request,
+                    } => Some(AppAction::SendSlashSkillMessage {
+                        skill_name,
+                        request,
+                    }),
+                },
+                "n" | "no" => {
+                    self.messages.push(ConversationEntry::AssistantText(
+                        "Stayed in plan mode.".into(),
+                    ));
+                    self.auto_scroll();
+                    None
+                }
+                _ => {
+                    self.pending_plan_exit = Some(pending_exit);
+                    self.messages
+                        .push(ConversationEntry::Error("Please answer yes or no.".into()));
+                    self.auto_scroll();
+                    None
+                }
+            };
+        }
 
         if let Some(interaction) = self.interaction_queue.pop_front() {
             let response = if interaction.kind == InteractionKind::Permission {
@@ -692,12 +743,27 @@ impl App {
                     },
                     SlashCommand::Skill { name, arguments } => {
                         self.messages.push(ConversationEntry::User(text.clone()));
-                        self.phase = AgentPhase::Thinking;
-                        self.auto_scroll();
-                        Some(AppAction::SendSlashSkillMessage {
-                            skill_name: name,
-                            request: arguments,
-                        })
+                        if self.plan_mode {
+                            self.messages.push(ConversationEntry::InteractionQuestion {
+                                prompt: format!(
+                                    "Leave plan mode and start /{name}? Answer yes or no."
+                                ),
+                                options: vec!["Yes".into(), "No".into()],
+                            });
+                            self.pending_plan_exit = Some(PendingPlanExit::StartSkillSession {
+                                skill_name: name,
+                                request: arguments,
+                            });
+                            self.auto_scroll();
+                            None
+                        } else {
+                            self.phase = AgentPhase::Thinking;
+                            self.auto_scroll();
+                            Some(AppAction::SendSlashSkillMessage {
+                                skill_name: name,
+                                request: arguments,
+                            })
+                        }
                     }
                 }
             } else {
@@ -707,6 +773,28 @@ impl App {
                 Some(AppAction::SendMessage(text))
             }
         }
+    }
+
+    pub fn request_plan_exit_confirmation(&mut self, pending_exit: PendingPlanExit) {
+        let prompt = match &pending_exit {
+            PendingPlanExit::FinalPlan { .. } => {
+                "Leave plan mode and start a normal session with this final plan? Answer yes or no."
+                    .to_string()
+            }
+            PendingPlanExit::StartSkillSession { skill_name, .. } => {
+                format!("Leave plan mode and start /{skill_name}? Answer yes or no.")
+            }
+        };
+        self.messages.push(ConversationEntry::InteractionQuestion {
+            prompt,
+            options: vec!["Yes".into(), "No".into()],
+        });
+        self.pending_plan_exit = Some(pending_exit);
+        self.auto_scroll();
+    }
+
+    pub fn begin_turn(&mut self) {
+        self.current_turn_assistant_text = None;
     }
 
     /// Move option selector cursor up.
@@ -847,6 +935,7 @@ impl App {
                 };
                 let text = trim_blank_lines(&text);
                 if !text.is_empty() {
+                    self.current_turn_assistant_text = Some(text.clone());
                     self.messages.push(ConversationEntry::AssistantText(text));
                 }
                 self.streaming_buffer.clear();
@@ -857,6 +946,7 @@ impl App {
                 if !self.streaming_buffer.trim().is_empty() {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
                     if !text.is_empty() {
+                        self.current_turn_assistant_text = Some(text.clone());
                         self.messages.push(ConversationEntry::AssistantText(text));
                     }
                 }
@@ -943,6 +1033,7 @@ impl App {
                 if !self.streaming_buffer.trim().is_empty() {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
                     if !text.is_empty() {
+                        self.current_turn_assistant_text = Some(text.clone());
                         self.messages.push(ConversationEntry::AssistantText(text));
                     }
                 }
@@ -1292,6 +1383,18 @@ mod tests {
     }
 
     #[test]
+    fn cancel_active_turn_clears_pending_plan_exit_confirmation() {
+        let mut app = App::new("test".into(), true, None);
+        app.pending_plan_exit = Some(PendingPlanExit::FinalPlan {
+            final_plan: "Plan text".into(),
+        });
+
+        app.cancel_active_turn();
+
+        assert!(app.pending_plan_exit.is_none());
+    }
+
+    #[test]
     fn submit_input_plan_command_enters_plan_mode() {
         let mut app = App::new("test".into(), false, None);
         app.input.set_from_string("/plan audit slash commands");
@@ -1388,6 +1491,95 @@ mod tests {
             Some(ConversationEntry::User(text)) if text == "/review audit this"
         ));
         assert!(matches!(app.phase, AgentPhase::Thinking));
+    }
+
+    #[test]
+    fn submit_input_skill_command_in_plan_mode_requests_confirmation() {
+        let mut app = App::new("test".into(), true, None);
+        app.input.set_from_string("/review audit this");
+
+        let action = app.submit_input();
+
+        assert!(action.is_none());
+        assert!(matches!(
+            app.pending_plan_exit,
+            Some(PendingPlanExit::StartSkillSession {
+                ref skill_name,
+                ref request
+            }) if skill_name == "review" && request == "audit this"
+        ));
+        assert!(matches!(
+            app.messages.first(),
+            Some(ConversationEntry::User(text)) if text == "/review audit this"
+        ));
+        assert!(matches!(
+            app.messages.get(1),
+            Some(ConversationEntry::InteractionQuestion { prompt, options })
+                if prompt.contains("Leave plan mode and start /review")
+                && options == &vec!["Yes".to_string(), "No".to_string()]
+        ));
+        assert_eq!(app.input_label(), "[plan] [confirm-exit] (y/n) > ");
+        assert!(matches!(app.phase, AgentPhase::Idle));
+    }
+
+    #[test]
+    fn submit_input_yes_confirms_pending_final_plan_exit() {
+        let mut app = App::new("test".into(), true, None);
+        app.request_plan_exit_confirmation(PendingPlanExit::FinalPlan {
+            final_plan: "Final plan".into(),
+        });
+        app.input.set_from_string("yes");
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::ExitPlanMode { final_plan }) if final_plan == "Final plan"
+        ));
+        assert!(app.pending_plan_exit.is_none());
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::InteractionPrompt(text)) if text == "yes"
+        ));
+    }
+
+    #[test]
+    fn submit_input_no_keeps_plan_mode_active() {
+        let mut app = App::new("test".into(), true, None);
+        app.request_plan_exit_confirmation(PendingPlanExit::FinalPlan {
+            final_plan: "Final plan".into(),
+        });
+        app.input.set_from_string("no");
+
+        let action = app.submit_input();
+
+        assert!(action.is_none());
+        assert!(app.pending_plan_exit.is_none());
+        assert!(app.plan_mode);
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::AssistantText(text)) if text == "Stayed in plan mode."
+        ));
+    }
+
+    #[test]
+    fn request_plan_exit_confirmation_records_prompt() {
+        let mut app = App::new("test".into(), true, None);
+
+        app.request_plan_exit_confirmation(PendingPlanExit::FinalPlan {
+            final_plan: "Final plan".into(),
+        });
+
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::InteractionQuestion { prompt, options })
+                if prompt.contains("start a normal session with this final plan")
+                && options == &vec!["Yes".to_string(), "No".to_string()]
+        ));
+        assert!(matches!(
+            app.pending_plan_exit,
+            Some(PendingPlanExit::FinalPlan { ref final_plan }) if final_plan == "Final plan"
+        ));
     }
 
     #[test]
