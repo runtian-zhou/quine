@@ -1,7 +1,7 @@
 mod app;
 mod ui;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
@@ -29,6 +29,23 @@ fn print_resume_command(socket_path: &Path, session_id: &str) {
         session_id,
         socket_path.display()
     );
+}
+
+fn build_context_debug_snapshot(
+    session_id: &str,
+    plan_mode: bool,
+    skills: &[String],
+    socket_path: &Path,
+    max_context_window: Option<u64>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session_id,
+        "plan_mode": plan_mode,
+        "skills": skills,
+        "max_context_window": max_context_window,
+        "socket_path": socket_path,
+        "cwd": std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    })
 }
 
 /// Run the TUI chat interface.
@@ -85,6 +102,7 @@ pub async fn run_tui_chat(
         auto_approve_permissions,
         &mut event_stream,
         &mut spinner_interval,
+        socket_path,
     )
     .await;
 
@@ -116,6 +134,7 @@ async fn run_event_loop(
     auto_approve_permissions: bool,
     event_stream: &mut EventStream,
     spinner_interval: &mut tokio::time::Interval,
+    socket_path: &Path,
 ) -> anyhow::Result<()> {
     loop {
         // Draw.
@@ -131,7 +150,7 @@ async fn run_event_loop(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if let Some(action) = handle_terminal_event(app, event) {
-                            execute_action(app, client, skills, available_skills, auto_approve_permissions, action).await?;
+                            execute_action(app, client, skills, available_skills, auto_approve_permissions, socket_path, action).await?;
                         }
                     }
                     Some(Err(_)) | None => {
@@ -318,6 +337,7 @@ async fn execute_action(
     skills: &[String],
     available_skills: &[String],
     auto_approve_permissions: bool,
+    socket_path: &Path,
     action: AppAction,
 ) -> anyhow::Result<()> {
     match action {
@@ -332,6 +352,20 @@ async fn execute_action(
                     .push(app::ConversationEntry::Error(e.to_string()));
                 app.phase = AgentPhase::Idle;
             }
+        }
+        AppAction::ShowContext => {
+            let snapshot = build_context_debug_snapshot(
+                &app.session_id,
+                app.plan_mode,
+                skills,
+                socket_path,
+                app.max_context_window,
+            );
+            app.messages.push(app::ConversationEntry::AssistantText(
+                serde_json::to_string_pretty(&snapshot)?,
+            ));
+            app.phase = AgentPhase::Idle;
+            app.auto_scroll();
         }
         AppAction::CompactSession => {
             let params = serde_json::json!({

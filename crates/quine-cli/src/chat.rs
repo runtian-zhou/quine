@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use quine_llm::Message;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -57,6 +57,7 @@ fn print_resume_command(socket_path: &Path, session_id: &str) {
 enum ChatCommandAction {
     Quit,
     ShowError(String),
+    ShowContext,
     SendMessage(String),
     CompactSession,
     EnterPlanModeAndSend(String),
@@ -105,6 +106,22 @@ async fn maybe_exit_plan_mode(
     Ok(true)
 }
 
+fn build_context_debug_snapshot(
+    session: &crate::session::CreatedSession,
+    session_in_plan_mode: bool,
+    skills: &[String],
+    socket_path: &Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "session_id": session.session_id,
+        "plan_mode": session_in_plan_mode,
+        "skills": skills,
+        "max_context_window": session.max_context_window,
+        "socket_path": socket_path,
+        "cwd": std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+    })
+}
+
 fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
     let trimmed = input.trim();
     if let Some(command) = parse_slash_command(trimmed) {
@@ -116,6 +133,13 @@ fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
                         ChatCommandAction::CompactSession
                     } else {
                         ChatCommandAction::ShowError("Usage: /compact".to_string())
+                    }
+                }
+                "context" => {
+                    if arguments.is_empty() {
+                        ChatCommandAction::ShowContext
+                    } else {
+                        ChatCommandAction::ShowError("Usage: /context".to_string())
                     }
                 }
                 "plan" => {
@@ -192,6 +216,17 @@ pub async fn run_chat(
                             ChatCommandAction::Quit => break,
                             ChatCommandAction::ShowError(message) => {
                                 renderer.render_error(&message).await?;
+                                continue;
+                            }
+                            ChatCommandAction::ShowContext => {
+                                let snapshot = build_context_debug_snapshot(
+                                    &session,
+                                    session_in_plan_mode,
+                                    skills,
+                                    socket_path,
+                                );
+                                let pretty = serde_json::to_string_pretty(&snapshot)?;
+                                renderer.render_info(&pretty).await?;
                                 continue;
                             }
                             ChatCommandAction::CompactSession => {

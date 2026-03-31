@@ -195,6 +195,7 @@ pub struct OptionSelectState {
 /// Actions the event loop should perform after handling an event.
 pub enum AppAction {
     SendMessage(String),
+    ShowContext,
     CompactSession,
     SendSlashSkillMessage {
         skill_name: String,
@@ -708,6 +709,16 @@ impl App {
                             } else {
                                 self.messages
                                     .push(ConversationEntry::Error("Usage: /compact".into()));
+                                self.auto_scroll();
+                                None
+                            }
+                        }
+                        "context" => {
+                            if arguments.is_empty() {
+                                Some(AppAction::ShowContext)
+                            } else {
+                                self.messages
+                                    .push(ConversationEntry::Error("Usage: /context".into()));
                                 self.auto_scroll();
                                 None
                             }
