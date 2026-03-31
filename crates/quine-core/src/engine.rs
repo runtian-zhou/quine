@@ -1969,7 +1969,10 @@ mod tests {
 
         match status {
             ExitStatus::Success { output } => {
-                assert!(output.contains("73"), "expected child output in wait result: {output}");
+                assert!(
+                    output.contains("73"),
+                    "expected child output in wait result: {output}"
+                );
             }
             other => panic!("expected completed exit status, got {other:?}"),
         }
