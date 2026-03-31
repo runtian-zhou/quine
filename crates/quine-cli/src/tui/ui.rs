@@ -26,11 +26,13 @@ fn format_duration_us(us: u64) -> String {
 
 /// Format token usage in a compact, TUI-friendly form.
 fn format_token_usage(usage: &quine_llm::TokenUsage, max_context_window: u64) -> String {
-    format!(
-        "ctx {current}/{max}",
-        current = usage.input_tokens + usage.output_tokens,
-        max = max_context_window,
-    )
+    let current = usage.input_tokens + usage.output_tokens;
+    let percent = if max_context_window == 0 {
+        0
+    } else {
+        current.saturating_mul(100) / max_context_window
+    };
+    format!("ctx {percent}%", percent = percent.min(100),)
 }
 
 fn format_context_status(
@@ -224,6 +226,251 @@ fn render_plan_box(lines: &mut Vec<Line<'_>>, plan: &str, width: u16) {
     )));
 }
 
+fn push_conversation_entry_lines(
+    lines: &mut Vec<Line<'static>>,
+    entry: &ConversationEntry,
+    area_width: u16,
+    max_context_window: Option<u64>,
+) {
+    match entry {
+        ConversationEntry::User(text) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "You: ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(text.clone()),
+            ]));
+        }
+        ConversationEntry::AssistantText(text) => {
+            for line in text.lines() {
+                lines.push(Line::from(Span::raw(format!("  {line}"))));
+            }
+        }
+        ConversationEntry::ToolCall {
+            tool_name,
+            summary,
+            status,
+            result_preview,
+            ..
+        } => {
+            let (marker, style) = match status {
+                ToolStatus::Running => ("⟳", Style::default().fg(Color::Yellow)),
+                ToolStatus::Success { .. } => ("✓", Style::default().fg(Color::Green)),
+                ToolStatus::Error { .. } => ("✗", Style::default().fg(Color::Red)),
+            };
+            let duration_str = match status {
+                ToolStatus::Running => String::new(),
+                ToolStatus::Success { duration_us } | ToolStatus::Error { duration_us } => {
+                    format!(" ({})", format_duration_us(*duration_us))
+                }
+            };
+            let label = if summary.is_empty() {
+                format!(" {tool_name}{duration_str}")
+            } else {
+                format!(" {tool_name}: {summary}{duration_str}")
+            };
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(marker, style),
+                Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
+            ]));
+            if tool_name == "plan" {
+                if let Some(preview) = result_preview {
+                    for line in preview.lines() {
+                        let style = if line.starts_with("Plan:") {
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            plan_status_style(line)
+                        };
+                        lines.push(Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled(line.to_string(), style),
+                        ]));
+                    }
+                }
+            }
+        }
+        ConversationEntry::PatchPreview(preview) => {
+            for line in preview.lines() {
+                let style = if line.starts_with("+ ") {
+                    Style::default().fg(Color::Green)
+                } else if line.starts_with("- ") {
+                    Style::default().fg(Color::Red)
+                } else {
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
+                };
+                lines.push(Line::from(vec![
+                    Span::raw("      "),
+                    Span::styled(line.to_string(), style),
+                ]));
+            }
+        }
+        ConversationEntry::PlanBox(plan) => {
+            render_plan_box(lines, plan, area_width);
+        }
+        ConversationEntry::PlanProgress {
+            action_id,
+            status,
+            remaining,
+            total,
+        } => {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled("plan", Style::default().fg(Color::Cyan)),
+                Span::styled(
+                    format!(" {action_id} -> {status} ({remaining} remaining / {total} total)"),
+                    Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+        ConversationEntry::Error(text) => {
+            for (i, line) in text.lines().enumerate() {
+                let prefix = if i == 0 { "Error: " } else { "       " };
+                lines.push(Line::from(Span::styled(
+                    format!("{prefix}{line}"),
+                    Style::default().fg(Color::Red),
+                )));
+            }
+        }
+        ConversationEntry::InteractionQuestion { prompt, options } => {
+            lines.push(Line::from(vec![
+                Span::styled("  ", Style::default().fg(Color::Yellow)),
+                Span::styled(
+                    prompt.to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            for (i, opt) in options.iter().enumerate() {
+                lines.push(Line::from(Span::styled(
+                    format!("     {}. {opt}", i + 1),
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+        }
+        ConversationEntry::InteractionPrompt(text) => {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    "Response: ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(text.clone()),
+            ]));
+        }
+        ConversationEntry::TurnInfo { duration_us, usage } => {
+            let time_str = format_duration_us(*duration_us);
+            let token_str = match (usage, max_context_window) {
+                (Some(u), Some(max_context_window)) => {
+                    format!(" | {}", format_token_usage(u, max_context_window))
+                }
+                (Some(u), None) => {
+                    format!(" | ctx {} used", u.input_tokens + u.output_tokens)
+                }
+                (None, _) => String::new(),
+            };
+            lines.push(Line::from(vec![Span::styled(
+                format!("  ── {time_str}{token_str} ──"),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            )]));
+        }
+    }
+}
+
+fn append_live_lines(lines: &mut Vec<Line<'static>>, app: &App) {
+    if !app.streaming_buffer.is_empty() {
+        let mut started = false;
+        for line in app.streaming_buffer.lines() {
+            if !started && line.trim().is_empty() {
+                continue;
+            }
+            started = true;
+            lines.push(Line::from(Span::styled(
+                line.to_string(),
+                Style::default().add_modifier(Modifier::DIM),
+            )));
+        }
+    }
+
+    match &app.phase {
+        AgentPhase::Thinking => {
+            lines.push(Line::from(Span::styled(
+                format!("{} Thinking...", app.spinner_char()),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        AgentPhase::RunningTool(name) => {
+            lines.push(Line::from(Span::styled(
+                format!("{} Running tool: {}...", app.spinner_char(), name),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+        AgentPhase::Streaming | AgentPhase::Idle => {}
+    }
+}
+
+fn conversation_line_rows(line: &Line<'_>, area_width: u16) -> u32 {
+    if area_width == 0 {
+        return 1;
+    }
+    let width = line.width() as u16;
+    if width == 0 {
+        return 1;
+    }
+    u32::from(width.div_ceil(area_width))
+}
+
+fn build_tail_conversation_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
+    let mut tail_lines = Vec::new();
+    append_live_lines(&mut tail_lines, app);
+
+    let target_rows = u32::from(area.height).saturating_mul(2).max(1);
+    let mut used_rows: u32 = tail_lines
+        .iter()
+        .map(|line| conversation_line_rows(line, area.width))
+        .sum();
+
+    let mut newer_entry_is_tool_related = false;
+    let mut have_newer_entry = false;
+
+    for entry in app.messages.iter().rev() {
+        let mut entry_lines = Vec::new();
+        push_conversation_entry_lines(&mut entry_lines, entry, area.width, app.max_context_window);
+
+        let entry_rows: u32 = entry_lines
+            .iter()
+            .map(|line| conversation_line_rows(line, area.width))
+            .sum();
+        let needs_separator = have_newer_entry && !newer_entry_is_tool_related;
+        let separator_rows = u32::from(needs_separator);
+
+        if used_rows >= target_rows && entry_rows + separator_rows > 0 {
+            break;
+        }
+
+        if needs_separator {
+            tail_lines.insert(0, Line::from(""));
+        }
+        for line in entry_lines.into_iter().rev() {
+            tail_lines.insert(0, line);
+        }
+        used_rows += entry_rows + separator_rows;
+        newer_entry_is_tool_related = matches!(entry, ConversationEntry::ToolCall { .. });
+        have_newer_entry = true;
+    }
+
+    tail_lines
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mode = if app.plan_mode { "plan" } else { "chat" };
     let phase = match &app.phase {
@@ -256,213 +503,38 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
 /// Render the scrollable conversation view.
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
-    let mut lines: Vec<Line<'_>> = Vec::new();
-
-    for (i, entry) in app.messages.iter().enumerate() {
-        // Add blank line separator between entries, but keep tool-related
-        // entries compact — no blank line before them.
-        if i > 0 {
-            let is_tool_related = matches!(entry, ConversationEntry::ToolCall { .. });
-            if !is_tool_related {
-                lines.push(Line::from(""));
-            }
-        }
-        match entry {
-            ConversationEntry::User(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "You: ",
-                        Style::default()
-                            .fg(Color::Green)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(text),
-                ]));
-            }
-            ConversationEntry::AssistantText(text) => {
-                for line in text.lines() {
-                    lines.push(Line::from(Span::raw(format!("  {line}"))));
+    let (lines, scroll) = if app.user_scrolled {
+        let mut lines: Vec<Line<'static>> = Vec::new();
+        for (i, entry) in app.messages.iter().enumerate() {
+            if i > 0 {
+                let is_tool_related = matches!(entry, ConversationEntry::ToolCall { .. });
+                if !is_tool_related {
+                    lines.push(Line::from(""));
                 }
             }
-            ConversationEntry::ToolCall {
-                tool_name,
-                summary,
-                status,
-                result_preview,
-                ..
-            } => {
-                let (marker, style) = match status {
-                    ToolStatus::Running => ("⟳", Style::default().fg(Color::Yellow)),
-                    ToolStatus::Success { .. } => ("✓", Style::default().fg(Color::Green)),
-                    ToolStatus::Error { .. } => ("✗", Style::default().fg(Color::Red)),
-                };
-                let duration_str = match status {
-                    ToolStatus::Running => String::new(),
-                    ToolStatus::Success { duration_us } | ToolStatus::Error { duration_us } => {
-                        format!(" ({})", format_duration_us(*duration_us))
-                    }
-                };
-                let label = if summary.is_empty() {
-                    format!(" {tool_name}{duration_str}")
-                } else {
-                    format!(" {tool_name}: {summary}{duration_str}")
-                };
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(marker, style),
-                    Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
-                ]));
-                if tool_name == "plan" {
-                    if let Some(preview) = result_preview {
-                        for line in preview.lines() {
-                            let style = if line.starts_with("Plan:") {
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::BOLD)
-                            } else {
-                                plan_status_style(line)
-                            };
-                            lines.push(Line::from(vec![
-                                Span::raw("      "),
-                                Span::styled(line.to_string(), style),
-                            ]));
-                        }
-                    }
-                }
-            }
-            ConversationEntry::PatchPreview(preview) => {
-                for line in preview.lines() {
-                    let style = if line.starts_with("+ ") {
-                        Style::default().fg(Color::Green)
-                    } else if line.starts_with("- ") {
-                        Style::default().fg(Color::Red)
-                    } else {
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM)
-                    };
-                    lines.push(Line::from(vec![
-                        Span::raw("      "),
-                        Span::styled(line.to_string(), style),
-                    ]));
-                }
-            }
-            ConversationEntry::PlanBox(plan) => {
-                render_plan_box(&mut lines, plan, area.width);
-            }
-            ConversationEntry::PlanProgress {
-                action_id,
-                status,
-                remaining,
-                total,
-            } => {
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled("plan", Style::default().fg(Color::Cyan)),
-                    Span::styled(
-                        format!(" {action_id} -> {status} ({remaining} remaining / {total} total)"),
-                        Style::default().fg(Color::Cyan).add_modifier(Modifier::DIM),
-                    ),
-                ]));
-            }
-            ConversationEntry::Error(text) => {
-                for (i, line) in text.lines().enumerate() {
-                    let prefix = if i == 0 { "Error: " } else { "       " };
-                    lines.push(Line::from(Span::styled(
-                        format!("{prefix}{line}"),
-                        Style::default().fg(Color::Red),
-                    )));
-                }
-            }
-            ConversationEntry::InteractionQuestion { prompt, options } => {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Style::default().fg(Color::Yellow)),
-                    Span::styled(
-                        prompt.to_string(),
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                ]));
-                for (i, opt) in options.iter().enumerate() {
-                    lines.push(Line::from(Span::styled(
-                        format!("     {}. {opt}", i + 1),
-                        Style::default().fg(Color::Cyan),
-                    )));
-                }
-            }
-            ConversationEntry::InteractionPrompt(text) => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        "Response: ",
-                        Style::default()
-                            .fg(Color::Yellow)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::raw(text),
-                ]));
-            }
-            ConversationEntry::TurnInfo { duration_us, usage } => {
-                let time_str = format_duration_us(*duration_us);
-                let token_str = match (usage, app.max_context_window) {
-                    (Some(u), Some(max_context_window)) => {
-                        format!(" | {}", format_token_usage(u, max_context_window))
-                    }
-                    (Some(u), None) => {
-                        format!(" | ctx {} used", u.input_tokens + u.output_tokens)
-                    }
-                    (None, _) => String::new(),
-                };
-                lines.push(Line::from(vec![Span::styled(
-                    format!("  ── {time_str}{token_str} ──"),
-                    Style::default()
-                        .fg(Color::DarkGray)
-                        .add_modifier(Modifier::DIM),
-                )]));
-            }
+            push_conversation_entry_lines(&mut lines, entry, area.width, app.max_context_window);
         }
-    }
-
-    if !app.streaming_buffer.is_empty() {
-        let mut started = false;
-        for line in app.streaming_buffer.lines() {
-            if !started && line.trim().is_empty() {
-                continue;
-            }
-            started = true;
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
-                Style::default().add_modifier(Modifier::DIM),
-            )));
-        }
-    }
-
-    match &app.phase {
-        AgentPhase::Thinking => {
-            lines.push(Line::from(Span::styled(
-                format!("{} Thinking...", app.spinner_char()),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-        AgentPhase::RunningTool(name) => {
-            lines.push(Line::from(Span::styled(
-                format!("{} Running tool: {}...", app.spinner_char(), name),
-                Style::default().fg(Color::Yellow),
-            )));
-        }
-        AgentPhase::Streaming | AgentPhase::Idle => {}
-    }
+        append_live_lines(&mut lines, app);
+        let content_height: u32 = lines
+            .iter()
+            .map(|line| conversation_line_rows(line, area.width))
+            .sum();
+        let view_height = area.height as u32;
+        app.last_view_height = view_height;
+        let max_scroll = content_height.saturating_sub(view_height);
+        let scroll = max_scroll.saturating_sub(app.scroll_offset.min(max_scroll));
+        (lines, scroll)
+    } else {
+        let lines = build_tail_conversation_lines(app, area);
+        app.last_view_height = area.height as u32;
+        (lines, 0)
+    };
 
     let text = Text::from(lines);
     let conversation = Paragraph::new(text).wrap(Wrap { trim: false });
 
-    let content_height = conversation.line_count(area.width) as u32;
     let view_height = area.height as u32;
     app.last_view_height = view_height;
-    let max_scroll = content_height.saturating_sub(view_height);
-    let scroll = if app.user_scrolled {
-        max_scroll.saturating_sub(app.scroll_offset.min(max_scroll))
-    } else {
-        max_scroll
-    };
 
     let scroll_u16 = scroll.min(u16::MAX as u32) as u16;
     let conversation = conversation.scroll((scroll_u16, 0));
@@ -563,11 +635,21 @@ mod tests {
     #[test]
     fn format_token_usage_compacts_values() {
         let usage = quine_llm::TokenUsage {
-            input_tokens: 1200,
-            output_tokens: 350,
+            input_tokens: 120_000,
+            output_tokens: 30_000,
         };
 
-        assert_eq!(format_token_usage(&usage, 200_000), "ctx 1550/200000");
+        assert_eq!(format_token_usage(&usage, 200_000), "ctx 75%");
+    }
+
+    #[test]
+    fn format_token_usage_clamps_to_full_context() {
+        let usage = quine_llm::TokenUsage {
+            input_tokens: 180_000,
+            output_tokens: 40_000,
+        };
+
+        assert_eq!(format_token_usage(&usage, 200_000), "ctx 100%");
     }
 
     #[test]
