@@ -175,7 +175,7 @@ fn openai_compat_context_window(model: &str) -> Option<u64> {
     } else if normalized.starts_with("llama-3.1") || normalized.starts_with("llama3.1") {
         Some(128_000)
     } else {
-        None
+        Some(250_000)
     }
 }
 
