@@ -285,7 +285,7 @@ async fn run_subagent_inner(
                     Ok(PermissionDecision::RequiresConfirmation { .. }) => {
                         // Auto-allow in subagent — no user interaction available.
                     }
-                    Ok(PermissionDecision::Deny { reason }) => {
+                    Ok(PermissionDecision::Deny { reason, .. }) => {
                         history.push(Message::tool_result(
                             tool_use_id,
                             format!("permission denied: {reason}"),

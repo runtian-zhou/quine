@@ -14,7 +14,9 @@ use crate::channel::{
 use crate::compaction::{self, CompactionTrigger};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
-use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision};
+use crate::permission::{
+    PermissionChecker, PermissionContext, PermissionDecision, PermissionDecisionReason,
+};
 use crate::persistence::{
     CoreCheckpoint, PersistedSession, PersistedSessionConfig, PersistedSessionState,
 };
@@ -32,7 +34,20 @@ use crate::tool::{
     ToolRegistry,
 };
 
-/// Default system prompt used when no CLAUDE.md and no explicit prompt is provided.
+fn format_permission_reason(reason: &str, detail: Option<&PermissionDecisionReason>) -> String {
+    match detail {
+        Some(PermissionDecisionReason::StructuralRisk { detail, .. }) => detail.clone(),
+        Some(PermissionDecisionReason::RuleMatch { description, .. }) => description.clone(),
+        Some(PermissionDecisionReason::Fallback { detail, .. }) => {
+            format!("{reason}: {detail}")
+        }
+        Some(PermissionDecisionReason::LlmAssessment { summary }) => {
+            format!("{reason}: {summary}")
+        }
+        None => reason.to_string(),
+    }
+}
+
 const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are a helpful coding assistant. You help users with software engineering tasks \
 using the tools available to you. Each message from the user is a new request — \
@@ -1284,6 +1299,8 @@ async fn check_permission(
             PermissionDecision::RequiresConfirmation {
                 risk_score: 0.5,
                 reason: format!("permission checker error: {e}"),
+                detail: None,
+                suggestion: None,
             }
         }
     };
@@ -1296,30 +1313,51 @@ async fn check_permission(
             );
             Ok(())
         }
-        PermissionDecision::Deny { reason } => {
+        PermissionDecision::Deny { reason, detail } => {
+            let rendered_reason = format_permission_reason(&reason, detail.as_ref());
             debug_log_session(
                 session_id,
-                format!("permission denied for tool `{}`: {reason}", call.tool_name),
+                format!(
+                    "permission denied for tool `{}`: {rendered_reason}",
+                    call.tool_name
+                ),
             );
             Err(ToolOutcome::Error {
-                message: format!("permission denied: {reason}"),
+                message: format!("permission denied: {rendered_reason}"),
             })
         }
-        PermissionDecision::RequiresConfirmation { risk_score, reason } => {
+        PermissionDecision::RequiresConfirmation {
+            risk_score,
+            reason,
+            detail,
+            suggestion,
+        } => {
+            let rendered_reason = format_permission_reason(&reason, detail.as_ref());
             debug_log_session(
                 session_id,
                 format!(
                     "permission confirmation required for tool `{}` (risk {:.1}): {}",
-                    call.tool_name, risk_score, reason
+                    call.tool_name, risk_score, rendered_reason
                 ),
             );
-            let prompt = format!(
-                "Tool `{}` with args `{}` scored {:.1} risk: {}. Allow? [y/N]",
-                call.tool_name,
-                serde_json::to_string(&call.arguments).unwrap_or_default(),
-                risk_score,
-                reason
-            );
+            let prompt = if let Some(suggestion) = suggestion {
+                format!(
+                    "Tool `{}` with args `{}` scored {:.1} risk: {}. Suggested scope: `{}`. Allow? [y/N]",
+                    call.tool_name,
+                    serde_json::to_string(&call.arguments).unwrap_or_default(),
+                    risk_score,
+                    rendered_reason,
+                    suggestion.pattern
+                )
+            } else {
+                format!(
+                    "Tool `{}` with args `{}` scored {:.1} risk: {}. Allow? [y/N]",
+                    call.tool_name,
+                    serde_json::to_string(&call.arguments).unwrap_or_default(),
+                    risk_score,
+                    rendered_reason
+                )
+            };
 
             let request = InteractionRequest {
                 prompt,
@@ -3168,6 +3206,8 @@ mod tests {
             Ok(PermissionDecision::RequiresConfirmation {
                 risk_score: 0.9,
                 reason: "test confirmation".into(),
+                detail: None,
+                suggestion: None,
             })
         }
     }

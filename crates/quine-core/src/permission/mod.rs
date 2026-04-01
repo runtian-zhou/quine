@@ -1,5 +1,7 @@
+pub mod bash_analysis;
 pub mod composite;
 pub mod llm_checker;
+#[path = "rule_checker_impl.rs"]
 pub mod rule_checker;
 
 use std::path::PathBuf;
@@ -25,6 +27,48 @@ pub enum PermissionError {
     Internal { message: String },
 }
 
+/// Structured explanation for a permission decision.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum PermissionDecisionReason {
+    RuleMatch {
+        behavior: String,
+        pattern: String,
+        description: String,
+    },
+    StructuralRisk {
+        kind: StructuralRiskKind,
+        detail: String,
+    },
+    Fallback {
+        command: String,
+        detail: String,
+    },
+    LlmAssessment {
+        summary: String,
+    },
+}
+
+/// Specific shell structure that raised risk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum StructuralRiskKind {
+    Pipe,
+    ControlOperator,
+    Redirection,
+    Heredoc,
+    CommandSubstitution,
+    Subshell,
+    DirectoryChange,
+    CompoundCommand,
+    ComplexShell,
+}
+
+/// Suggested reusable permission scope for future UX.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PermissionSuggestion {
+    pub pattern: String,
+    pub description: String,
+}
+
 /// The result of a permission check on a tool invocation.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PermissionDecision {
@@ -32,9 +76,17 @@ pub enum PermissionDecision {
     Allow,
     /// Potentially dangerous — requires user confirmation.
     /// Includes a risk score (0.0-1.0) and explanation.
-    RequiresConfirmation { risk_score: f64, reason: String },
+    RequiresConfirmation {
+        risk_score: f64,
+        reason: String,
+        detail: Option<PermissionDecisionReason>,
+        suggestion: Option<PermissionSuggestion>,
+    },
     /// Blocked outright — must not execute.
-    Deny { reason: String },
+    Deny {
+        reason: String,
+        detail: Option<PermissionDecisionReason>,
+    },
 }
 
 impl PermissionDecision {
@@ -88,9 +140,12 @@ mod tests {
         let confirm = PermissionDecision::RequiresConfirmation {
             risk_score: 0.5,
             reason: "test".into(),
+            detail: None,
+            suggestion: None,
         };
         let deny = PermissionDecision::Deny {
             reason: "test".into(),
+            detail: None,
         };
 
         assert!(!allow.is_more_restrictive_than(&confirm));
@@ -118,13 +173,22 @@ mod tests {
         let decision = PermissionDecision::RequiresConfirmation {
             risk_score: 0.7,
             reason: "risky command".into(),
+            detail: None,
+            suggestion: None,
         };
         let json = serde_json::to_string(&decision).unwrap();
         let deserialized: PermissionDecision = serde_json::from_str(&json).unwrap();
         match deserialized {
-            PermissionDecision::RequiresConfirmation { risk_score, reason } => {
+            PermissionDecision::RequiresConfirmation {
+                risk_score,
+                reason,
+                detail,
+                suggestion,
+            } => {
                 assert!((risk_score - 0.7).abs() < f64::EPSILON);
                 assert_eq!(reason, "risky command");
+                assert!(detail.is_none());
+                assert!(suggestion.is_none());
             }
             _ => panic!("expected RequiresConfirmation"),
         }

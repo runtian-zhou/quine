@@ -5,7 +5,10 @@ use futures::StreamExt;
 use quine_llm::{LlmEvent, LlmProvider, Message};
 use serde::Deserialize;
 
-use super::{PermissionChecker, PermissionContext, PermissionDecision, PermissionError};
+use super::{
+    PermissionChecker, PermissionContext, PermissionDecision, PermissionDecisionReason,
+    PermissionError,
+};
 
 /// System prompt for the LLM-based permission checker.
 const PERMISSION_SYSTEM_PROMPT: &str = r#"You are a security evaluator for a coding agent's tool calls. Your job is to assess the risk of executing a tool invocation.
@@ -63,14 +66,21 @@ impl LlmChecker {
 
         if score > 0.7 || response.decision.eq_ignore_ascii_case("deny") {
             Ok(PermissionDecision::Deny {
-                reason: response.reason,
+                reason: response.reason.clone(),
+                detail: Some(PermissionDecisionReason::LlmAssessment {
+                    summary: response.reason,
+                }),
             })
         } else if response.decision.eq_ignore_ascii_case("allow") {
             Ok(PermissionDecision::Allow)
         } else {
             Ok(PermissionDecision::RequiresConfirmation {
                 risk_score: score,
-                reason: response.reason,
+                reason: response.reason.clone(),
+                detail: Some(PermissionDecisionReason::LlmAssessment {
+                    summary: response.reason,
+                }),
+                suggestion: None,
             })
         }
     }
@@ -144,6 +154,10 @@ impl PermissionChecker for LlmChecker {
                 reason: format!(
                     "could not parse LLM permission response, defaulting to confirmation: {full_text}"
                 ),
+                detail: Some(PermissionDecisionReason::LlmAssessment {
+                    summary: full_text,
+                }),
+                suggestion: None,
             })
         })
     }
