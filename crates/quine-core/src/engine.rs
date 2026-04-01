@@ -6,6 +6,7 @@ use chrono::Utc;
 use futures::StreamExt;
 use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, ToolDefinition};
 use tokio::sync::{mpsc, oneshot};
+use tokio::task::JoinSet;
 
 use crate::channel::{
     CoreHandle, CoreInput, CoreOutput, MailboxMessage, MessageSource, ToolOutcome,
@@ -37,6 +38,8 @@ You are a helpful coding assistant. You help users with software engineering tas
 using the tools available to you. Each message from the user is a new request — \
 respond to it directly. Use tools when needed to read files, run commands, or \
 write code. Be concise and accurate.";
+
+const CONCURRENT_TOOL_BATCH_ALLOWLIST: &[&str] = &["find", "read_file"];
 
 fn debug_enabled() -> bool {
     std::env::var("QUINE_DEBUG").is_ok()
@@ -740,6 +743,26 @@ enum SessionControlFlow {
     Interrupted,
 }
 
+struct PreparedConcurrentToolCall {
+    index: usize,
+    tool_use_id: String,
+    tool_name: String,
+    arguments: serde_json::Value,
+    tool: Arc<dyn crate::tool::Tool>,
+    filesystem: Arc<dyn crate::filesystem::SessionFilesystem>,
+    working_directory: PathBuf,
+    plan_store: crate::tool::plan::PlanStore,
+}
+
+struct CompletedConcurrentToolCall {
+    index: usize,
+    tool_use_id: String,
+    tool_name: String,
+    arguments: serde_json::Value,
+    result: ToolOutcome,
+    duration_us: u64,
+}
+
 fn session_output(session: &SessionContext) -> Option<String> {
     session.history.iter().rev().find_map(|message| {
         if message.role != quine_llm::Role::Assistant {
@@ -811,6 +834,160 @@ fn handle_session_control_input(
             SessionControlFlow::Continue
         }
     }
+}
+
+fn tool_batch_is_concurrency_eligible(session: &SessionContext, calls: &[PendingToolCall]) -> bool {
+    calls.len() > 1
+        && calls.iter().all(|call| {
+            CONCURRENT_TOOL_BATCH_ALLOWLIST.contains(&call.tool_name.as_str())
+                && session
+                    .tool_registry
+                    .get(&call.tool_name)
+                    .is_some_and(|tool| {
+                        !tool.is_interactive() && tool.is_read_only() && tool.is_idempotent()
+                    })
+        })
+}
+
+fn prepare_concurrent_tool_calls(
+    session: &SessionContext,
+    calls: &[PendingToolCall],
+) -> Option<Vec<PreparedConcurrentToolCall>> {
+    calls
+        .iter()
+        .enumerate()
+        .map(|(index, call)| {
+            let tool = session.tool_registry.get(&call.tool_name)?;
+            Some(PreparedConcurrentToolCall {
+                index,
+                tool_use_id: call.tool_use_id.clone(),
+                tool_name: call.tool_name.clone(),
+                arguments: call.arguments.clone(),
+                tool: Arc::clone(tool),
+                filesystem: Arc::clone(&session.filesystem),
+                working_directory: session.working_directory.clone(),
+                plan_store: session.plan_store.clone(),
+            })
+        })
+        .collect()
+}
+
+async fn execute_concurrent_tool_batch(
+    calls: Vec<PreparedConcurrentToolCall>,
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    session_id: SessionId,
+    io: &mut CoreIo<'_>,
+) -> Vec<CompletedConcurrentToolCall> {
+    let (cancel_tx, cancellation) = CancellationChannel::new_pair();
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return Vec::new();
+    };
+    if session.interrupted {
+        return Vec::new();
+    }
+    session.cancel_tx = Some(cancel_tx.clone());
+
+    let mut results: Vec<Option<CompletedConcurrentToolCall>> =
+        std::iter::repeat_with(|| None).take(calls.len()).collect();
+    let mut join_set = JoinSet::new();
+    for call in calls {
+        let cancellation = cancellation.clone();
+        let input_tx = io.input_tx.clone();
+        join_set.spawn(async move {
+            let ctx = ExecutionContext {
+                session_id,
+                filesystem: call.filesystem,
+                working_directory: call.working_directory,
+                interaction_channel: None,
+                plan_store: call.plan_store,
+                core_input: Some(input_tx),
+                cancellation,
+            };
+            let started_at = std::time::Instant::now();
+            let result = match call.tool.execute(call.arguments.clone(), &ctx).await {
+                Ok(tool_output) if tool_output.is_error => ToolOutcome::Error {
+                    message: tool_output.content,
+                },
+                Ok(tool_output) => ToolOutcome::Success {
+                    output: tool_output.content,
+                },
+                Err(ToolError::Cancelled) => ToolOutcome::Cancelled,
+                Err(tool_err) => ToolOutcome::Error {
+                    message: tool_err.to_string(),
+                },
+            };
+            CompletedConcurrentToolCall {
+                index: call.index,
+                tool_use_id: call.tool_use_id,
+                tool_name: call.tool_name,
+                arguments: call.arguments,
+                result,
+                duration_us: started_at.elapsed().as_micros() as u64,
+            }
+        });
+    }
+
+    let mut remaining = results.len();
+    while remaining > 0 {
+        tokio::select! {
+            joined = join_set.join_next() => {
+                match joined {
+                    Some(Ok(result)) => {
+                        let index = result.index;
+                        results[index] = Some(result);
+                        remaining -= 1;
+                    }
+                    Some(Err(join_err)) => {
+                        debug_log_session(
+                            session_id,
+                            format!("concurrent tool task panicked: {join_err}"),
+                        );
+                        remaining -= 1;
+                    }
+                    None => break,
+                }
+            }
+            maybe_input = io.input.recv() => {
+                match maybe_input {
+                    Some(CoreInput::Cancel { session_id: cancel_sid }) if cancel_sid == session_id => {
+                        debug_log_session(session_id, "concurrent tool batch cancelled by core input");
+                        interrupt_session(sessions, io.deferred_inputs, session_id);
+                        let _ = cancel_tx.send(true);
+                    }
+                    Some(CoreInput::Signal { session_id: signal_sid, signal })
+                        if signal_sid == session_id
+                            && matches!(signal, SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill) =>
+                    {
+                        debug_log_session(
+                            session_id,
+                            "concurrent tool batch interrupted by session signal",
+                        );
+                        interrupt_session(sessions, io.deferred_inputs, session_id);
+                        let _ = cancel_tx.send(true);
+                    }
+                    Some(other) => {
+                        io.deferred_inputs.push_back(other);
+                    }
+                    None => {
+                        debug_log_session(
+                            session_id,
+                            "concurrent tool batch failed: input channel closed during execution",
+                        );
+                        let _ = cancel_tx.send(true);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(session) = sessions.get_mut(&session_id) {
+        if let Some(active_cancel_tx) = session.cancel_tx.as_ref() {
+            let _ = active_cancel_tx.send(true);
+        }
+        session.cancel_tx = None;
+    }
+
+    results.into_iter().flatten().collect()
 }
 
 async fn compact_session_history(
@@ -2075,63 +2252,104 @@ async fn handle_llm_turn(
                     format!("LLM requested {} tool call(s)", calls.len()),
                 );
 
-                // Execute each tool call directly
-                for call in &calls {
-                    if sessions
-                        .get(&session_id)
-                        .is_some_and(|session| session.interrupted)
-                    {
-                        debug_log_session(
-                            session_id,
-                            "skipping pending tool calls because session is interrupted",
-                        );
-                        let duration_us = turn_start.elapsed().as_micros() as u64;
-                        let _ = io
-                            .output
-                            .send(CoreOutput::SessionStateChanged {
-                                session_id,
-                                state: SessionState::Idle,
-                            })
-                            .await;
-                        let _ = io
-                            .output
-                            .send(CoreOutput::TurnComplete {
-                                session_id,
-                                duration_us,
-                                usage: accumulated_usage.clone(),
-                            })
-                            .await;
-                        return TurnOutcome::Cancelled;
-                    }
-                    if debug {
-                        debug_log_session(
-                            session_id,
-                            format!(
-                                "calling tool `{}` (id={}) args={}",
-                                call.tool_name,
-                                call.tool_use_id,
-                                serde_json::to_string(&call.arguments).unwrap_or_default()
-                            ),
-                        );
-                    }
+                let concurrent_batch = sessions
+                    .get(&session_id)
+                    .filter(|session| tool_batch_is_concurrency_eligible(session, &calls))
+                    .and_then(|session| prepare_concurrent_tool_calls(session, &calls));
 
-                    // Emit ToolRequest for informational purposes
-                    let _ = io
-                        .output
-                        .send(CoreOutput::ToolRequest {
-                            session_id,
+                let concurrent_mode = concurrent_batch.is_some();
+                let completed_calls = if let Some(prepared_calls) = concurrent_batch {
+                    for call in &calls {
+                        if debug {
+                            debug_log_session(
+                                session_id,
+                                format!(
+                                    "calling tool `{}` concurrently (id={}) args={}",
+                                    call.tool_name,
+                                    call.tool_use_id,
+                                    serde_json::to_string(&call.arguments).unwrap_or_default()
+                                ),
+                            );
+                        }
+                        let _ = io
+                            .output
+                            .send(CoreOutput::ToolRequest {
+                                session_id,
+                                tool_use_id: call.tool_use_id.clone(),
+                                tool_name: call.tool_name.clone(),
+                                arguments: call.arguments.clone(),
+                            })
+                            .await;
+                    }
+                    execute_concurrent_tool_batch(prepared_calls, sessions, session_id, io).await
+                } else {
+                    let mut completed_calls = Vec::with_capacity(calls.len());
+                    for call in &calls {
+                        if sessions
+                            .get(&session_id)
+                            .is_some_and(|session| session.interrupted)
+                        {
+                            debug_log_session(
+                                session_id,
+                                "skipping pending tool calls because session is interrupted",
+                            );
+                            let duration_us = turn_start.elapsed().as_micros() as u64;
+                            let _ = io
+                                .output
+                                .send(CoreOutput::SessionStateChanged {
+                                    session_id,
+                                    state: SessionState::Idle,
+                                })
+                                .await;
+                            let _ = io
+                                .output
+                                .send(CoreOutput::TurnComplete {
+                                    session_id,
+                                    duration_us,
+                                    usage: accumulated_usage.clone(),
+                                })
+                                .await;
+                            return TurnOutcome::Cancelled;
+                        }
+                        if debug {
+                            debug_log_session(
+                                session_id,
+                                format!(
+                                    "calling tool `{}` (id={}) args={}",
+                                    call.tool_name,
+                                    call.tool_use_id,
+                                    serde_json::to_string(&call.arguments).unwrap_or_default()
+                                ),
+                            );
+                        }
+                        let _ = io
+                            .output
+                            .send(CoreOutput::ToolRequest {
+                                session_id,
+                                tool_use_id: call.tool_use_id.clone(),
+                                tool_name: call.tool_name.clone(),
+                                arguments: call.arguments.clone(),
+                            })
+                            .await;
+
+                        let tool_start = std::time::Instant::now();
+                        let result =
+                            execute_tool_call(call, sessions, session_id, io, engine).await;
+                        completed_calls.push(CompletedConcurrentToolCall {
+                            index: completed_calls.len(),
                             tool_use_id: call.tool_use_id.clone(),
                             tool_name: call.tool_name.clone(),
                             arguments: call.arguments.clone(),
-                        })
-                        .await;
+                            result,
+                            duration_us: tool_start.elapsed().as_micros() as u64,
+                        });
+                    }
+                    completed_calls
+                };
 
-                    let tool_start = std::time::Instant::now();
-                    let result = execute_tool_call(call, sessions, session_id, io, engine).await;
-                    let tool_duration_us = tool_start.elapsed().as_micros() as u64;
-
-                    // Append tool result to history
-                    let (tool_output, is_error) = match &result {
+                let mut saw_cancelled_tool = false;
+                for completed_call in &completed_calls {
+                    let (tool_output, is_error) = match &completed_call.result {
                         ToolOutcome::Success { output } => (output.clone(), false),
                         ToolOutcome::Error { message } => (message.clone(), true),
                         ToolOutcome::Cancelled => {
@@ -2139,16 +2357,15 @@ async fn handle_llm_turn(
                         }
                     };
 
-                    // Emit ToolResult with timing info
                     let _ = io
                         .output
                         .send(CoreOutput::ToolResult {
                             session_id,
-                            tool_use_id: call.tool_use_id.clone(),
-                            tool_name: call.tool_name.clone(),
+                            tool_use_id: completed_call.tool_use_id.clone(),
+                            tool_name: completed_call.tool_name.clone(),
                             content: tool_output.clone(),
                             is_error,
-                            duration_us: tool_duration_us,
+                            duration_us: completed_call.duration_us,
                         })
                         .await;
 
@@ -2161,7 +2378,10 @@ async fn handle_llm_turn(
                         };
                         debug_log_session(
                             session_id,
-                            format!("tool `{}` result ({status}): {}", call.tool_name, preview),
+                            format!(
+                                "tool `{}` result ({status}): {}",
+                                completed_call.tool_name, preview
+                            ),
                         );
                     }
 
@@ -2169,8 +2389,8 @@ async fn handle_llm_turn(
                         let history_output = match prepare_tool_result_for_history(
                             session,
                             session_id,
-                            &call.tool_use_id,
-                            &call.tool_name,
+                            &completed_call.tool_use_id,
+                            &completed_call.tool_name,
                             &tool_output,
                             is_error,
                         )
@@ -2200,13 +2420,17 @@ async fn handle_llm_turn(
                             }
                         };
                         session.history.push(Message::tool_result(
-                            &call.tool_use_id,
+                            &completed_call.tool_use_id,
                             &history_output,
                             is_error,
                         ));
                     }
 
-                    if matches!(result, ToolOutcome::Cancelled) {
+                    if matches!(completed_call.result, ToolOutcome::Cancelled) {
+                        saw_cancelled_tool = true;
+                    }
+
+                    if !concurrent_mode && matches!(completed_call.result, ToolOutcome::Cancelled) {
                         debug_log_session(
                             session_id,
                             "LLM turn aborted because tool execution was cancelled",
@@ -2228,18 +2452,23 @@ async fn handle_llm_turn(
                         return TurnOutcome::Cancelled;
                     }
 
-                    // Plan execution integration: after update_plan, emit
-                    // progress and inject prompts for newly ready actions.
-                    if call.tool_name == "plan" {
-                        let is_update = call.arguments.get("operation").and_then(|v| v.as_str())
+                    if completed_call.tool_name == "plan" {
+                        let is_update = completed_call
+                            .arguments
+                            .get("operation")
+                            .and_then(|v| v.as_str())
                             == Some("update_plan");
 
                         if is_update {
-                            if let Some(plan_id_str) =
-                                call.arguments.get("plan_id").and_then(|v| v.as_str())
+                            if let Some(plan_id_str) = completed_call
+                                .arguments
+                                .get("plan_id")
+                                .and_then(|v| v.as_str())
                             {
-                                if let Some(action_id_str) =
-                                    call.arguments.get("action_id").and_then(|v| v.as_str())
+                                if let Some(action_id_str) = completed_call
+                                    .arguments
+                                    .get("action_id")
+                                    .and_then(|v| v.as_str())
                                 {
                                     handle_plan_progress(
                                         sessions
@@ -2255,6 +2484,28 @@ async fn handle_llm_turn(
                             }
                         }
                     }
+                }
+
+                if concurrent_mode && saw_cancelled_tool {
+                    debug_log_session(
+                        session_id,
+                        "LLM turn aborted because concurrent tool execution was cancelled",
+                    );
+                    if let Some(session) = sessions.get_mut(&session_id) {
+                        session.cancel_tx = None;
+                        session.state = SessionState::Idle;
+                    }
+                    let duration_us = turn_start.elapsed().as_micros() as u64;
+                    let _ = io
+                        .output
+                        .send(CoreOutput::TurnComplete {
+                            session_id,
+                            duration_us,
+                            usage: accumulated_usage.clone(),
+                        })
+                        .await;
+                    emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
+                    return TurnOutcome::Cancelled;
                 }
 
                 // Call LLM again with tool results
@@ -2861,8 +3112,10 @@ mod tests {
     use crate::permission::PermissionError;
     use crate::session::{ExitStatus, InheritanceFlags};
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use tempfile::TempDir;
-    use tokio::sync::oneshot;
+    use tokio::sync::{oneshot, Barrier};
 
     /// A mock LLM provider that returns a fixed text response.
     struct MockProvider {
@@ -2916,6 +3169,408 @@ mod tests {
                 risk_score: 0.9,
                 reason: "test confirmation".into(),
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_tool_batch_requires_explicit_safe_metadata_and_allowlist() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
+        let session = SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                auto_approve_permissions: false,
+                archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
+                max_context_window: None,
+            },
+            &provider,
+            &permission_checker,
+        )
+        .await
+        .unwrap();
+
+        let safe_calls = vec![
+            PendingToolCall {
+                tool_use_id: "toolu_1".into(),
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({}),
+            },
+            PendingToolCall {
+                tool_use_id: "toolu_2".into(),
+                tool_name: "find".into(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        assert!(tool_batch_is_concurrency_eligible(&session, &safe_calls));
+
+        let unknown_calls = vec![
+            PendingToolCall {
+                tool_use_id: "toolu_1".into(),
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({}),
+            },
+            PendingToolCall {
+                tool_use_id: "toolu_2".into(),
+                tool_name: "unknown".into(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        assert!(!tool_batch_is_concurrency_eligible(
+            &session,
+            &unknown_calls
+        ));
+
+        let special_tool_calls = vec![
+            PendingToolCall {
+                tool_use_id: "toolu_1".into(),
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({}),
+            },
+            PendingToolCall {
+                tool_use_id: "toolu_2".into(),
+                tool_name: "wait_child".into(),
+                arguments: serde_json::json!({"child_id": "test"}),
+            },
+        ];
+        assert!(!tool_batch_is_concurrency_eligible(
+            &session,
+            &special_tool_calls
+        ));
+    }
+
+    #[tokio::test]
+    async fn concurrent_tool_batch_preserves_request_order_in_outputs() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolCallThenTextProvider {
+            call_count: AtomicU32::new(0),
+            tool_calls: vec![
+                (
+                    "toolu_read".into(),
+                    "read_file".into(),
+                    serde_json::json!({}),
+                ),
+                ("toolu_find".into(), "find".into(), serde_json::json!({})),
+            ],
+            final_text: "done".into(),
+        });
+        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
+        let mut session = SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: vec![Message::user("inspect")],
+                auto_approve_permissions: false,
+                archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
+                max_context_window: None,
+            },
+            &provider,
+            &permission_checker,
+        )
+        .await
+        .unwrap();
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(Barrier::new(2));
+        let completion_order = Arc::new(Mutex::new(Vec::new()));
+        session.tool_registry.register(Arc::new(ProbeTool {
+            name: "read_file",
+            delay: std::time::Duration::from_millis(60),
+            active: Arc::clone(&active),
+            max_active: Arc::clone(&max_active),
+            barrier: Arc::clone(&barrier),
+            completion_order: Arc::clone(&completion_order),
+        }));
+        session.tool_registry.register(Arc::new(ProbeTool {
+            name: "find",
+            delay: std::time::Duration::from_millis(5),
+            active,
+            max_active: Arc::clone(&max_active),
+            barrier,
+            completion_order: Arc::clone(&completion_order),
+        }));
+        session.tools = session.tool_registry.tool_definitions();
+
+        let session_id = SessionId::new();
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(32);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            permission_checker: &permission_checker,
+            session_tree: &mut session_tree,
+        };
+
+        let outcome = handle_llm_turn(&mut sessions, session_id, &mut io, &mut engine).await;
+        assert!(matches!(outcome, TurnOutcome::Completed(Some(ref text)) if text == "done"));
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            completion_order.lock().unwrap().as_slice(),
+            &["find", "read_file"]
+        );
+
+        let mut tool_request_ids = Vec::new();
+        let mut tool_result_ids = Vec::new();
+        let mut saw_text_complete = false;
+        let mut saw_turn_complete = false;
+        while let Ok(event) = output_rx.try_recv() {
+            match event {
+                CoreOutput::ToolRequest { tool_use_id, .. } => tool_request_ids.push(tool_use_id),
+                CoreOutput::ToolResult { tool_use_id, .. } => tool_result_ids.push(tool_use_id),
+                CoreOutput::TextComplete { full_text, .. } => {
+                    assert_eq!(full_text, "done");
+                    saw_text_complete = true;
+                }
+                CoreOutput::TurnComplete { .. } => saw_turn_complete = true,
+                _ => {}
+            }
+        }
+
+        assert_eq!(tool_request_ids, vec!["toolu_read", "toolu_find"]);
+        assert_eq!(tool_result_ids, vec!["toolu_read", "toolu_find"]);
+        assert!(saw_text_complete);
+        assert!(saw_turn_complete);
+    }
+
+    #[tokio::test]
+    async fn cancelling_concurrent_tool_batch_reaches_all_running_calls() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolCallThenTextProvider {
+            call_count: AtomicU32::new(0),
+            tool_calls: vec![
+                (
+                    "toolu_read".into(),
+                    "read_file".into(),
+                    serde_json::json!({}),
+                ),
+                ("toolu_find".into(), "find".into(), serde_json::json!({})),
+            ],
+            final_text: "should not happen".into(),
+        });
+        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
+        let mut session = SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: vec![Message::user("inspect")],
+                auto_approve_permissions: false,
+                archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
+                max_context_window: None,
+            },
+            &provider,
+            &permission_checker,
+        )
+        .await
+        .unwrap();
+
+        let started = Arc::new(Barrier::new(3));
+        let read_cancelled = Arc::new(AtomicBool::new(false));
+        let find_cancelled = Arc::new(AtomicBool::new(false));
+        session
+            .tool_registry
+            .register(Arc::new(CancellableProbeTool {
+                name: "read_file",
+                started: Arc::clone(&started),
+                cancelled: Arc::clone(&read_cancelled),
+            }));
+        session
+            .tool_registry
+            .register(Arc::new(CancellableProbeTool {
+                name: "find",
+                started: Arc::clone(&started),
+                cancelled: Arc::clone(&find_cancelled),
+            }));
+        session.tools = session.tool_registry.tool_definitions();
+        session.state = SessionState::Streaming;
+
+        let session_id = SessionId::new();
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(32);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(8);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            permission_checker: &permission_checker,
+            session_tree: &mut session_tree,
+        };
+
+        let send_cancel = async {
+            started.wait().await;
+            input_tx
+                .send(CoreInput::Cancel { session_id })
+                .await
+                .unwrap();
+        };
+        let (outcome, ()) = tokio::join!(
+            handle_llm_turn(&mut sessions, session_id, &mut io, &mut engine),
+            send_cancel
+        );
+        assert!(matches!(outcome, TurnOutcome::Cancelled));
+        assert!(read_cancelled.load(Ordering::SeqCst));
+        assert!(find_cancelled.load(Ordering::SeqCst));
+
+        let mut tool_result_ids = Vec::new();
+        let mut saw_turn_complete = false;
+        while let Ok(event) = output_rx.try_recv() {
+            match event {
+                CoreOutput::ToolResult { tool_use_id, .. } => tool_result_ids.push(tool_use_id),
+                CoreOutput::TurnComplete { .. } => saw_turn_complete = true,
+                CoreOutput::TextComplete { full_text, .. } => {
+                    panic!("unexpected text completion after cancel: {full_text}");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(tool_result_ids, vec!["toolu_read", "toolu_find"]);
+        assert!(saw_turn_complete);
+    }
+
+    struct ToolCallThenTextProvider {
+        call_count: AtomicU32,
+        tool_calls: Vec<(String, String, serde_json::Value)>,
+        final_text: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ToolCallThenTextProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            let events = if count == 0 {
+                let mut events = Vec::new();
+                for (tool_use_id, tool_name, arguments) in &self.tool_calls {
+                    events.push(Ok(LlmEvent::ToolCall {
+                        tool_use_id: tool_use_id.clone(),
+                        tool_name: tool_name.clone(),
+                        arguments: arguments.clone(),
+                    }));
+                }
+                events.push(Ok(LlmEvent::Done { usage: None }));
+                events
+            } else {
+                vec![
+                    Ok(LlmEvent::TextDelta {
+                        text: self.final_text.clone(),
+                    }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    struct ProbeTool {
+        name: &'static str,
+        delay: std::time::Duration,
+        active: Arc<AtomicUsize>,
+        max_active: Arc<AtomicUsize>,
+        barrier: Arc<Barrier>,
+        completion_order: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for ProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Test probe tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn is_read_only(&self) -> bool {
+            true
+        }
+
+        fn is_idempotent(&self) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _context: &ExecutionContext,
+        ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+            let active_now = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = self
+                .max_active
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
+                    Some(current.max(active_now))
+                });
+            self.barrier.wait().await;
+            tokio::time::sleep(self.delay).await;
+            self.completion_order.lock().unwrap().push(self.name);
+            self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(crate::tool::ToolOutput::success(self.name))
+        }
+    }
+
+    struct CancellableProbeTool {
+        name: &'static str,
+        started: Arc<Barrier>,
+        cancelled: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for CancellableProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Test cancellable probe tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn is_read_only(&self) -> bool {
+            true
+        }
+
+        fn is_idempotent(&self) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            context: &ExecutionContext,
+        ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+            self.started.wait().await;
+            context.cancellation.cancelled().await;
+            self.cancelled.store(true, Ordering::SeqCst);
+            Err(crate::tool::ToolError::Cancelled)
         }
     }
 
