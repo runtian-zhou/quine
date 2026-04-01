@@ -36,8 +36,8 @@ features/           # feature request markdown files
 | Crate | Purpose |
 |-------|---------|
 | **quine-cli** | CLI frontend with interactive (REPL) and non-interactive modes. Thin client that communicates with the harness daemon — does not run the agent loop directly. |
-| **quine-core** | Agent harness library. Orchestrates agent execution: state machine, tool dispatch, conversation management, permissions, replay. Owns core orchestration traits. |
-| **quine-harness** | Local daemon service wrapping quine-core. Manages multiple concurrent agent sessions, background agents, and shared state (permissions, logs, tool registries). |
+| **quine-core** | Agent harness library. Orchestrates agent execution: state machine, tool dispatch, conversation management, permissions, replay, and scheduler/mailbox ordering semantics. Owns core orchestration traits. |
+| **quine-harness** | Local daemon service wrapping quine-core. Hosts the core runtime, persistence, and IPC surfaces, and adapts daemon requests onto core-owned orchestration behavior. |
 | **quine-llm** | LLM provider adapter. Unified interface over multiple providers (Anthropic, OpenAI, etc.) with streaming support. |
 | **quine-sdk** | Rust-first client SDK for connecting to `quine-harness` over the existing Unix domain socket JSON-RPC transport. Keeps transport internals crate-private and exposes a small connection-oriented API. |
 

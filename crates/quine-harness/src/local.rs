@@ -2,8 +2,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use std::cmp::Ordering;
-use std::collections::BinaryHeap;
 use std::collections::HashMap;
 
 use quine_core::{
@@ -13,7 +11,7 @@ use quine_core::{
 };
 use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
-use tokio::time::{Duration, Instant};
+use tokio::time::Duration;
 
 use crate::config::{default_state_dir, max_context_window_from_env, SessionConfig};
 use crate::error::HarnessError;
@@ -26,12 +24,10 @@ use crate::storage::{session_context_from_checkpoint, StorageManager};
 /// subscribers via a broadcast channel. Tools are now executed directly
 /// within the core, so this harness simply forwards events.
 pub struct LocalHarness {
-    scheduler_tx: mpsc::Sender<ScheduledCommand>,
+    core_input: mpsc::Sender<CoreInput>,
     event_tx: broadcast::Sender<CoreOutput>,
     /// Handle for the core event loop task.
     _core_task: tokio::task::JoinHandle<()>,
-    /// Handle for the scheduler task that serializes core-loop work.
-    _scheduler_task: tokio::task::JoinHandle<()>,
     /// Handle for the event fan-out task.
     _fanout_task: tokio::task::JoinHandle<()>,
     /// Durable checkpoint storage owned by the harness.
@@ -75,12 +71,10 @@ impl LocalHarness {
         let (harness_handle, core_handle) = create_channels(ChannelConfig::default());
 
         let HarnessHandle { input, output } = harness_handle;
-        let scheduler_input = input.clone();
 
         // Broadcast channel for fanning out core events.
         let (event_tx, _) = broadcast::channel::<CoreOutput>(256);
         let event_tx_clone = event_tx.clone();
-        let (scheduler_tx, scheduler_rx) = mpsc::channel(256);
         let archive_root = archive_root.unwrap_or_else(default_state_dir);
         let storage =
             Arc::new(storage.unwrap_or_else(|| StorageManager::new(archive_root.clone())));
@@ -124,8 +118,6 @@ impl LocalHarness {
             max_context_window,
         ));
 
-        let scheduler_task = tokio::spawn(Self::scheduler_loop(scheduler_input, scheduler_rx));
-
         // Spawn a fan-out task that reads from the core output channel and
         // broadcasts events. The core now handles tool execution directly,
         // so no stub tool results are needed.
@@ -137,10 +129,9 @@ impl LocalHarness {
         ));
 
         Ok(Self {
-            scheduler_tx,
+            core_input: input,
             event_tx,
             _core_task: core_task,
-            _scheduler_task: scheduler_task,
             _fanout_task: fanout_task,
             _storage: storage,
             sessions,
@@ -154,15 +145,14 @@ impl LocalHarness {
         content: String,
         delay: Duration,
     ) -> Result<(), HarnessError> {
-        self.enqueue(ScheduledCommand::new(
-            ScheduledAction::SendMessage {
+        self.core_input
+            .send(CoreInput::ScheduleUserMessage {
                 session_id,
                 content,
-                reply: None,
-            },
-            delay,
-        ))
-        .await
+                delay,
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)
     }
 
     /// Fan-out loop: reads events from the core and broadcasts them.
@@ -211,289 +201,6 @@ impl LocalHarness {
             let _ = event_tx.send(event);
         }
     }
-
-    async fn enqueue(&self, command: ScheduledCommand) -> Result<(), HarnessError> {
-        self.scheduler_tx
-            .send(command)
-            .await
-            .map_err(|_| HarnessError::CoreChannelClosed)
-    }
-
-    async fn scheduler_loop(
-        harness_input: mpsc::Sender<CoreInput>,
-        mut scheduler_rx: mpsc::Receiver<ScheduledCommand>,
-    ) {
-        let mut pending = BinaryHeap::new();
-        let mut next_sequence = 0_u64;
-        let mut channel_closed = false;
-        let mut ipc_mailboxes: HashMap<String, Vec<String>> = HashMap::new();
-
-        loop {
-            let now = Instant::now();
-            while pending
-                .peek()
-                .is_some_and(|command: &QueuedCommand| command.execute_at <= now)
-            {
-                let queued = pending.pop().expect("pending heap is not empty");
-                if Self::dispatch_scheduled_action(
-                    &harness_input,
-                    &mut ipc_mailboxes,
-                    queued.action,
-                )
-                .await
-                {
-                    return;
-                }
-            }
-
-            if channel_closed && pending.is_empty() {
-                return;
-            }
-
-            if pending.is_empty() {
-                match scheduler_rx.recv().await {
-                    Some(command) => {
-                        pending.push(QueuedCommand::new(command, next_sequence));
-                        next_sequence += 1;
-                    }
-                    None => channel_closed = true,
-                }
-                continue;
-            }
-
-            let next_deadline = pending
-                .peek()
-                .map(|command| command.execute_at)
-                .expect("pending heap is not empty");
-
-            if channel_closed {
-                tokio::time::sleep_until(next_deadline).await;
-                continue;
-            }
-
-            tokio::select! {
-                maybe_command = scheduler_rx.recv() => {
-                    match maybe_command {
-                        Some(command) => {
-                            pending.push(QueuedCommand::new(command, next_sequence));
-                            next_sequence += 1;
-                        }
-                        None => channel_closed = true,
-                    }
-                }
-                _ = tokio::time::sleep_until(next_deadline) => {}
-            }
-        }
-    }
-
-    async fn dispatch_scheduled_action(
-        harness_input: &mpsc::Sender<CoreInput>,
-        ipc_mailboxes: &mut HashMap<String, Vec<String>>,
-        action: ScheduledAction,
-    ) -> bool {
-        match action {
-            ScheduledAction::CreateSession {
-                session_id,
-                config,
-                reply,
-            } => {
-                let skills = load_skills_from_config(&config.skills).await;
-                let (core_reply_tx, core_reply_rx) = oneshot::channel();
-                let result = match harness_input
-                    .send(CoreInput::CreateSession {
-                        session_id,
-                        system_prompt: config.system_prompt,
-                        working_directory: config.working_directory,
-                        skills,
-                        plan_mode: config.plan_mode,
-                        auto_approve_permissions: config.auto_approve_permissions,
-                        initial_messages: config.initial_messages,
-                        reply: core_reply_tx,
-                    })
-                    .await
-                {
-                    Ok(()) => core_reply_rx
-                        .await
-                        .map_err(|_| HarnessError::CoreChannelClosed)
-                        .and_then(|result| {
-                            result.map_err(|reason| HarnessError::SessionCreationFailed { reason })
-                        }),
-                    Err(_) => Err(HarnessError::CoreChannelClosed),
-                };
-                let _ = reply.send(result);
-                false
-            }
-            ScheduledAction::SendMessage {
-                session_id,
-                content,
-                reply,
-            } => {
-                let result = harness_input
-                    .send(CoreInput::UserMessage {
-                        session_id,
-                        content,
-                    })
-                    .await
-                    .map_err(|_| HarnessError::CoreChannelClosed);
-                if let Some(reply) = reply {
-                    let _ = reply.send(result);
-                }
-                false
-            }
-            ScheduledAction::CompactSession { session_id, reply } => {
-                let (core_reply_tx, core_reply_rx) = oneshot::channel();
-                let result = match harness_input
-                    .send(CoreInput::CompactSession {
-                        session_id,
-                        reply: core_reply_tx,
-                    })
-                    .await
-                {
-                    Ok(()) => core_reply_rx
-                        .await
-                        .map_err(|_| HarnessError::CoreChannelClosed)
-                        .and_then(|result| {
-                            result.map_err(|reason| HarnessError::Internal { message: reason })
-                        }),
-                    Err(_) => Err(HarnessError::CoreChannelClosed),
-                };
-                let _ = reply.send(result);
-                false
-            }
-            ScheduledAction::RequestCheckpoint { reply } => {
-                let (core_reply_tx, core_reply_rx) = oneshot::channel();
-                let result = match harness_input
-                    .send(CoreInput::RequestCheckpoint {
-                        reply: core_reply_tx,
-                    })
-                    .await
-                {
-                    Ok(()) => core_reply_rx
-                        .await
-                        .map(|_| ())
-                        .map_err(|_| HarnessError::CoreChannelClosed),
-                    Err(_) => Err(HarnessError::CoreChannelClosed),
-                };
-                let _ = reply.send(result);
-                false
-            }
-            ScheduledAction::SubmitToolResult {
-                session_id,
-                tool_use_id,
-                output,
-                is_error,
-                reply,
-            } => {
-                let result = harness_input
-                    .send(CoreInput::ToolResult {
-                        session_id,
-                        tool_use_id,
-                        result: if is_error {
-                            quine_core::ToolOutcome::Error { message: output }
-                        } else {
-                            quine_core::ToolOutcome::Success { output }
-                        },
-                    })
-                    .await
-                    .map_err(|_| HarnessError::CoreChannelClosed);
-                let _ = reply.send(result);
-                false
-            }
-            ScheduledAction::SubmitInteractionResponse {
-                session_id,
-                response,
-                reply,
-            } => {
-                let result = harness_input
-                    .send(CoreInput::InteractionResponse {
-                        session_id,
-                        response,
-                    })
-                    .await
-                    .map_err(|_| HarnessError::CoreChannelClosed);
-                let _ = reply.send(result);
-                false
-            }
-            ScheduledAction::Cancel { session_id, reply } => {
-                let result = harness_input
-                    .send(CoreInput::Cancel { session_id })
-                    .await
-                    .map_err(|_| HarnessError::CoreChannelClosed);
-                let _ = reply.send(result);
-                false
-            }
-            ScheduledAction::Shutdown { reply } => {
-                let result = harness_input
-                    .send(CoreInput::Shutdown)
-                    .await
-                    .map_err(|_| HarnessError::CoreChannelClosed);
-                let _ = reply.send(result);
-                true
-            }
-            ScheduledAction::SpawnChildSession {
-                parent_id,
-                child_id,
-                task,
-                system_prompt,
-                reply,
-            } => {
-                let (core_reply_tx, core_reply_rx) = oneshot::channel();
-                let result = match harness_input
-                    .send(CoreInput::SpawnSession {
-                        parent_id,
-                        child_id,
-                        task,
-                        system_prompt,
-                        inheritance: InheritanceFlags::default(),
-                        reply: core_reply_tx,
-                    })
-                    .await
-                {
-                    Ok(()) => core_reply_rx
-                        .await
-                        .map_err(|_| HarnessError::CoreChannelClosed)
-                        .and_then(|result| {
-                            result.map_err(|reason| HarnessError::SessionCreationFailed { reason })
-                        }),
-                    Err(_) => Err(HarnessError::CoreChannelClosed),
-                };
-                let _ = reply.send(result);
-                false
-            }
-            ScheduledAction::SignalSession {
-                session_id,
-                signal,
-                reply,
-            } => {
-                let result = harness_input
-                    .send(CoreInput::Signal { session_id, signal })
-                    .await
-                    .map_err(|_| HarnessError::CoreChannelClosed);
-                let _ = reply.send(result);
-                false
-            }
-            ScheduledAction::SendIpcMessage {
-                target,
-                content,
-                reply,
-            } => {
-                ipc_mailboxes.entry(target).or_default().push(content);
-                let _ = reply.send(Ok(()));
-                false
-            }
-            ScheduledAction::RecvIpcMessage { source, reply } => {
-                let message = ipc_mailboxes.get_mut(&source).and_then(|messages| {
-                    if messages.is_empty() {
-                        None
-                    } else {
-                        Some(messages.remove(0))
-                    }
-                });
-                let _ = reply.send(Ok(message));
-                false
-            }
-        }
-    }
 }
 
 /// Load skills by name using `quine-core` default skill support.
@@ -511,19 +218,26 @@ impl HarnessService for LocalHarness {
     async fn create_session(&self, config: SessionConfig) -> Result<SessionId, HarnessError> {
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
+        let skills = load_skills_from_config(&config.skills).await;
 
-        self.enqueue(ScheduledCommand::immediate(
-            ScheduledAction::CreateSession {
+        self.core_input
+            .send(CoreInput::CreateSession {
                 session_id,
-                config,
+                system_prompt: config.system_prompt,
+                working_directory: config.working_directory,
+                skills,
+                plan_mode: config.plan_mode,
+                auto_approve_permissions: config.auto_approve_permissions,
+                initial_messages: config.initial_messages,
                 reply: reply_tx,
-            },
-        ))
-        .await?;
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
 
         reply_rx
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)??;
+            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|reason| HarnessError::SessionCreationFailed { reason })?;
 
         Ok(session_id)
     }
@@ -533,30 +247,28 @@ impl HarnessService for LocalHarness {
         session_id: SessionId,
         content: String,
     ) -> Result<(), HarnessError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(ScheduledCommand::immediate(ScheduledAction::SendMessage {
-            session_id,
-            content,
-            reply: Some(reply_tx),
-        }))
-        .await?;
-        reply_rx
+        self.core_input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content,
+            })
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|_| HarnessError::CoreChannelClosed)
     }
 
     async fn compact_session(&self, session_id: SessionId) -> Result<(), HarnessError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(ScheduledCommand::immediate(
-            ScheduledAction::CompactSession {
+        self.core_input
+            .send(CoreInput::CompactSession {
                 session_id,
                 reply: reply_tx,
-            },
-        ))
-        .await?;
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
         reply_rx
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|message| HarnessError::Internal { message })
     }
 
     async fn submit_tool_result(
@@ -566,20 +278,18 @@ impl HarnessService for LocalHarness {
         output: String,
         is_error: bool,
     ) -> Result<(), HarnessError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(ScheduledCommand::immediate(
-            ScheduledAction::SubmitToolResult {
+        self.core_input
+            .send(CoreInput::ToolResult {
                 session_id,
                 tool_use_id,
-                output,
-                is_error,
-                reply: reply_tx,
-            },
-        ))
-        .await?;
-        reply_rx
+                result: if is_error {
+                    quine_core::ToolOutcome::Error { message: output }
+                } else {
+                    quine_core::ToolOutcome::Success { output }
+                },
+            })
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|_| HarnessError::CoreChannelClosed)
     }
 
     async fn submit_interaction_response(
@@ -587,41 +297,27 @@ impl HarnessService for LocalHarness {
         session_id: SessionId,
         response: InteractionResponse,
     ) -> Result<(), HarnessError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(ScheduledCommand::immediate(
-            ScheduledAction::SubmitInteractionResponse {
+        self.core_input
+            .send(CoreInput::InteractionResponse {
                 session_id,
                 response,
-                reply: reply_tx,
-            },
-        ))
-        .await?;
-        reply_rx
+            })
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|_| HarnessError::CoreChannelClosed)
     }
 
     async fn cancel(&self, session_id: SessionId) -> Result<(), HarnessError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(ScheduledCommand::immediate(ScheduledAction::Cancel {
-            session_id,
-            reply: reply_tx,
-        }))
-        .await?;
-        reply_rx
+        self.core_input
+            .send(CoreInput::Cancel { session_id })
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|_| HarnessError::CoreChannelClosed)
     }
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(ScheduledCommand::immediate(ScheduledAction::Shutdown {
-            reply: reply_tx,
-        }))
-        .await?;
-        reply_rx
+        self.core_input
+            .send(CoreInput::Shutdown)
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|_| HarnessError::CoreChannelClosed)
     }
 
     fn subscribe(&self) -> broadcast::Receiver<CoreOutput> {
@@ -670,13 +366,13 @@ impl HarnessService for LocalHarness {
         drop(sessions);
 
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(ScheduledCommand::immediate(
-            ScheduledAction::RequestCheckpoint { reply: reply_tx },
-        ))
-        .await?;
+        self.core_input
+            .send(CoreInput::RequestCheckpoint { reply: reply_tx })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
         reply_rx
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)??;
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
 
         let checkpoint = self
             ._storage
@@ -719,20 +415,22 @@ impl HarnessService for LocalHarness {
         let child_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
 
-        self.enqueue(ScheduledCommand::immediate(
-            ScheduledAction::SpawnChildSession {
+        self.core_input
+            .send(CoreInput::SpawnSession {
                 parent_id: parent_id.unwrap_or_default(),
                 child_id,
                 task,
                 system_prompt,
+                inheritance: InheritanceFlags::default(),
                 reply: reply_tx,
-            },
-        ))
-        .await?;
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
 
         reply_rx
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)??;
+            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|reason| HarnessError::SessionCreationFailed { reason })?;
 
         Ok(child_id)
     }
@@ -742,51 +440,45 @@ impl HarnessService for LocalHarness {
         session_id: SessionId,
         signal: SessionSignal,
     ) -> Result<(), HarnessError> {
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(ScheduledCommand::immediate(
-            ScheduledAction::SignalSession {
-                session_id,
-                signal,
-                reply: reply_tx,
-            },
-        ))
-        .await?;
-        reply_rx
+        self.core_input
+            .send(CoreInput::Signal { session_id, signal })
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|_| HarnessError::CoreChannelClosed)
     }
 
     async fn send_ipc_message(&self, target: String, content: String) -> Result<(), HarnessError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(ScheduledCommand::immediate(
-            ScheduledAction::SendIpcMessage {
+        self.core_input
+            .send(CoreInput::SendHarnessIpcMessage {
                 target,
                 content,
                 reply: reply_tx,
-            },
-        ))
-        .await?;
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
         reply_rx
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|message| HarnessError::Internal { message })
     }
 
     async fn recv_ipc_message(
         &self,
         source: String,
-        _non_blocking: bool,
+        non_blocking: bool,
     ) -> Result<Option<String>, HarnessError> {
         let (reply_tx, reply_rx) = oneshot::channel();
-        self.enqueue(ScheduledCommand::immediate(
-            ScheduledAction::RecvIpcMessage {
+        self.core_input
+            .send(CoreInput::RecvHarnessIpcMessage {
                 source,
+                non_blocking,
                 reply: reply_tx,
-            },
-        ))
-        .await?;
-        reply_rx
+            })
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+        Ok(reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?)
     }
 
     async fn schedule_agent(
@@ -797,167 +489,17 @@ impl HarnessService for LocalHarness {
         delay: Duration,
         cadence: Option<Duration>,
     ) -> Result<(), HarnessError> {
-        let scheduler_tx = self.scheduler_tx.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(delay).await;
-            if let Some(cadence) = cadence {
-                loop {
-                    let child_id = SessionId::new();
-                    let (reply_tx, _reply_rx) = oneshot::channel();
-                    if scheduler_tx
-                        .send(ScheduledCommand::immediate(
-                            ScheduledAction::SpawnChildSession {
-                                parent_id: parent_id.unwrap_or_default(),
-                                child_id,
-                                task: task.clone(),
-                                system_prompt: system_prompt.clone(),
-                                reply: reply_tx,
-                            },
-                        ))
-                        .await
-                        .is_err()
-                    {
-                        break;
-                    }
-                    tokio::time::sleep(cadence).await;
-                }
-            } else {
-                let child_id = SessionId::new();
-                let (reply_tx, _reply_rx) = oneshot::channel();
-                let _ = scheduler_tx
-                    .send(ScheduledCommand::immediate(
-                        ScheduledAction::SpawnChildSession {
-                            parent_id: parent_id.unwrap_or_default(),
-                            child_id,
-                            task,
-                            system_prompt,
-                            reply: reply_tx,
-                        },
-                    ))
-                    .await;
-            }
-        });
-        Ok(())
+        self.core_input
+            .send(CoreInput::ScheduleSpawnSession {
+                parent_id: parent_id.unwrap_or_default(),
+                task,
+                system_prompt,
+                delay,
+                cadence,
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)
     }
-}
-
-struct ScheduledCommand {
-    execute_at: Instant,
-    action: ScheduledAction,
-}
-
-impl ScheduledCommand {
-    fn immediate(action: ScheduledAction) -> Self {
-        Self::new(action, Duration::ZERO)
-    }
-
-    fn new(action: ScheduledAction, delay: Duration) -> Self {
-        Self {
-            execute_at: Instant::now() + delay,
-            action,
-        }
-    }
-}
-
-struct QueuedCommand {
-    execute_at: Instant,
-    sequence: u64,
-    action: ScheduledAction,
-}
-
-impl QueuedCommand {
-    fn new(command: ScheduledCommand, sequence: u64) -> Self {
-        Self {
-            execute_at: command.execute_at,
-            sequence,
-            action: command.action,
-        }
-    }
-}
-
-impl PartialEq for QueuedCommand {
-    fn eq(&self, other: &Self) -> bool {
-        self.execute_at == other.execute_at && self.sequence == other.sequence
-    }
-}
-
-impl Eq for QueuedCommand {}
-
-impl Ord for QueuedCommand {
-    fn cmp(&self, other: &Self) -> Ordering {
-        other
-            .execute_at
-            .cmp(&self.execute_at)
-            .then_with(|| other.sequence.cmp(&self.sequence))
-    }
-}
-
-impl PartialOrd for QueuedCommand {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[allow(dead_code)]
-enum ScheduledAction {
-    CreateSession {
-        session_id: SessionId,
-        config: SessionConfig,
-        reply: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    SendMessage {
-        session_id: SessionId,
-        content: String,
-        reply: Option<oneshot::Sender<Result<(), HarnessError>>>,
-    },
-    CompactSession {
-        session_id: SessionId,
-        reply: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    RequestCheckpoint {
-        reply: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    SubmitToolResult {
-        session_id: SessionId,
-        tool_use_id: String,
-        output: String,
-        is_error: bool,
-        reply: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    SubmitInteractionResponse {
-        session_id: SessionId,
-        response: InteractionResponse,
-        reply: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    Cancel {
-        session_id: SessionId,
-        reply: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    Shutdown {
-        reply: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    SpawnChildSession {
-        parent_id: SessionId,
-        child_id: SessionId,
-        task: String,
-        system_prompt: Option<String>,
-        reply: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    SignalSession {
-        session_id: SessionId,
-        signal: SessionSignal,
-        reply: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    SendIpcMessage {
-        target: String,
-        content: String,
-        reply: oneshot::Sender<Result<(), HarnessError>>,
-    },
-    RecvIpcMessage {
-        #[allow(dead_code)]
-        source: String,
-        reply: oneshot::Sender<Result<Option<String>, HarnessError>>,
-    },
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use quine_llm::Message;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
+use tokio::time::Duration;
 
 use crate::error::CoreError;
 use crate::persistence::CoreCheckpoint;
@@ -38,6 +39,13 @@ pub enum CoreInput {
         content: String,
     },
 
+    /// Schedule a user message for future delivery.
+    ScheduleUserMessage {
+        session_id: SessionId,
+        content: String,
+        delay: Duration,
+    },
+
     /// Compact a session's stored context without sending a new user message.
     CompactSession {
         session_id: SessionId,
@@ -71,6 +79,15 @@ pub enum CoreInput {
         reply: oneshot::Sender<Result<(), String>>,
     },
 
+    /// Schedule a future or recurring child-session spawn.
+    ScheduleSpawnSession {
+        parent_id: SessionId,
+        task: String,
+        system_prompt: Option<String>,
+        delay: Duration,
+        cadence: Option<Duration>,
+    },
+
     /// Send a signal to a session.
     Signal {
         session_id: SessionId,
@@ -98,6 +115,20 @@ pub enum CoreInput {
         source: MessageSource,
         non_blocking: bool,
         reply: oneshot::Sender<Option<MailboxMessage>>,
+    },
+
+    /// Send a message through the harness-facing IPC mailbox.
+    SendHarnessIpcMessage {
+        target: String,
+        content: String,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+
+    /// Receive a message from the harness-facing IPC mailbox.
+    RecvHarnessIpcMessage {
+        source: String,
+        non_blocking: bool,
+        reply: oneshot::Sender<Option<String>>,
     },
 
     /// Persist and acknowledge a fresh checkpoint of the current core state.
