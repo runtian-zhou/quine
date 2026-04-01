@@ -18,6 +18,7 @@ use crate::persistence::{
     CoreCheckpoint, PersistedSession, PersistedSessionConfig, PersistedSessionState,
 };
 use crate::planner::scheduler::{get_ready_actions, render_plan};
+use crate::scheduler::spawn_scheduler;
 use crate::session::{ExitStatus, SessionId, SessionSignal, SessionState};
 use crate::session_tree::SessionTree;
 use crate::skill::Skill;
@@ -2307,6 +2308,7 @@ pub async fn run_core_loop_with_compaction(
     let mut sessions: HashMap<SessionId, SessionContext> = HashMap::new();
     let mut session_tree = SessionTree::new();
     let mut deferred_inputs = VecDeque::new();
+    let (scheduler_handle, scheduler_task) = spawn_scheduler(handle.input_tx.clone());
     debug_log("core event loop started");
 
     if let Some(checkpoint) = restored_checkpoint {
@@ -2469,6 +2471,32 @@ pub async fn run_core_loop_with_compaction(
                         .send(CoreOutput::SessionError {
                             session_id,
                             error: CoreError::SessionNotFound,
+                        })
+                        .await;
+                }
+            }
+
+            CoreInput::ScheduleUserMessage {
+                session_id,
+                content,
+                delay,
+            } => {
+                debug_log_session(
+                    session_id,
+                    format!("received ScheduleUserMessage (delay={}s)", delay.as_secs()),
+                );
+                if scheduler_handle
+                    .schedule_user_message(session_id, content, delay)
+                    .await
+                    .is_err()
+                {
+                    let _ = handle
+                        .output
+                        .send(CoreOutput::SessionError {
+                            session_id,
+                            error: CoreError::Internal {
+                                message: "scheduler unavailable".into(),
+                            },
                         })
                         .await;
                 }
@@ -2693,6 +2721,37 @@ pub async fn run_core_loop_with_compaction(
                     }
                 }
             }
+            CoreInput::ScheduleSpawnSession {
+                parent_id,
+                task,
+                system_prompt,
+                delay,
+                cadence,
+            } => {
+                debug_log_session(
+                    parent_id,
+                    format!(
+                        "received ScheduleSpawnSession (delay={}s cadence={:?})",
+                        delay.as_secs(),
+                        cadence.map(|value| value.as_secs())
+                    ),
+                );
+                if scheduler_handle
+                    .schedule_spawn_session(parent_id, task, system_prompt, delay, cadence)
+                    .await
+                    .is_err()
+                {
+                    let _ = handle
+                        .output
+                        .send(CoreOutput::SessionError {
+                            session_id: parent_id,
+                            error: CoreError::Internal {
+                                message: "scheduler unavailable".into(),
+                            },
+                        })
+                        .await;
+                }
+            }
             CoreInput::Signal { session_id, signal } => {
                 debug_log_session(session_id, format!("received Signal::{signal:?}"));
                 match signal {
@@ -2750,6 +2809,29 @@ pub async fn run_core_loop_with_compaction(
                     }
                 }
             }
+            CoreInput::SendHarnessIpcMessage {
+                target,
+                content,
+                reply,
+            } => {
+                let result = scheduler_handle
+                    .send_ipc_message(target, content)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = reply.send(result);
+            }
+            CoreInput::RecvHarnessIpcMessage {
+                source,
+                non_blocking,
+                reply,
+            } => {
+                let result = scheduler_handle
+                    .recv_ipc_message(source, non_blocking)
+                    .await
+                    .ok()
+                    .flatten();
+                let _ = reply.send(result);
+            }
             CoreInput::RequestCheckpoint { reply } => {
                 emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
                 let _ = reply.send(());
@@ -2767,6 +2849,9 @@ pub async fn run_core_loop_with_compaction(
             }
         }
     }
+
+    let _ = scheduler_handle.shutdown().await;
+    let _ = scheduler_task.await;
 }
 
 #[cfg(test)]

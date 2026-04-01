@@ -7,6 +7,7 @@ pub mod ipc;
 pub mod permission;
 pub mod persistence;
 pub mod planner;
+mod scheduler;
 pub mod session;
 pub mod session_tree;
 pub mod skill;
