@@ -187,6 +187,14 @@ impl Tool for FindTool {
         })
     }
 
+    fn is_read_only(&self) -> bool {
+        true
+    }
+
+    fn is_idempotent(&self) -> bool {
+        true
+    }
+
     async fn execute(
         &self,
         arguments: serde_json::Value,

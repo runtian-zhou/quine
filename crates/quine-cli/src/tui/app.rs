@@ -1476,6 +1476,8 @@ mod tests {
                 name: "read_file".into(),
                 description: "Read file".into(),
                 parameters: serde_json::json!({"type": "object"}),
+                read_only: true,
+                idempotent: true,
             }],
             loaded_skills: vec![crate::context_debug::SkillSnapshot {
                 name: "review".into(),

@@ -105,6 +105,12 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema describing the tool's parameters.
     pub parameters: serde_json::Value,
+    /// Whether the tool is safe to classify as read-only.
+    #[serde(default)]
+    pub read_only: bool,
+    /// Whether repeated executions with the same arguments are safe.
+    #[serde(default)]
+    pub idempotent: bool,
 }
 
 /// Token usage statistics from an LLM response.
@@ -198,9 +204,25 @@ mod tests {
                 },
                 "required": ["path"]
             }),
+            read_only: true,
+            idempotent: true,
         };
         let json = serde_json::to_string(&tool).unwrap();
         let deserialized: ToolDefinition = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.name, "read_file");
+        assert!(deserialized.read_only);
+        assert!(deserialized.idempotent);
+    }
+
+    #[test]
+    fn tool_definition_defaults_missing_flags_to_false() {
+        let json = serde_json::json!({
+            "name": "find",
+            "description": "Find files",
+            "parameters": {"type": "object"}
+        });
+        let deserialized: ToolDefinition = serde_json::from_value(json).unwrap();
+        assert!(!deserialized.read_only);
+        assert!(!deserialized.idempotent);
     }
 }

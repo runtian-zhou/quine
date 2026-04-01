@@ -255,6 +255,16 @@ pub trait Tool: Send + Sync {
         false
     }
 
+    /// Whether this tool is safe to classify as read-only.
+    fn is_read_only(&self) -> bool {
+        false
+    }
+
+    /// Whether repeated executions with the same arguments are safe.
+    fn is_idempotent(&self) -> bool {
+        false
+    }
+
     /// Execute the tool with the given arguments and context.
     async fn execute(
         &self,
@@ -295,6 +305,8 @@ impl ToolRegistry {
                 name: tool.name().to_string(),
                 description: tool.description().to_string(),
                 parameters: tool.parameters_schema(),
+                read_only: tool.is_read_only(),
+                idempotent: tool.is_idempotent(),
             })
             .collect();
         defs.sort_by(|a, b| a.name.cmp(&b.name));
@@ -413,6 +425,12 @@ mod tests {
             fn parameters_schema(&self) -> serde_json::Value {
                 serde_json::json!({"type": "object"})
             }
+            fn is_read_only(&self) -> bool {
+                true
+            }
+            fn is_idempotent(&self) -> bool {
+                true
+            }
             async fn execute(
                 &self,
                 _arguments: serde_json::Value,
@@ -427,6 +445,8 @@ mod tests {
         let defs = registry.tool_definitions();
         assert_eq!(defs.len(), 1);
         assert_eq!(defs[0].name, "dummy");
+        assert!(defs[0].read_only);
+        assert!(defs[0].idempotent);
     }
 
     #[test]

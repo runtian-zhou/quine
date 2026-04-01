@@ -205,6 +205,8 @@ fn build_available_tools(session: &PersistedSession) -> Vec<ToolDefinition> {
                     name: tool.name,
                     description: tool.description,
                     parameters: tool.parameters,
+                    read_only: false,
+                    idempotent: false,
                 }),
         );
     }
