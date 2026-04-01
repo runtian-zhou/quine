@@ -22,3 +22,6 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "sync", "macros", "net", "io-util", "signal", "fs", "time", "test-util"] }
 tracing = "0.1"
 uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"

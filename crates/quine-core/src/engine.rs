@@ -10,6 +10,7 @@ use crate::channel::{CoreHandle, CoreInput, CoreOutput, ToolOutcome};
 use crate::compaction::{self, CompactionTrigger};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
+use crate::memory::{render_memory_section, MemoryService};
 use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision};
 use crate::planner::scheduler::{get_ready_actions, render_plan};
 use crate::session::{ExitStatus, SessionId, SessionSignal, SessionState};
@@ -123,6 +124,7 @@ struct SessionContext {
 }
 
 struct SessionInit {
+    session_id: SessionId,
     system_prompt: Option<String>,
     skills: Vec<Skill>,
     working_directory: PathBuf,
@@ -131,6 +133,7 @@ struct SessionInit {
     auto_approve_permissions: bool,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
+    memory_service: Option<Arc<dyn MemoryService>>,
 }
 
 impl SessionContext {
@@ -140,6 +143,7 @@ impl SessionContext {
         permission_checker: &Option<Arc<dyn PermissionChecker>>,
     ) -> Result<Self, CoreError> {
         let SessionInit {
+            session_id,
             system_prompt,
             skills,
             working_directory,
@@ -148,6 +152,7 @@ impl SessionContext {
             auto_approve_permissions,
             archive_root,
             max_context_window,
+            memory_service,
         } = init;
         let filesystem = Arc::new(
             OverlayFilesystem::new(working_directory.clone(), working_directory.clone())
@@ -189,6 +194,17 @@ impl SessionContext {
         let tools = tool_registry.tool_definitions();
 
         // Build combined system prompt: CLAUDE.md + base + skills + default fallback.
+        let applicable_memory = if let Some(service) = &memory_service {
+            service
+                .load_applicable(&working_directory, session_id)
+                .await
+                .map_err(|e| CoreError::Internal {
+                    message: format!("failed to load memory: {e}"),
+                })?
+        } else {
+            Vec::new()
+        };
+
         let combined_prompt = {
             let mut prompt_parts = Vec::new();
 
@@ -213,6 +229,9 @@ impl SessionContext {
                 if let Some(sp) = &skill.system_prompt {
                     prompt_parts.push(format!("\n## Skill: {}\n{}", skill.meta.name, sp));
                 }
+            }
+            if let Some(memory_prompt) = render_memory_section(&applicable_memory) {
+                prompt_parts.push(memory_prompt);
             }
 
             // Always ensure a system prompt exists (critical for local models).
@@ -795,6 +814,7 @@ async fn start_child_session(
 
     let ctx = SessionContext::new(
         SessionInit {
+            session_id: child_id,
             system_prompt,
             skills: Vec::new(),
             working_directory: work_dir,
@@ -803,6 +823,7 @@ async fn start_child_session(
             auto_approve_permissions: false,
             archive_root,
             max_context_window,
+            memory_service: None,
         },
         engine.provider,
         engine.permission_checker,
@@ -1955,6 +1976,7 @@ pub async fn run_core_loop(
         handle,
         provider,
         permission_checker,
+        None,
         std::env::temp_dir().join("quine-core-compactions"),
         None,
     )
@@ -1965,6 +1987,7 @@ pub async fn run_core_loop_with_compaction(
     mut handle: CoreHandle,
     provider: Arc<dyn LlmProvider>,
     permission_checker: Option<Arc<dyn PermissionChecker>>,
+    memory_service: Option<Arc<dyn MemoryService>>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
 ) {
@@ -2012,6 +2035,7 @@ pub async fn run_core_loop_with_compaction(
 
                 match SessionContext::new(
                     SessionInit {
+                        session_id,
                         system_prompt,
                         skills,
                         working_directory: work_dir,
@@ -2020,6 +2044,7 @@ pub async fn run_core_loop_with_compaction(
                         auto_approve_permissions,
                         archive_root: archive_root.clone(),
                         max_context_window,
+                        memory_service: memory_service.clone(),
                     },
                     &provider,
                     &permission_checker,
@@ -2174,10 +2199,7 @@ pub async fn run_core_loop_with_compaction(
                                 Err(error) => {
                                     let _ = handle
                                         .output
-                                        .send(CoreOutput::SessionError {
-                                            session_id,
-                                            error,
-                                        })
+                                        .send(CoreOutput::SessionError { session_id, error })
                                         .await;
                                     continue;
                                 }
@@ -2450,6 +2472,7 @@ mod tests {
         let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
             SessionInit {
+                session_id: SessionId::new(),
                 system_prompt: None,
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
@@ -2458,6 +2481,7 @@ mod tests {
                 auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                memory_service: None,
             },
             &provider,
             &permission_checker,
@@ -2509,6 +2533,7 @@ mod tests {
         let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
             SessionInit {
+                session_id: SessionId::new(),
                 system_prompt: None,
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
@@ -2517,6 +2542,7 @@ mod tests {
                 auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                memory_service: None,
             },
             &provider,
             &permission_checker,
@@ -2580,6 +2606,7 @@ mod tests {
         let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
             SessionInit {
+                session_id: SessionId::new(),
                 system_prompt: None,
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
@@ -2588,6 +2615,7 @@ mod tests {
                 auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                memory_service: None,
             },
             &provider,
             &permission_checker,
@@ -2641,6 +2669,7 @@ mod tests {
         let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
             SessionInit {
+                session_id: SessionId::new(),
                 system_prompt: None,
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
@@ -2649,6 +2678,7 @@ mod tests {
                 auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                memory_service: None,
             },
             &provider,
             &permission_checker,
@@ -2681,6 +2711,7 @@ mod tests {
         ));
         let session = SessionContext::new(
             SessionInit {
+                session_id: SessionId::new(),
                 system_prompt: None,
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
@@ -2689,6 +2720,7 @@ mod tests {
                 auto_approve_permissions: false,
                 archive_root: archive_root.clone(),
                 max_context_window: None,
+                memory_service: None,
             },
             &provider,
             &permission_checker,
@@ -2713,7 +2745,9 @@ mod tests {
         assert!(output.contains("archive="));
         assert!(output.contains("[... elided ...]"));
 
-        let archived_dir = archive_root.join("tool-results").join(session_id_string(session_id));
+        let archived_dir = archive_root
+            .join("tool-results")
+            .join(session_id_string(session_id));
         let entries = std::fs::read_dir(&archived_dir)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()

@@ -1197,6 +1197,7 @@ dependencies = [
  "quine-llm",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror",
  "tokio",
  "tracing",

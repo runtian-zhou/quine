@@ -1,6 +1,7 @@
 pub mod config;
 pub mod error;
 pub mod local;
+pub mod memory_store;
 pub mod protocol;
 pub mod server;
 pub mod service;
@@ -12,6 +13,7 @@ pub use config::{
 };
 pub use error::HarnessError;
 pub use local::LocalHarness;
+pub use memory_store::FilesystemMemoryStore;
 pub use protocol::{
     JsonRpcError, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
 };

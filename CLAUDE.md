@@ -36,7 +36,7 @@ features/           # feature request markdown files
 |-------|---------|
 | **quine-cli** | CLI frontend with interactive (REPL) and non-interactive modes. Thin client that communicates with the harness daemon — does not run the agent loop directly. |
 | **quine-core** | Agent harness library. Orchestrates agent execution: state machine, tool dispatch, conversation management, permissions, replay. Owns core orchestration traits. |
-| **quine-harness** | Local daemon service wrapping quine-core. Manages multiple concurrent agent sessions, background agents, and shared state (permissions, logs, tool registries). |
+| **quine-harness** | Local daemon service wrapping quine-core. Manages multiple concurrent agent sessions, background agents, shared state (permissions, logs, tool registries), and the local persistent memory backend. |
 | **quine-llm** | LLM provider adapter. Unified interface over multiple providers (Anthropic, OpenAI, etc.) with streaming support. |
 
 **Dependency flow:** `quine-cli` -> `quine-harness` (via IPC/API) -> `quine-core` -> `quine-llm`
@@ -65,6 +65,7 @@ Rules:
 - **Tool pattern**: Each tool implements the `Tool` trait. One file per tool under `quine-core/src/tool/`.
 - **Skill discovery**: Load native Quine skills from `.quine/skills/` and preserve compatibility with legacy `.claude/commands/` markdown prompts plus Codex-style `<skill>/SKILL.md` directories.
 - **Tests**: Unit tests in the same file (`#[cfg(test)] mod tests`). Integration tests in `crates/<crate>/tests/`.
+- **Memory**: Durable memory is distinct from transcript history and compaction. `quine-core` owns the memory trait and prompt rendering, while `quine-harness` persists user/project/session memory under `<state_dir>/memory/`.
 - **Naming**: snake_case for files/modules, PascalCase for types. No abbreviations in public APIs.
 - **Visibility**: Minimize `pub`. Expose crate APIs through `lib.rs` re-exports.
 - **Clippy**: Zero warnings policy. Fix all clippy lints before committing.

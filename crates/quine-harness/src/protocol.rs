@@ -122,6 +122,9 @@ pub mod methods {
     pub const LIST_SKILLS: &str = "list_skills";
     pub const GET_SKILL: &str = "get_skill";
     pub const SCHEDULE_AGENT: &str = "schedule_agent";
+    pub const LIST_MEMORY: &str = "list_memory";
+    pub const UPSERT_MEMORY: &str = "upsert_memory";
+    pub const DELETE_MEMORY: &str = "delete_memory";
 }
 
 /// Notification method names.
