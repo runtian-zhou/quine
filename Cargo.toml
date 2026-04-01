@@ -1,3 +1,9 @@
 [workspace]
 resolver = "2"
-members = ["crates/quine-core", "crates/quine-llm", "crates/quine-harness", "crates/quine-cli"]
+members = [
+    "crates/quine-core",
+    "crates/quine-llm",
+    "crates/quine-harness",
+    "crates/quine-cli",
+    "crates/quine-sdk",
+]
