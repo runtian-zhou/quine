@@ -6,8 +6,8 @@ use std::collections::HashMap;
 
 use quine_core::{
     create_channels, load_skills, ChannelConfig, CoreCheckpoint, CoreInput, CoreOutput,
-    HarnessHandle, InheritanceFlags, InteractionResponse, PermissionChecker, SessionId,
-    SessionSignal, Skill,
+    HarnessHandle, InheritanceFlags, InteractionResponse, MemoryService, PermissionChecker,
+    SessionId, SessionSignal, Skill,
 };
 use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
@@ -15,6 +15,7 @@ use tokio::time::Duration;
 
 use crate::config::{default_state_dir, max_context_window_from_env, SessionConfig};
 use crate::error::HarnessError;
+use crate::memory_store::FilesystemMemoryStore;
 use crate::service::HarnessService;
 use crate::storage::{session_context_from_checkpoint, StorageManager};
 
@@ -26,6 +27,7 @@ use crate::storage::{session_context_from_checkpoint, StorageManager};
 pub struct LocalHarness {
     core_input: mpsc::Sender<CoreInput>,
     event_tx: broadcast::Sender<CoreOutput>,
+    _memory_service: Arc<dyn MemoryService>,
     /// Handle for the core event loop task.
     _core_task: tokio::task::JoinHandle<()>,
     /// Handle for the event fan-out task.
@@ -78,6 +80,8 @@ impl LocalHarness {
         let archive_root = archive_root.unwrap_or_else(default_state_dir);
         let storage =
             Arc::new(storage.unwrap_or_else(|| StorageManager::new(archive_root.clone())));
+        let memory_service: Arc<dyn MemoryService> =
+            Arc::new(FilesystemMemoryStore::new(archive_root.clone()));
         let restored_checkpoint =
             storage
                 .load_latest_checkpoint()
@@ -105,7 +109,6 @@ impl LocalHarness {
             })
             .unwrap_or_default();
         let sessions = Arc::new(Mutex::new(initial_sessions));
-
         let max_context_window = max_context_window_from_env();
 
         // Spawn the core event loop.
@@ -114,6 +117,7 @@ impl LocalHarness {
             provider,
             permission_checker,
             restored_checkpoint,
+            Some(memory_service.clone()),
             archive_root,
             max_context_window,
         ));
@@ -131,6 +135,7 @@ impl LocalHarness {
         Ok(Self {
             core_input: input,
             event_tx,
+            _memory_service: memory_service,
             _core_task: core_task,
             _fanout_task: fanout_task,
             _storage: storage,
@@ -499,6 +504,43 @@ impl HarnessService for LocalHarness {
             })
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)
+    }
+
+    async fn list_memory(
+        &self,
+        scope: &quine_core::MemoryScope,
+    ) -> Result<Vec<quine_core::MemoryRecord>, HarnessError> {
+        self._memory_service
+            .list(scope)
+            .await
+            .map_err(|error| HarnessError::Internal {
+                message: format!("memory list failed: {error}"),
+            })
+    }
+
+    async fn upsert_memory(
+        &self,
+        record: quine_core::MemoryRecord,
+    ) -> Result<quine_core::MemoryRecord, HarnessError> {
+        self._memory_service
+            .upsert(record)
+            .await
+            .map_err(|error| HarnessError::Internal {
+                message: format!("memory upsert failed: {error}"),
+            })
+    }
+
+    async fn delete_memory(
+        &self,
+        scope: &quine_core::MemoryScope,
+        id: &str,
+    ) -> Result<(), HarnessError> {
+        self._memory_service
+            .delete(scope, id)
+            .await
+            .map_err(|error| HarnessError::Internal {
+                message: format!("memory delete failed: {error}"),
+            })
     }
 }
 

@@ -10,7 +10,9 @@ use crate::session::{
     create_session, create_session_with_initial_messages, create_slash_skill_session,
     resolve_resume_target,
 };
-use crate::slash_command::{parse_slash_command, SlashCommand};
+use crate::slash_command::{
+    parse_memory_command, parse_slash_command, MemoryCommand, MemoryScopeArgument, SlashCommand,
+};
 use quine_harness::protocol::{methods, notifications};
 
 /// Shut down the daemon if we spawned it.
@@ -61,6 +63,7 @@ enum ChatCommandAction {
     ShowContext,
     SendMessage(String),
     CompactSession,
+    ExecuteMemoryCommand(MemoryCommand),
     EnterPlanModeAndSend(String),
     StartSkillSession { skill_name: String, request: String },
 }
@@ -136,6 +139,10 @@ fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
                         ChatCommandAction::EnterPlanModeAndSend(arguments)
                     }
                 }
+                "memory" => match parse_memory_command(&arguments) {
+                    Ok(command) => ChatCommandAction::ExecuteMemoryCommand(command),
+                    Err(message) => ChatCommandAction::ShowError(message),
+                },
                 "loop" => ChatCommandAction::ShowError(
                     "`/loop` is only supported in the TUI right now".to_string(),
                 ),
@@ -149,6 +156,111 @@ fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
     } else {
         ChatCommandAction::SendMessage(trimmed.to_string())
     }
+}
+
+fn memory_scope_params(scope: &MemoryScopeArgument, session_id: &str) -> serde_json::Value {
+    match scope {
+        MemoryScopeArgument::User => serde_json::json!({ "scope": "user" }),
+        MemoryScopeArgument::Project => serde_json::json!({
+            "scope": "project",
+            "project_root": std::env::current_dir()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string(),
+        }),
+        MemoryScopeArgument::Session => serde_json::json!({
+            "scope": "session",
+            "session_id": session_id,
+        }),
+    }
+}
+
+fn memory_record_id(title: &str) -> String {
+    let normalized = title
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    let compact = normalized
+        .split('-')
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    if compact.is_empty() {
+        "memory".to_string()
+    } else {
+        compact
+    }
+}
+
+async fn execute_memory_command(
+    client: &mut IpcClient,
+    renderer: &mut impl Renderer,
+    session_id: &str,
+    command: MemoryCommand,
+) -> anyhow::Result<()> {
+    match command {
+        MemoryCommand::List { scope } => {
+            let params = memory_scope_params(&scope, session_id);
+            match client.call(methods::LIST_MEMORY, Some(params)).await? {
+                Ok(value) => {
+                    let records: Vec<serde_json::Value> = serde_json::from_value(value)?;
+                    if records.is_empty() {
+                        renderer.render_info("No memory records.").await?;
+                    } else {
+                        for record in records {
+                            let id = record
+                                .get("id")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("<unknown>");
+                            let title = record
+                                .get("title")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("<untitled>");
+                            let body = record
+                                .get("body")
+                                .and_then(|value| value.as_str())
+                                .unwrap_or("");
+                            renderer
+                                .render_info(&format!("{id}: {title} — {body}"))
+                                .await?;
+                        }
+                    }
+                }
+                Err(error) => renderer.render_error(&error).await?,
+            }
+        }
+        MemoryCommand::Add { scope, title, body } => {
+            let mut params = memory_scope_params(&scope, session_id);
+            params["record"] = serde_json::json!({
+                "id": memory_record_id(&title),
+                "scope": { "kind": "user" },
+                "title": title,
+                "body": body,
+                "tags": [],
+                "updated_at": chrono::Utc::now(),
+            });
+            match client.call(methods::UPSERT_MEMORY, Some(params)).await? {
+                Ok(_) => renderer.render_info("Memory saved.").await?,
+                Err(error) => renderer.render_error(&error).await?,
+            }
+        }
+        MemoryCommand::Delete { scope, id } => {
+            let mut params = memory_scope_params(&scope, session_id);
+            params["id"] = serde_json::json!(id);
+            match client.call(methods::DELETE_MEMORY, Some(params)).await? {
+                Ok(_) => renderer.render_info("Memory deleted.").await?,
+                Err(error) => renderer.render_error(&error).await?,
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Run the interactive chat REPL.
@@ -218,6 +330,16 @@ pub async fn run_chat(
                                     Ok(_) => renderer.render_info("Context compacted.").await?,
                                     Err(error) => renderer.render_error(&error).await?,
                                 }
+                                continue;
+                            }
+                            ChatCommandAction::ExecuteMemoryCommand(command) => {
+                                execute_memory_command(
+                                    &mut client,
+                                    &mut renderer,
+                                    &session.session_id,
+                                    command,
+                                )
+                                .await?;
                                 continue;
                             }
                             ChatCommandAction::SendMessage(content) => content,

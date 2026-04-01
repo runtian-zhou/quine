@@ -6,6 +6,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
+use quine_core::{MemoryRecord, MemoryScope};
+
 use crate::protocol::{
     error_codes, methods, notifications, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest,
     JsonRpcResponse,
@@ -308,6 +310,35 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
 
     if let Err(e) = session_log::append_log_entry(&entry).await {
         tracing::warn!("failed to write session log: {e}");
+    }
+}
+
+fn parse_memory_scope(params: Option<&serde_json::Value>) -> Result<MemoryScope, &'static str> {
+    let params = params.ok_or("missing params")?;
+    let scope = params
+        .get("scope")
+        .and_then(|value| value.as_str())
+        .ok_or("missing scope")?;
+
+    match scope {
+        "user" => Ok(MemoryScope::User),
+        "project" => {
+            let root = params
+                .get("project_root")
+                .and_then(|value| value.as_str())
+                .ok_or("missing project_root")?;
+            Ok(MemoryScope::Project { root: root.into() })
+        }
+        "session" => {
+            let session_id = params
+                .get("session_id")
+                .cloned()
+                .ok_or("missing session_id")?;
+            let session_id =
+                serde_json::from_value(session_id).map_err(|_| "invalid session_id")?;
+            Ok(MemoryScope::Session { session_id })
+        }
+        _ => Err("invalid scope"),
     }
 }
 
@@ -723,6 +754,116 @@ async fn handle_request(
             }
         }
 
+        methods::LIST_MEMORY => match parse_memory_scope(request.params.as_ref()) {
+            Ok(scope) => match service.list_memory(&scope).await {
+                Ok(records) => {
+                    let resp = JsonRpcResponse::success(id, records);
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+                Err(error) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INTERNAL_ERROR,
+                        error.to_string(),
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            },
+            Err(message) => {
+                let resp = JsonRpcErrorResponse::new(id, error_codes::INVALID_PARAMS, message);
+                Some(serde_json::to_string(&resp).unwrap_or_default())
+            }
+        },
+
+        methods::UPSERT_MEMORY => {
+            let scope = match parse_memory_scope(request.params.as_ref()) {
+                Ok(scope) => scope,
+                Err(message) => {
+                    let resp = JsonRpcErrorResponse::new(id, error_codes::INVALID_PARAMS, message);
+                    return Some(serde_json::to_string(&resp).unwrap_or_default());
+                }
+            };
+            let params = request.params.as_ref();
+            let record = params
+                .and_then(|value| value.get("record"))
+                .cloned()
+                .map(serde_json::from_value::<MemoryRecord>)
+                .transpose();
+
+            match record {
+                Ok(Some(mut record)) => {
+                    record.scope = scope;
+                    match service.upsert_memory(record).await {
+                        Ok(record) => {
+                            let resp = JsonRpcResponse::success(id, record);
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(error) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                error.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                Ok(None) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing record",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+                Err(error) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid record: {error}"),
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::DELETE_MEMORY => match parse_memory_scope(request.params.as_ref()) {
+            Ok(scope) => {
+                let id_value = request
+                    .params
+                    .as_ref()
+                    .and_then(|value| value.get("id"))
+                    .and_then(|value| value.as_str());
+                match id_value {
+                    Some(memory_id) => match service.delete_memory(&scope, memory_id).await {
+                        Ok(()) => {
+                            let resp = JsonRpcResponse::success(id, "ok");
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(error) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                error.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    },
+                    None => {
+                        let resp = JsonRpcErrorResponse::new(
+                            id,
+                            error_codes::INVALID_PARAMS,
+                            "missing id",
+                        );
+                        Some(serde_json::to_string(&resp).unwrap_or_default())
+                    }
+                }
+            }
+            Err(message) => {
+                let resp = JsonRpcErrorResponse::new(id, error_codes::INVALID_PARAMS, message);
+                Some(serde_json::to_string(&resp).unwrap_or_default())
+            }
+        },
         methods::LIST_SESSIONS => match service.list_sessions().await {
             Ok(summaries) => {
                 let resp = JsonRpcResponse::success(

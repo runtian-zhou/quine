@@ -74,6 +74,11 @@ pub fn default_state_dir() -> PathBuf {
     }
 }
 
+/// Returns the default path for durable memory storage.
+pub fn default_memory_dir() -> PathBuf {
+    default_state_dir().join("memory")
+}
+
 /// Build an LLM `ProviderConfig` from environment variables.
 ///
 /// Uses `LLM_PROVIDER` to select the backend (`"anthropic"` or `"openai"`,
@@ -252,5 +257,10 @@ mod tests {
     #[test]
     fn default_state_dir_is_non_empty() {
         assert!(!default_state_dir().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn default_memory_dir_extends_state_dir() {
+        assert!(default_memory_dir().ends_with("memory"));
     }
 }

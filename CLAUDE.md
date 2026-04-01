@@ -37,7 +37,7 @@ features/           # feature request markdown files
 |-------|---------|
 | **quine-cli** | CLI frontend with interactive (REPL) and non-interactive modes. Thin client that communicates with the harness daemon — does not run the agent loop directly. |
 | **quine-core** | Agent harness library. Orchestrates agent execution: state machine, tool dispatch, conversation management, permissions, replay, and scheduler/mailbox ordering semantics. Owns core orchestration traits. |
-| **quine-harness** | Local daemon service wrapping quine-core. Hosts the core runtime, persistence, and IPC surfaces, and adapts daemon requests onto core-owned orchestration behavior. |
+| **quine-harness** | Local daemon service wrapping quine-core. Hosts the core runtime, persistence, and IPC surfaces, adapts daemon requests onto core-owned orchestration behavior, and persists the local durable memory backend. |
 | **quine-llm** | LLM provider adapter. Unified interface over multiple providers (Anthropic, OpenAI, etc.) with streaming support. |
 | **quine-sdk** | Rust-first client SDK for connecting to `quine-harness` over the existing Unix domain socket JSON-RPC transport. Keeps transport internals crate-private and exposes a small connection-oriented API. |
 
@@ -67,6 +67,7 @@ Rules:
 - **Tool pattern**: Each tool implements the `Tool` trait. One file per tool under `quine-core/src/tool/`. Tool metadata should stay conservative: `is_read_only()` and `is_idempotent()` default to `false`, and only explicitly reviewed tools may opt into concurrent multi-call execution.
 - **Skill discovery**: Load native Quine skills from `.quine/skills/` and preserve compatibility with legacy `.claude/commands/` markdown prompts plus Codex-style `<skill>/SKILL.md` directories.
 - **Tests**: Unit tests in the same file (`#[cfg(test)] mod tests`). Integration tests in `crates/<crate>/tests/`.
+- **Memory**: Durable memory is distinct from transcript history and compaction. `quine-core` owns the memory trait and prompt rendering, while `quine-harness` persists user/project/session memory under `<state_dir>/memory/`.
 - **Naming**: snake_case for files/modules, PascalCase for types. No abbreviations in public APIs.
 - **Visibility**: Minimize `pub`. Expose crate APIs through `lib.rs` re-exports.
 - **Clippy**: Zero warnings policy. Fix all clippy lints before committing.

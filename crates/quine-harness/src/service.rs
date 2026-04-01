@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use quine_core::{CoreCheckpoint, CoreOutput, InteractionResponse, SessionId, SessionSignal};
+use quine_core::{
+    CoreCheckpoint, CoreOutput, InteractionResponse, MemoryRecord, MemoryScope, SessionId,
+    SessionSignal,
+};
 use tokio::sync::broadcast;
 use tokio::time::Duration;
 
@@ -124,6 +127,27 @@ pub trait HarnessService: Send + Sync {
         _delay: Duration,
         _cadence: Option<Duration>,
     ) -> Result<(), HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    /// List memory records for a given scope.
+    async fn list_memory(&self, _scope: &MemoryScope) -> Result<Vec<MemoryRecord>, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    /// Create or update a memory record.
+    async fn upsert_memory(&self, _record: MemoryRecord) -> Result<MemoryRecord, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    /// Delete a memory record by scope and identifier.
+    async fn delete_memory(&self, _scope: &MemoryScope, _id: &str) -> Result<(), HarnessError> {
         Err(HarnessError::Internal {
             message: "not implemented".into(),
         })
