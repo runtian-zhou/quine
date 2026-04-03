@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use tokio::process::Command;
@@ -73,6 +73,7 @@ impl Tool for BashTool {
         }
 
         let timeout = Duration::from_secs(timeout_secs);
+        let started_at = Instant::now();
 
         let mut command_builder = Command::new("/bin/sh");
         command_builder
@@ -124,6 +125,8 @@ impl Tool for BashTool {
                     text.push_str(&stderr);
                 }
 
+                append_execution_time(&mut text, started_at.elapsed());
+
                 if exit_code != 0 {
                     text.push_str(&format!("\n(exit code: {exit_code})"));
                     Ok(ToolOutput::error(text))
@@ -142,6 +145,14 @@ impl Tool for BashTool {
             }
         }
     }
+}
+
+fn append_execution_time(text: &mut String, elapsed: Duration) {
+    let millis = elapsed.as_millis();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&format!("Execution time: {millis}ms"));
 }
 
 fn is_probably_file_edit_command(command: &str) -> bool {
@@ -266,7 +277,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result.content.trim(), "hello");
+        assert!(result.content.contains("hello"));
+        assert!(result.content.contains("Execution time:"));
         assert!(!result.is_error);
     }
 
@@ -281,6 +293,7 @@ mod tests {
             .unwrap();
 
         assert!(result.is_error);
+        assert!(result.content.contains("Execution time:"));
         assert!(result.content.contains("exit code: 42"));
     }
 
@@ -323,6 +336,20 @@ mod tests {
             matches!(result, Err(ToolError::Timeout { .. })),
             "expected timeout, got: {result:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn bash_uses_default_timeout_when_omitted() {
+        let (_base, ctx) = make_context().await;
+        let tool = BashTool;
+
+        let result = tool
+            .execute(serde_json::json!({"command": "echo timeout-default"}), &ctx)
+            .await
+            .unwrap();
+
+        assert!(result.content.contains("timeout-default"));
+        assert!(result.content.contains("Execution time:"));
     }
 
     #[tokio::test]

@@ -4492,7 +4492,8 @@ mod tests {
             .await
             .unwrap();
 
-        if let Ok(Some(event)) = tokio::time::timeout(TokioDuration::from_millis(100), output.recv()).await
+        if let Ok(Some(event)) =
+            tokio::time::timeout(TokioDuration::from_millis(100), output.recv()).await
         {
             assert!(
                 !matches!(event, CoreOutput::SessionError { .. }),
