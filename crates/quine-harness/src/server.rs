@@ -381,8 +381,8 @@ async fn handle_request(
                 working_directory: None,
                 skills,
                 plan_mode,
-                auto_approve_permissions,
                 initial_messages,
+                auto_approve_permissions,
             };
 
             match service.create_session(config).await {

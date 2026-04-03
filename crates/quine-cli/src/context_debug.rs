@@ -66,7 +66,6 @@ pub(crate) struct SessionContextSnapshot {
     pub skills: Vec<String>,
     pub working_directory: PathBuf,
     pub plan_mode: bool,
-    pub auto_approve_permissions: bool,
     pub available_tools: Vec<ToolDefinition>,
     pub loaded_skills: Vec<SkillSnapshot>,
     pub plans: Vec<PlanSnapshot>,

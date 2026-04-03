@@ -25,8 +25,6 @@ pub enum CoreInput {
         skills: Vec<Skill>,
         /// Whether this session operates in read-only plan mode.
         plan_mode: bool,
-        /// Whether bash permission prompts should be auto-approved.
-        auto_approve_permissions: bool,
         /// Seed the new session with these messages after the system prompt.
         initial_messages: Vec<Message>,
         /// Acknowledges session creation.
@@ -374,7 +372,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: Vec::new(),
                 reply: reply_tx,
             })

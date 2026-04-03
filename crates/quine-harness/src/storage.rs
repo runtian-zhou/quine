@@ -58,7 +58,6 @@ pub struct SessionContextSnapshot {
     pub skills: Vec<String>,
     pub working_directory: PathBuf,
     pub plan_mode: bool,
-    pub auto_approve_permissions: bool,
     pub available_tools: Vec<ToolDefinition>,
     pub loaded_skills: Vec<SkillSnapshot>,
     pub plans: Vec<PlanSnapshot>,
@@ -119,7 +118,6 @@ fn snapshot_from_persisted(
         skills: session.config.skill_names.clone(),
         working_directory: session.config.working_directory.clone(),
         plan_mode: session.config.plan_mode,
-        auto_approve_permissions: session.config.auto_approve_permissions,
         available_tools: build_available_tools(session),
         loaded_skills: build_loaded_skills(session),
         plans: session
@@ -403,7 +401,6 @@ mod tests {
                     skill_names: Vec::new(),
                     working_directory: PathBuf::from("/tmp/project"),
                     plan_mode: false,
-                    auto_approve_permissions: false,
                 },
                 history: vec![quine_llm::Message::user("hello")],
                 plan_store: PersistedPlanStore::default(),

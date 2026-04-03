@@ -8,7 +8,6 @@ use quine_llm::{LlmEvent, LlmProvider, Message};
 
 use super::{ExecutionContext, InteractionChannel, Tool, ToolError, ToolOutput, ToolRegistry};
 use crate::filesystem::SessionFilesystem;
-use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision};
 use crate::session::SessionId;
 use crate::tool::{
     ask_user::AskUserTool, bash::BashTool, plan::PlanTool, read::ReadTool, write::WriteTool,
@@ -21,18 +20,11 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// the result. This is the primary mechanism for delegating subtasks.
 pub(crate) struct SubagentTool {
     provider: Arc<dyn LlmProvider>,
-    permission_checker: Option<Arc<dyn PermissionChecker>>,
 }
 
 impl SubagentTool {
-    pub(crate) fn new(
-        provider: Arc<dyn LlmProvider>,
-        permission_checker: Option<Arc<dyn PermissionChecker>>,
-    ) -> Self {
-        Self {
-            provider,
-            permission_checker,
-        }
+    pub(crate) fn new(provider: Arc<dyn LlmProvider>) -> Self {
+        Self { provider }
     }
 }
 
@@ -98,7 +90,6 @@ impl Tool for SubagentTool {
 
         match run_subagent(
             &*self.provider,
-            self.permission_checker.as_deref(),
             task,
             system_prompt,
             Arc::clone(&context.filesystem),
@@ -154,7 +145,6 @@ fn wrap_channel_with_label(parent: &InteractionChannel, label: String) -> Intera
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent(
     provider: &dyn LlmProvider,
-    permission_checker: Option<&dyn PermissionChecker>,
     task: &str,
     system_prompt: Option<&str>,
     filesystem: Arc<dyn SessionFilesystem>,
@@ -166,7 +156,6 @@ async fn run_subagent(
         timeout,
         run_subagent_inner(
             provider,
-            permission_checker,
             task,
             system_prompt,
             filesystem,
@@ -184,7 +173,6 @@ async fn run_subagent(
 
 async fn run_subagent_inner(
     provider: &dyn LlmProvider,
-    permission_checker: Option<&dyn PermissionChecker>,
     task: &str,
     system_prompt: Option<&str>,
     filesystem: Arc<dyn SessionFilesystem>,
@@ -274,31 +262,6 @@ async fn run_subagent_inner(
 
         // Execute each tool call.
         for (tool_use_id, tool_name, arguments) in &tool_calls {
-            // Permission check (auto-allow RequiresConfirmation in subagent context).
-            if let Some(checker) = permission_checker {
-                let perm_ctx = PermissionContext {
-                    session_id,
-                    working_directory: working_directory.clone(),
-                };
-                match checker.check(tool_name, arguments, &perm_ctx).await {
-                    Ok(PermissionDecision::Allow) => {}
-                    Ok(PermissionDecision::RequiresConfirmation { .. }) => {
-                        // Auto-allow in subagent — no user interaction available.
-                    }
-                    Ok(PermissionDecision::Deny { reason }) => {
-                        history.push(Message::tool_result(
-                            tool_use_id,
-                            format!("permission denied: {reason}"),
-                            true,
-                        ));
-                        continue;
-                    }
-                    Err(_) => {
-                        // On checker error, auto-allow.
-                    }
-                }
-            }
-
             let tool = match tool_registry.get(tool_name) {
                 Some(t) => Arc::clone(t),
                 None => {
@@ -443,7 +406,7 @@ mod tests {
     #[tokio::test]
     async fn subagent_simple_task() {
         let provider: Arc<dyn LlmProvider> = Arc::new(TextProvider::new("SUBAGENT_RESULT_777"));
-        let tool = SubagentTool::new(provider, None);
+        let tool = SubagentTool::new(provider);
         let (_base, _session, ctx) = make_context().await;
 
         let result = tool
@@ -460,7 +423,7 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenTextProvider {
             call_count: AtomicU32::new(0),
         });
-        let tool = SubagentTool::new(provider, None);
+        let tool = SubagentTool::new(provider);
         let (_base, _session, ctx) = make_context().await;
 
         let result = tool
@@ -501,7 +464,7 @@ mod tests {
         }
 
         let provider: Arc<dyn LlmProvider> = Arc::new(InfiniteToolProvider);
-        let tool = SubagentTool::new(provider, None);
+        let tool = SubagentTool::new(provider);
         let (_base, _session, ctx) = make_context().await;
 
         let result = tool
@@ -534,7 +497,7 @@ mod tests {
         }
 
         let provider: Arc<dyn LlmProvider> = Arc::new(ErrorProvider);
-        let tool = SubagentTool::new(provider, None);
+        let tool = SubagentTool::new(provider);
         let (_base, _session, ctx) = make_context().await;
 
         let result = tool
@@ -619,7 +582,7 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(AskUserProvider {
             call_count: AtomicU32::new(0),
         });
-        let tool = SubagentTool::new(provider, None);
+        let tool = SubagentTool::new(provider);
 
         let handle = tokio::spawn(async move {
             tool.execute(
@@ -660,7 +623,7 @@ mod tests {
     #[tokio::test]
     async fn subagent_without_interaction_channel_still_works() {
         let provider: Arc<dyn LlmProvider> = Arc::new(TextProvider::new("NO_CHANNEL_RESULT"));
-        let tool = SubagentTool::new(provider, None);
+        let tool = SubagentTool::new(provider);
         let (_base, _session, ctx) = make_context().await;
         // ctx.interaction_channel is None (from make_context)
 
@@ -734,7 +697,7 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(ProtocolCheckingProvider {
             call_count: AtomicU32::new(0),
         });
-        let tool = SubagentTool::new(provider, None);
+        let tool = SubagentTool::new(provider);
         let (_base, _session, ctx) = make_context().await;
 
         let result = tool

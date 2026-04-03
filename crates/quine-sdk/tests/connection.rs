@@ -98,7 +98,6 @@ async fn real_daemon_connect() {
     let harness = Arc::new(
         LocalHarness::new(
             Arc::new(MockProvider),
-            None,
             Some(StorageManager::new(storage_root)),
         )
         .await
@@ -126,7 +125,6 @@ async fn real_daemon_create_session() {
     let harness = Arc::new(
         LocalHarness::new(
             Arc::new(MockProvider),
-            None,
             Some(StorageManager::new(storage_root)),
         )
         .await

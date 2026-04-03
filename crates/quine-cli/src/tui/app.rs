@@ -1432,7 +1432,6 @@ mod tests {
             skills: vec!["review".into()],
             working_directory: std::path::PathBuf::from("/tmp/project"),
             plan_mode: false,
-            auto_approve_permissions: false,
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
@@ -1471,7 +1470,6 @@ mod tests {
             skills: vec!["review".into()],
             working_directory: std::path::PathBuf::from("/tmp/project"),
             plan_mode: false,
-            auto_approve_permissions: false,
             available_tools: vec![quine_llm::ToolDefinition {
                 name: "read_file".into(),
                 description: "Read file".into(),

@@ -786,11 +786,10 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             explorer.snapshot.history.len()
         )),
         Line::from(format!(
-            "skills [{}] | {} | plan_mode {} | auto_approve {}",
+            "skills [{}] | {} | plan_mode {}",
             explorer.snapshot.skills.join(", "),
             tool_usage_summary(explorer),
             explorer.snapshot.plan_mode,
-            explorer.snapshot.auto_approve_permissions,
         )),
         Line::from(format!(
             "cwd {}",
@@ -1201,7 +1200,6 @@ mod tests {
             skills: vec![],
             working_directory: std::path::PathBuf::from("/tmp/project"),
             plan_mode: false,
-            auto_approve_permissions: true,
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
@@ -1243,7 +1241,6 @@ mod tests {
             skills: vec![],
             working_directory: std::path::PathBuf::from("/tmp/project"),
             plan_mode: false,
-            auto_approve_permissions: true,
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
@@ -1289,7 +1286,6 @@ mod tests {
             skills: vec!["review".into()],
             working_directory: std::path::PathBuf::from("/tmp/project"),
             plan_mode: false,
-            auto_approve_permissions: true,
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
@@ -1332,7 +1328,6 @@ mod tests {
             skills: vec!["review".into(), "qa".into()],
             working_directory: std::path::PathBuf::from("/tmp/project"),
             plan_mode: false,
-            auto_approve_permissions: true,
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
@@ -1377,7 +1372,6 @@ mod tests {
             skills: vec!["review".into()],
             working_directory: std::path::PathBuf::from("/tmp/project"),
             plan_mode: false,
-            auto_approve_permissions: true,
             available_tools: vec![quine_llm::ToolDefinition {
                 name: "bash".into(),
                 description: "Execute a shell command in the workspace.".into(),
@@ -1428,7 +1422,6 @@ mod tests {
             skills: vec!["review".into()],
             working_directory: std::path::PathBuf::from("/tmp/project"),
             plan_mode: false,
-            auto_approve_permissions: true,
             available_tools: vec![quine_llm::ToolDefinition {
                 name: "read_file".into(),
                 description: "Read a file".into(),
@@ -1464,7 +1457,6 @@ mod tests {
             skills: vec!["review".into()],
             working_directory: std::path::PathBuf::from("/tmp/project"),
             plan_mode: false,
-            auto_approve_permissions: true,
             available_tools: vec![],
             loaded_skills: vec![crate::context_debug::SkillSnapshot {
                 name: "review".into(),
@@ -1502,7 +1494,6 @@ mod tests {
             skills: vec!["review".into()],
             working_directory: std::path::PathBuf::from("/tmp/project"),
             plan_mode: false,
-            auto_approve_permissions: true,
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![crate::context_debug::PlanSnapshot {
