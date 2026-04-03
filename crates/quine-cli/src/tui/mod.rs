@@ -39,11 +39,17 @@ pub async fn run_tui_chat(
     socket_path: &Path,
     skills: &[String],
     plan_mode: bool,
-    auto_approve_permissions: bool,
+    auto_approve: bool,
     resume_checkpoint: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let available_skills = fetch_available_skills(&mut client).await?;
+
+    if auto_approve {
+        eprintln!(
+            "`--auto-approve` is retained for CLI compatibility and currently has no effect."
+        );
+    }
 
     let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
 
@@ -53,7 +59,7 @@ pub async fn run_tui_chat(
             session_id: target.session_id,
             max_context_window: None,
         },
-        None => create_session(&mut client, skills, plan_mode, auto_approve_permissions).await?,
+        None => create_session(&mut client, skills, plan_mode).await?,
     };
 
     // Setup terminal.
@@ -85,7 +91,6 @@ pub async fn run_tui_chat(
         &mut client,
         skills,
         &available_skills,
-        auto_approve_permissions,
         &mut event_stream,
         &mut spinner_interval,
         socket_path,
@@ -119,7 +124,6 @@ async fn run_event_loop(
     client: &mut IpcClient,
     skills: &[String],
     available_skills: &[String],
-    auto_approve_permissions: bool,
     event_stream: &mut EventStream,
     spinner_interval: &mut tokio::time::Interval,
     socket_path: &Path,
@@ -138,7 +142,7 @@ async fn run_event_loop(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if let Some(action) = handle_terminal_event(app, event) {
-                            execute_action(app, client, skills, available_skills, auto_approve_permissions, socket_path, action).await?;
+                            execute_action(app, client, skills, available_skills, socket_path, action).await?;
                         }
                     }
                     Some(Err(_)) | None => {
@@ -376,7 +380,6 @@ async fn execute_action(
     client: &mut IpcClient,
     skills: &[String],
     available_skills: &[String],
-    auto_approve_permissions: bool,
     _socket_path: &Path,
     action: AppAction,
 ) -> anyhow::Result<()> {
@@ -436,14 +439,7 @@ async fn execute_action(
                 app.set_phase(AgentPhase::Idle);
                 app.auto_scroll();
             } else {
-                match create_slash_skill_session(
-                    client,
-                    &skill_name,
-                    &request,
-                    auto_approve_permissions,
-                )
-                .await
-                {
+                match create_slash_skill_session(client, &skill_name, &request).await {
                     Ok(session) => {
                         app.reset_for_new_session(
                             session.session_id,
@@ -496,7 +492,7 @@ async fn execute_action(
         AppAction::EnterPlanMode {
             request,
             was_plan_mode,
-        } => match create_session(client, skills, true, auto_approve_permissions).await {
+        } => match create_session(client, skills, true).await {
             Ok(session) => {
                 app.reset_for_new_session(session.session_id, true, session.max_context_window);
                 app.push_message(app::ConversationEntry::User(request.clone()));

@@ -37,7 +37,7 @@ enum Commands {
         /// Start in read-only plan mode (restricted to exploration and planning).
         #[arg(long)]
         plan: bool,
-        /// Deprecated compatibility flag. Accepted but ignored by the runtime.
+        /// Retained for CLI compatibility; currently has no effect.
         #[arg(long)]
         auto_approve: bool,
         /// Resume a restored checkpoint by session ID, or use `latest`.
@@ -63,9 +63,6 @@ enum Commands {
         /// Skills to load for this session (can be repeated).
         #[arg(long, short = 's')]
         skill: Vec<String>,
-        /// Deprecated compatibility flag. Accepted but ignored by the runtime.
-        #[arg(long)]
-        auto_approve: bool,
     },
     /// Respond to an interaction request (e.g., ask_user prompt) on an existing session.
     Respond {
@@ -220,9 +217,6 @@ enum DaemonCommands {
         /// Socket path override.
         #[arg(long)]
         socket: Option<String>,
-        /// Deprecated compatibility flag. Accepted but ignored by the runtime.
-        #[arg(long)]
-        auto_approve: bool,
     },
     /// Stop the harness daemon.
     Stop {
@@ -261,7 +255,6 @@ async fn main() -> anyhow::Result<()> {
             json,
             socket,
             skill,
-            auto_approve,
         } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
@@ -273,7 +266,6 @@ async fn main() -> anyhow::Result<()> {
                 resume.as_deref(),
                 json,
                 &skill,
-                auto_approve,
             )
             .await?;
         }
@@ -302,10 +294,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::Daemon { command } => match command {
-            DaemonCommands::Start {
-                socket,
-                auto_approve: _,
-            } => {
+            DaemonCommands::Start { socket } => {
                 let socket_path = socket
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(default_socket_path);
