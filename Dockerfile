@@ -9,6 +9,8 @@ RUN apt-get update \
         jq \
         less \
         procps \
+        python-is-python3 \
+        python3 \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
