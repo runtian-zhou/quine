@@ -54,6 +54,11 @@ impl SessionTree {
         self.exit_statuses.insert(session, status);
     }
 
+    pub fn exit_status(&self, session: SessionId) -> Option<&ExitStatus> {
+        self.exit_statuses.get(&session)
+    }
+
+
     /// Register a waiter that will be notified when the given session exits.
     ///
     /// If the session has already exited, the exit status is sent immediately.
@@ -72,6 +77,7 @@ impl SessionTree {
             false
         }
     }
+
 
     pub fn snapshot(&self) -> PersistedSessionTree {
         PersistedSessionTree {

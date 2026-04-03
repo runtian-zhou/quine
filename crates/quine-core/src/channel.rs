@@ -98,6 +98,7 @@ pub enum CoreInput {
         child_id: SessionId,
         reply: oneshot::Sender<Option<ExitStatus>>,
         non_blocking: bool,
+        timeout: Option<Duration>,
     },
 
     /// Send an inter-session message.
@@ -112,6 +113,7 @@ pub enum CoreInput {
         session_id: SessionId,
         source: MessageSource,
         non_blocking: bool,
+        timeout: Option<Duration>,
         reply: oneshot::Sender<Option<MailboxMessage>>,
     },
 

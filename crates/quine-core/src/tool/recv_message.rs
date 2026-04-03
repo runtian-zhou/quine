@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use tokio::sync::oneshot;
+use tokio::time::Duration;
 
 use super::{ExecutionContext, Tool, ToolError, ToolOutput};
 use crate::channel::{CoreInput, MailboxMessage, MessageSource};
@@ -29,6 +30,11 @@ impl Tool for RecvMessageTool {
                 "non_blocking": {
                     "type": "boolean",
                     "description": "If true, return immediately with null if no message. Default false."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional timeout in milliseconds for blocking waits. Returns an error if the deadline expires."
                 }
             },
             "required": ["source"]
@@ -51,6 +57,11 @@ impl Tool for RecvMessageTool {
             .get("non_blocking")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+
+        let timeout = arguments
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .map(Duration::from_millis);
 
         let source = if source_str == "any" {
             MessageSource::Any
@@ -77,6 +88,7 @@ impl Tool for RecvMessageTool {
                 session_id: context.session_id,
                 source,
                 non_blocking,
+                timeout,
                 reply: reply_tx,
             })
             .await
