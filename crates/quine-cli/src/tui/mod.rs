@@ -159,10 +159,10 @@ async fn run_event_loop(
                         }
                     }
                     None => {
-                        app.messages.push(app::ConversationEntry::Error(
+                        app.push_message(app::ConversationEntry::Error(
                             "Connection to daemon lost.".into(),
                         ));
-                        app.phase = AgentPhase::Idle;
+                        app.set_phase(AgentPhase::Idle);
                     }
                 }
             }
@@ -390,21 +390,19 @@ async fn execute_action(
                 "content": msg,
             });
             if let Err(e) = client.call(methods::SEND_MESSAGE, Some(params)).await {
-                app.messages
-                    .push(app::ConversationEntry::Error(e.to_string()));
-                app.phase = AgentPhase::Idle;
+                app.push_message(app::ConversationEntry::Error(e.to_string()));
+                app.set_phase(AgentPhase::Idle);
             }
         }
         AppAction::ShowContext => {
             match fetch_session_context(client, &app.session_id).await {
                 Ok(snapshot) => app.open_context_explorer(snapshot),
                 Err(error) => {
-                    app.messages
-                        .push(app::ConversationEntry::Error(error.to_string()));
+                    app.push_message(app::ConversationEntry::Error(error.to_string()));
                     app.auto_scroll();
                 }
             }
-            app.phase = AgentPhase::Idle;
+            app.set_phase(AgentPhase::Idle);
         }
         AppAction::CompactSession => {
             let params = serde_json::json!({
@@ -412,19 +410,18 @@ async fn execute_action(
             });
             match client.call(methods::COMPACT_SESSION, Some(params)).await {
                 Ok(Ok(_)) => {
-                    app.messages.push(app::ConversationEntry::AssistantText(
+                    app.push_message(app::ConversationEntry::AssistantText(
                         "Context compacted.".into(),
                     ));
                 }
                 Ok(Err(error)) => {
-                    app.messages.push(app::ConversationEntry::Error(error));
+                    app.push_message(app::ConversationEntry::Error(error));
                 }
                 Err(error) => {
-                    app.messages
-                        .push(app::ConversationEntry::Error(error.to_string()));
+                    app.push_message(app::ConversationEntry::Error(error.to_string()));
                 }
             }
-            app.phase = AgentPhase::Idle;
+            app.set_phase(AgentPhase::Idle);
             app.auto_scroll();
         }
         AppAction::SendSlashSkillMessage {
@@ -435,10 +432,10 @@ async fn execute_action(
                 .iter()
                 .any(|candidate| candidate == &skill_name)
             {
-                app.messages.push(app::ConversationEntry::Error(format!(
+                app.push_message(app::ConversationEntry::Error(format!(
                     "Unknown slash command: /{skill_name}"
                 )));
-                app.phase = AgentPhase::Idle;
+                app.set_phase(AgentPhase::Idle);
                 app.auto_scroll();
             } else {
                 match create_slash_skill_session(
@@ -455,17 +452,15 @@ async fn execute_action(
                             false,
                             session.max_context_window,
                         );
-                        app.messages
-                            .push(app::ConversationEntry::AssistantText(format!(
-                                "Started skill session: /{skill_name}"
-                            )));
-                        app.messages
-                            .push(app::ConversationEntry::User(if request.is_empty() {
-                                format!("/{skill_name}")
-                            } else {
-                                format!("/{skill_name} {request}")
-                            }));
-                        app.phase = AgentPhase::Thinking;
+                        app.push_message(app::ConversationEntry::AssistantText(format!(
+                            "Started skill session: /{skill_name}"
+                        )));
+                        app.push_message(app::ConversationEntry::User(if request.is_empty() {
+                            format!("/{skill_name}")
+                        } else {
+                            format!("/{skill_name} {request}")
+                        }));
+                        app.set_phase(AgentPhase::Thinking);
                         app.auto_scroll();
                         app.begin_turn();
                         let params = serde_json::json!({
@@ -473,15 +468,13 @@ async fn execute_action(
                             "content": request,
                         });
                         if let Err(e) = client.call(methods::SEND_MESSAGE, Some(params)).await {
-                            app.messages
-                                .push(app::ConversationEntry::Error(e.to_string()));
-                            app.phase = AgentPhase::Idle;
+                            app.push_message(app::ConversationEntry::Error(e.to_string()));
+                            app.set_phase(AgentPhase::Idle);
                         }
                     }
                     Err(e) => {
-                        app.messages
-                            .push(app::ConversationEntry::Error(e.to_string()));
-                        app.phase = AgentPhase::Idle;
+                        app.push_message(app::ConversationEntry::Error(e.to_string()));
+                        app.set_phase(AgentPhase::Idle);
                     }
                 }
             }
@@ -498,10 +491,9 @@ async fn execute_action(
                 "cadence_secs": cadence.map(|value| value.as_secs()),
             });
             if let Err(e) = client.call(methods::SCHEDULE_AGENT, Some(params)).await {
-                app.messages
-                    .push(app::ConversationEntry::Error(e.to_string()));
+                app.push_message(app::ConversationEntry::Error(e.to_string()));
             }
-            app.phase = AgentPhase::Idle;
+            app.set_phase(AgentPhase::Idle);
         }
         AppAction::EnterPlanMode {
             request,
@@ -509,9 +501,8 @@ async fn execute_action(
         } => match create_session(client, skills, true, auto_approve_permissions).await {
             Ok(session) => {
                 app.reset_for_new_session(session.session_id, true, session.max_context_window);
-                app.messages
-                    .push(app::ConversationEntry::User(request.clone()));
-                app.phase = AgentPhase::Thinking;
+                app.push_message(app::ConversationEntry::User(request.clone()));
+                app.set_phase(AgentPhase::Thinking);
                 app.auto_scroll();
                 app.begin_turn();
                 let params = serde_json::json!({
@@ -519,16 +510,14 @@ async fn execute_action(
                     "content": request,
                 });
                 if let Err(e) = client.call(methods::SEND_MESSAGE, Some(params)).await {
-                    app.messages
-                        .push(app::ConversationEntry::Error(e.to_string()));
-                    app.phase = AgentPhase::Idle;
+                    app.push_message(app::ConversationEntry::Error(e.to_string()));
+                    app.set_phase(AgentPhase::Idle);
                 }
             }
             Err(e) => {
                 app.plan_mode = was_plan_mode;
-                app.messages
-                    .push(app::ConversationEntry::Error(e.to_string()));
-                app.phase = AgentPhase::Idle;
+                app.push_message(app::ConversationEntry::Error(e.to_string()));
+                app.set_phase(AgentPhase::Idle);
             }
         },
         AppAction::ExitPlanMode { final_plan } => {
@@ -547,18 +536,16 @@ async fn execute_action(
                         false,
                         session.max_context_window,
                     );
-                    app.messages.push(app::ConversationEntry::AssistantText(
+                    app.push_message(app::ConversationEntry::AssistantText(
                         "Plan complete. Started a fresh normal session with the final plan carried over."
                             .into(),
                     ));
-                    app.messages
-                        .push(app::ConversationEntry::PlanBox(final_plan));
+                    app.push_message(app::ConversationEntry::PlanBox(final_plan));
                     app.auto_scroll();
                 }
                 Err(e) => {
-                    app.messages
-                        .push(app::ConversationEntry::Error(e.to_string()));
-                    app.phase = AgentPhase::Idle;
+                    app.push_message(app::ConversationEntry::Error(e.to_string()));
+                    app.set_phase(AgentPhase::Idle);
                 }
             }
         }
@@ -571,8 +558,7 @@ async fn execute_action(
                 .call(methods::SUBMIT_INTERACTION_RESPONSE, Some(params))
                 .await
             {
-                app.messages
-                    .push(app::ConversationEntry::Error(e.to_string()));
+                app.push_message(app::ConversationEntry::Error(e.to_string()));
             }
         }
         AppAction::Cancel => {

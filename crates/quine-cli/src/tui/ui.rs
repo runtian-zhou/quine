@@ -9,8 +9,8 @@ use serde_json::to_string_pretty;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
-    AgentPhase, App, ContextExplorerState, ContextExplorerTab, ConversationEntry, InputBuffer,
-    ToolStatus,
+    AgentPhase, App, ContextExplorerState, ContextExplorerTab, ConversationEntry,
+    ConversationRenderCache, InputBuffer, ToolStatus,
 };
 
 /// Format a duration in microseconds to a human-readable string.
@@ -452,6 +452,29 @@ fn conversation_content_height(lines: &[Line<'static>], area_width: u16) -> u32 
         .line_count(area_width) as u32
 }
 
+fn ensure_conversation_cache(app: &mut App, area_width: u16) -> &ConversationRenderCache {
+    let revision = app.conversation_revision();
+    let should_rebuild = app
+        .conversation_cache
+        .as_ref()
+        .is_none_or(|cache| cache.width != area_width || cache.revision != revision);
+
+    if should_rebuild {
+        let lines = build_conversation_lines(app, area_width);
+        let content_height = conversation_content_height(&lines, area_width);
+        app.conversation_cache = Some(ConversationRenderCache {
+            width: area_width,
+            revision,
+            lines,
+            content_height,
+        });
+    }
+
+    app.conversation_cache
+        .as_ref()
+        .expect("conversation cache initialized")
+}
+
 fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mode = if app.plan_mode { "plan" } else { "chat" };
     let phase = match &app.phase {
@@ -486,8 +509,10 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
 
-    let lines = build_conversation_lines(app, area.width);
-    let content_height = conversation_content_height(&lines, area.width);
+    let (content_height, lines) = {
+        let cache = ensure_conversation_cache(app, area.width);
+        (cache.content_height, cache.lines.clone())
+    };
     let view_height = area.height as u32;
     app.last_view_height = view_height;
     let max_scroll = content_height.saturating_sub(view_height);

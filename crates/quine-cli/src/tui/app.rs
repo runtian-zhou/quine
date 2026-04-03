@@ -6,6 +6,7 @@ use std::time::Duration;
 use crate::context_debug::{HistoryEntry, SessionContextSnapshot};
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{notifications, JsonRpcNotification};
+use ratatui::text::Line;
 use unicode_width::UnicodeWidthChar;
 
 /// Spinner braille frames for the waiting animation.
@@ -483,6 +484,17 @@ pub struct App {
     pub last_view_height: u32,
     /// Interactive explorer for large `/context` snapshots in the TUI.
     pub context_explorer: Option<ContextExplorerState>,
+    /// Monotonic revision for conversation-affecting state.
+    conversation_revision: u64,
+    /// Cached rendered conversation lines and wrapped height for the current width.
+    pub conversation_cache: Option<ConversationRenderCache>,
+}
+
+pub struct ConversationRenderCache {
+    pub width: u16,
+    pub revision: u64,
+    pub lines: Vec<Line<'static>>,
+    pub content_height: u32,
 }
 
 struct LoopCommand {
@@ -576,14 +588,40 @@ impl App {
             pending_plan_exit: None,
             last_view_height: 0,
             context_explorer: None,
+            conversation_revision: 0,
+            conversation_cache: None,
+        }
+    }
+
+    fn invalidate_conversation_cache(&mut self) {
+        self.conversation_revision = self.conversation_revision.wrapping_add(1);
+        self.conversation_cache = None;
+    }
+
+    pub fn conversation_revision(&self) -> u64 {
+        self.conversation_revision
+    }
+
+    pub fn push_message(&mut self, entry: ConversationEntry) {
+        self.messages.push(entry);
+        self.invalidate_conversation_cache();
+    }
+
+    pub fn set_phase(&mut self, phase: AgentPhase) {
+        if self.phase != phase {
+            self.phase = phase;
+            self.invalidate_conversation_cache();
         }
     }
 
     /// Reset UI state after cancelling in-flight work.
     pub fn cancel_active_turn(&mut self) {
-        self.phase = AgentPhase::Idle;
+        self.set_phase(AgentPhase::Idle);
         self.reasoning_buffer.clear();
-        self.streaming_buffer.clear();
+        if !self.streaming_buffer.is_empty() {
+            self.streaming_buffer.clear();
+            self.invalidate_conversation_cache();
+        }
         self.current_turn_assistant_text = None;
         self.interaction_queue.clear();
         self.option_select = None;
@@ -615,6 +653,7 @@ impl App {
         self.plan_mode = plan_mode;
         self.pending_plan_exit = None;
         self.context_explorer = None;
+        self.invalidate_conversation_cache();
         self.auto_scroll();
     }
 
@@ -622,6 +661,7 @@ impl App {
     pub fn tick_spinner(&mut self) {
         if self.phase != AgentPhase::Idle {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+            self.invalidate_conversation_cache();
         }
     }
 
@@ -689,8 +729,7 @@ impl App {
                     .unwrap_or_default()
             };
             self.interaction_queue.pop_front();
-            self.messages
-                .push(ConversationEntry::InteractionPrompt(response.clone()));
+            self.push_message(ConversationEntry::InteractionPrompt(response.clone()));
             self.auto_scroll();
             return Some(AppAction::SubmitInteraction(response));
         }
@@ -704,8 +743,7 @@ impl App {
         self.saved_input.clear();
 
         if let Some(pending_exit) = self.pending_plan_exit.take() {
-            self.messages
-                .push(ConversationEntry::InteractionPrompt(text.clone()));
+            self.push_message(ConversationEntry::InteractionPrompt(text.clone()));
             self.auto_scroll();
             return match text.to_ascii_lowercase().as_str() {
                 "y" | "yes" => match pending_exit {
@@ -721,7 +759,7 @@ impl App {
                     }),
                 },
                 "n" | "no" => {
-                    self.messages.push(ConversationEntry::AssistantText(
+                    self.push_message(ConversationEntry::AssistantText(
                         "Stayed in plan mode.".into(),
                     ));
                     self.auto_scroll();
@@ -729,8 +767,9 @@ impl App {
                 }
                 _ => {
                     self.pending_plan_exit = Some(pending_exit);
-                    self.messages
-                        .push(ConversationEntry::Error("Please answer yes or no.".into()));
+                    self.push_message(ConversationEntry::Error(
+                        "Please answer yes or no.".into(),
+                    ));
                     self.auto_scroll();
                     None
                 }
@@ -749,6 +788,7 @@ impl App {
             };
             self.messages
                 .push(ConversationEntry::InteractionPrompt(text));
+            self.invalidate_conversation_cache();
             self.auto_scroll();
             Some(AppAction::SubmitInteraction(response))
         } else {
@@ -762,15 +802,14 @@ impl App {
                         }
                         "compact" => {
                             if arguments.is_empty() {
-                                self.messages.push(ConversationEntry::AssistantText(
+                                self.push_message(ConversationEntry::AssistantText(
                                     "Compacting context...".into(),
                                 ));
-                                self.phase = AgentPhase::Thinking;
+                                self.set_phase(AgentPhase::Thinking);
                                 self.auto_scroll();
                                 Some(AppAction::CompactSession)
                             } else {
-                                self.messages
-                                    .push(ConversationEntry::Error("Usage: /compact".into()));
+                                self.push_message(ConversationEntry::Error("Usage: /compact".into()));
                                 self.auto_scroll();
                                 None
                             }
@@ -787,7 +826,7 @@ impl App {
                         }
                         "plan" => {
                             if arguments.is_empty() {
-                                self.messages.push(ConversationEntry::Error(
+                                self.push_message(ConversationEntry::Error(
                                     "Usage: /plan <request>".into(),
                                 ));
                                 self.auto_scroll();
@@ -795,9 +834,8 @@ impl App {
                             } else {
                                 let was_plan_mode = self.plan_mode;
                                 if was_plan_mode {
-                                    self.messages
-                                        .push(ConversationEntry::User(arguments.clone()));
-                                    self.phase = AgentPhase::Thinking;
+                                    self.push_message(ConversationEntry::User(arguments.clone()));
+                                    self.set_phase(AgentPhase::Thinking);
                                     self.auto_scroll();
                                     Some(AppAction::SendMessage(arguments))
                                 } else {
@@ -810,7 +848,7 @@ impl App {
                         }
                         "loop" => match parse_loop_arguments(&arguments) {
                             Ok(loop_command) => {
-                                self.messages.push(ConversationEntry::AssistantText(format!(
+                                self.push_message(ConversationEntry::AssistantText(format!(
                                     "Scheduled loop: {}",
                                     loop_command.description()
                                 )));
@@ -822,13 +860,13 @@ impl App {
                                 })
                             }
                             Err(message) => {
-                                self.messages.push(ConversationEntry::Error(message));
+                                self.push_message(ConversationEntry::Error(message));
                                 self.auto_scroll();
                                 None
                             }
                         },
                         other => {
-                            self.messages.push(ConversationEntry::Error(format!(
+                            self.push_message(ConversationEntry::Error(format!(
                                 "Unknown slash command: /{other}"
                             )));
                             self.auto_scroll();
@@ -836,9 +874,9 @@ impl App {
                         }
                     },
                     SlashCommand::Skill { name, arguments } => {
-                        self.messages.push(ConversationEntry::User(text.clone()));
+                        self.push_message(ConversationEntry::User(text.clone()));
                         if self.plan_mode {
-                            self.messages.push(ConversationEntry::InteractionQuestion {
+                            self.push_message(ConversationEntry::InteractionQuestion {
                                 prompt: format!(
                                     "Leave plan mode and start /{name}? Answer yes or no."
                                 ),
@@ -851,7 +889,7 @@ impl App {
                             self.auto_scroll();
                             None
                         } else {
-                            self.phase = AgentPhase::Thinking;
+                            self.set_phase(AgentPhase::Thinking);
                             self.auto_scroll();
                             Some(AppAction::SendSlashSkillMessage {
                                 skill_name: name,
@@ -861,8 +899,8 @@ impl App {
                     }
                 }
             } else {
-                self.messages.push(ConversationEntry::User(text.clone()));
-                self.phase = AgentPhase::Thinking;
+                self.push_message(ConversationEntry::User(text.clone()));
+                self.set_phase(AgentPhase::Thinking);
                 self.auto_scroll();
                 Some(AppAction::SendMessage(text))
             }
@@ -879,7 +917,7 @@ impl App {
                 format!("Leave plan mode and start /{skill_name}? Answer yes or no.")
             }
         };
-        self.messages.push(ConversationEntry::InteractionQuestion {
+        self.push_message(ConversationEntry::InteractionQuestion {
             prompt,
             options: vec!["Yes".into(), "No".into()],
         });
@@ -1142,8 +1180,9 @@ impl App {
                     .and_then(|p| p.get("delta"))
                     .and_then(|v| v.as_str())
                 {
-                    self.phase = AgentPhase::Streaming;
+                    self.set_phase(AgentPhase::Streaming);
                     self.streaming_buffer.push_str(delta);
+                    self.invalidate_conversation_cache();
                     self.auto_scroll();
                 }
             }
@@ -1162,9 +1201,12 @@ impl App {
                 let text = trim_blank_lines(&text);
                 if !text.is_empty() {
                     self.current_turn_assistant_text = Some(text.clone());
-                    self.messages.push(ConversationEntry::AssistantText(text));
+                    self.push_message(ConversationEntry::AssistantText(text));
                 }
-                self.streaming_buffer.clear();
+                if !self.streaming_buffer.is_empty() {
+                    self.streaming_buffer.clear();
+                    self.invalidate_conversation_cache();
+                }
                 self.auto_scroll();
             }
             notifications::TOOL_REQUEST => {
@@ -1173,10 +1215,13 @@ impl App {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
                     if !text.is_empty() {
                         self.current_turn_assistant_text = Some(text.clone());
-                        self.messages.push(ConversationEntry::AssistantText(text));
+                        self.push_message(ConversationEntry::AssistantText(text));
                     }
                 }
-                self.streaming_buffer.clear();
+                if !self.streaming_buffer.is_empty() {
+                    self.streaming_buffer.clear();
+                    self.invalidate_conversation_cache();
+                }
 
                 if let Some(params) = &notif.params {
                     let tool_name = params
@@ -1196,8 +1241,8 @@ impl App {
                     } else {
                         summary
                     };
-                    self.phase = AgentPhase::RunningTool(tool_name.clone());
-                    self.messages.push(ConversationEntry::ToolCall {
+                    self.set_phase(AgentPhase::RunningTool(tool_name.clone()));
+                    self.push_message(ConversationEntry::ToolCall {
                         tool_name: tool_name.clone(),
                         tool_use_id,
                         summary,
@@ -1206,7 +1251,7 @@ impl App {
                     });
                     if tool_name == "apply_patch" {
                         if let Some(preview) = build_apply_patch_preview(&arguments) {
-                            self.messages.push(ConversationEntry::PatchPreview(preview));
+                            self.push_message(ConversationEntry::PatchPreview(preview));
                         }
                     }
                     self.auto_scroll();
@@ -1249,8 +1294,9 @@ impl App {
                                     }
                                 }
                                 if matches!(self.phase, AgentPhase::RunningTool(_)) {
-                                    self.phase = AgentPhase::Thinking;
+                                    self.set_phase(AgentPhase::Thinking);
                                 }
+                                self.invalidate_conversation_cache();
                                 break;
                             }
                         }
@@ -1263,10 +1309,13 @@ impl App {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
                     if !text.is_empty() {
                         self.current_turn_assistant_text = Some(text.clone());
-                        self.messages.push(ConversationEntry::AssistantText(text));
+                        self.push_message(ConversationEntry::AssistantText(text));
                     }
                 }
-                self.streaming_buffer.clear();
+                if !self.streaming_buffer.is_empty() {
+                    self.streaming_buffer.clear();
+                    self.invalidate_conversation_cache();
+                }
                 let duration_us = notif
                     .params
                     .as_ref()
@@ -1282,9 +1331,8 @@ impl App {
                     })
                 });
                 self.last_turn_usage = usage.clone();
-                self.messages
-                    .push(ConversationEntry::TurnInfo { duration_us, usage });
-                self.phase = AgentPhase::Idle;
+                self.push_message(ConversationEntry::TurnInfo { duration_us, usage });
+                self.set_phase(AgentPhase::Idle);
                 self.auto_scroll();
             }
             notifications::PLAN_PROGRESS => {
@@ -1304,7 +1352,7 @@ impl App {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(0) as usize;
                     let total = params.get("total").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                    self.messages.push(ConversationEntry::PlanProgress {
+                    self.push_message(ConversationEntry::PlanProgress {
                         action_id,
                         status,
                         remaining,
@@ -1320,8 +1368,7 @@ impl App {
                     .and_then(|p| p.get("error"))
                     .and_then(|v| v.as_str())
                 {
-                    self.messages
-                        .push(ConversationEntry::Error(err.to_string()));
+                    self.push_message(ConversationEntry::Error(err.to_string()));
                 }
             }
             notifications::INTERACTION_NEEDED => {
@@ -1372,7 +1419,7 @@ impl App {
                     .and_then(|v| v.as_str())
                     .map(ToString::to_string);
 
-                self.messages.push(ConversationEntry::InteractionQuestion {
+                self.push_message(ConversationEntry::InteractionQuestion {
                     prompt: prompt.clone(),
                     options: options.clone(),
                 });
