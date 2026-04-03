@@ -1,7 +1,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::fmt;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::context_debug::{HistoryEntry, SessionContextSnapshot};
 use crate::slash_command::{parse_slash_command, SlashCommand};
@@ -101,9 +101,16 @@ fn build_apply_patch_preview(arguments: &serde_json::Value) -> Option<String> {
 /// Status of a tool call execution.
 #[derive(Debug, Clone)]
 pub enum ToolStatus {
-    Running,
-    Success { duration_us: u64 },
-    Error { duration_us: u64 },
+    Running {
+        started_at: Instant,
+        timeout: Option<Duration>,
+    },
+    Success {
+        duration_us: u64,
+    },
+    Error {
+        duration_us: u64,
+    },
 }
 
 /// A single entry in the conversation view.
@@ -531,7 +538,7 @@ fn parse_loop_arguments(arguments: &str) -> Result<LoopCommand, String> {
     match mode {
         "every" => Ok(LoopCommand {
             request,
-            delay: duration,
+            delay: Duration::ZERO,
             cadence: Some(duration),
         }),
         "in" => Ok(LoopCommand {
@@ -668,7 +675,23 @@ impl App {
     pub fn tick_spinner(&mut self) {
         if self.phase != AgentPhase::Idle {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
+            if self.has_running_tool_timers() {
+                self.invalidate_conversation_cache();
+            }
         }
+    }
+
+    fn has_running_tool_timers(&self) -> bool {
+        self.messages.iter().any(|entry| {
+            matches!(
+                entry,
+                ConversationEntry::ToolCall {
+                    tool_name,
+                    status: ToolStatus::Running { .. },
+                    ..
+                } if tool_name == "bash"
+            )
+        })
     }
 
     /// Get the current spinner character.
@@ -1248,11 +1271,23 @@ impl App {
                         summary
                     };
                     self.set_phase(AgentPhase::RunningTool(tool_name.clone()));
+                    let timeout = match tool_name.as_str() {
+                        "bash" => Some(Duration::from_secs(
+                            arguments
+                                .get("timeout")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(120),
+                        )),
+                        _ => None,
+                    };
                     self.push_message(ConversationEntry::ToolCall {
                         tool_name: tool_name.clone(),
                         tool_use_id,
                         summary,
-                        status: ToolStatus::Running,
+                        status: ToolStatus::Running {
+                            started_at: Instant::now(),
+                            timeout,
+                        },
                         result_preview: None,
                     });
                     if tool_name == "apply_patch" {
@@ -1466,6 +1501,7 @@ impl App {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use std::time::{Duration, Instant};
 
     fn make_notif(method: &str, params: serde_json::Value) -> JsonRpcNotification {
         JsonRpcNotification {
@@ -1636,6 +1672,27 @@ mod tests {
     }
 
     #[test]
+    fn tick_spinner_invalidates_cache_for_running_bash_timer() {
+        let mut app = App::new("test".into(), false, None);
+        app.push_message(ConversationEntry::ToolCall {
+            tool_name: "bash".into(),
+            tool_use_id: "toolu_1".into(),
+            summary: "sleep 1".into(),
+            status: ToolStatus::Running {
+                started_at: Instant::now(),
+                timeout: Some(Duration::from_secs(120)),
+            },
+            result_preview: None,
+        });
+        let revision = app.conversation_revision();
+        app.set_phase(AgentPhase::RunningTool("bash".into()));
+
+        app.tick_spinner();
+
+        assert!(app.conversation_revision() > revision);
+    }
+
+    #[test]
     fn tool_request_for_apply_patch_adds_preview() {
         let mut app = App::new("test".into(), false, None);
         let notif = make_notif(
@@ -1659,7 +1716,11 @@ mod tests {
 
         assert!(matches!(
             app.messages.first(),
-            Some(ConversationEntry::ToolCall { tool_name, .. }) if tool_name == "apply_patch"
+            Some(ConversationEntry::ToolCall {
+                tool_name,
+                status: ToolStatus::Running { timeout: None, .. },
+                ..
+            }) if tool_name == "apply_patch"
         ));
         assert!(matches!(
             app.messages.get(1),
@@ -2000,7 +2061,7 @@ mod tests {
     }
 
     #[test]
-    fn submit_input_loop_command_schedules_work() {
+    fn submit_input_loop_every_schedules_immediate_first_run() {
         let mut app = App::new("test".into(), false, None);
         app.input.set_from_string("/loop every 5m check logs");
 
@@ -2010,8 +2071,24 @@ mod tests {
             action,
             Some(AppAction::ScheduleLoop { request, delay, cadence })
                 if request == "check logs"
-                    && delay == Duration::from_secs(300)
+                    && delay == Duration::ZERO
                     && cadence == Some(Duration::from_secs(300))
+        ));
+    }
+
+    #[test]
+    fn submit_input_loop_in_preserves_requested_delay() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/loop in 5m check logs");
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::ScheduleLoop { request, delay, cadence })
+                if request == "check logs"
+                    && delay == Duration::from_secs(300)
+                    && cadence.is_none()
         ));
     }
 
