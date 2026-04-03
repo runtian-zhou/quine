@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run-docker-workspace.sh [--chat] [--image TAG] [--build|--no-build] [--] [command...]
+Usage: scripts/run-docker-workspace.sh [--chat [chat-args...]] [--image TAG] [--build|--no-build] [--] [command...]
 
 Build a Quine Docker image from the current git workspace and run it with the
 workspace mounted at /workspace. For linked worktrees, the script also mounts
@@ -15,7 +15,8 @@ GitHub CLI auth is stored in a persistent Docker volume. On first use, run
 `gh auth login -h github.com` inside the container to authorize it.
 
 Options:
-  --chat        Run `cargo run --bin quine -- chat --auto-approve` instead of opening a shell.
+  --chat        Run `cargo run --bin quine -- chat --auto-approve`.
+                Remaining arguments are passed through to the chat command.
   --image TAG   Override the Docker image tag.
   --build       Force `docker build` before running.
   --no-build    Skip `docker build`.
@@ -24,6 +25,7 @@ Options:
 Examples:
   scripts/run-docker-workspace.sh
   scripts/run-docker-workspace.sh --chat
+  scripts/run-docker-workspace.sh --chat --resume session-id
   scripts/run-docker-workspace.sh -- cargo test -p quine-core
 EOF
 }
@@ -104,15 +106,22 @@ fi
 gh_auth_volume="${GH_AUTH_VOLUME:-quine-gh-auth-${workspace_name}}"
 cargo_registry_volume="${CARGO_REGISTRY_VOLUME:-quine-cargo-registry-${workspace_name}}"
 cargo_git_volume="${CARGO_GIT_VOLUME:-quine-cargo-git-${workspace_name}}"
+quine_state_dir="${QUINE_STATE_DIR:-${HOME}/.quine}"
+mkdir -p "$quine_state_dir"
 
-if [[ ${#command_args[@]} -eq 0 ]]; then
-  if [[ "$mode" == "chat" ]]; then
-    entrypoint_args=(--entrypoint "cargo")
-    command_args=("run" "--bin" "quine" "--" "chat" "--auto-approve")
-  else
-    entrypoint_args=(--entrypoint "/bin/bash")
-    command_args=("-l")
+if [[ "$mode" == "chat" ]]; then
+  chat_args=()
+  if [[ ${#command_args[@]} -gt 0 ]]; then
+    chat_args=("${command_args[@]}")
   fi
+  entrypoint_args=(--entrypoint "cargo")
+  command_args=("run" "--bin" "quine" "--" "chat" "--auto-approve")
+  if [[ ${#chat_args[@]} -gt 0 ]]; then
+    command_args+=("${chat_args[@]}")
+  fi
+elif [[ ${#command_args[@]} -eq 0 ]]; then
+  entrypoint_args=(--entrypoint "/bin/bash")
+  command_args=("-l")
 else
   entrypoint_args=(--entrypoint "${command_args[0]}")
   command_args=("${command_args[@]:1}")
@@ -141,6 +150,7 @@ mounts=(
   --mount "type=bind,src=${workspace_root},dst=${workspace_root}"
   --mount "type=bind,src=${common_dir_abs},dst=${common_dir_abs}"
   --mount "type=volume,src=${gh_auth_volume},dst=/root/.config/gh"
+  --mount "type=bind,src=${quine_state_dir},dst=/root/.quine"
   --mount "type=volume,src=${cargo_registry_volume},dst=/usr/local/cargo/registry"
   --mount "type=volume,src=${cargo_git_volume},dst=/usr/local/cargo/git"
 )
@@ -201,6 +211,7 @@ fi
 echo "Starting container from workspace: $workspace_root"
 echo "Git common dir mounted from: $common_dir_abs"
 echo "GitHub auth volume: $gh_auth_volume"
+echo "Quine state dir: $quine_state_dir"
 echo "Cargo registry volume: $cargo_registry_volume"
 echo "Cargo git volume: $cargo_git_volume"
 if [[ "$origin_url" == https://github.com/* ]]; then

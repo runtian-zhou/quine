@@ -57,7 +57,9 @@ impl PersistedSessionState {
             SessionState::Idle => Some(Self::Idle),
             SessionState::Paused => Some(Self::Paused),
             SessionState::Destroyed => Some(Self::Destroyed),
-            SessionState::Streaming | SessionState::AwaitingToolResult => None,
+            SessionState::Streaming | SessionState::AwaitingToolResult | SessionState::Waiting => {
+                None
+            }
         }
     }
 }
@@ -105,6 +107,10 @@ mod tests {
         );
         assert_eq!(
             PersistedSessionState::from_runtime(SessionState::AwaitingToolResult),
+            None
+        );
+        assert_eq!(
+            PersistedSessionState::from_runtime(SessionState::Waiting),
             None
         );
     }

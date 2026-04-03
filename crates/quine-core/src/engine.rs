@@ -1,11 +1,13 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
 use futures::StreamExt;
 use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, ToolDefinition};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
+
+use tokio::time::{Duration, Instant};
 use tokio::task::JoinSet;
 
 use crate::channel::{
@@ -132,8 +134,57 @@ struct SessionContext {
     created_at: chrono::DateTime<Utc>,
     /// Delivered mailbox messages that have not yet been consumed.
     mailbox: VecDeque<MailboxMessage>,
-    /// Pending blocking mailbox receives waiting for a matching message.
-    pending_recv: Vec<(MessageSource, oneshot::Sender<Option<MailboxMessage>>)>,
+    /// Suspended wait, if this session is waiting on an event-driven dependency.
+    suspended_wait: Option<SuspendedWait>,
+}
+
+#[derive(Clone)]
+enum SuspendedWait {
+    Mailbox {
+        tool_use_id: String,
+        source: MessageSource,
+        timeout_at: Option<Instant>,
+    },
+    ChildExit {
+        tool_use_id: String,
+        child_id: SessionId,
+        timeout_at: Option<Instant>,
+    },
+}
+
+impl SuspendedWait {
+    fn depends_on(&self) -> Option<SessionId> {
+        match self {
+            Self::Mailbox {
+                source: MessageSource::Session(session_id),
+                ..
+            } => Some(*session_id),
+            Self::Mailbox {
+                source: MessageSource::Any,
+                ..
+            } => None,
+            Self::ChildExit { child_id, .. } => Some(*child_id),
+        }
+    }
+
+    fn timeout_at(&self) -> Option<Instant> {
+        match self {
+            Self::Mailbox { timeout_at, .. } | Self::ChildExit { timeout_at, .. } => *timeout_at,
+        }
+    }
+
+    fn timeout_message(&self) -> &'static str {
+        match self {
+            Self::Mailbox { .. } => "recv_message timed out",
+            Self::ChildExit { .. } => "wait_child timed out",
+        }
+    }
+
+    fn tool_use_id(&self) -> &str {
+        match self {
+            Self::Mailbox { tool_use_id, .. } | Self::ChildExit { tool_use_id, .. } => tool_use_id,
+        }
+    }
 }
 
 struct SessionInit {
@@ -268,7 +319,7 @@ impl SessionContext {
             persisted_config,
             created_at: Utc::now(),
             mailbox: VecDeque::new(),
-            pending_recv: Vec::new(),
+            suspended_wait: None,
         })
     }
 
@@ -368,23 +419,162 @@ fn pop_mailbox_message(
     mailbox.remove(index)
 }
 
-fn deliver_or_queue_message(
-    session: &mut SessionContext,
-    message: MailboxMessage,
-) -> Result<bool, MailboxMessage> {
-    if let Some(index) = session
-        .pending_recv
-        .iter()
-        .position(|(source, _)| mailbox_matches_source(&message, source))
-    {
-        let (_, reply) = session.pending_recv.remove(index);
-        if reply.send(Some(message.clone())).is_ok() {
-            return Ok(true);
+fn waiting_on_session(session: &SessionContext) -> Option<SessionId> {
+    session.suspended_wait.as_ref().and_then(SuspendedWait::depends_on)
+}
+
+fn waiting_would_cycle(
+    sessions: &HashMap<SessionId, SessionContext>,
+    waiter: SessionId,
+    dependency: SessionId,
+) -> bool {
+    let mut current = dependency;
+    let mut visited = HashSet::new();
+    while visited.insert(current) {
+        if current == waiter {
+            return true;
         }
-        return deliver_or_queue_message(session, message);
+        let Some(next) = sessions.get(&current).and_then(waiting_on_session) else {
+            return false;
+        };
+        current = next;
+    }
+    false
+}
+
+async fn emit_session_waiting(
+    sessions: &HashMap<SessionId, SessionContext>,
+    session_id: SessionId,
+    output: &mpsc::Sender<CoreOutput>,
+    session_tree: &SessionTree,
+) {
+    let _ = output
+        .send(CoreOutput::SessionStateChanged {
+            session_id,
+            state: SessionState::Waiting,
+        })
+        .await;
+    emit_checkpoint_request(sessions, session_tree, output).await;
+}
+
+async fn resume_session_from_wait(
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    session_id: SessionId,
+    tool_result: ToolOutcome,
+    io: &mut CoreIo<'_>,
+    engine: &mut EngineState<'_>,
+) {
+    let Some(tool_use_id) = sessions
+        .get(&session_id)
+        .and_then(|session| session.suspended_wait.as_ref().map(|wait| wait.tool_use_id().to_string()))
+    else {
+        return;
+    };
+
+    let (output_text, is_error) = match &tool_result {
+        ToolOutcome::Success { output } => (output.clone(), false),
+        ToolOutcome::Error { message } => (message.clone(), true),
+        ToolOutcome::Cancelled => ("Tool execution was cancelled".to_string(), true),
+    };
+
+    let history_output = {
+        let Some(session) = sessions.get(&session_id) else {
+            return;
+        };
+        match prepare_tool_result_for_history(
+            session,
+            session_id,
+            &tool_use_id,
+            "suspended_wait",
+            &output_text,
+            is_error,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = io
+                    .output
+                    .send(CoreOutput::SessionError { session_id, error })
+                    .await;
+                return;
+            }
+        }
+    };
+
+    if let Some(session) = sessions.get_mut(&session_id) {
+        session.suspended_wait = None;
+        session.history.push(Message::tool_result(&tool_use_id, &history_output, is_error));
+        session.state = SessionState::Streaming;
     }
 
-    Err(message)
+    let _ = io
+        .output
+        .send(CoreOutput::ToolResult {
+            session_id,
+            tool_use_id: tool_use_id.clone(),
+            tool_name: "suspended_wait".into(),
+            content: output_text,
+            is_error,
+            duration_us: 0,
+        })
+        .await;
+    let _ = io
+        .output
+        .send(CoreOutput::SessionStateChanged {
+            session_id,
+            state: SessionState::Streaming,
+        })
+        .await;
+
+    let turn_outcome = handle_llm_turn(sessions, session_id, io, engine).await;
+    if engine.session_tree.parent_of(session_id).is_some() {
+        finalize_child_session(
+            sessions,
+            engine.session_tree,
+            session_id,
+            turn_outcome,
+            io.output,
+            io.deferred_inputs,
+        )
+            .await;
+    }
+}
+
+fn next_wait_deadline(sessions: &HashMap<SessionId, SessionContext>) -> Option<Instant> {
+    sessions
+        .values()
+        .filter_map(|session| session.suspended_wait.as_ref().and_then(SuspendedWait::timeout_at))
+        .min()
+}
+
+async fn drain_wait_timeouts(
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    io: &mut CoreIo<'_>,
+    engine: &mut EngineState<'_>,
+) {
+    let now = Instant::now();
+    let expired: Vec<(SessionId, &'static str)> = sessions
+        .iter()
+        .filter_map(|(session_id, session)| {
+            let wait = session.suspended_wait.as_ref()?;
+            let deadline = wait.timeout_at()?;
+            (deadline <= now).then_some((*session_id, wait.timeout_message()))
+        })
+        .collect();
+
+    for (session_id, message) in expired {
+        resume_session_from_wait(
+            sessions,
+            session_id,
+            ToolOutcome::Error {
+                message: message.to_string(),
+            },
+            io,
+            engine,
+        )
+        .await;
+    }
 }
 
 async fn handle_send_message_input(
@@ -393,6 +583,8 @@ async fn handle_send_message_input(
     from: SessionId,
     to: SessionId,
     content: String,
+    deferred_inputs: &mut VecDeque<CoreInput>,
+    wake_waits: &Notify,
 ) {
     debug_log_session(from, format!("received SendMessage to {to:?}"));
     if let Some(target_session) = sessions.get_mut(&to) {
@@ -400,8 +592,20 @@ async fn handle_send_message_input(
             from,
             content: content.clone(),
         };
-        if deliver_or_queue_message(target_session, message.clone()).is_err() {
-            target_session.mailbox.push_back(message);
+        let should_resume = matches!(
+            target_session.suspended_wait.as_ref(),
+            Some(SuspendedWait::Mailbox { source, .. }) if mailbox_matches_source(&message, source)
+        );
+        target_session.mailbox.push_back(message);
+        if should_resume {
+            deferred_inputs.push_back(CoreInput::ToolResult {
+                session_id: to,
+                tool_use_id: "__resume_recv_message__".into(),
+                result: ToolOutcome::Success {
+                    output: String::new(),
+                },
+            });
+            wake_waits.notify_one();
         }
         let _ = output
             .send(CoreOutput::MessageReceived {
@@ -707,6 +911,7 @@ enum TurnOutcome {
     Completed(Option<String>),
     Failed(String),
     Cancelled,
+    Suspended,
 }
 
 enum SessionControlFlow {
@@ -785,6 +990,7 @@ fn handle_session_control_input(
         CoreInput::Cancel {
             session_id: cancel_sid,
         } if cancel_sid == session_id => {
+            clear_suspended_wait(sessions, session_id);
             interrupt_session(sessions, deferred_inputs, session_id);
             SessionControlFlow::Interrupted
         }
@@ -797,6 +1003,7 @@ fn handle_session_control_input(
                 SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill
             ) =>
         {
+            clear_suspended_wait(sessions, session_id);
             interrupt_session(sessions, deferred_inputs, session_id);
             SessionControlFlow::Interrupted
         }
@@ -998,6 +1205,18 @@ async fn compact_session_history(
     Ok(true)
 }
 
+fn clear_suspended_wait(
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    session_id: SessionId,
+) {
+    if let Some(session) = sessions.get_mut(&session_id) {
+        session.suspended_wait = None;
+        if session.state == SessionState::Waiting {
+            session.state = SessionState::Idle;
+        }
+    }
+}
+
 fn session_id_string(session_id: SessionId) -> String {
     serde_json::to_value(session_id)
         .ok()
@@ -1092,6 +1311,7 @@ async fn finalize_child_session(
     session_id: SessionId,
     turn_outcome: TurnOutcome,
     output: &mpsc::Sender<CoreOutput>,
+    deferred_inputs: &mut VecDeque<CoreInput>,
 ) {
     let Some(session) = sessions.get_mut(&session_id) else {
         return;
@@ -1103,10 +1323,21 @@ async fn finalize_child_session(
         },
         TurnOutcome::Failed(error) => ExitStatus::Failed { error },
         TurnOutcome::Cancelled => ExitStatus::Cancelled,
+        TurnOutcome::Suspended => return,
     };
 
     let parent_id = session_tree.parent_of(session_id);
     session_tree.record_exit(session_id, status.clone());
+
+    let waiting_parents: Vec<SessionId> = sessions
+        .iter()
+        .filter_map(|(candidate_id, candidate)| match candidate.suspended_wait.as_ref() {
+            Some(SuspendedWait::ChildExit { child_id, .. }) if *child_id == session_id => {
+                Some(*candidate_id)
+            }
+            _ => None,
+        })
+        .collect();
 
     let _ = output
         .send(CoreOutput::SessionStateChanged {
@@ -1126,6 +1357,15 @@ async fn finalize_child_session(
     }
 
     sessions.remove(&session_id);
+    for waiting_parent in waiting_parents {
+        deferred_inputs.push_back(CoreInput::ToolResult {
+            session_id: waiting_parent,
+            tool_use_id: "__resume_wait_child__".into(),
+            result: ToolOutcome::Success {
+                output: String::new(),
+            },
+        });
+    }
     emit_checkpoint_request(sessions, session_tree, output).await;
 }
 
@@ -1199,24 +1439,6 @@ async fn start_child_session(
     Ok(())
 }
 
-async fn wait_on_child_session(
-    session_tree: &mut SessionTree,
-    parent_id: SessionId,
-    child_id: SessionId,
-    non_blocking: bool,
-) -> Option<ExitStatus> {
-    if session_tree.parent_of(child_id) != Some(parent_id) {
-        return None;
-    }
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    let already_exited = session_tree.register_waiter(child_id, reply_tx);
-    if already_exited || !non_blocking {
-        reply_rx.await.ok()
-    } else {
-        None
-    }
-}
 
 /// Execute a tool call directly within the core.
 ///
@@ -1321,6 +1543,11 @@ async fn execute_tool_call(
             .get("non_blocking")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let timeout = call
+            .arguments
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .map(Duration::from_millis);
         let child_id = match crate::tool::wait_child::parse_session_id(child_id_str) {
             Some(child_id) => child_id,
             None => {
@@ -1333,19 +1560,55 @@ async fn execute_tool_call(
             }
         };
 
-        let status =
-            wait_on_child_session(engine.session_tree, session_id, child_id, non_blocking).await;
+        if engine.session_tree.parent_of(child_id) != Some(session_id) {
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.cancel_tx = None;
+            }
+            return ToolOutcome::Success {
+                output: "null".into(),
+            };
+        }
+
+        if let Some(status) = engine.session_tree.exit_status(child_id).cloned() {
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.cancel_tx = None;
+            }
+            return ToolOutcome::Success {
+                output: serde_json::to_string(&status).unwrap_or_else(|_| "unknown".into()),
+            };
+        }
+
+        if non_blocking {
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.cancel_tx = None;
+            }
+            return ToolOutcome::Success {
+                output: "null".into(),
+            };
+        }
+
+        if waiting_would_cycle(sessions, session_id, child_id) {
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.cancel_tx = None;
+            }
+            return ToolOutcome::Error {
+                message: format!(
+                    "deadlock detected: waiting for child {child_id:?} would create a wait cycle"
+                ),
+            };
+        }
+
         if let Some(session) = sessions.get_mut(&session_id) {
             session.cancel_tx = None;
+            session.state = SessionState::Waiting;
+            session.suspended_wait = Some(SuspendedWait::ChildExit {
+                tool_use_id: call.tool_use_id.clone(),
+                child_id,
+                timeout_at: timeout.map(|value| Instant::now() + value),
+            });
         }
-        return match status {
-            Some(status) => ToolOutcome::Success {
-                output: serde_json::to_string(&status).unwrap_or_else(|_| "unknown".into()),
-            },
-            None => ToolOutcome::Success {
-                output: "null".into(),
-            },
-        };
+        emit_session_waiting(sessions, session_id, io.output, engine.session_tree).await;
+        return ToolOutcome::Cancelled;
     }
 
     if call.tool_name == "recv_message" {
@@ -1365,6 +1628,11 @@ async fn execute_tool_call(
             .get("non_blocking")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let timeout = call
+            .arguments
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .map(Duration::from_millis);
         let source = if source_str == "any" {
             MessageSource::Any
         } else {
@@ -1389,86 +1657,46 @@ async fn execute_tool_call(
             None
         };
 
-        let message = if let Some(message) = message {
-            Some(message)
-        } else if non_blocking {
-            None
-        } else {
-            'recv_loop: loop {
-                match io.input.recv().await {
-                    Some(CoreInput::Cancel {
-                        session_id: cancel_sid,
-                    }) if cancel_sid == session_id => {
-                        debug_log_session(session_id, "recv_message cancelled by core input");
-                        interrupt_session(sessions, io.deferred_inputs, session_id);
-                        if let Some(session) = sessions.get_mut(&session_id) {
-                            session.cancel_tx = None;
-                        }
-                        return ToolOutcome::Cancelled;
-                    }
-                    Some(CoreInput::Signal {
-                        session_id: signal_sid,
-                        signal,
-                    }) if signal_sid == session_id
-                        && matches!(
-                            signal,
-                            SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill
-                        ) =>
-                    {
-                        debug_log_session(session_id, "recv_message interrupted by session signal");
-                        interrupt_session(sessions, io.deferred_inputs, session_id);
-                        if let Some(session) = sessions.get_mut(&session_id) {
-                            session.cancel_tx = None;
-                        }
-                        return ToolOutcome::Cancelled;
-                    }
-                    Some(CoreInput::SendMessage { from, to, content }) => {
-                        handle_send_message_input(sessions, io.output, from, to, content).await;
-                        if let Some(session) = sessions.get_mut(&session_id) {
-                            if let Some(message) =
-                                pop_mailbox_message(&mut session.mailbox, &source)
-                            {
-                                break 'recv_loop Some(message);
-                            }
-                        }
-                    }
-                    Some(other) => {
-                        io.deferred_inputs.push_back(other);
-                    }
-                    None => {
-                        debug_log_session(
-                            session_id,
-                            "recv_message failed: input channel closed during execution",
-                        );
-                        if let Some(session) = sessions.get_mut(&session_id) {
-                            if let Some(cancel_tx) = session.cancel_tx.as_ref() {
-                                let _ = cancel_tx.send(true);
-                            }
-                            session.cancel_tx = None;
-                        }
-                        return ToolOutcome::Error {
-                            message: "input channel closed".into(),
-                        };
-                    }
-                }
-            }
-        };
-
         if let Some(session) = sessions.get_mut(&session_id) {
             session.cancel_tx = None;
         }
-        return match message {
-            Some(MailboxMessage { from, content }) => ToolOutcome::Success {
+
+        if let Some(message) = message {
+            return ToolOutcome::Success {
                 output: serde_json::json!({
-                    "from": from,
-                    "content": content,
+                    "from": message.from,
+                    "content": message.content,
                 })
                 .to_string(),
-            },
-            None => ToolOutcome::Success {
+            };
+        }
+
+        if non_blocking {
+            return ToolOutcome::Success {
                 output: "null".into(),
-            },
-        };
+            };
+        }
+
+        if let MessageSource::Session(source_session) = source {
+            if waiting_would_cycle(sessions, session_id, source_session) {
+                return ToolOutcome::Error {
+                    message: format!(
+                        "deadlock detected: waiting for session {source_session:?} would create a wait cycle"
+                    ),
+                };
+            }
+        }
+
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.state = SessionState::Waiting;
+            session.suspended_wait = Some(SuspendedWait::Mailbox {
+                tool_use_id: call.tool_use_id.clone(),
+                source,
+                timeout_at: timeout.map(|value| Instant::now() + value),
+            });
+        }
+        emit_session_waiting(sessions, session_id, io.output, engine.session_tree).await;
+        return ToolOutcome::Cancelled;
     }
 
     let (tool, filesystem, working_directory, plan_store, cancellation) = {
@@ -2198,8 +2426,18 @@ async fn handle_llm_turn(
                         ));
                     }
 
+                    let should_resume = matches!(completed_call.result, ToolOutcome::Cancelled)
+                        && sessions
+                            .get(&session_id)
+                            .and_then(|session| session.suspended_wait.as_ref())
+                            .is_some();
+
                     if matches!(completed_call.result, ToolOutcome::Cancelled) {
                         saw_cancelled_tool = true;
+                    }
+
+                    if should_resume {
+                        return TurnOutcome::Suspended;
                     }
 
                     if !concurrent_mode && matches!(completed_call.result, ToolOutcome::Cancelled) {
@@ -2325,6 +2563,26 @@ pub async fn run_core_loop_with_compaction(
     archive_root: PathBuf,
     max_context_window: Option<u64>,
 ) {
+    let wake_waits = Arc::new(Notify::new());
+    run_core_loop_with_compaction_and_wait_notifier(
+        &mut handle,
+        provider,
+        restored_checkpoint,
+        archive_root,
+        max_context_window,
+        wake_waits,
+    )
+    .await;
+}
+
+async fn run_core_loop_with_compaction_and_wait_notifier(
+    handle: &mut CoreHandle,
+    provider: Arc<dyn LlmProvider>,
+    restored_checkpoint: Option<CoreCheckpoint>,
+    archive_root: PathBuf,
+    max_context_window: Option<u64>,
+    wake_waits: Arc<Notify>,
+) {
     let mut sessions: HashMap<SessionId, SessionContext> = HashMap::new();
     let mut session_tree = SessionTree::new();
     let mut deferred_inputs = VecDeque::new();
@@ -2360,11 +2618,42 @@ pub async fn run_core_loop_with_compaction(
     }
 
     loop {
+        let mut io = CoreIo {
+            output: &handle.output,
+            input: &mut handle.input,
+            input_tx: &handle.input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut engine = EngineState {
+            provider: &provider,
+            session_tree: &mut session_tree,
+        };
+        drain_wait_timeouts(&mut sessions, &mut io, &mut engine).await;
+
         let input = match deferred_inputs.pop_front() {
             Some(input) => input,
-            None => match handle.input.recv().await {
-                Some(input) => input,
-                None => break,
+            None => {
+                if let Some(deadline) = next_wait_deadline(&sessions) {
+                    tokio::select! {
+                        _ = wake_waits.notified() => {
+                            continue;
+                        }
+                        _ = tokio::time::sleep_until(deadline) => {
+                            continue;
+                        }
+                        maybe_input = handle.input.recv() => {
+                            match maybe_input {
+                                Some(input) => input,
+                                None => break,
+                            }
+                        }
+                    }
+                } else {
+                    match handle.input.recv().await {
+                        Some(input) => input,
+                        None => break,
+                    }
+                }
             },
         };
         match input {
@@ -2446,6 +2735,7 @@ pub async fn run_core_loop_with_compaction(
                     {
                         let session = sessions.get_mut(&session_id).unwrap();
                         session.interrupted = false;
+                        session.suspended_wait = None;
                         session.state = SessionState::Streaming;
                         session.history.push(Message::user(&content));
                     }
@@ -2475,6 +2765,7 @@ pub async fn run_core_loop_with_compaction(
                             session_id,
                             turn_outcome,
                             &handle.output,
+                            &mut deferred_inputs,
                         )
                         .await;
                     }
@@ -2546,6 +2837,64 @@ pub async fn run_core_loop_with_compaction(
                 // Legacy path: the harness sent a tool result.
                 // With the new architecture, tools are executed in-core,
                 // but we still accept external tool results for backward compat.
+                if let Some(wait) = sessions
+                    .get(&session_id)
+                    .and_then(|session| session.suspended_wait.clone())
+                {
+                    let resume_result = match wait {
+                        SuspendedWait::Mailbox { source, .. } => {
+                            let message = sessions
+                                .get_mut(&session_id)
+                                .and_then(|session| pop_mailbox_message(&mut session.mailbox, &source));
+                            match message {
+                                Some(MailboxMessage { from, content }) => ToolOutcome::Success {
+                                    output: serde_json::json!({
+                                        "from": from,
+                                        "content": content,
+                                    })
+                                    .to_string(),
+                                },
+                                None => ToolOutcome::Error {
+                                    message: "recv_message resumed without a matching message"
+                                        .into(),
+                                },
+                            }
+                        }
+                        SuspendedWait::ChildExit { child_id, .. } => match session_tree
+                            .exit_status(child_id)
+                            .cloned()
+                        {
+                            Some(status) => ToolOutcome::Success {
+                                output: serde_json::to_string(&status)
+                                    .unwrap_or_else(|_| "unknown".into()),
+                            },
+                            None => ToolOutcome::Error {
+                                message: "wait_child resumed before child exit was recorded".into(),
+                            },
+                        },
+                    };
+
+                    let mut io = CoreIo {
+                        output: &handle.output,
+                        input: &mut handle.input,
+                        input_tx: &handle.input_tx,
+                        deferred_inputs: &mut deferred_inputs,
+                    };
+                    let mut engine = EngineState {
+                        provider: &provider,
+                        session_tree: &mut session_tree,
+                    };
+                    resume_session_from_wait(
+                        &mut sessions,
+                        session_id,
+                        resume_result,
+                        &mut io,
+                        &mut engine,
+                    )
+                    .await;
+                    continue;
+                }
+
                 if let Some(actual_state) = sessions.get(&session_id).map(|s| s.state) {
                     if actual_state != SessionState::AwaitingToolResult {
                         let _ = handle
@@ -2624,6 +2973,7 @@ pub async fn run_core_loop_with_compaction(
                                 session_id,
                                 turn_outcome,
                                 &handle.output,
+                                &mut deferred_inputs,
                             )
                             .await;
                         }
@@ -2785,6 +3135,7 @@ pub async fn run_core_loop_with_compaction(
                     SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill => {
                         if sessions.contains_key(&session_id) {
                             interrupt_session(&mut sessions, &mut deferred_inputs, session_id);
+                            clear_suspended_wait(&mut sessions, session_id);
                             let _ = handle
                                 .output
                                 .send(CoreOutput::SessionStateChanged {
@@ -2797,12 +3148,22 @@ pub async fn run_core_loop_with_compaction(
                 }
             }
             CoreInput::SendMessage { from, to, content } => {
-                handle_send_message_input(&mut sessions, &handle.output, from, to, content).await;
+                handle_send_message_input(
+                    &mut sessions,
+                    &handle.output,
+                    from,
+                    to,
+                    content,
+                    &mut deferred_inputs,
+                    wake_waits.as_ref(),
+                )
+                .await;
             }
             CoreInput::RecvMessage {
                 session_id,
                 source,
                 non_blocking,
+                timeout: _,
                 reply,
             } => {
                 debug_log_session(session_id, "received RecvMessage");
@@ -2810,10 +3171,14 @@ pub async fn run_core_loop_with_compaction(
                     Some(session) => {
                         if let Some(message) = pop_mailbox_message(&mut session.mailbox, &source) {
                             let _ = reply.send(Some(message));
-                        } else if non_blocking {
-                            let _ = reply.send(None);
                         } else {
-                            session.pending_recv.push((source, reply));
+                            let _ = reply.send(None);
+                            if !non_blocking {
+                                debug_log_session(
+                                    session_id,
+                                    "legacy RecvMessage request could not block in core loop",
+                                );
+                            }
                         }
                     }
                     None => {
@@ -2853,11 +3218,14 @@ pub async fn run_core_loop_with_compaction(
                 child_id,
                 reply,
                 non_blocking,
+                timeout: _,
             } => {
-                let result =
-                    wait_on_child_session(&mut session_tree, parent_id, child_id, non_blocking)
-                        .await;
-                let _ = reply.send(result);
+                let result = if session_tree.parent_of(child_id) == Some(parent_id) {
+                    session_tree.exit_status(child_id).cloned()
+                } else {
+                    None
+                };
+                let _ = reply.send(if result.is_some() || non_blocking { result } else { None });
             }
         }
     }
@@ -2876,6 +3244,7 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
     use tokio::sync::{oneshot, Barrier};
+    use tokio::time::Duration as TokioDuration;
 
     /// A mock LLM provider that returns a fixed text response.
     struct MockProvider {
@@ -2912,6 +3281,263 @@ mod tests {
                 ]
             };
             Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[test]
+    fn wait_graph_cycle_detection_catches_indirect_cycles() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut sessions = HashMap::new();
+        let session_a = runtime.block_on(SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-wait-cycles-a"),
+                max_context_window: None,
+            },
+            &provider,
+        )).unwrap();
+        let session_b = runtime.block_on(SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-wait-cycles-b"),
+                max_context_window: None,
+            },
+            &provider,
+        )).unwrap();
+        let session_c = runtime.block_on(SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-wait-cycles-c"),
+                max_context_window: None,
+            },
+            &provider,
+        )).unwrap();
+
+        let id_a = SessionId::new();
+        let id_b = SessionId::new();
+        let id_c = SessionId::new();
+        let mut session_a = session_a;
+        let mut session_b = session_b;
+        let session_c = session_c;
+        session_a.suspended_wait = Some(SuspendedWait::Mailbox {
+            tool_use_id: "toolu_a".into(),
+            source: MessageSource::Session(id_b),
+            timeout_at: None,
+        });
+        session_b.suspended_wait = Some(SuspendedWait::Mailbox {
+            tool_use_id: "toolu_b".into(),
+            source: MessageSource::Session(id_c),
+            timeout_at: None,
+        });
+        sessions.insert(id_a, session_a);
+        sessions.insert(id_b, session_b);
+        sessions.insert(id_c, session_c);
+
+        assert!(waiting_would_cycle(&sessions, id_c, id_a));
+        assert!(waiting_would_cycle(&sessions, id_b, id_b));
+        assert!(!waiting_would_cycle(&sessions, id_c, SessionId::new()));
+    }
+
+    #[test]
+    fn next_wait_deadline_picks_earliest_timeout() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut sessions = HashMap::new();
+        let id_a = SessionId::new();
+        let id_b = SessionId::new();
+        let mut session_a = runtime.block_on(SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-timeout-a"),
+                max_context_window: None,
+            },
+            &provider,
+        )).unwrap();
+        let mut session_b = runtime.block_on(SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-timeout-b"),
+                max_context_window: None,
+            },
+            &provider,
+        )).unwrap();
+        let early = Instant::now() + TokioDuration::from_millis(10);
+        let late = Instant::now() + TokioDuration::from_millis(20);
+        session_a.suspended_wait = Some(SuspendedWait::Mailbox {
+            tool_use_id: "toolu_a".into(),
+            source: MessageSource::Any,
+            timeout_at: Some(late),
+        });
+        session_b.suspended_wait = Some(SuspendedWait::ChildExit {
+            tool_use_id: "toolu_b".into(),
+            child_id: SessionId::new(),
+            timeout_at: Some(early),
+        });
+        sessions.insert(id_a, session_a);
+        sessions.insert(id_b, session_b);
+
+        assert_eq!(next_wait_deadline(&sessions), Some(early));
+    }
+
+    #[tokio::test]
+    async fn timeout_expiry_resumes_waiting_session_with_error() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session_id = SessionId::new();
+        let mut session = SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: vec![Message::assistant_tool_use(None, vec![])],
+                archive_root: std::env::temp_dir().join("quine-core-timeout-resume"),
+                max_context_window: None,
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.state = SessionState::Waiting;
+        session.suspended_wait = Some(SuspendedWait::Mailbox {
+            tool_use_id: "toolu_timeout".into(),
+            source: MessageSource::Any,
+            timeout_at: Some(Instant::now() - TokioDuration::from_millis(1)),
+        });
+
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(16);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            session_tree: &mut session_tree,
+        };
+
+        drain_wait_timeouts(&mut sessions, &mut io, &mut engine).await;
+
+        let session = sessions.get(&session_id).unwrap();
+        assert!(session.suspended_wait.is_none());
+        assert_eq!(session.state, SessionState::Idle);
+        let tool_entries: Vec<_> = session
+            .history
+            .iter()
+            .filter(|message| message.role == quine_llm::Role::Tool)
+            .collect();
+        assert!(!tool_entries.is_empty());
+        let serialized = serde_json::to_string(tool_entries.last().unwrap()).unwrap();
+        assert!(serialized.contains("recv_message timed out"));
+
+        let mut saw_tool_error = false;
+        while let Ok(event) = output_rx.try_recv() {
+            if let CoreOutput::ToolResult { is_error, content, .. } = event {
+                saw_tool_error = is_error && content.contains("recv_message timed out");
+            }
+        }
+        assert!(saw_tool_error);
+    }
+
+    #[tokio::test]
+    async fn send_message_queues_resume_for_waiting_mailbox_session() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let waiting_id = SessionId::new();
+        let sender_id = SessionId::new();
+        let mut waiting_session = SessionContext::new(
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-mailbox-resume"),
+                max_context_window: None,
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        waiting_session.state = SessionState::Waiting;
+        waiting_session.suspended_wait = Some(SuspendedWait::Mailbox {
+            tool_use_id: "toolu_wait".into(),
+            source: MessageSource::Session(sender_id),
+            timeout_at: None,
+        });
+
+        let mut sessions = HashMap::from([(waiting_id, waiting_session)]);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(8);
+        let mut deferred_inputs = VecDeque::new();
+        let wake_waits = Notify::new();
+
+        handle_send_message_input(
+            &mut sessions,
+            &output_tx,
+            sender_id,
+            waiting_id,
+            "hello".into(),
+            &mut deferred_inputs,
+            &wake_waits,
+        )
+        .await;
+
+        let queued = deferred_inputs.pop_front().expect("expected resume input");
+        match queued {
+            CoreInput::ToolResult { session_id, .. } => assert_eq!(session_id, waiting_id),
+            other => panic!("expected queued ToolResult, got {other:?}"),
+        }
+
+        let session = sessions.get_mut(&waiting_id).unwrap();
+        let message = pop_mailbox_message(
+            &mut session.mailbox,
+            &MessageSource::Session(sender_id),
+        )
+        .expect("expected queued mailbox message");
+        assert_eq!(message.content, "hello");
+
+        let event = output_rx.recv().await.expect("expected MessageReceived");
+        match event {
+            CoreOutput::MessageReceived {
+                session_id,
+                from,
+                content,
+            } => {
+                assert_eq!(session_id, waiting_id);
+                assert_eq!(from, sender_id);
+                assert_eq!(content, "hello");
+            }
+            other => panic!("expected MessageReceived, got {other:?}"),
         }
     }
 
@@ -3620,6 +4246,7 @@ mod tests {
                 child_id,
                 reply: wait_reply_tx,
                 non_blocking: false,
+                timeout: None,
             })
             .await
             .unwrap();
@@ -4314,6 +4941,7 @@ mod tests {
                 session_id: receiver_id,
                 source: MessageSource::Session(sender_id),
                 non_blocking: false,
+                timeout: None,
                 reply: reply_tx,
             })
             .await
@@ -4334,6 +4962,7 @@ mod tests {
                 session_id: receiver_id,
                 source: MessageSource::Any,
                 non_blocking: true,
+                timeout: None,
                 reply: reply_tx,
             })
             .await

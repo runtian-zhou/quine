@@ -31,6 +31,8 @@ pub enum SessionState {
     Streaming,
     /// Waiting for the harness to return tool results.
     AwaitingToolResult,
+    /// Waiting for an event-driven dependency such as a mailbox message or child exit.
+    Waiting,
     /// Session is paused.
     Paused,
     /// Session has been destroyed.

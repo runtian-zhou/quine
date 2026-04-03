@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use tokio::sync::oneshot;
+use tokio::time::Duration;
 
 use super::{ExecutionContext, Tool, ToolError, ToolOutput};
 use crate::channel::CoreInput;
@@ -30,6 +31,11 @@ impl Tool for WaitChildTool {
                 "non_blocking": {
                     "type": "boolean",
                     "description": "If true, return immediately with null if child is still running. Default false."
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Optional timeout in milliseconds for blocking waits. Returns an error if the deadline expires."
                 }
             },
             "required": ["child_id"]
@@ -52,6 +58,10 @@ impl Tool for WaitChildTool {
             .get("non_blocking")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let timeout = arguments
+            .get("timeout_ms")
+            .and_then(|v| v.as_u64())
+            .map(Duration::from_millis);
 
         let core_input = context
             .core_input
@@ -74,6 +84,7 @@ impl Tool for WaitChildTool {
                 child_id,
                 reply: reply_tx,
                 non_blocking,
+                timeout,
             })
             .await
             .map_err(|_| ToolError::Internal {
