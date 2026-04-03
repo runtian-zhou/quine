@@ -16,6 +16,10 @@ use crate::channel::{
 use crate::compaction::{self, CompactionTrigger};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
+use crate::memory::{
+    refresh_summary_from_history, restore_memory_state, should_refresh_summary,
+    snapshot_memory_state, MemoryDiagnostics, SessionMemoryState,
+};
 use crate::persistence::{
     CoreCheckpoint, PersistedSession, PersistedSessionConfig, PersistedSessionState,
 };
@@ -55,6 +59,45 @@ fn debug_log_session(session_id: SessionId, message: impl AsRef<str>) {
     if debug_enabled() {
         eprintln!("[core][session={session_id:?}] {}", message.as_ref());
     }
+}
+
+fn schedule_session_memory_refresh(
+    session: &mut SessionContext,
+    session_id: SessionId,
+    input_tx: mpsc::Sender<CoreInput>,
+) {
+    if !should_refresh_summary(&session.session_memory, &session.history) {
+        return;
+    }
+
+    let history = session.history.clone();
+    let memory_state = session.session_memory.clone();
+    let refresh_handle = memory_state.refresh_handle.clone();
+    session.session_memory.refresh_in_flight = true;
+    tokio::spawn(async move {
+        let _guard = refresh_handle.lock.lock().await;
+        let refresh_result = tokio::task::spawn_blocking(move || {
+            refresh_summary_from_history(&memory_state, &history)
+        })
+        .await;
+
+        let (last_summarized_message_index, refreshed_at) = match refresh_result {
+            Ok(Ok(Some(update))) => (
+                Some(update.metadata.last_summarized_message_index),
+                Some(update.metadata.updated_at),
+            ),
+            _ => (None, None),
+        };
+
+        let _ = input_tx
+            .send(CoreInput::SessionMemoryRefreshFinished {
+                session_id,
+                last_summarized_message_index,
+                refreshed_at,
+            })
+            .await;
+        debug_log_session(session_id, "session memory refresh finished");
+    });
 }
 
 /// System prompt prepended in plan mode to restrict the agent to planning-only work.
@@ -136,6 +179,11 @@ struct SessionContext {
     mailbox: VecDeque<MailboxMessage>,
     /// Suspended wait, if this session is waiting on an event-driven dependency.
     suspended_wait: Option<SuspendedWait>,
+    /// Session memory bookkeeping and paths.
+    session_memory: SessionMemoryState,
+    #[allow(dead_code)]
+    /// Session memory diagnostics.
+    memory_diagnostics: MemoryDiagnostics,
 }
 
 #[derive(Clone)]
@@ -280,7 +328,11 @@ fn build_combined_system_prompt(
 }
 
 impl SessionContext {
-    async fn new(init: SessionInit, provider: &Arc<dyn LlmProvider>) -> Result<Self, CoreError> {
+    async fn new(
+        session_id: SessionId,
+        init: SessionInit,
+        provider: &Arc<dyn LlmProvider>,
+    ) -> Result<Self, CoreError> {
         let persisted_config = init.to_persisted_config();
         let SessionInit {
             system_prompt: _,
@@ -300,6 +352,7 @@ impl SessionContext {
         );
 
         let plan_store = crate::tool::plan::new_plan_store();
+        let session_memory = restore_memory_state(&archive_root, session_id, None);
 
         let tool_registry = build_tool_registry_for_session(
             provider,
@@ -338,6 +391,8 @@ impl SessionContext {
             created_at: Utc::now(),
             mailbox: VecDeque::new(),
             suspended_wait: None,
+            session_memory,
+            memory_diagnostics: MemoryDiagnostics::default(),
         })
     }
 
@@ -354,10 +409,12 @@ impl SessionContext {
             config,
             history,
             plan_store,
+            memory_state,
         } = persisted;
         let skills =
             crate::skill::load_skills(&config.working_directory, &config.skill_names).await;
         let mut session = Self::new(
+            session_id,
             SessionInit {
                 system_prompt: config.system_prompt.clone(),
                 skills,
@@ -404,6 +461,8 @@ impl SessionContext {
         session.tools = session.tool_registry.tool_definitions();
         session.persisted_config = config;
         session.created_at = created_at;
+        session.session_memory =
+            restore_memory_state(&session.archive_root, session_id, memory_state.as_ref());
         Ok((session_id, session))
     }
 
@@ -416,6 +475,7 @@ impl SessionContext {
             config: self.persisted_config.clone(),
             history: self.history.clone(),
             plan_store: crate::tool::plan::snapshot_plan_store(&self.plan_store).await,
+            memory_state: Some(snapshot_memory_state(&self.session_memory)),
         })
     }
 
@@ -1480,6 +1540,7 @@ async fn start_child_session(
     let work_dir_display = work_dir.display().to_string();
 
     let ctx = SessionContext::new(
+        child_id,
         SessionInit {
             system_prompt,
             skills: Vec::new(),
@@ -2286,6 +2347,9 @@ async fn handle_llm_turn(
                         usage: accumulated_usage,
                     })
                     .await;
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    schedule_session_memory_refresh(session, session_id, io.input_tx.clone());
+                }
                 emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
                 return TurnOutcome::Completed(Some(full_text));
             }
@@ -2604,6 +2668,9 @@ async fn handle_llm_turn(
                             usage: accumulated_usage.clone(),
                         })
                         .await;
+                    if let Some(session) = sessions.get_mut(&session_id) {
+                        schedule_session_memory_refresh(session, session_id, io.input_tx.clone());
+                    }
                     emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
                     return TurnOutcome::Cancelled;
                 }
@@ -2774,6 +2841,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 let work_dir_display = work_dir.display().to_string();
 
                 match SessionContext::new(
+                    session_id,
                     SessionInit {
                         system_prompt,
                         skills,
@@ -3121,6 +3189,23 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 }
             }
 
+            CoreInput::SessionMemoryRefreshFinished {
+                session_id,
+                last_summarized_message_index,
+                refreshed_at,
+            } => {
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.session_memory.refresh_in_flight = false;
+                    if let Some(index) = last_summarized_message_index {
+                        session.session_memory.last_summarized_message_index = Some(index);
+                    }
+                    if let Some(timestamp) = refreshed_at {
+                        session.session_memory.last_refresh_at = Some(timestamp);
+                    }
+                    emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
+                }
+            }
+
             CoreInput::Shutdown => {
                 debug_log("received Shutdown; exiting core event loop");
                 break;
@@ -3361,6 +3446,8 @@ mod tests {
     use tokio::sync::{oneshot, Barrier};
     use tokio::time::Duration as TokioDuration;
 
+    use crate::memory::load_summary_metadata;
+
     /// A mock LLM provider that returns a fixed text response.
     struct MockProvider {
         response_text: String,
@@ -3409,6 +3496,7 @@ mod tests {
         let mut sessions = HashMap::new();
         let session_a = runtime
             .block_on(SessionContext::new(
+                SessionId::new(),
                 SessionInit {
                     system_prompt: None,
                     skills: Vec::new(),
@@ -3423,6 +3511,7 @@ mod tests {
             .unwrap();
         let session_b = runtime
             .block_on(SessionContext::new(
+                SessionId::new(),
                 SessionInit {
                     system_prompt: None,
                     skills: Vec::new(),
@@ -3437,6 +3526,7 @@ mod tests {
             .unwrap();
         let session_c = runtime
             .block_on(SessionContext::new(
+                SessionId::new(),
                 SessionInit {
                     system_prompt: None,
                     skills: Vec::new(),
@@ -3487,6 +3577,7 @@ mod tests {
         let id_b = SessionId::new();
         let mut session_a = runtime
             .block_on(SessionContext::new(
+                SessionId::new(),
                 SessionInit {
                     system_prompt: None,
                     skills: Vec::new(),
@@ -3501,6 +3592,7 @@ mod tests {
             .unwrap();
         let mut session_b = runtime
             .block_on(SessionContext::new(
+                SessionId::new(),
                 SessionInit {
                     system_prompt: None,
                     skills: Vec::new(),
@@ -3536,6 +3628,7 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let session_id = SessionId::new();
         let mut session = SessionContext::new(
+            SessionId::new(),
             SessionInit {
                 system_prompt: None,
                 skills: Vec::new(),
@@ -3604,6 +3697,7 @@ mod tests {
         let waiting_id = SessionId::new();
         let sender_id = SessionId::new();
         let mut waiting_session = SessionContext::new(
+            SessionId::new(),
             SessionInit {
                 system_prompt: None,
                 skills: Vec::new(),
@@ -3670,6 +3764,7 @@ mod tests {
     async fn concurrent_tool_batch_requires_explicit_safe_metadata_and_allowlist() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let session = SessionContext::new(
+            SessionId::new(),
             SessionInit {
                 system_prompt: None,
                 skills: Vec::new(),
@@ -3748,6 +3843,7 @@ mod tests {
             final_text: "done".into(),
         });
         let mut session = SessionContext::new(
+            SessionId::new(),
             SessionInit {
                 system_prompt: None,
                 skills: Vec::new(),
@@ -3847,6 +3943,7 @@ mod tests {
             final_text: "should not happen".into(),
         });
         let mut session = SessionContext::new(
+            SessionId::new(),
             SessionInit {
                 system_prompt: None,
                 skills: Vec::new(),
@@ -4061,6 +4158,7 @@ mod tests {
     async fn execute_tool_call_consumes_cancel_for_non_interactive_tool() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let session = SessionContext::new(
+            SessionId::new(),
             SessionInit {
                 system_prompt: None,
                 skills: Vec::new(),
@@ -4116,6 +4214,7 @@ mod tests {
     async fn execute_tool_call_buffers_unrelated_input_while_waiting_for_cancel() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let session = SessionContext::new(
+            SessionId::new(),
             SessionInit {
                 system_prompt: None,
                 skills: Vec::new(),
@@ -4183,6 +4282,7 @@ mod tests {
     async fn execute_tool_call_consumes_stop_signal_for_non_interactive_tool() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let session = SessionContext::new(
+            SessionId::new(),
             SessionInit {
                 system_prompt: None,
                 skills: Vec::new(),
@@ -4240,6 +4340,7 @@ mod tests {
     async fn prepare_tool_result_for_history_keeps_small_output_inline() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let session = SessionContext::new(
+            SessionId::new(),
             SessionInit {
                 system_prompt: None,
                 skills: Vec::new(),
@@ -4277,6 +4378,7 @@ mod tests {
             SessionId::new()
         ));
         let session = SessionContext::new(
+            SessionId::new(),
             SessionInit {
                 system_prompt: None,
                 skills: Vec::new(),
@@ -4397,7 +4499,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_and_shutdown() {
+    async fn create_session_and_shutdown_baseline() {
         let (harness, core) = create_channels(ChannelConfig::default());
 
         let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
@@ -4419,6 +4521,277 @@ mod tests {
             .unwrap();
 
         assert!(reply_rx.await.unwrap().is_ok());
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_memory_foundation_creates_and_updates_summary() {
+        let temp = TempDir::new().unwrap();
+        let (mut harness, core) = create_channels(ChannelConfig::default());
+        let provider = Arc::new(MockProvider::new("assistant reply"));
+        let loop_handle = tokio::spawn(run_core_loop_with_compaction(
+            core,
+            provider,
+            None,
+            temp.path().to_path_buf(),
+            None,
+        ));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        let _ = harness.output.recv().await.unwrap();
+
+        for content in [
+            "first message about crates/quine-core/src/engine.rs",
+            "second message",
+        ] {
+            harness
+                .input
+                .send(CoreInput::UserMessage {
+                    session_id,
+                    content: content.into(),
+                })
+                .await
+                .unwrap();
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), harness.output.recv())
+                    .await
+                {
+                    Ok(Some(CoreOutput::TurnComplete { .. })) => break,
+                    Ok(Some(_)) => {}
+                    other => panic!("unexpected event while waiting for TurnComplete: {other:?}"),
+                }
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let summary_path = temp
+            .path()
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("session-memory")
+            .join("summary.md");
+        let metadata_path = temp
+            .path()
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("session-memory")
+            .join("summary.meta.json");
+        assert!(summary_path.exists(), "summary file should exist");
+        assert!(metadata_path.exists(), "summary metadata should exist");
+        let summary = std::fs::read_to_string(&summary_path).unwrap();
+        assert!(summary.contains("## Current State"));
+        assert!(summary.contains("crates/quine-core/src/engine.rs"));
+        let metadata = load_summary_metadata(&metadata_path).unwrap();
+        assert!(metadata.last_summarized_message_index >= 1);
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn session_memory_refresh_clears_inflight_and_advances_multiple_turns() {
+        let temp = TempDir::new().unwrap();
+        let (mut harness, core) = create_channels(ChannelConfig::default());
+        let provider = Arc::new(MockProvider::new("assistant reply"));
+        let loop_handle = tokio::spawn(run_core_loop_with_compaction(
+            core,
+            provider,
+            None,
+            temp.path().to_path_buf(),
+            None,
+        ));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        let _ = harness.output.recv().await.unwrap();
+
+        for content in ["LIVE ROUND 1", "LIVE ROUND 2"] {
+            harness
+                .input
+                .send(CoreInput::UserMessage {
+                    session_id,
+                    content: content.into(),
+                })
+                .await
+                .unwrap();
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), harness.output.recv())
+                    .await
+                {
+                    Ok(Some(CoreOutput::TurnComplete { .. })) => break,
+                    Ok(Some(_)) => {}
+                    other => panic!("unexpected event while waiting for TurnComplete: {other:?}"),
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        }
+
+        let metadata_path = temp
+            .path()
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("session-memory")
+            .join("summary.meta.json");
+        let metadata = load_summary_metadata(&metadata_path).unwrap();
+        assert!(metadata.last_summarized_message_index >= 4);
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_session_memory_foundation_recovers_missing_files() {
+        let temp = TempDir::new().unwrap();
+        let provider = Arc::new(MockProvider::new("assistant reply"));
+        let session_id = SessionId::new();
+
+        {
+            let (mut harness, core) = create_channels(ChannelConfig::default());
+            let loop_handle = tokio::spawn(run_core_loop_with_compaction(
+                core,
+                provider.clone(),
+                None,
+                temp.path().to_path_buf(),
+                None,
+            ));
+            let (reply_tx, reply_rx) = oneshot::channel();
+            harness
+                .input
+                .send(CoreInput::CreateSession {
+                    session_id,
+                    system_prompt: None,
+                    working_directory: None,
+                    skills: Vec::new(),
+                    plan_mode: false,
+                    initial_messages: Vec::new(),
+                    reply: reply_tx,
+                })
+                .await
+                .unwrap();
+            reply_rx.await.unwrap().unwrap();
+            let _ = harness.output.recv().await.unwrap();
+            harness
+                .input
+                .send(CoreInput::UserMessage {
+                    session_id,
+                    content: "seed session memory".into(),
+                })
+                .await
+                .unwrap();
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), harness.output.recv())
+                    .await
+                {
+                    Ok(Some(CoreOutput::TurnComplete { .. })) => break,
+                    Ok(Some(_)) => {}
+                    other => panic!("unexpected event while waiting for TurnComplete: {other:?}"),
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            harness.input.send(CoreInput::Shutdown).await.unwrap();
+            loop_handle.await.unwrap();
+        }
+
+        let summary_dir = temp
+            .path()
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("session-memory");
+        let summary_path = summary_dir.join("summary.md");
+        let metadata_path = summary_dir.join("summary.meta.json");
+        std::fs::remove_file(&summary_path).unwrap();
+        std::fs::remove_file(&metadata_path).unwrap();
+
+        let checkpoint = crate::persistence::CoreCheckpoint::new(
+            vec![crate::persistence::PersistedSession {
+                session_id,
+                created_at: Utc::now(),
+                state: crate::persistence::PersistedSessionState::Idle,
+                config: crate::persistence::PersistedSessionConfig {
+                    system_prompt: None,
+                    skill_names: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap_or_default(),
+                    plan_mode: false,
+                },
+                history: vec![
+                    Message::user("seed session memory"),
+                    Message::assistant("assistant reply"),
+                ],
+                plan_store: crate::persistence::PersistedPlanStore::default(),
+                memory_state: Some(crate::persistence::PersistedMemoryState {
+                    session_memory: Some(crate::persistence::PersistedSessionMemoryState {
+                        enabled: true,
+                        last_summarized_message_index: Some(1),
+                        template_version: 1,
+                    }),
+                }),
+            }],
+            crate::persistence::PersistedSessionTree {
+                parents: std::collections::HashMap::new(),
+                children: std::collections::HashMap::new(),
+                exit_statuses: std::collections::HashMap::new(),
+            },
+        );
+
+        let (mut harness, core) = create_channels(ChannelConfig::default());
+        let loop_handle = tokio::spawn(run_core_loop_with_compaction(
+            core,
+            provider,
+            Some(checkpoint),
+            temp.path().to_path_buf(),
+            None,
+        ));
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "resume after restore".into(),
+            })
+            .await
+            .unwrap();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), harness.output.recv())
+                .await
+            {
+                Ok(Some(CoreOutput::TurnComplete { .. })) => break,
+                Ok(Some(_)) => {}
+                other => panic!("unexpected event while waiting for TurnComplete: {other:?}"),
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert!(summary_path.exists(), "summary file should be recreated");
+        assert!(metadata_path.exists(), "metadata file should be recreated");
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();

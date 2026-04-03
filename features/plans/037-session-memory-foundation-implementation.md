@@ -70,6 +70,7 @@ agreed — reviewed the latest QA plan revision and it now provides executable u
   - Add `mod memory;` and keep it crate-private unless a test/re-export need proves otherwise.
 - `crates/quine-core/src/memory/mod.rs`
   - Introduce the internal memory module entrypoint and shared internal types.
+  - Implemented with crate-private exports for session-memory helpers and summary refresh logic.
 - `crates/quine-core/src/memory/session.rs`
   - Define the concrete runtime structs from the design doc:
     - `SessionMemoryPaths`
@@ -78,9 +79,20 @@ agreed — reviewed the latest QA plan revision and it now provides executable u
   - Keep this focused on runtime bookkeeping and filesystem path ownership.
 - `crates/quine-core/src/memory/template.rs`
   - Define `SessionSummaryDocument` rendering into the canonical `summary.md` template.
-  - Template should include stable headings aligned with the roadmap: `Current State`, `Task Specification`, `Files and Functions`, `Workflow`, `Errors & Corrections`, `Codebase and System Documentation`, `Learnings`, `Key Results`, and `Worklog`.
+  - Template includes the stable headings aligned with the roadmap.
 - `crates/quine-core/src/memory/summary.rs`
-  - Define the concrete metadata/update structs from the design doc:
+  - Implement deterministic transcript-to-summary refresh logic and JSON sidecar metadata parsing/serialization.
+- `crates/quine-core/src/engine.rs`
+  - Extend `SessionContext` with additive session-memory state and diagnostics.
+  - Restore and snapshot persisted session-memory metadata.
+  - Schedule a best-effort asynchronous post-turn summary refresh after turn completion.
+- `crates/quine-core/src/persistence.rs`
+  - Add additive optional persisted memory-state structures to checkpoints with backward-compatible defaults.
+- `crates/quine-core/src/session.rs`
+  - Add `Display` support for `SessionId` so session-owned state paths remain stable and readable.
+- `features/037-session-memory-foundation.md`
+  - Mark feature status as `in-progress` while implementation and validation proceed.
+- Define the concrete metadata/update structs from the design doc:
     - `SessionSummaryMetadata`
     - `SessionSummaryUpdate`
   - Implement deterministic summary refresh logic.
