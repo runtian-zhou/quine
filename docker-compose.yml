@@ -21,7 +21,7 @@ services:
       ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
       PERMISSION_LLM_ENABLED: ${PERMISSION_LLM_ENABLED:-false}
     volumes:
-      - /Users/runtianz/quine:/workspace
+      - .:/workspace
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - quine-target:/workspace/target
