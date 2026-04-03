@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap};
+use std::time::{Duration, Instant};
 
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -32,10 +33,22 @@ fn format_duration_us(us: u64) -> String {
 
 fn tool_duration_label(status: &ToolStatus) -> Option<String> {
     match status {
-        ToolStatus::Running => None,
+        ToolStatus::Running { .. } => None,
         ToolStatus::Success { duration_us } | ToolStatus::Error { duration_us } => {
             Some(format!(" ({})", format_duration_us(*duration_us)))
         }
+    }
+}
+
+fn format_running_timer(started_at: Instant, timeout: Option<Duration>) -> String {
+    let elapsed = started_at.elapsed();
+    let elapsed_label = format_duration_us(elapsed.as_micros() as u64);
+    match timeout {
+        Some(timeout) => {
+            let timeout_label = format_duration_us(timeout.as_micros() as u64);
+            format!(" ({} / {})", elapsed_label, timeout_label)
+        }
+        None => format!(" ({elapsed_label})"),
     }
 }
 
@@ -275,7 +288,7 @@ fn push_conversation_entry_lines(
             ..
         } => {
             let (marker, marker_style) = match status {
-                ToolStatus::Running => ("⟳", Style::default().fg(Color::Yellow)),
+                ToolStatus::Running { .. } => ("⟳", Style::default().fg(Color::Yellow)),
                 ToolStatus::Success { .. } => ("✓", Style::default().fg(Color::Green)),
                 ToolStatus::Error { .. } => ("✗", Style::default().fg(Color::Red)),
             };
@@ -296,6 +309,19 @@ fn push_conversation_entry_lines(
                         .fg(Color::DarkGray)
                         .add_modifier(Modifier::DIM),
                 ));
+            } else if let ToolStatus::Running {
+                started_at,
+                timeout,
+            } = status
+            {
+                if tool_name == "bash" {
+                    spans.push(Span::styled(
+                        format_running_timer(*started_at, *timeout),
+                        Style::default()
+                            .fg(Color::DarkGray)
+                            .add_modifier(Modifier::DIM),
+                    ));
+                }
             }
             lines.push(Line::from(spans));
             if tool_name == "plan" {
@@ -1156,6 +1182,7 @@ mod tests {
     use crate::context_debug::{HistoryEntry, SessionContextSnapshot};
     use crate::tui::app::ConversationEntry;
     use ratatui::layout::{Position, Rect};
+    use std::time::{Duration, Instant};
 
     fn buffer_lines(backend: &ratatui::backend::TestBackend) -> Vec<String> {
         let buffer = backend.buffer();
@@ -1577,7 +1604,10 @@ mod tests {
             tool_name: "bash".into(),
             tool_use_id: "tc1".into(),
             summary: "echo running".into(),
-            status: ToolStatus::Running,
+            status: ToolStatus::Running {
+                started_at: Instant::now(),
+                timeout: Some(Duration::from_secs(120)),
+            },
             result_preview: None,
         });
         app.messages.push(ConversationEntry::ToolCall {
@@ -1617,7 +1647,10 @@ mod tests {
             tool_name: "bash".into(),
             tool_use_id: "tc1".into(),
             summary: "echo test".into(),
-            status: ToolStatus::Running,
+            status: ToolStatus::Running {
+                started_at: Instant::now(),
+                timeout: Some(Duration::from_secs(120)),
+            },
             result_preview: None,
         });
         app.messages
@@ -1664,7 +1697,10 @@ mod tests {
             tool_name: "bash".into(),
             tool_use_id: "tc1".into(),
             summary: "echo test".into(),
-            status: ToolStatus::Running,
+            status: ToolStatus::Running {
+                started_at: Instant::now() - Duration::from_secs(3),
+                timeout: Some(Duration::from_secs(120)),
+            },
             result_preview: None,
         });
 
@@ -1684,6 +1720,30 @@ mod tests {
 
         assert_eq!(tool_index - assistant_index, 2);
         assert!(lines[assistant_index + 1].is_empty());
+    }
+
+    #[test]
+    fn draw_renders_bash_running_timer_with_elapsed_and_timeout() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "bash".into(),
+            tool_use_id: "tc1".into(),
+            summary: "sleep 10".into(),
+            status: ToolStatus::Running {
+                started_at: Instant::now() - Duration::from_secs(3),
+                timeout: Some(Duration::from_secs(120)),
+            },
+            result_preview: None,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("bash: sleep 10") && line.contains("3.0s / 120s")));
     }
 
     #[test]
