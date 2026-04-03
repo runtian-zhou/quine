@@ -48,6 +48,7 @@ pub async fn run_tui_chat(
     let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
 
     // Create or resume session.
+    let session_plan_mode = resumed.as_ref().map(|target| target.plan_mode);
     let session = match resumed {
         Some(target) => crate::session::CreatedSession {
             session_id: target.session_id,
@@ -75,7 +76,11 @@ pub async fn run_tui_chat(
         original_hook(info);
     }));
 
-    let mut app = app::App::new(session.session_id, plan_mode, session.max_context_window);
+    let mut app = app::App::new(
+        session.session_id,
+        session_plan_mode.unwrap_or(plan_mode),
+        session.max_context_window,
+    );
     let mut event_stream = EventStream::new();
     let mut spinner_interval = tokio::time::interval(Duration::from_millis(80));
 

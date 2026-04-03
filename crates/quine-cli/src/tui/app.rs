@@ -880,8 +880,8 @@ impl App {
                         }
                     },
                     SlashCommand::Skill { name, arguments } => {
-                        self.push_message(ConversationEntry::User(text.clone()));
                         if self.plan_mode {
+                            self.push_message(ConversationEntry::User(text.clone()));
                             self.push_message(ConversationEntry::InteractionQuestion {
                                 prompt: format!(
                                     "Leave plan mode and start /{name}? Answer yes or no."
@@ -1890,10 +1890,7 @@ mod tests {
             Some(AppAction::SendSlashSkillMessage { skill_name, request })
                 if skill_name == "review" && request == "audit this"
         ));
-        assert!(matches!(
-            app.messages.last(),
-            Some(ConversationEntry::User(text)) if text == "/review audit this"
-        ));
+        assert!(app.messages.is_empty());
         assert!(matches!(app.phase, AgentPhase::Thinking));
     }
 
@@ -1998,10 +1995,7 @@ mod tests {
             Some(AppAction::SendSlashSkillMessage { skill_name, request })
                 if skill_name == "feature-planning" && request.is_empty()
         ));
-        assert!(matches!(
-            app.messages.last(),
-            Some(ConversationEntry::User(text)) if text == "/feature-planning"
-        ));
+        assert!(app.messages.is_empty());
         assert!(matches!(app.phase, AgentPhase::Thinking));
     }
 

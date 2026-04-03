@@ -5,6 +5,7 @@ use quine_llm::Message;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResumeTarget {
     pub(crate) session_id: String,
+    pub(crate) plan_mode: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -107,6 +108,10 @@ pub(crate) async fn resolve_resume_target(
                 .and_then(|value| value.as_str())
                 .ok_or_else(|| anyhow::anyhow!("checkpoint session missing session_id"))?
                 .to_string(),
+            plan_mode: session
+                .get("plan_mode")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
         })),
         None => anyhow::bail!("checkpoint not found: {checkpoint}"),
     }
@@ -274,6 +279,43 @@ mod tests {
         assert_eq!(
             picked.get("session_id").and_then(|v| v.as_str()),
             Some("newer")
+        );
+    }
+
+    #[test]
+    fn resolve_resume_target_extracts_plan_mode() {
+        let sessions = serde_json::json!([
+            {"session_id": "normal", "first_event": "2024-01-01T00:00:00Z", "plan_mode": false},
+            {"session_id": "planner", "first_event": "2024-01-02T00:00:00Z", "plan_mode": true}
+        ]);
+        let picked = sessions
+            .as_array()
+            .unwrap()
+            .iter()
+            .max_by_key(|session| {
+                session
+                    .get("first_event")
+                    .and_then(|value| value.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap();
+        let target = ResumeTarget {
+            session_id: picked
+                .get("session_id")
+                .and_then(|value| value.as_str())
+                .unwrap()
+                .to_string(),
+            plan_mode: picked
+                .get("plan_mode")
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false),
+        };
+        assert_eq!(
+            target,
+            ResumeTarget {
+                session_id: "planner".into(),
+                plan_mode: true
+            }
         );
     }
 
