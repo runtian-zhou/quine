@@ -4,7 +4,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: scripts/run-docker-workspace.sh [--chat] [--image TAG] [--no-build] [--] [command...]
+Usage: scripts/run-docker-workspace.sh [--chat] [--image TAG] [--build|--no-build] [--] [command...]
 
 Build a Quine Docker image from the current git workspace and run it with the
 workspace mounted at /workspace. For linked worktrees, the script also mounts
@@ -17,6 +17,7 @@ GitHub CLI auth is stored in a persistent Docker volume. On first use, run
 Options:
   --chat        Run `cargo run --bin quine -- chat --auto-approve` instead of opening a shell.
   --image TAG   Override the Docker image tag.
+  --build       Force `docker build` before running.
   --no-build    Skip `docker build`.
   --help        Show this help.
 
@@ -49,7 +50,7 @@ warn() {
 
 mode="shell"
 image_tag=""
-build_image=1
+build_image="auto"
 command_args=()
 entrypoint_args=()
 
@@ -64,8 +65,12 @@ while [[ $# -gt 0 ]]; do
       image_tag="$2"
       shift 2
       ;;
+    --build)
+      build_image="yes"
+      shift
+      ;;
     --no-build)
-      build_image=0
+      build_image="no"
       shift
       ;;
     --help|-h)
@@ -90,12 +95,15 @@ workspace_root="$(abs_path "$workspace_root")"
 git_dir_abs="$(git -C "$workspace_root" rev-parse --path-format=absolute --git-dir)"
 common_dir_abs="$(git -C "$workspace_root" rev-parse --path-format=absolute --git-common-dir)"
 origin_url="$(git -C "$workspace_root" remote get-url origin 2>/dev/null || true)"
+git_commit_hash="$(git -C "$workspace_root" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 
 workspace_name="$(basename "$workspace_root")"
 if [[ -z "$image_tag" ]]; then
   image_tag="quine-workspace:${workspace_name}"
 fi
 gh_auth_volume="${GH_AUTH_VOLUME:-quine-gh-auth-${workspace_name}}"
+cargo_registry_volume="${CARGO_REGISTRY_VOLUME:-quine-cargo-registry-${workspace_name}}"
+cargo_git_volume="${CARGO_GIT_VOLUME:-quine-cargo-git-${workspace_name}}"
 
 if [[ ${#command_args[@]} -eq 0 ]]; then
   if [[ "$mode" == "chat" ]]; then
@@ -110,9 +118,16 @@ else
   command_args=("${command_args[@]:1}")
 fi
 
-if [[ "$build_image" -eq 1 ]]; then
+if [[ "$build_image" == "yes" ]]; then
   echo "Building Docker image: $image_tag"
-  docker build -t "$image_tag" "$workspace_root"
+  docker build --build-arg "GIT_COMMIT_HASH=${git_commit_hash}" -t "$image_tag" "$workspace_root"
+elif [[ "$build_image" == "auto" ]]; then
+  if docker image inspect "$image_tag" >/dev/null 2>&1; then
+    echo "Using cached Docker image: $image_tag"
+  else
+    echo "Building Docker image: $image_tag"
+    docker build --build-arg "GIT_COMMIT_HASH=${git_commit_hash}" -t "$image_tag" "$workspace_root"
+  fi
 fi
 
 tmpdir="$(mktemp -d "${TMPDIR:-/tmp}/quine-docker-workspace.XXXXXX")"
@@ -126,12 +141,15 @@ mounts=(
   --mount "type=bind,src=${workspace_root},dst=${workspace_root}"
   --mount "type=bind,src=${common_dir_abs},dst=${common_dir_abs}"
   --mount "type=volume,src=${gh_auth_volume},dst=/root/.config/gh"
+  --mount "type=volume,src=${cargo_registry_volume},dst=/usr/local/cargo/registry"
+  --mount "type=volume,src=${cargo_git_volume},dst=/usr/local/cargo/git"
 )
 docker_env=(
   -e XDG_RUNTIME_DIR=/tmp/xdg-runtime
   -e XDG_STATE_HOME=/root/.quine
   -e GIT_CONFIG_GLOBAL=/root/.gitconfig
   -e GH_CONFIG_DIR=/root/.config/gh
+  -e CARGO_TARGET_DIR=/opt/quine-target
   -e LLM_PROVIDER="${LLM_PROVIDER:-openai}"
   -e LLM_BASE_URL="${LLM_BASE_URL:-http://host.docker.internal:8000/v1}"
   -e LLM_API_KEY="${LLM_API_KEY:-}"
@@ -183,6 +201,8 @@ fi
 echo "Starting container from workspace: $workspace_root"
 echo "Git common dir mounted from: $common_dir_abs"
 echo "GitHub auth volume: $gh_auth_volume"
+echo "Cargo registry volume: $cargo_registry_volume"
+echo "Cargo git volume: $cargo_git_volume"
 if [[ "$origin_url" == https://github.com/* ]]; then
   echo "If this is the first run, authorize inside Docker with: gh auth login -h github.com"
 fi

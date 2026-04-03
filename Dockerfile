@@ -12,16 +12,26 @@ RUN apt-get update \
         ripgrep \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /workspace
-
 ENV CARGO_HOME=/usr/local/cargo
+ENV CARGO_TARGET_DIR=/opt/quine-target
 ENV HOME=/root
 ENV XDG_RUNTIME_DIR=/tmp/xdg-runtime
 ENV XDG_STATE_HOME=/root/.quine
 
 RUN rustup component add clippy rustfmt
 
-RUN mkdir -p /tmp/xdg-runtime /root/.quine/state
+RUN mkdir -p /tmp/xdg-runtime /root/.quine/state /opt/quine-target
+
+WORKDIR /opt/quine-src
+
+COPY . .
+
+ARG GIT_COMMIT_HASH=unknown
+ENV GIT_COMMIT_HASH=${GIT_COMMIT_HASH}
+
+RUN cargo build --bin quine
+
+WORKDIR /workspace
 
 ENTRYPOINT ["/bin/bash"]
 CMD ["-l"]
