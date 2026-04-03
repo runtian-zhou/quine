@@ -1,14 +1,12 @@
 use std::path::Path;
 
-use quine_llm::Message;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::IpcClient;
 use crate::context_debug::render_session_context;
 use crate::render::{Renderer, TerminalRenderer};
 use crate::session::{
-    create_session, create_session_with_initial_messages, create_slash_skill_session,
-    resolve_resume_target,
+    create_session, create_slash_skill_session, exit_plan_mode, resolve_resume_target,
 };
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{methods, notifications};
@@ -67,11 +65,9 @@ enum ChatCommandAction {
 
 async fn maybe_exit_plan_mode(
     client: &mut IpcClient,
-    skills: &[String],
-    auto_approve_permissions: bool,
     lines: &mut tokio::io::Lines<BufReader<tokio::io::Stdin>>,
     session_in_plan_mode: &mut bool,
-    session: &mut crate::session::CreatedSession,
+    session_id: &str,
     completed_text: &str,
 ) -> anyhow::Result<bool> {
     if !*session_in_plan_mode {
@@ -93,15 +89,7 @@ async fn maybe_exit_plan_mode(
         return Ok(false);
     }
 
-    let initial_messages = [Message::assistant(final_plan.to_string())];
-    *session = create_session_with_initial_messages(
-        client,
-        skills,
-        false,
-        auto_approve_permissions,
-        &initial_messages,
-    )
-    .await?;
+    exit_plan_mode(client, session_id).await?;
     *session_in_plan_mode = false;
 
     Ok(true)
@@ -303,22 +291,17 @@ pub async fn run_chat(
                                             if handled {
                                                 if maybe_exit_plan_mode(
                                                     &mut client,
-                                                    skills,
-                                                    auto_approve_permissions,
                                                     &mut lines,
                                                     &mut session_in_plan_mode,
-                                                    &mut session,
+                                                    &session.session_id,
                                                     &completed_text,
                                                 )
                                                 .await?
                                                 {
-                                                    eprintln!(
-                                                        "Plan complete; started normal session with final plan: {}",
-                                                        session.session_id
-                                                    );
+                                                    eprintln!("Plan complete; session left plan mode.");
                                                     renderer
                                                         .render_info(
-                                                            "Final plan carried over into the new session.",
+                                                            "Session left plan mode; the final plan remains in the transcript.",
                                                         )
                                                         .await?;
                                                 }

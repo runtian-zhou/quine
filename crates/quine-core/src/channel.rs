@@ -37,6 +37,12 @@ pub enum CoreInput {
         content: String,
     },
 
+    /// Leave read-only plan mode for an existing session.
+    ExitPlanMode {
+        session_id: SessionId,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+
     /// Schedule a user message for future delivery.
     ScheduleUserMessage {
         session_id: SessionId,

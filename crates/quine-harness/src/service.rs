@@ -23,6 +23,13 @@ pub trait HarnessService: Send + Sync {
         content: String,
     ) -> Result<(), HarnessError>;
 
+    /// Leave read-only plan mode for an existing session.
+    async fn exit_plan_mode(&self, _session_id: SessionId) -> Result<(), HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
     /// Compact an existing session's conversation history.
     async fn compact_session(&self, session_id: SessionId) -> Result<(), HarnessError>;
 

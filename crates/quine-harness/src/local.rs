@@ -250,6 +250,21 @@ impl HarnessService for LocalHarness {
             .map_err(|_| HarnessError::CoreChannelClosed)
     }
 
+    async fn exit_plan_mode(&self, session_id: SessionId) -> Result<(), HarnessError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.core_input
+            .send(CoreInput::ExitPlanMode {
+                session_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+        reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|message| HarnessError::Internal { message })
+    }
+
     async fn compact_session(&self, session_id: SessionId) -> Result<(), HarnessError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.core_input
@@ -710,6 +725,115 @@ mod tests {
         })
         .await
         .unwrap();
+
+        restored.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
+    async fn local_harness_exit_plan_mode_updates_persisted_session_state() {
+        let storage = temp_storage();
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let session_id = harness
+            .create_session(SessionConfig {
+                plan_mode: true,
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if harness
+                    .list_sessions()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|session| {
+                        session
+                            .get("session_id")
+                            .and_then(|value| value.as_str())
+                            .map(|value| {
+                                value
+                                    == serde_json::to_value(session_id)
+                                        .ok()
+                                        .and_then(|value| value.as_str().map(str::to_owned))
+                                        .unwrap_or_default()
+                            })
+                            .unwrap_or(false)
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session should appear in local session listing");
+
+        let persisted_before = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(plan_mode) =
+                    storage
+                        .load_latest_checkpoint()
+                        .await
+                        .unwrap()
+                        .and_then(|checkpoint| {
+                            checkpoint
+                                .sessions
+                                .iter()
+                                .find(|session| session.session_id == session_id)
+                                .map(|session| session.config.plan_mode)
+                        })
+                {
+                    break plan_mode;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session should be persisted before exit");
+        assert!(persisted_before);
+
+        harness.exit_plan_mode(session_id).await.unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if storage
+                    .load_latest_checkpoint()
+                    .await
+                    .unwrap()
+                    .and_then(|checkpoint| {
+                        checkpoint
+                            .sessions
+                            .iter()
+                            .find(|session| session.session_id == session_id)
+                            .map(|session| session.config.plan_mode)
+                    })
+                    == Some(false)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("checkpoint should persist updated plan_mode");
+
+        harness.shutdown().await.unwrap();
+
+        let restored = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let checkpoint_restored = restored.get_session_context(session_id).await.unwrap();
+        let session_restored = checkpoint_restored
+            .sessions
+            .iter()
+            .find(|session| session.session_id == session_id)
+            .expect("session should restore from checkpoint");
+        assert!(!session_restored.config.plan_mode);
 
         restored.shutdown().await.unwrap();
         let _ = fs::remove_dir_all(storage.root());

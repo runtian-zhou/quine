@@ -7,8 +7,8 @@ use futures::StreamExt;
 use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, ToolDefinition};
 use tokio::sync::{mpsc, oneshot, Notify};
 
-use tokio::time::{Duration, Instant};
 use tokio::task::JoinSet;
+use tokio::time::{Duration, Instant};
 
 use crate::channel::{
     CoreHandle, CoreInput, CoreOutput, MailboxMessage, MessageSource, ToolOutcome,
@@ -212,14 +212,81 @@ impl SessionInit {
     }
 }
 
+fn build_tool_registry_for_session(
+    provider: &Arc<dyn LlmProvider>,
+    plan_store: crate::tool::plan::PlanStore,
+    persisted_config: &PersistedSessionConfig,
+    skills: &[Skill],
+) -> ToolRegistry {
+    let mut tool_registry = ToolRegistry::new();
+    tool_registry.register(Arc::new(ReadTool));
+    tool_registry.register(Arc::new(BashTool));
+    tool_registry.register(Arc::new(FindTool));
+    tool_registry.register(Arc::new(AskUserTool));
+    tool_registry.register(Arc::new(PlanTool::new(plan_store)));
+
+    if !persisted_config.plan_mode {
+        tool_registry.register(Arc::new(WriteTool));
+        tool_registry.register(Arc::new(SubagentTool::new(Arc::clone(provider))));
+        tool_registry.register(Arc::new(SpawnTool));
+        tool_registry.register(Arc::new(WaitChildTool));
+        tool_registry.register(Arc::new(SignalTool));
+        tool_registry.register(Arc::new(SendMessageTool));
+        tool_registry.register(Arc::new(RecvMessageTool));
+    }
+
+    for skill in skills {
+        for tool_def in &skill.tool_definitions {
+            tool_registry.register(Arc::new(SkillTemplateTool::new(tool_def.clone())));
+        }
+    }
+
+    tool_registry
+}
+
+fn build_combined_system_prompt(
+    working_directory: &std::path::Path,
+    persisted_config: &PersistedSessionConfig,
+    skills: &[Skill],
+) -> Option<String> {
+    let mut prompt_parts = Vec::new();
+
+    if persisted_config.plan_mode {
+        prompt_parts.push(PLAN_MODE_SYSTEM_PROMPT.to_string());
+    }
+
+    if let Some(claude_md_path) = find_claude_md(working_directory) {
+        if let Ok(content) = std::fs::read_to_string(&claude_md_path) {
+            prompt_parts.push(format!(
+                "# Project Instructions (from CLAUDE.md)\n\n{content}"
+            ));
+        }
+    }
+
+    if let Some(base) = &persisted_config.system_prompt {
+        prompt_parts.push(base.clone());
+    }
+    for skill in skills {
+        if let Some(sp) = &skill.system_prompt {
+            prompt_parts.push(format!("\n## Skill: {}\n{}", skill.meta.name, sp));
+        }
+    }
+
+    if prompt_parts.is_empty() {
+        prompt_parts.push(DEFAULT_SYSTEM_PROMPT.to_string());
+    }
+
+    Some(prompt_parts.join("\n\n"))
+}
+
 impl SessionContext {
     async fn new(init: SessionInit, provider: &Arc<dyn LlmProvider>) -> Result<Self, CoreError> {
         let persisted_config = init.to_persisted_config();
         let SessionInit {
-            system_prompt,
+            system_prompt: _,
             skills,
             working_directory,
-            plan_mode,
+            plan_mode: _,
             initial_messages,
             archive_root,
             max_context_window,
@@ -234,65 +301,16 @@ impl SessionContext {
 
         let plan_store = crate::tool::plan::new_plan_store();
 
-        let mut tool_registry = ToolRegistry::new();
-        tool_registry.register(Arc::new(ReadTool));
-        tool_registry.register(Arc::new(BashTool));
-        tool_registry.register(Arc::new(FindTool));
-        tool_registry.register(Arc::new(AskUserTool));
-        tool_registry.register(Arc::new(PlanTool::new(plan_store.clone())));
-
-        if !plan_mode {
-            tool_registry.register(Arc::new(WriteTool));
-            tool_registry.register(Arc::new(SubagentTool::new(Arc::clone(provider))));
-            tool_registry.register(Arc::new(SpawnTool));
-            tool_registry.register(Arc::new(WaitChildTool));
-            tool_registry.register(Arc::new(SignalTool));
-            tool_registry.register(Arc::new(SendMessageTool));
-            tool_registry.register(Arc::new(RecvMessageTool));
-        }
-
-        // Register skill template tools.
-        for skill in &skills {
-            for tool_def in &skill.tool_definitions {
-                tool_registry.register(Arc::new(SkillTemplateTool::new(tool_def.clone())));
-            }
-        }
-
+        let tool_registry = build_tool_registry_for_session(
+            provider,
+            plan_store.clone(),
+            &persisted_config,
+            &skills,
+        );
         let tools = tool_registry.tool_definitions();
 
-        // Build combined system prompt: CLAUDE.md + base + skills + default fallback.
-        let combined_prompt = {
-            let mut prompt_parts = Vec::new();
-
-            // In plan mode, prepend the read-only architect prompt.
-            if plan_mode {
-                prompt_parts.push(PLAN_MODE_SYSTEM_PROMPT.to_string());
-            }
-
-            // Auto-load CLAUDE.md from working directory (with parent traversal).
-            if let Some(claude_md_path) = find_claude_md(&working_directory) {
-                if let Ok(content) = std::fs::read_to_string(&claude_md_path) {
-                    prompt_parts.push(format!(
-                        "# Project Instructions (from CLAUDE.md)\n\n{content}"
-                    ));
-                }
-            }
-
-            if let Some(base) = &system_prompt {
-                prompt_parts.push(base.clone());
-            }
-            for skill in &skills {
-                if let Some(sp) = &skill.system_prompt {
-                    prompt_parts.push(format!("\n## Skill: {}\n{}", skill.meta.name, sp));
-                }
-            }
-
-            // Always ensure a system prompt exists (critical for local models).
-            if prompt_parts.is_empty() {
-                prompt_parts.push(DEFAULT_SYSTEM_PROMPT.to_string());
-            }
-            Some(prompt_parts.join("\n\n"))
-        };
+        let combined_prompt =
+            build_combined_system_prompt(&working_directory, &persisted_config, &skills);
 
         let mut history = Vec::new();
         if let Some(prompt) = &combined_prompt {
@@ -400,6 +418,66 @@ impl SessionContext {
             plan_store: crate::tool::plan::snapshot_plan_store(&self.plan_store).await,
         })
     }
+
+    async fn rebuild_session_config(
+        &mut self,
+        provider: &Arc<dyn LlmProvider>,
+    ) -> Result<(), CoreError> {
+        let skills = crate::skill::load_skills(
+            &self.persisted_config.working_directory,
+            &self.persisted_config.skill_names,
+        )
+        .await;
+        self.tool_registry = build_tool_registry_for_session(
+            provider,
+            self.plan_store.clone(),
+            &self.persisted_config,
+            &skills,
+        );
+        self.tools = self.tool_registry.tool_definitions();
+        self.system_prompt = build_combined_system_prompt(
+            &self.persisted_config.working_directory,
+            &self.persisted_config,
+            &skills,
+        );
+
+        match &self.system_prompt {
+            Some(prompt) => {
+                if matches!(
+                    self.history.first(),
+                    Some(Message {
+                        role: quine_llm::Role::System,
+                        ..
+                    })
+                ) {
+                    self.history[0] = Message::system(prompt.clone());
+                } else {
+                    self.history.insert(0, Message::system(prompt.clone()));
+                }
+            }
+            None => {
+                if matches!(
+                    self.history.first(),
+                    Some(Message {
+                        role: quine_llm::Role::System,
+                        ..
+                    })
+                ) {
+                    self.history.remove(0);
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn exit_plan_mode(&mut self, provider: &Arc<dyn LlmProvider>) -> Result<(), CoreError> {
+        if !self.persisted_config.plan_mode {
+            return Ok(());
+        }
+        self.persisted_config.plan_mode = false;
+        self.rebuild_session_config(provider).await
+    }
 }
 
 fn mailbox_matches_source(message: &MailboxMessage, source: &MessageSource) -> bool {
@@ -420,7 +498,10 @@ fn pop_mailbox_message(
 }
 
 fn waiting_on_session(session: &SessionContext) -> Option<SessionId> {
-    session.suspended_wait.as_ref().and_then(SuspendedWait::depends_on)
+    session
+        .suspended_wait
+        .as_ref()
+        .and_then(SuspendedWait::depends_on)
 }
 
 fn waiting_would_cycle(
@@ -464,10 +545,12 @@ async fn resume_session_from_wait(
     io: &mut CoreIo<'_>,
     engine: &mut EngineState<'_>,
 ) {
-    let Some(tool_use_id) = sessions
-        .get(&session_id)
-        .and_then(|session| session.suspended_wait.as_ref().map(|wait| wait.tool_use_id().to_string()))
-    else {
+    let Some(tool_use_id) = sessions.get(&session_id).and_then(|session| {
+        session
+            .suspended_wait
+            .as_ref()
+            .map(|wait| wait.tool_use_id().to_string())
+    }) else {
         return;
     };
 
@@ -504,7 +587,11 @@ async fn resume_session_from_wait(
 
     if let Some(session) = sessions.get_mut(&session_id) {
         session.suspended_wait = None;
-        session.history.push(Message::tool_result(&tool_use_id, &history_output, is_error));
+        session.history.push(Message::tool_result(
+            &tool_use_id,
+            &history_output,
+            is_error,
+        ));
         session.state = SessionState::Streaming;
     }
 
@@ -537,14 +624,19 @@ async fn resume_session_from_wait(
             io.output,
             io.deferred_inputs,
         )
-            .await;
+        .await;
     }
 }
 
 fn next_wait_deadline(sessions: &HashMap<SessionId, SessionContext>) -> Option<Instant> {
     sessions
         .values()
-        .filter_map(|session| session.suspended_wait.as_ref().and_then(SuspendedWait::timeout_at))
+        .filter_map(|session| {
+            session
+                .suspended_wait
+                .as_ref()
+                .and_then(SuspendedWait::timeout_at)
+        })
         .min()
 }
 
@@ -1205,10 +1297,7 @@ async fn compact_session_history(
     Ok(true)
 }
 
-fn clear_suspended_wait(
-    sessions: &mut HashMap<SessionId, SessionContext>,
-    session_id: SessionId,
-) {
+fn clear_suspended_wait(sessions: &mut HashMap<SessionId, SessionContext>, session_id: SessionId) {
     if let Some(session) = sessions.get_mut(&session_id) {
         session.suspended_wait = None;
         if session.state == SessionState::Waiting {
@@ -1331,12 +1420,14 @@ async fn finalize_child_session(
 
     let waiting_parents: Vec<SessionId> = sessions
         .iter()
-        .filter_map(|(candidate_id, candidate)| match candidate.suspended_wait.as_ref() {
-            Some(SuspendedWait::ChildExit { child_id, .. }) if *child_id == session_id => {
-                Some(*candidate_id)
-            }
-            _ => None,
-        })
+        .filter_map(
+            |(candidate_id, candidate)| match candidate.suspended_wait.as_ref() {
+                Some(SuspendedWait::ChildExit { child_id, .. }) if *child_id == session_id => {
+                    Some(*candidate_id)
+                }
+                _ => None,
+            },
+        )
         .collect();
 
     let _ = output
@@ -1438,7 +1529,6 @@ async fn start_child_session(
     });
     Ok(())
 }
-
 
 /// Execute a tool call directly within the core.
 ///
@@ -2654,7 +2744,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         None => break,
                     }
                 }
-            },
+            }
         };
         match input {
             CoreInput::CreateSession {
@@ -2719,6 +2809,31 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     Err(e) => {
                         debug_log_session(session_id, format!("session creation failed: {e}"));
                         let _ = reply.send(Err(format!("failed to create session: {e}")));
+                    }
+                }
+            }
+
+            CoreInput::ExitPlanMode { session_id, reply } => {
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    let _ = reply.send(Err("unknown session".into()));
+                    continue;
+                };
+
+                if !matches!(session.state, SessionState::Idle | SessionState::Paused) {
+                    let _ = reply.send(Err(format!(
+                        "cannot exit plan mode while session is {:?}",
+                        session.state
+                    )));
+                    continue;
+                }
+
+                match session.exit_plan_mode(&provider).await {
+                    Ok(()) => {
+                        emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(format!("failed to exit plan mode: {error}")));
                     }
                 }
             }
@@ -2843,9 +2958,9 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 {
                     let resume_result = match wait {
                         SuspendedWait::Mailbox { source, .. } => {
-                            let message = sessions
-                                .get_mut(&session_id)
-                                .and_then(|session| pop_mailbox_message(&mut session.mailbox, &source));
+                            let message = sessions.get_mut(&session_id).and_then(|session| {
+                                pop_mailbox_message(&mut session.mailbox, &source)
+                            });
                             match message {
                                 Some(MailboxMessage { from, content }) => ToolOutcome::Success {
                                     output: serde_json::json!({
@@ -2860,18 +2975,18 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                 },
                             }
                         }
-                        SuspendedWait::ChildExit { child_id, .. } => match session_tree
-                            .exit_status(child_id)
-                            .cloned()
-                        {
-                            Some(status) => ToolOutcome::Success {
-                                output: serde_json::to_string(&status)
-                                    .unwrap_or_else(|_| "unknown".into()),
-                            },
-                            None => ToolOutcome::Error {
-                                message: "wait_child resumed before child exit was recorded".into(),
-                            },
-                        },
+                        SuspendedWait::ChildExit { child_id, .. } => {
+                            match session_tree.exit_status(child_id).cloned() {
+                                Some(status) => ToolOutcome::Success {
+                                    output: serde_json::to_string(&status)
+                                        .unwrap_or_else(|_| "unknown".into()),
+                                },
+                                None => ToolOutcome::Error {
+                                    message: "wait_child resumed before child exit was recorded"
+                                        .into(),
+                                },
+                            }
+                        }
                     };
 
                     let mut io = CoreIo {
@@ -3225,7 +3340,11 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 } else {
                     None
                 };
-                let _ = reply.send(if result.is_some() || non_blocking { result } else { None });
+                let _ = reply.send(if result.is_some() || non_blocking {
+                    result
+                } else {
+                    None
+                });
             }
         }
     }
@@ -3292,42 +3411,48 @@ mod tests {
             .build()
             .unwrap();
         let mut sessions = HashMap::new();
-        let session_a = runtime.block_on(SessionContext::new(
-            SessionInit {
-                system_prompt: None,
-                skills: Vec::new(),
-                working_directory: std::env::current_dir().unwrap_or_default(),
-                plan_mode: false,
-                initial_messages: Vec::new(),
-                archive_root: std::env::temp_dir().join("quine-core-wait-cycles-a"),
-                max_context_window: None,
-            },
-            &provider,
-        )).unwrap();
-        let session_b = runtime.block_on(SessionContext::new(
-            SessionInit {
-                system_prompt: None,
-                skills: Vec::new(),
-                working_directory: std::env::current_dir().unwrap_or_default(),
-                plan_mode: false,
-                initial_messages: Vec::new(),
-                archive_root: std::env::temp_dir().join("quine-core-wait-cycles-b"),
-                max_context_window: None,
-            },
-            &provider,
-        )).unwrap();
-        let session_c = runtime.block_on(SessionContext::new(
-            SessionInit {
-                system_prompt: None,
-                skills: Vec::new(),
-                working_directory: std::env::current_dir().unwrap_or_default(),
-                plan_mode: false,
-                initial_messages: Vec::new(),
-                archive_root: std::env::temp_dir().join("quine-core-wait-cycles-c"),
-                max_context_window: None,
-            },
-            &provider,
-        )).unwrap();
+        let session_a = runtime
+            .block_on(SessionContext::new(
+                SessionInit {
+                    system_prompt: None,
+                    skills: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap_or_default(),
+                    plan_mode: false,
+                    initial_messages: Vec::new(),
+                    archive_root: std::env::temp_dir().join("quine-core-wait-cycles-a"),
+                    max_context_window: None,
+                },
+                &provider,
+            ))
+            .unwrap();
+        let session_b = runtime
+            .block_on(SessionContext::new(
+                SessionInit {
+                    system_prompt: None,
+                    skills: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap_or_default(),
+                    plan_mode: false,
+                    initial_messages: Vec::new(),
+                    archive_root: std::env::temp_dir().join("quine-core-wait-cycles-b"),
+                    max_context_window: None,
+                },
+                &provider,
+            ))
+            .unwrap();
+        let session_c = runtime
+            .block_on(SessionContext::new(
+                SessionInit {
+                    system_prompt: None,
+                    skills: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap_or_default(),
+                    plan_mode: false,
+                    initial_messages: Vec::new(),
+                    archive_root: std::env::temp_dir().join("quine-core-wait-cycles-c"),
+                    max_context_window: None,
+                },
+                &provider,
+            ))
+            .unwrap();
 
         let id_a = SessionId::new();
         let id_b = SessionId::new();
@@ -3364,30 +3489,34 @@ mod tests {
         let mut sessions = HashMap::new();
         let id_a = SessionId::new();
         let id_b = SessionId::new();
-        let mut session_a = runtime.block_on(SessionContext::new(
-            SessionInit {
-                system_prompt: None,
-                skills: Vec::new(),
-                working_directory: std::env::current_dir().unwrap_or_default(),
-                plan_mode: false,
-                initial_messages: Vec::new(),
-                archive_root: std::env::temp_dir().join("quine-core-timeout-a"),
-                max_context_window: None,
-            },
-            &provider,
-        )).unwrap();
-        let mut session_b = runtime.block_on(SessionContext::new(
-            SessionInit {
-                system_prompt: None,
-                skills: Vec::new(),
-                working_directory: std::env::current_dir().unwrap_or_default(),
-                plan_mode: false,
-                initial_messages: Vec::new(),
-                archive_root: std::env::temp_dir().join("quine-core-timeout-b"),
-                max_context_window: None,
-            },
-            &provider,
-        )).unwrap();
+        let mut session_a = runtime
+            .block_on(SessionContext::new(
+                SessionInit {
+                    system_prompt: None,
+                    skills: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap_or_default(),
+                    plan_mode: false,
+                    initial_messages: Vec::new(),
+                    archive_root: std::env::temp_dir().join("quine-core-timeout-a"),
+                    max_context_window: None,
+                },
+                &provider,
+            ))
+            .unwrap();
+        let mut session_b = runtime
+            .block_on(SessionContext::new(
+                SessionInit {
+                    system_prompt: None,
+                    skills: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap_or_default(),
+                    plan_mode: false,
+                    initial_messages: Vec::new(),
+                    archive_root: std::env::temp_dir().join("quine-core-timeout-b"),
+                    max_context_window: None,
+                },
+                &provider,
+            ))
+            .unwrap();
         let early = Instant::now() + TokioDuration::from_millis(10);
         let late = Instant::now() + TokioDuration::from_millis(20);
         session_a.suspended_wait = Some(SuspendedWait::Mailbox {
@@ -3463,7 +3592,10 @@ mod tests {
 
         let mut saw_tool_error = false;
         while let Ok(event) = output_rx.try_recv() {
-            if let CoreOutput::ToolResult { is_error, content, .. } = event {
+            if let CoreOutput::ToolResult {
+                is_error, content, ..
+            } = event
+            {
                 saw_tool_error = is_error && content.contains("recv_message timed out");
             }
         }
@@ -3519,11 +3651,8 @@ mod tests {
         }
 
         let session = sessions.get_mut(&waiting_id).unwrap();
-        let message = pop_mailbox_message(
-            &mut session.mailbox,
-            &MessageSource::Session(sender_id),
-        )
-        .expect("expected queued mailbox message");
+        let message = pop_mailbox_message(&mut session.mailbox, &MessageSource::Session(sender_id))
+            .expect("expected queued mailbox message");
         assert_eq!(message.content, "hello");
 
         let event = output_rx.recv().await.expect("expected MessageReceived");

@@ -418,6 +418,47 @@ async fn handle_request(
             }
         }
 
+        methods::EXIT_PLAN_MODE => {
+            let session_id = match request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("session_id"))
+                .cloned()
+                .map(serde_json::from_value::<quine_core::SessionId>)
+                .transpose()
+            {
+                Ok(Some(session_id)) => session_id,
+                Ok(None) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing session_id",
+                    );
+                    return Some(serde_json::to_string(&resp).unwrap_or_default());
+                }
+                Err(error) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid session_id: {error}"),
+                    );
+                    return Some(serde_json::to_string(&resp).unwrap_or_default());
+                }
+            };
+
+            match service.exit_plan_mode(session_id).await {
+                Ok(()) => Some(
+                    serde_json::to_string(&JsonRpcResponse::success(id, serde_json::json!(null)))
+                        .unwrap_or_default(),
+                ),
+                Err(e) => {
+                    let resp =
+                        JsonRpcErrorResponse::new(id, error_codes::INTERNAL_ERROR, e.to_string());
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
         methods::SEND_MESSAGE => {
             let params = request.params.as_ref();
             let session_id_str = params
