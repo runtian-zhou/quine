@@ -443,10 +443,7 @@ fn build_conversation_lines(app: &App, area_width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
     for (i, entry) in app.messages.iter().enumerate() {
         if i > 0 {
-            let is_tool_related = matches!(entry, ConversationEntry::ToolCall { .. });
-            if !is_tool_related {
-                lines.push(Line::from(""));
-            }
+            lines.push(Line::from(""));
         }
         push_conversation_entry_lines(&mut lines, entry, area_width, app.max_context_window);
     }
@@ -1656,6 +1653,37 @@ mod tests {
 
         assert_eq!(reply_index - hello_index, 2);
         assert!(lines[hello_index + 1].is_empty());
+    }
+
+    #[test]
+    fn draw_renders_single_blank_line_before_tool_entries_too() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages
+            .push(ConversationEntry::AssistantText("hi there".into()));
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "bash".into(),
+            tool_use_id: "tc1".into(),
+            summary: "echo test".into(),
+            status: ToolStatus::Running,
+            result_preview: None,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        let assistant_index = lines
+            .iter()
+            .position(|line| line.contains("  hi there"))
+            .unwrap();
+        let tool_index = lines
+            .iter()
+            .position(|line| line.contains("bash: echo test"))
+            .unwrap();
+
+        assert_eq!(tool_index - assistant_index, 2);
+        assert!(lines[assistant_index + 1].is_empty());
     }
 
     #[test]
