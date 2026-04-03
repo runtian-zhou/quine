@@ -413,13 +413,13 @@ fn append_live_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     match &app.phase {
         AgentPhase::Thinking => {
             lines.push(Line::from(Span::styled(
-                format!("{} Thinking...", app.spinner_char()),
+                "Thinking...".to_string(),
                 Style::default().fg(Color::Yellow),
             )));
         }
         AgentPhase::RunningTool(name) => {
             lines.push(Line::from(Span::styled(
-                format!("{} Running tool: {}...", app.spinner_char(), name),
+                format!("Running tool: {name}..."),
                 Style::default().fg(Color::Yellow),
             )));
         }

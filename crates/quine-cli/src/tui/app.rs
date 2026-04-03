@@ -661,7 +661,6 @@ impl App {
     pub fn tick_spinner(&mut self) {
         if self.phase != AgentPhase::Idle {
             self.spinner_frame = (self.spinner_frame + 1) % SPINNER_FRAMES.len();
-            self.invalidate_conversation_cache();
         }
     }
 
@@ -1615,6 +1614,18 @@ mod tests {
             })
         ));
         assert!(app.streaming_buffer.is_empty());
+    }
+
+    #[test]
+    fn tick_spinner_does_not_invalidate_conversation_cache() {
+        let mut app = App::new("test".into(), false, None);
+        app.set_phase(AgentPhase::Thinking);
+        let revision = app.conversation_revision();
+
+        app.tick_spinner();
+
+        assert_eq!(app.conversation_revision(), revision);
+        assert_ne!(app.spinner_frame, 0);
     }
 
     #[test]

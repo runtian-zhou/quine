@@ -2897,16 +2897,12 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
 
                 if let Some(actual_state) = sessions.get(&session_id).map(|s| s.state) {
                     if actual_state != SessionState::AwaitingToolResult {
-                        let _ = handle
-                            .output
-                            .send(CoreOutput::SessionError {
-                                session_id,
-                                error: CoreError::InvalidState {
-                                    expected: SessionState::AwaitingToolResult,
-                                    actual: actual_state,
-                                },
-                            })
-                            .await;
+                        debug_log_session(
+                            session_id,
+                            format!(
+                                "ignoring stale external ToolResult for tool_use_id={tool_use_id} while session is {actual_state:?}"
+                            ),
+                        );
                     } else {
                         let (output_text, is_error) = match &result {
                             ToolOutcome::Success { output } => (output.clone(), false),
@@ -4323,6 +4319,56 @@ mod tests {
                 other => panic!("expected SessionNotFound, got {other:?}"),
             },
             other => panic!("expected SessionError, got {other:?}"),
+        }
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn stale_external_tool_result_is_ignored_when_session_is_idle() {
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+
+        assert!(reply_rx.await.unwrap().is_ok());
+        let _ = output.recv().await.unwrap(); // SessionStateChanged(Idle)
+
+        harness
+            .input
+            .send(CoreInput::ToolResult {
+                session_id,
+                tool_use_id: "toolu_stale".into(),
+                result: ToolOutcome::Success {
+                    output: "stale".into(),
+                },
+            })
+            .await
+            .unwrap();
+
+        if let Ok(Some(event)) = tokio::time::timeout(TokioDuration::from_millis(100), output.recv()).await
+        {
+            assert!(
+                !matches!(event, CoreOutput::SessionError { .. }),
+                "stale external tool result should not emit a session error, got {event:?}"
+            );
         }
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
