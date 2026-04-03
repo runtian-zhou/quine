@@ -23,5 +23,5 @@ RUN rustup component add clippy rustfmt
 
 RUN mkdir -p /tmp/xdg-runtime /root/.quine/state
 
-ENTRYPOINT ["cargo", "run", "--bin", "quine", "--"]
-CMD ["chat"]
+ENTRYPOINT ["/bin/bash"]
+CMD ["-l"]
