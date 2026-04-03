@@ -37,7 +37,7 @@ enum Commands {
         /// Start in read-only plan mode (restricted to exploration and planning).
         #[arg(long)]
         plan: bool,
-        /// Auto-approve permission checks for this session.
+        /// Deprecated compatibility flag. Accepted but ignored by the runtime.
         #[arg(long)]
         auto_approve: bool,
         /// Resume a restored checkpoint by session ID, or use `latest`.
@@ -63,7 +63,7 @@ enum Commands {
         /// Skills to load for this session (can be repeated).
         #[arg(long, short = 's')]
         skill: Vec<String>,
-        /// Auto-approve permission checks for the created session.
+        /// Deprecated compatibility flag. Accepted but ignored by the runtime.
         #[arg(long)]
         auto_approve: bool,
     },
@@ -220,7 +220,7 @@ enum DaemonCommands {
         /// Socket path override.
         #[arg(long)]
         socket: Option<String>,
-        /// Disable permission checks and allow all bash commands without confirmation.
+        /// Deprecated compatibility flag. Accepted but ignored by the runtime.
         #[arg(long)]
         auto_approve: bool,
     },
@@ -304,7 +304,7 @@ async fn main() -> anyhow::Result<()> {
         Commands::Daemon { command } => match command {
             DaemonCommands::Start {
                 socket,
-                auto_approve,
+                auto_approve: _,
             } => {
                 let socket_path = socket
                     .map(std::path::PathBuf::from)
@@ -312,11 +312,8 @@ async fn main() -> anyhow::Result<()> {
 
                 // Start the daemon in-process.
                 let provider = quine_harness::create_provider_from_env();
-                let checker =
-                    (!auto_approve).then(quine_harness::create_default_permission_checker);
-                let harness = std::sync::Arc::new(
-                    quine_harness::LocalHarness::new(provider, checker, None).await?,
-                );
+                let harness =
+                    std::sync::Arc::new(quine_harness::LocalHarness::new(provider, None).await?);
                 quine_harness::server::run_ipc_server(&socket_path, harness).await?;
             }
             DaemonCommands::Stop { socket } => {

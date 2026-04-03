@@ -1,10 +1,6 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use quine_core::permission::composite::CompositeChecker;
-use quine_core::permission::llm_checker::LlmChecker;
-use quine_core::permission::rule_checker::RuleBasedChecker;
-use quine_core::PermissionChecker;
 use quine_llm::anthropic::AnthropicConfig;
 use quine_llm::config::ProviderConfig;
 use quine_llm::openai_compat::OpenAiCompatConfig;
@@ -27,7 +23,7 @@ pub struct SessionConfig {
     /// Seed the session with these messages after the system prompt.
     #[serde(default)]
     pub initial_messages: Vec<Message>,
-    /// Whether bash permission prompts should be auto-approved for this session.
+    /// Deprecated compatibility flag. Accepted but ignored.
     #[serde(default)]
     pub auto_approve_permissions: bool,
 }
@@ -176,25 +172,6 @@ fn openai_compat_context_window(model: &str) -> Option<u64> {
     }
 }
 
-/// Create the default permission checker from environment configuration.
-///
-/// Uses `LlmChecker` first when `PERMISSION_LLM_ENABLED=true` is set in the
-/// environment. If the LLM marks a command as dangerous, a manual low-risk
-/// allowlist in `RuleBasedChecker` may override that decision to allow it.
-pub fn create_default_permission_checker() -> Arc<dyn PermissionChecker> {
-    let llm_checker = if std::env::var("PERMISSION_LLM_ENABLED")
-        .map(|v| v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false)
-    {
-        let provider = create_provider_from_env();
-        Some(LlmChecker::new(provider))
-    } else {
-        None
-    };
-
-    Arc::new(CompositeChecker::new(llm_checker, RuleBasedChecker::new()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,7 +205,6 @@ mod tests {
             deserialized.system_prompt.as_deref(),
             Some("You are helpful.")
         );
-        assert!(deserialized.auto_approve_permissions);
     }
 
     #[test]

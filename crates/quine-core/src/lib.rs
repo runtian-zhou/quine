@@ -4,7 +4,6 @@ pub mod engine;
 pub mod error;
 pub mod filesystem;
 pub mod ipc;
-pub mod permission;
 pub mod persistence;
 pub mod planner;
 mod scheduler;
@@ -19,7 +18,6 @@ pub use channel::{
 pub use engine::{run_core_loop, run_core_loop_with_compaction};
 pub use error::CoreError;
 pub use filesystem::{DirEntry, FsError, NullFilesystem, OverlayFilesystem, SessionFilesystem};
-pub use permission::{PermissionChecker, PermissionContext, PermissionDecision, PermissionError};
 pub use persistence::{
     CoreCheckpoint, PersistedPlanStore, PersistedSession, PersistedSessionConfig,
     PersistedSessionState, PersistedSessionTree, CORE_CHECKPOINT_FORMAT_VERSION,

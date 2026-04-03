@@ -343,10 +343,9 @@ pub fn built_in_tool_definitions(plan_mode: bool) -> Vec<quine_llm::ToolDefiniti
     registry.register(Arc::new(read::ReadTool));
     if !plan_mode {
         registry.register(Arc::new(write::WriteTool));
-        registry.register(Arc::new(subagent::SubagentTool::new(
-            Arc::new(NoopProvider),
-            None,
-        )));
+        registry.register(Arc::new(subagent::SubagentTool::new(Arc::new(
+            NoopProvider,
+        ))));
         registry.register(Arc::new(spawn::SpawnTool));
         registry.register(Arc::new(wait_child::WaitChildTool));
         registry.register(Arc::new(signal::SignalTool));

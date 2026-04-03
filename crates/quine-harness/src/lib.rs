@@ -8,8 +8,7 @@ pub mod session_log;
 pub mod storage;
 
 pub use config::{
-    create_default_permission_checker, create_provider_from_env, default_socket_path,
-    default_state_dir, HarnessConfig, SessionConfig,
+    create_provider_from_env, default_socket_path, default_state_dir, HarnessConfig, SessionConfig,
 };
 pub use error::HarnessError;
 pub use local::LocalHarness;

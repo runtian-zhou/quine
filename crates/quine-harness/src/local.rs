@@ -6,8 +6,7 @@ use std::collections::HashMap;
 
 use quine_core::{
     create_channels, load_skills, ChannelConfig, CoreCheckpoint, CoreInput, CoreOutput,
-    HarnessHandle, InheritanceFlags, InteractionResponse, PermissionChecker, SessionId,
-    SessionSignal, Skill,
+    HarnessHandle, InheritanceFlags, InteractionResponse, SessionId, SessionSignal, Skill,
 };
 use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
@@ -45,26 +44,23 @@ struct SessionListing {
 
 impl LocalHarness {
     /// Create a new `LocalHarness` that spawns the core event loop with the
-    /// given LLM provider and optional permission checker.
+    /// given LLM provider.
     pub async fn new(
         provider: Arc<dyn LlmProvider>,
-        permission_checker: Option<Arc<dyn PermissionChecker>>,
         storage: Option<StorageManager>,
     ) -> Result<Self, HarnessError> {
-        Self::with_storage(provider, permission_checker, storage, None).await
+        Self::with_storage(provider, storage, None).await
     }
 
     pub async fn with_archive_root(
         provider: Arc<dyn LlmProvider>,
-        permission_checker: Option<Arc<dyn PermissionChecker>>,
         archive_root: Option<std::path::PathBuf>,
     ) -> Result<Self, HarnessError> {
-        Self::with_storage(provider, permission_checker, None, archive_root).await
+        Self::with_storage(provider, None, archive_root).await
     }
 
     async fn with_storage(
         provider: Arc<dyn LlmProvider>,
-        permission_checker: Option<Arc<dyn PermissionChecker>>,
         storage: Option<StorageManager>,
         archive_root: Option<std::path::PathBuf>,
     ) -> Result<Self, HarnessError> {
@@ -112,7 +108,6 @@ impl LocalHarness {
         let core_task = tokio::spawn(quine_core::run_core_loop_with_compaction(
             core_handle,
             provider,
-            permission_checker,
             restored_checkpoint,
             archive_root,
             max_context_window,
@@ -227,7 +222,6 @@ impl HarnessService for LocalHarness {
                 working_directory: config.working_directory,
                 skills,
                 plan_mode: config.plan_mode,
-                auto_approve_permissions: config.auto_approve_permissions,
                 initial_messages: config.initial_messages,
                 reply: reply_tx,
             })
@@ -538,7 +532,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_harness_create_session_and_message() {
-        let harness = LocalHarness::new(Arc::new(MockProvider), None, None)
+        let harness = LocalHarness::new(Arc::new(MockProvider), None)
             .await
             .unwrap();
         let mut rx = harness.subscribe();
@@ -603,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn local_harness_restores_checkpointed_session() {
         let storage = temp_storage();
-        let harness = LocalHarness::new(Arc::new(EchoProvider), None, Some(storage.clone()))
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
             .await
             .unwrap();
         let session_id = harness
@@ -628,7 +622,7 @@ mod tests {
 
         harness.shutdown().await.unwrap();
 
-        let restored = LocalHarness::new(Arc::new(EchoProvider), None, Some(storage.clone()))
+        let restored = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
             .await
             .unwrap();
         let mut rx = restored.subscribe();
@@ -653,7 +647,7 @@ mod tests {
     #[tokio::test]
     async fn local_harness_lists_restored_sessions_for_resume_e2e() {
         let storage = temp_storage();
-        let harness = LocalHarness::new(Arc::new(EchoProvider), None, Some(storage.clone()))
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
             .await
             .unwrap();
         let session_id = harness
@@ -678,7 +672,7 @@ mod tests {
 
         harness.shutdown().await.unwrap();
 
-        let restored = LocalHarness::new(Arc::new(EchoProvider), None, Some(storage.clone()))
+        let restored = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
             .await
             .unwrap();
         let session_id_str = serde_json::to_value(session_id)
@@ -723,7 +717,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_harness_schedule_agent_one_shot() {
-        let harness = LocalHarness::new(Arc::new(MockProvider), None, None)
+        let harness = LocalHarness::new(Arc::new(MockProvider), None)
             .await
             .unwrap();
         harness
@@ -735,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_harness_recvs_ipc_message() {
-        let harness = LocalHarness::new(Arc::new(MockProvider), None, None)
+        let harness = LocalHarness::new(Arc::new(MockProvider), None)
             .await
             .unwrap();
         harness
@@ -754,7 +748,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn local_harness_scheduled_message_runs_after_delay() {
-        let harness = LocalHarness::new(Arc::new(EchoProvider), None, None)
+        let harness = LocalHarness::new(Arc::new(EchoProvider), None)
             .await
             .unwrap();
         let mut rx = harness.subscribe();
@@ -798,7 +792,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn local_harness_orders_immediate_before_delayed_message() {
-        let harness = LocalHarness::new(Arc::new(EchoProvider), None, None)
+        let harness = LocalHarness::new(Arc::new(EchoProvider), None)
             .await
             .unwrap();
         let mut rx = harness.subscribe();

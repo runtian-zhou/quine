@@ -14,7 +14,6 @@ use crate::channel::{
 use crate::compaction::{self, CompactionTrigger};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
-use crate::permission::{PermissionChecker, PermissionContext, PermissionDecision};
 use crate::persistence::{
     CoreCheckpoint, PersistedSession, PersistedSessionConfig, PersistedSessionState,
 };
@@ -28,8 +27,7 @@ use crate::tool::{
     recv_message::RecvMessageTool, send_message::SendMessageTool, signal::SignalTool,
     skill_template::SkillTemplateTool, spawn::SpawnTool, subagent::SubagentTool,
     wait_child::WaitChildTool, write::WriteTool, CancellationChannel, ExecutionContext,
-    InteractionChannel, InteractionKind, InteractionRequest, InteractionResponse, ToolError,
-    ToolRegistry,
+    InteractionChannel, InteractionRequest, InteractionResponse, ToolError, ToolRegistry,
 };
 
 /// Default system prompt used when no CLAUDE.md and no explicit prompt is provided.
@@ -112,8 +110,6 @@ struct SessionContext {
     filesystem: Arc<dyn crate::filesystem::SessionFilesystem>,
     /// Working directory for this session.
     working_directory: PathBuf,
-    /// Whether bash permission prompts should be auto-approved.
-    auto_approve_permissions: bool,
     /// Sender for pending interaction responses (tool_use_id -> sender).
     pending_interaction: Option<oneshot::Sender<InteractionResponse>>,
     /// Shared plan store for this session.
@@ -146,7 +142,6 @@ struct SessionInit {
     working_directory: PathBuf,
     plan_mode: bool,
     initial_messages: Vec<Message>,
-    auto_approve_permissions: bool,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
 }
@@ -162,17 +157,12 @@ impl SessionInit {
                 .collect(),
             working_directory: self.working_directory.clone(),
             plan_mode: self.plan_mode,
-            auto_approve_permissions: self.auto_approve_permissions,
         }
     }
 }
 
 impl SessionContext {
-    async fn new(
-        init: SessionInit,
-        provider: &Arc<dyn LlmProvider>,
-        permission_checker: &Option<Arc<dyn PermissionChecker>>,
-    ) -> Result<Self, CoreError> {
+    async fn new(init: SessionInit, provider: &Arc<dyn LlmProvider>) -> Result<Self, CoreError> {
         let persisted_config = init.to_persisted_config();
         let SessionInit {
             system_prompt,
@@ -180,7 +170,6 @@ impl SessionContext {
             working_directory,
             plan_mode,
             initial_messages,
-            auto_approve_permissions,
             archive_root,
             max_context_window,
         } = init;
@@ -203,10 +192,7 @@ impl SessionContext {
 
         if !plan_mode {
             tool_registry.register(Arc::new(WriteTool));
-            tool_registry.register(Arc::new(SubagentTool::new(
-                Arc::clone(provider),
-                permission_checker.clone(),
-            )));
+            tool_registry.register(Arc::new(SubagentTool::new(Arc::clone(provider))));
             tool_registry.register(Arc::new(SpawnTool));
             tool_registry.register(Arc::new(WaitChildTool));
             tool_registry.register(Arc::new(SignalTool));
@@ -271,7 +257,6 @@ impl SessionContext {
             tool_registry,
             filesystem,
             working_directory,
-            auto_approve_permissions,
             pending_interaction: None,
             plan_store,
             cancel_tx: None,
@@ -290,7 +275,6 @@ impl SessionContext {
     async fn from_persisted(
         persisted: PersistedSession,
         provider: &Arc<dyn LlmProvider>,
-        permission_checker: &Option<Arc<dyn PermissionChecker>>,
         archive_root: PathBuf,
         max_context_window: Option<u64>,
     ) -> Result<(SessionId, Self), CoreError> {
@@ -311,12 +295,10 @@ impl SessionContext {
                 working_directory: config.working_directory.clone(),
                 plan_mode: config.plan_mode,
                 initial_messages: Vec::new(),
-                auto_approve_permissions: config.auto_approve_permissions,
                 archive_root,
                 max_context_window,
             },
             provider,
-            permission_checker,
         )
         .await?;
         session.state = state.into();
@@ -331,10 +313,7 @@ impl SessionContext {
             registry.register(Arc::new(PlanTool::new(session.plan_store.clone())));
             if !session.persisted_config.plan_mode {
                 registry.register(Arc::new(WriteTool));
-                registry.register(Arc::new(SubagentTool::new(
-                    Arc::clone(provider),
-                    permission_checker.clone(),
-                )));
+                registry.register(Arc::new(SubagentTool::new(Arc::clone(provider))));
                 registry.register(Arc::new(SpawnTool));
                 registry.register(Arc::new(WaitChildTool));
                 registry.register(Arc::new(SignalTool));
@@ -712,13 +691,6 @@ enum LlmTurnResult {
     },
 }
 
-struct PermissionWait<'a> {
-    output: &'a mpsc::Sender<CoreOutput>,
-    input: &'a mut mpsc::Receiver<CoreInput>,
-    deferred_inputs: &'a mut VecDeque<CoreInput>,
-    cancellation: &'a CancellationChannel,
-}
-
 struct CoreIo<'a> {
     output: &'a mpsc::Sender<CoreOutput>,
     input: &'a mut mpsc::Receiver<CoreInput>,
@@ -728,7 +700,6 @@ struct CoreIo<'a> {
 
 struct EngineState<'a> {
     provider: &'a Arc<dyn LlmProvider>,
-    permission_checker: &'a Option<Arc<dyn PermissionChecker>>,
     session_tree: &'a mut SessionTree,
 }
 
@@ -1184,12 +1155,10 @@ async fn start_child_session(
             working_directory: work_dir,
             plan_mode: false,
             initial_messages: Vec::new(),
-            auto_approve_permissions: false,
             archive_root,
             max_context_window,
         },
         engine.provider,
-        engine.permission_checker,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -1249,162 +1218,6 @@ async fn wait_on_child_session(
     }
 }
 
-/// Check permissions for a tool call, optionally requesting user confirmation.
-///
-/// Returns `Ok(())` if the tool is allowed to proceed, or `Err(ToolOutcome)` with
-/// the denial/cancellation outcome.
-async fn check_permission(
-    checker: &dyn PermissionChecker,
-    call: &PendingToolCall,
-    session: &SessionContext,
-    session_id: SessionId,
-    wait: PermissionWait<'_>,
-) -> Result<(), ToolOutcome> {
-    let context = PermissionContext {
-        session_id,
-        working_directory: session.working_directory.clone(),
-    };
-
-    debug_log_session(
-        session_id,
-        format!(
-            "permission check requested for tool `{}` with args {}",
-            call.tool_name,
-            serde_json::to_string(&call.arguments).unwrap_or_default()
-        ),
-    );
-
-    let decision = match checker
-        .check(&call.tool_name, &call.arguments, &context)
-        .await
-    {
-        Ok(d) => d,
-        Err(e) => {
-            // On checker error, default to requiring confirmation
-            PermissionDecision::RequiresConfirmation {
-                risk_score: 0.5,
-                reason: format!("permission checker error: {e}"),
-            }
-        }
-    };
-
-    match decision {
-        PermissionDecision::Allow => {
-            debug_log_session(
-                session_id,
-                format!("permission allowed for tool `{}`", call.tool_name),
-            );
-            Ok(())
-        }
-        PermissionDecision::Deny { reason } => {
-            debug_log_session(
-                session_id,
-                format!("permission denied for tool `{}`: {reason}", call.tool_name),
-            );
-            Err(ToolOutcome::Error {
-                message: format!("permission denied: {reason}"),
-            })
-        }
-        PermissionDecision::RequiresConfirmation { risk_score, reason } => {
-            debug_log_session(
-                session_id,
-                format!(
-                    "permission confirmation required for tool `{}` (risk {:.1}): {}",
-                    call.tool_name, risk_score, reason
-                ),
-            );
-            let prompt = format!(
-                "Tool `{}` with args `{}` scored {:.1} risk: {}. Allow? [y/N]",
-                call.tool_name,
-                serde_json::to_string(&call.arguments).unwrap_or_default(),
-                risk_score,
-                reason
-            );
-
-            let request = InteractionRequest {
-                prompt,
-                kind: InteractionKind::Confirmation,
-                options: Vec::new(),
-                allow_freeform: false,
-                source_label: None,
-            };
-
-            let _ = wait
-                .output
-                .send(CoreOutput::InteractionNeeded {
-                    session_id,
-                    request,
-                })
-                .await;
-
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                tokio::select! {
-                    _ = wait.cancellation.cancelled() => {
-                        debug_log_session(session_id, "permission check cancelled");
-                        return Err(ToolOutcome::Cancelled);
-                    }
-                    recv = tokio::time::timeout_at(deadline, wait.input.recv()) => {
-                        match recv {
-                            Ok(Some(CoreInput::InteractionResponse {
-                                session_id: resp_sid,
-                                response,
-                            })) if resp_sid == session_id => {
-                                let answer = response.response.trim().to_lowercase();
-                                if answer == "y" || answer == "yes" {
-                                    debug_log_session(
-                                        session_id,
-                                        format!("permission confirmed by user for tool `{}`", call.tool_name),
-                                    );
-                                    return Ok(());
-                                }
-                                debug_log_session(
-                                    session_id,
-                                    format!("permission rejected by user for tool `{}`", call.tool_name),
-                                );
-                                return Err(ToolOutcome::Error {
-                                    message: format!("permission denied by user: {reason}"),
-                                });
-                            }
-                            Ok(Some(CoreInput::Cancel {
-                                session_id: cancel_sid,
-                            })) if cancel_sid == session_id => {
-                                debug_log_session(session_id, "permission check interrupted by cancel input");
-                                return Err(ToolOutcome::Cancelled);
-                            }
-                            Ok(Some(CoreInput::Signal { session_id: signal_sid, signal }))
-                                if signal_sid == session_id
-                                    && matches!(signal, SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill) =>
-                            {
-                                debug_log_session(session_id, "permission check interrupted by session signal");
-                                return Err(ToolOutcome::Cancelled);
-                            }
-                            Ok(Some(other)) => {
-                                wait.deferred_inputs.push_back(other);
-                                continue;
-                            }
-                            Ok(None) => {
-                                debug_log_session(session_id, "permission check failed: input channel closed");
-                                return Err(ToolOutcome::Error {
-                                    message: "input channel closed during permission check".into(),
-                                });
-                            }
-                            Err(_) => {
-                                debug_log_session(session_id, "permission check timed out waiting for response");
-                                return Err(ToolOutcome::Error {
-                                    message: format!(
-                                        "permission check timed out (no response within 30s): {reason}"
-                                    ),
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Execute a tool call directly within the core.
 ///
 /// For interactive tools, sets up a channel and emits `InteractionNeeded`.
@@ -1417,7 +1230,7 @@ async fn execute_tool_call(
     engine: &mut EngineState<'_>,
 ) -> ToolOutcome {
     let (cancel_tx, cancellation) = CancellationChannel::new_pair();
-    let auto_approve_permissions = {
+    {
         let Some(session) = sessions.get_mut(&session_id) else {
             return ToolOutcome::Error {
                 message: "session not found".into(),
@@ -1426,53 +1239,12 @@ async fn execute_tool_call(
         if session.interrupted {
             return ToolOutcome::Cancelled;
         }
-        let auto_approve_permissions = session.auto_approve_permissions;
         session.cancel_tx = Some(cancel_tx.clone());
-        auto_approve_permissions
-    };
+    }
     debug_log_session(
         session_id,
         format!("starting tool execution for `{}`", call.tool_name),
     );
-
-    // Only check permissions for bash tool — other tools are safe by design.
-    if call.tool_name == "bash" {
-        if let Some(checker) = engine
-            .permission_checker
-            .as_deref()
-            .filter(|_| !auto_approve_permissions)
-        {
-            let permission_outcome = {
-                let Some(session) = sessions.get(&session_id) else {
-                    return ToolOutcome::Error {
-                        message: "session not found".into(),
-                    };
-                };
-                check_permission(
-                    checker,
-                    call,
-                    session,
-                    session_id,
-                    PermissionWait {
-                        output: io.output,
-                        input: io.input,
-                        deferred_inputs: io.deferred_inputs,
-                        cancellation: &cancellation,
-                    },
-                )
-                .await
-            };
-            if let Err(outcome) = permission_outcome {
-                if matches!(outcome, ToolOutcome::Cancelled) {
-                    interrupt_session(sessions, io.deferred_inputs, session_id);
-                }
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    session.cancel_tx = None;
-                }
-                return outcome;
-            }
-        }
-    }
 
     if call.tool_name == "spawn" {
         let task = match call.arguments.get("task").and_then(|v| v.as_str()) {
@@ -2534,13 +2306,11 @@ async fn handle_llm_turn(
 pub async fn run_core_loop(
     handle: CoreHandle,
     provider: Arc<dyn LlmProvider>,
-    permission_checker: Option<Arc<dyn PermissionChecker>>,
     restored_checkpoint: Option<CoreCheckpoint>,
 ) {
     run_core_loop_with_compaction(
         handle,
         provider,
-        permission_checker,
         restored_checkpoint,
         std::env::temp_dir().join("quine-core-compactions"),
         None,
@@ -2551,7 +2321,6 @@ pub async fn run_core_loop(
 pub async fn run_core_loop_with_compaction(
     mut handle: CoreHandle,
     provider: Arc<dyn LlmProvider>,
-    permission_checker: Option<Arc<dyn PermissionChecker>>,
     restored_checkpoint: Option<CoreCheckpoint>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
@@ -2568,7 +2337,6 @@ pub async fn run_core_loop_with_compaction(
             match SessionContext::from_persisted(
                 persisted_session,
                 &provider,
-                &permission_checker,
                 archive_root.clone(),
                 max_context_window,
             )
@@ -2606,16 +2374,14 @@ pub async fn run_core_loop_with_compaction(
                 working_directory,
                 skills,
                 plan_mode,
-                auto_approve_permissions,
                 initial_messages,
                 reply,
             } => {
                 debug_log_session(
                     session_id,
                     format!(
-                        "received CreateSession (plan_mode={}, auto_approve_permissions={}, skills={})",
+                        "received CreateSession (plan_mode={}, skills={})",
                         plan_mode,
-                        auto_approve_permissions,
                         skills.len()
                     ),
                 );
@@ -2635,12 +2401,10 @@ pub async fn run_core_loop_with_compaction(
                         working_directory: work_dir,
                         plan_mode,
                         initial_messages,
-                        auto_approve_permissions,
                         archive_root: archive_root.clone(),
                         max_context_window,
                     },
                     &provider,
-                    &permission_checker,
                 )
                 .await
                 {
@@ -2700,7 +2464,6 @@ pub async fn run_core_loop_with_compaction(
                     };
                     let mut engine = EngineState {
                         provider: &provider,
-                        permission_checker: &permission_checker,
                         session_tree: &mut session_tree,
                     };
                     let turn_outcome =
@@ -2850,7 +2613,6 @@ pub async fn run_core_loop_with_compaction(
                         };
                         let mut engine = EngineState {
                             provider: &provider,
-                            permission_checker: &permission_checker,
                             session_tree: &mut session_tree,
                         };
                         let turn_outcome =
@@ -2938,7 +2700,6 @@ pub async fn run_core_loop_with_compaction(
                 };
                 let mut engine = EngineState {
                     provider: &provider,
-                    permission_checker: &permission_checker,
                     session_tree: &mut session_tree,
                 };
                 let result = start_child_session(
@@ -3109,7 +2870,6 @@ pub async fn run_core_loop_with_compaction(
 mod tests {
     use super::*;
     use crate::channel::{create_channels, ChannelConfig};
-    use crate::permission::PermissionError;
     use crate::session::{ExitStatus, InheritanceFlags};
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -3155,27 +2915,9 @@ mod tests {
         }
     }
 
-    struct ConfirmChecker;
-
-    #[async_trait::async_trait]
-    impl PermissionChecker for ConfirmChecker {
-        async fn check(
-            &self,
-            _tool_name: &str,
-            _arguments: &serde_json::Value,
-            _context: &PermissionContext,
-        ) -> Result<PermissionDecision, PermissionError> {
-            Ok(PermissionDecision::RequiresConfirmation {
-                risk_score: 0.9,
-                reason: "test confirmation".into(),
-            })
-        }
-    }
-
     #[tokio::test]
     async fn concurrent_tool_batch_requires_explicit_safe_metadata_and_allowlist() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
-        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
             SessionInit {
                 system_prompt: None,
@@ -3183,12 +2925,10 @@ mod tests {
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
-                auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
             },
             &provider,
-            &permission_checker,
         )
         .await
         .unwrap();
@@ -3256,7 +2996,6 @@ mod tests {
             ],
             final_text: "done".into(),
         });
-        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let mut session = SessionContext::new(
             SessionInit {
                 system_prompt: None,
@@ -3264,12 +3003,10 @@ mod tests {
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
                 initial_messages: vec![Message::user("inspect")],
-                auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
             },
             &provider,
-            &permission_checker,
         )
         .await
         .unwrap();
@@ -3310,7 +3047,6 @@ mod tests {
         let mut session_tree = SessionTree::new();
         let mut engine = EngineState {
             provider: &provider,
-            permission_checker: &permission_checker,
             session_tree: &mut session_tree,
         };
 
@@ -3359,7 +3095,6 @@ mod tests {
             ],
             final_text: "should not happen".into(),
         });
-        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let mut session = SessionContext::new(
             SessionInit {
                 system_prompt: None,
@@ -3367,12 +3102,10 @@ mod tests {
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
                 initial_messages: vec![Message::user("inspect")],
-                auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
             },
             &provider,
-            &permission_checker,
         )
         .await
         .unwrap();
@@ -3411,7 +3144,6 @@ mod tests {
         let mut session_tree = SessionTree::new();
         let mut engine = EngineState {
             provider: &provider,
-            permission_checker: &permission_checker,
             session_tree: &mut session_tree,
         };
 
@@ -3577,7 +3309,6 @@ mod tests {
     #[tokio::test]
     async fn execute_tool_call_consumes_cancel_for_non_interactive_tool() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
-        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
             SessionInit {
                 system_prompt: None,
@@ -3585,12 +3316,10 @@ mod tests {
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
-                auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
             },
             &provider,
-            &permission_checker,
         )
         .await
         .unwrap();
@@ -3620,7 +3349,6 @@ mod tests {
         let mut session_tree = SessionTree::new();
         let mut engine = EngineState {
             provider: &provider,
-            permission_checker: &permission_checker,
             session_tree: &mut session_tree,
         };
         let result =
@@ -3636,7 +3364,6 @@ mod tests {
     #[tokio::test]
     async fn execute_tool_call_buffers_unrelated_input_while_waiting_for_cancel() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
-        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
             SessionInit {
                 system_prompt: None,
@@ -3644,12 +3371,10 @@ mod tests {
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
-                auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
             },
             &provider,
-            &permission_checker,
         )
         .await
         .unwrap();
@@ -3688,7 +3413,6 @@ mod tests {
         let mut session_tree = SessionTree::new();
         let mut engine = EngineState {
             provider: &provider,
-            permission_checker: &permission_checker,
             session_tree: &mut session_tree,
         };
         let result =
@@ -3707,7 +3431,6 @@ mod tests {
     #[tokio::test]
     async fn execute_tool_call_consumes_stop_signal_for_non_interactive_tool() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
-        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
             SessionInit {
                 system_prompt: None,
@@ -3715,12 +3438,10 @@ mod tests {
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
-                auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
             },
             &provider,
-            &permission_checker,
         )
         .await
         .unwrap();
@@ -3753,7 +3474,6 @@ mod tests {
         let mut session_tree = SessionTree::new();
         let mut engine = EngineState {
             provider: &provider,
-            permission_checker: &permission_checker,
             session_tree: &mut session_tree,
         };
         let result =
@@ -3768,7 +3488,6 @@ mod tests {
     #[tokio::test]
     async fn prepare_tool_result_for_history_keeps_small_output_inline() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
-        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let session = SessionContext::new(
             SessionInit {
                 system_prompt: None,
@@ -3776,12 +3495,10 @@ mod tests {
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
-                auto_approve_permissions: false,
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
             },
             &provider,
-            &permission_checker,
         )
         .await
         .unwrap();
@@ -3804,7 +3521,6 @@ mod tests {
     #[tokio::test]
     async fn prepare_tool_result_for_history_archives_oversized_output() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
-        let permission_checker: Option<Arc<dyn PermissionChecker>> = None;
         let archive_root = std::env::temp_dir().join(format!(
             "quine-core-compaction-tests-{:?}",
             SessionId::new()
@@ -3816,12 +3532,10 @@ mod tests {
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
-                auto_approve_permissions: false,
                 archive_root: archive_root.clone(),
                 max_context_window: None,
             },
             &provider,
-            &permission_checker,
         )
         .await
         .unwrap();
@@ -3862,7 +3576,7 @@ mod tests {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new("73"));
-        let loop_handle = tokio::spawn(run_core_loop(core, provider, None, None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider, None));
 
         let parent_id = SessionId::new();
         let (create_reply_tx, create_reply_rx) = oneshot::channel();
@@ -3874,7 +3588,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: Vec::new(),
                 reply: create_reply_tx,
             })
@@ -3935,12 +3648,7 @@ mod tests {
     async fn create_session_and_shutdown() {
         let (harness, core) = create_channels(ChannelConfig::default());
 
-        let loop_handle = tokio::spawn(run_core_loop(
-            core,
-            Arc::new(MockProvider::empty()),
-            None,
-            None,
-        ));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -3952,7 +3660,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: Vec::new(),
                 reply: reply_tx,
             })
@@ -3970,12 +3677,7 @@ mod tests {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
 
-        let loop_handle = tokio::spawn(run_core_loop(
-            core,
-            Arc::new(MockProvider::empty()),
-            None,
-            None,
-        ));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
         harness
@@ -4005,12 +3707,7 @@ mod tests {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
 
-        let loop_handle = tokio::spawn(run_core_loop(
-            core,
-            Arc::new(MockProvider::empty()),
-            None,
-            None,
-        ));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -4022,7 +3719,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: Vec::new(),
                 reply: reply_tx,
             })
@@ -4067,12 +3763,7 @@ mod tests {
     async fn duplicate_session_id_returns_error() {
         let (harness, core) = create_channels(ChannelConfig::default());
 
-        let loop_handle = tokio::spawn(run_core_loop(
-            core,
-            Arc::new(MockProvider::empty()),
-            None,
-            None,
-        ));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
 
         let session_id = SessionId::new();
 
@@ -4085,7 +3776,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: Vec::new(),
                 reply: reply_tx,
             })
@@ -4102,7 +3792,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: Vec::new(),
                 reply: reply_tx,
             })
@@ -4120,7 +3809,7 @@ mod tests {
         let mut output = harness.output;
 
         let provider = MockProvider::new("Hello from the LLM!");
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None, None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -4132,7 +3821,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: Vec::new(),
                 reply: reply_tx,
             })
@@ -4230,7 +3918,7 @@ mod tests {
         let provider = ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
         };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None, None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -4242,7 +3930,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: Vec::new(),
                 reply: reply_tx,
             })
@@ -4353,7 +4040,7 @@ mod tests {
             call_count: std::sync::atomic::AtomicU32::new(0),
             marker_path: marker_path.clone(),
         };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None, None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -4365,7 +4052,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: Vec::new(),
                 reply: reply_tx,
             })
@@ -4436,7 +4122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auto_approve_session_bypasses_permission_prompt() {
+    async fn bash_tool_runs_without_permission_prompt() {
         struct ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32,
         }
@@ -4475,12 +4161,10 @@ mod tests {
 
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
-        let checker: Arc<dyn PermissionChecker> = Arc::new(ConfirmChecker);
         let provider = ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
         };
-        let loop_handle =
-            tokio::spawn(run_core_loop(core, Arc::new(provider), Some(checker), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -4492,7 +4176,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: true,
                 initial_messages: Vec::new(),
                 reply: reply_tx,
             })
@@ -4528,10 +4211,7 @@ mod tests {
             }
         }
 
-        assert!(
-            !saw_interaction_needed,
-            "auto-approve session should not prompt"
-        );
+        assert!(!saw_interaction_needed, "bash tool should no longer prompt");
         assert!(saw_turn_complete, "turn should complete successfully");
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
@@ -4542,7 +4222,7 @@ mod tests {
     async fn create_session_seeds_initial_messages_after_system_prompt() {
         let (harness, core) = create_channels(ChannelConfig::default());
         let provider = Arc::new(MockProvider::empty());
-        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None, None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -4555,7 +4235,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: vec![seeded_message.clone()],
                 reply: reply_tx,
             })
@@ -4572,7 +4251,7 @@ mod tests {
     async fn send_and_receive_mailbox_messages() {
         let (mut harness, core) = create_channels(ChannelConfig::default());
         let provider = Arc::new(MockProvider::empty());
-        let loop_handle = tokio::spawn(run_core_loop(core, provider, None, None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider, None));
 
         let sender_id = SessionId::new();
         let receiver_id = SessionId::new();
@@ -4587,7 +4266,6 @@ mod tests {
                     working_directory: None,
                     skills: Vec::new(),
                     plan_mode: false,
-                    auto_approve_permissions: false,
                     initial_messages: Vec::new(),
                     reply: reply_tx,
                 })
@@ -4709,7 +4387,7 @@ mod tests {
         let provider = RecvMessageProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
         };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None, None));
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
 
         let receiver_id = SessionId::new();
         let sender_id = SessionId::new();
@@ -4722,7 +4400,6 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
-                auto_approve_permissions: false,
                 initial_messages: Vec::new(),
                 reply: reply_tx,
             })

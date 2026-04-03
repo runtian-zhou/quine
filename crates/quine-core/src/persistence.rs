@@ -42,7 +42,6 @@ pub struct PersistedSessionConfig {
     pub skill_names: Vec<String>,
     pub working_directory: PathBuf,
     pub plan_mode: bool,
-    pub auto_approve_permissions: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
