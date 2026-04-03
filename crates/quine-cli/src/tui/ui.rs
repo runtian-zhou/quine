@@ -17,15 +17,24 @@ use super::app::{
 fn format_duration_us(us: u64) -> String {
     let secs = us as f64 / 1_000_000.0;
     if secs >= 10.0 {
-        format!("{:.0}s", secs)
+        format!("{secs:.0}s")
     } else if secs >= 1.0 {
-        format!("{:.1}s", secs)
+        format!("{secs:.1}s")
     } else {
         let ms = us as f64 / 1_000.0;
         if ms >= 1.0 {
-            format!("{:.0}ms", ms)
+            format!("{ms:.0}ms")
         } else {
             "<1ms".to_string()
+        }
+    }
+}
+
+fn tool_duration_label(status: &ToolStatus) -> Option<String> {
+    match status {
+        ToolStatus::Running => None,
+        ToolStatus::Success { duration_us } | ToolStatus::Error { duration_us } => {
+            Some(format!(" ({})", format_duration_us(*duration_us)))
         }
     }
 }
@@ -265,27 +274,30 @@ fn push_conversation_entry_lines(
             result_preview,
             ..
         } => {
-            let (marker, style) = match status {
+            let (marker, marker_style) = match status {
                 ToolStatus::Running => ("⟳", Style::default().fg(Color::Yellow)),
                 ToolStatus::Success { .. } => ("✓", Style::default().fg(Color::Green)),
                 ToolStatus::Error { .. } => ("✗", Style::default().fg(Color::Red)),
             };
-            let duration_str = match status {
-                ToolStatus::Running => String::new(),
-                ToolStatus::Success { duration_us } | ToolStatus::Error { duration_us } => {
-                    format!(" ({})", format_duration_us(*duration_us))
-                }
-            };
             let label = if summary.is_empty() {
-                format!(" {tool_name}{duration_str}")
+                format!(" {tool_name}")
             } else {
-                format!(" {tool_name}: {summary}{duration_str}")
+                format!(" {tool_name}: {summary}")
             };
-            lines.push(Line::from(vec![
+            let mut spans = vec![
                 Span::raw("    "),
-                Span::styled(marker, style),
+                Span::styled(marker, marker_style),
                 Span::styled(label, Style::default().add_modifier(Modifier::DIM)),
-            ]));
+            ];
+            if let Some(duration_label) = tool_duration_label(status) {
+                spans.push(Span::styled(
+                    duration_label,
+                    Style::default()
+                        .fg(Color::DarkGray)
+                        .add_modifier(Modifier::DIM),
+                ));
+            }
+            lines.push(Line::from(spans));
             if tool_name == "plan" {
                 if let Some(preview) = result_preview {
                     for line in preview.lines() {
