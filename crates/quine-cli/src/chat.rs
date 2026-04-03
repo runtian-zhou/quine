@@ -148,12 +148,20 @@ pub async fn run_chat(
     socket_path: &Path,
     skills: &[String],
     plan_mode: bool,
-    auto_approve_permissions: bool,
+    auto_approve: bool,
     resume_checkpoint: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let mut renderer = TerminalRenderer::new();
     let available_skills = fetch_available_skills(&mut client).await?;
+
+    if auto_approve {
+        renderer
+            .render_info(
+                "`--auto-approve` is retained for CLI compatibility and currently has no effect.",
+            )
+            .await?;
+    }
 
     let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
 
@@ -165,7 +173,7 @@ pub async fn run_chat(
             session_id: target.session_id,
             max_context_window: None,
         },
-        None => create_session(&mut client, skills, plan_mode, auto_approve_permissions).await?,
+        None => create_session(&mut client, skills, plan_mode).await?,
     };
     let mut session_in_plan_mode = session_plan_mode.unwrap_or(plan_mode);
 
@@ -214,13 +222,7 @@ pub async fn run_chat(
                             }
                             ChatCommandAction::SendMessage(content) => content,
                             ChatCommandAction::EnterPlanModeAndSend(content) => {
-                                session = create_session(
-                                    &mut client,
-                                    skills,
-                                    true,
-                                    auto_approve_permissions,
-                                )
-                                .await?;
+                                session = create_session(&mut client, skills, true).await?;
                                 session_in_plan_mode = true;
                                 eprintln!("Switched to plan mode: {}", session.session_id);
                                 content
@@ -248,7 +250,6 @@ pub async fn run_chat(
                                     &mut client,
                                     &skill_name,
                                     &request,
-                                    auto_approve_permissions,
                                 )
                                 .await?;
                                 session_in_plan_mode = false;

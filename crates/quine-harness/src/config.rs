@@ -23,9 +23,6 @@ pub struct SessionConfig {
     /// Seed the session with these messages after the system prompt.
     #[serde(default)]
     pub initial_messages: Vec<Message>,
-    /// Deprecated compatibility flag. Accepted but ignored.
-    #[serde(default)]
-    pub auto_approve_permissions: bool,
 }
 
 /// Configuration for the harness daemon.
@@ -197,7 +194,6 @@ mod tests {
             skills: Vec::new(),
             plan_mode: false,
             initial_messages: Vec::new(),
-            auto_approve_permissions: true,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: SessionConfig = serde_json::from_str(&json).unwrap();

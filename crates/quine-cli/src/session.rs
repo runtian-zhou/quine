@@ -17,7 +17,6 @@ pub(crate) struct CreatedSession {
 fn build_session_params(
     skills: &[String],
     plan_mode: bool,
-    auto_approve_permissions: bool,
     initial_messages: &[Message],
     system_prompt: Option<String>,
 ) -> Option<serde_json::Value> {
@@ -31,9 +30,6 @@ fn build_session_params(
     if plan_mode {
         session_params["plan_mode"] = serde_json::json!(true);
     }
-    if auto_approve_permissions {
-        session_params["auto_approve_permissions"] = serde_json::json!(true);
-    }
     if !initial_messages.is_empty() {
         session_params["initial_messages"] =
             serde_json::to_value(initial_messages).expect("initial messages should serialize");
@@ -45,16 +41,9 @@ fn build_session_params(
 pub(crate) fn build_create_session_params(
     skills: &[String],
     plan_mode: bool,
-    auto_approve_permissions: bool,
     initial_messages: &[Message],
 ) -> Option<serde_json::Value> {
-    build_session_params(
-        skills,
-        plan_mode,
-        auto_approve_permissions,
-        initial_messages,
-        None,
-    )
+    build_session_params(skills, plan_mode, initial_messages, None)
 }
 
 fn slash_skill_arguments_overlay(request: &str) -> Option<String> {
@@ -121,29 +110,20 @@ pub(crate) async fn create_session(
     client: &mut IpcClient,
     skills: &[String],
     plan_mode: bool,
-    auto_approve_permissions: bool,
 ) -> anyhow::Result<CreatedSession> {
-    create_session_with_initial_messages(client, skills, plan_mode, auto_approve_permissions, &[])
-        .await
+    create_session_with_initial_messages(client, skills, plan_mode, &[]).await
 }
 
 pub(crate) async fn create_slash_skill_session(
     client: &mut IpcClient,
     skill_name: &str,
     request: &str,
-    auto_approve_permissions: bool,
 ) -> anyhow::Result<CreatedSession> {
     let skills = [skill_name.to_string()];
     let result = client
         .call(
             methods::CREATE_SESSION,
-            build_session_params(
-                &skills,
-                false,
-                auto_approve_permissions,
-                &[],
-                slash_skill_arguments_overlay(request),
-            ),
+            build_session_params(&skills, false, &[], slash_skill_arguments_overlay(request)),
         )
         .await?;
 
@@ -175,18 +155,12 @@ pub(crate) async fn create_session_with_initial_messages(
     client: &mut IpcClient,
     skills: &[String],
     plan_mode: bool,
-    auto_approve_permissions: bool,
     initial_messages: &[Message],
 ) -> anyhow::Result<CreatedSession> {
     let result = client
         .call(
             methods::CREATE_SESSION,
-            build_create_session_params(
-                skills,
-                plan_mode,
-                auto_approve_permissions,
-                initial_messages,
-            ),
+            build_create_session_params(skills, plan_mode, initial_messages),
         )
         .await?;
 
@@ -236,22 +210,20 @@ mod tests {
 
     #[test]
     fn build_create_session_params_includes_plan_mode() {
-        let params =
-            build_create_session_params(&["feature-request".into()], true, true, &[]).unwrap();
+        let params = build_create_session_params(&["feature-request".into()], true, &[]).unwrap();
 
         assert_eq!(
             params,
             serde_json::json!({
                 "skills": ["feature-request"],
-                "plan_mode": true,
-                "auto_approve_permissions": true
+                "plan_mode": true
             })
         );
     }
 
     #[test]
     fn build_create_session_params_omits_empty_fields() {
-        assert_eq!(build_create_session_params(&[], false, false, &[]), None);
+        assert_eq!(build_create_session_params(&[], false, &[]), None);
     }
 
     #[test]
