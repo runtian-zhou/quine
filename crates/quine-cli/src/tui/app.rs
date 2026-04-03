@@ -657,6 +657,13 @@ impl App {
         self.auto_scroll();
     }
 
+    pub fn exit_plan_mode(&mut self) {
+        self.plan_mode = false;
+        self.pending_plan_exit = None;
+        self.set_phase(AgentPhase::Idle);
+        self.invalidate_conversation_cache();
+    }
+
     /// Advance the spinner animation frame.
     pub fn tick_spinner(&mut self) {
         if self.phase != AgentPhase::Idle {
@@ -767,9 +774,7 @@ impl App {
                 }
                 _ => {
                     self.pending_plan_exit = Some(pending_exit);
-                    self.push_message(ConversationEntry::Error(
-                        "Please answer yes or no.".into(),
-                    ));
+                    self.push_message(ConversationEntry::Error("Please answer yes or no.".into()));
                     self.auto_scroll();
                     None
                 }
@@ -809,7 +814,9 @@ impl App {
                                 self.auto_scroll();
                                 Some(AppAction::CompactSession)
                             } else {
-                                self.push_message(ConversationEntry::Error("Usage: /compact".into()));
+                                self.push_message(ConversationEntry::Error(
+                                    "Usage: /compact".into(),
+                                ));
                                 self.auto_scroll();
                                 None
                             }

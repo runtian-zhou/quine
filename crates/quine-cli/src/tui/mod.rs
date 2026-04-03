@@ -18,12 +18,10 @@ use crate::client::IpcClient;
 use crate::context_debug::fetch_session_context;
 use crate::run::fetch_available_skills;
 use crate::session::{
-    create_session, create_session_with_initial_messages, create_slash_skill_session,
-    resolve_resume_target,
+    create_session, create_slash_skill_session, exit_plan_mode, resolve_resume_target,
 };
 use app::{AgentPhase, AppAction, PendingPlanExit};
 use quine_harness::protocol::{methods, notifications};
-use quine_llm::Message;
 
 fn print_resume_command(socket_path: &Path, session_id: &str) {
     eprintln!(
@@ -521,23 +519,11 @@ async fn execute_action(
             }
         },
         AppAction::ExitPlanMode { final_plan } => {
-            match create_session_with_initial_messages(
-                client,
-                skills,
-                false,
-                auto_approve_permissions,
-                &[Message::assistant(final_plan.clone())],
-            )
-            .await
-            {
-                Ok(session) => {
-                    app.reset_for_new_session(
-                        session.session_id,
-                        false,
-                        session.max_context_window,
-                    );
+            match exit_plan_mode(client, &app.session_id).await {
+                Ok(()) => {
+                    app.exit_plan_mode();
                     app.push_message(app::ConversationEntry::AssistantText(
-                        "Plan complete. Started a fresh normal session with the final plan carried over."
+                        "Plan complete. Continued in the same session with plan mode disabled."
                             .into(),
                     ));
                     app.push_message(app::ConversationEntry::PlanBox(final_plan));

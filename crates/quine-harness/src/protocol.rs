@@ -106,6 +106,7 @@ pub mod error_codes {
 /// Well-known RPC method names for the harness protocol.
 pub mod methods {
     pub const CREATE_SESSION: &str = "create_session";
+    pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
     pub const SEND_MESSAGE: &str = "send_message";
     pub const COMPACT_SESSION: &str = "compact_session";
     pub const SUBMIT_TOOL_RESULT: &str = "submit_tool_result";

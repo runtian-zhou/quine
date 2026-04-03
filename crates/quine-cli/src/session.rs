@@ -209,6 +209,22 @@ pub(crate) async fn create_session_with_initial_messages(
     }
 }
 
+pub(crate) async fn exit_plan_mode(client: &mut IpcClient, session_id: &str) -> anyhow::Result<()> {
+    let result = client
+        .call(
+            methods::EXIT_PLAN_MODE,
+            Some(serde_json::json!({
+                "session_id": session_id,
+            })),
+        )
+        .await?;
+
+    match result {
+        Ok(_) => Ok(()),
+        Err(e) => anyhow::bail!("failed to exit plan mode: {e}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
