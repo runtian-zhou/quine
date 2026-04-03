@@ -40,6 +40,7 @@ struct SessionListing {
     state: quine_core::SessionState,
     created_at: chrono::DateTime<Utc>,
     event_count: usize,
+    plan_mode: bool,
 }
 
 impl LocalHarness {
@@ -94,6 +95,7 @@ impl LocalHarness {
                                 state: session.state.into(),
                                 created_at: session.created_at,
                                 event_count: session.history.len(),
+                                plan_mode: session.config.plan_mode,
                             },
                         )
                     })
@@ -187,6 +189,7 @@ impl LocalHarness {
                                 state: *state,
                                 created_at: Utc::now(),
                                 event_count: 0,
+                                plan_mode: false,
                             });
                     }
                 }
@@ -232,6 +235,16 @@ impl HarnessService for LocalHarness {
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)?
             .map_err(|reason| HarnessError::SessionCreationFailed { reason })?;
+
+        self.sessions.lock().await.insert(
+            session_id,
+            SessionListing {
+                state: quine_core::SessionState::Idle,
+                created_at: Utc::now(),
+                event_count: 0,
+                plan_mode: config.plan_mode,
+            },
+        );
 
         Ok(session_id)
     }
@@ -347,6 +360,7 @@ impl HarnessService for LocalHarness {
                     "status": format!("{:?}", session.state).to_lowercase(),
                     "first_event": session.created_at.to_rfc3339(),
                     "event_count": session.event_count,
+                    "plan_mode": session.plan_mode,
                 })
             })
             .collect();
@@ -744,35 +758,6 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if harness
-                    .list_sessions()
-                    .await
-                    .unwrap()
-                    .iter()
-                    .any(|session| {
-                        session
-                            .get("session_id")
-                            .and_then(|value| value.as_str())
-                            .map(|value| {
-                                value
-                                    == serde_json::to_value(session_id)
-                                        .ok()
-                                        .and_then(|value| value.as_str().map(str::to_owned))
-                                        .unwrap_or_default()
-                            })
-                            .unwrap_or(false)
-                    })
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("session should appear in local session listing");
-
         let persisted_before = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Some(plan_mode) =
@@ -836,6 +821,55 @@ mod tests {
         assert!(!session_restored.config.plan_mode);
 
         restored.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
+    async fn local_harness_persists_plan_mode_in_session_listing() {
+        let storage = temp_storage();
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let session_id = harness
+            .create_session(SessionConfig {
+                plan_mode: true,
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if harness
+                    .list_sessions()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .any(|session| {
+                        session
+                            .get("session_id")
+                            .and_then(|value| value.as_str())
+                            .map(|value| {
+                                value
+                                    == serde_json::to_value(session_id)
+                                        .ok()
+                                        .and_then(|value| value.as_str().map(str::to_owned))
+                                        .unwrap_or_default()
+                            })
+                            .unwrap_or(false)
+                            && session.get("plan_mode").and_then(|value| value.as_bool())
+                                == Some(true)
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session should appear in local session listing");
+
+        harness.shutdown().await.unwrap();
         let _ = fs::remove_dir_all(storage.root());
     }
 

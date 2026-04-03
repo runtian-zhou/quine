@@ -5,6 +5,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::client::IpcClient;
 use crate::context_debug::render_session_context;
 use crate::render::{Renderer, TerminalRenderer};
+use crate::run::fetch_available_skills;
 use crate::session::{
     create_session, create_slash_skill_session, exit_plan_mode, resolve_resume_target,
 };
@@ -152,8 +153,11 @@ pub async fn run_chat(
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let mut renderer = TerminalRenderer::new();
+    let available_skills = fetch_available_skills(&mut client).await?;
 
     let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
+
+    let session_plan_mode = resumed.as_ref().map(|target| target.plan_mode);
 
     // Create or resume a session.
     let mut session = match resumed {
@@ -163,7 +167,7 @@ pub async fn run_chat(
         },
         None => create_session(&mut client, skills, plan_mode, auto_approve_permissions).await?,
     };
-    let mut session_in_plan_mode = plan_mode;
+    let mut session_in_plan_mode = session_plan_mode.unwrap_or(plan_mode);
 
     eprintln!("Session created: {}", session.session_id);
     eprintln!("Type /quit or Ctrl-D to exit.\n");
@@ -222,6 +226,12 @@ pub async fn run_chat(
                                 content
                             }
                             ChatCommandAction::StartSkillSession { skill_name, request } => {
+                                if !available_skills.iter().any(|candidate| candidate == &skill_name) {
+                                    renderer
+                                        .render_error(&format!("Unknown slash command: /{skill_name}"))
+                                        .await?;
+                                    continue;
+                                }
                                 if session_in_plan_mode
                                     && !confirm_plan_exit(
                                         &mut lines,
@@ -542,6 +552,17 @@ mod tests {
         assert_eq!(
             handle_chat_command("/loop every 5m check logs", false),
             ChatCommandAction::ShowError("`/loop` is only supported in the TUI right now".into())
+        );
+    }
+
+    #[test]
+    fn chat_command_unknown_builtin_is_local_error() {
+        assert_eq!(
+            handle_chat_command("/unknown thing", false),
+            ChatCommandAction::StartSkillSession {
+                skill_name: "unknown".into(),
+                request: "thing".into(),
+            }
         );
     }
 
