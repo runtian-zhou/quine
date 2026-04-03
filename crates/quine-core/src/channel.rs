@@ -140,6 +140,13 @@ pub enum CoreInput {
     /// Persist and acknowledge a fresh checkpoint of the current core state.
     RequestCheckpoint { reply: oneshot::Sender<()> },
 
+    /// Internal signal that a background session-memory refresh has finished.
+    SessionMemoryRefreshFinished {
+        session_id: SessionId,
+        last_summarized_message_index: Option<usize>,
+        refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+
     /// Graceful shutdown of the entire core event loop.
     Shutdown,
 }

@@ -34,6 +34,8 @@ pub struct PersistedSession {
     pub config: PersistedSessionConfig,
     pub history: Vec<quine_llm::Message>,
     pub plan_store: PersistedPlanStore,
+    #[serde(default)]
+    pub memory_state: Option<PersistedMemoryState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,6 +44,19 @@ pub struct PersistedSessionConfig {
     pub skill_names: Vec<String>,
     pub working_directory: PathBuf,
     pub plan_mode: bool,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedMemoryState {
+    #[serde(default)]
+    pub session_memory: Option<PersistedSessionMemoryState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedSessionMemoryState {
+    pub enabled: bool,
+    pub last_summarized_message_index: Option<usize>,
+    pub template_version: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,5 +161,39 @@ mod tests {
         let roundtrip: PersistedPlanStore = serde_json::from_str(&json).unwrap();
         assert_eq!(roundtrip.plans.len(), 1);
         assert_eq!(roundtrip.plans[0].title, "plan");
+    }
+
+    #[test]
+    fn memory_state_defaults_for_older_checkpoints() {
+        let json = serde_json::json!({
+            "session_id": SessionId::new(),
+            "created_at": Utc::now(),
+            "state": "Idle",
+            "config": {
+                "system_prompt": null,
+                "skill_names": [],
+                "working_directory": ".",
+                "plan_mode": false
+            },
+            "history": [],
+            "plan_store": { "plans": [] }
+        });
+        let roundtrip: PersistedSession = serde_json::from_value(json).unwrap();
+        assert!(roundtrip.memory_state.is_none());
+    }
+
+    #[test]
+    fn persisted_memory_state_round_trips_without_summary_contents() {
+        let state = PersistedMemoryState {
+            session_memory: Some(PersistedSessionMemoryState {
+                enabled: true,
+                last_summarized_message_index: Some(4),
+                template_version: 1,
+            }),
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        assert!(json.get("summary").is_none());
+        let roundtrip: PersistedMemoryState = serde_json::from_value(json).unwrap();
+        assert_eq!(roundtrip, state);
     }
 }

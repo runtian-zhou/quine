@@ -404,6 +404,7 @@ mod tests {
                 },
                 history: vec![quine_llm::Message::user("hello")],
                 plan_store: PersistedPlanStore::default(),
+                memory_state: None,
             }],
             PersistedSessionTree {
                 parents: Default::default(),
