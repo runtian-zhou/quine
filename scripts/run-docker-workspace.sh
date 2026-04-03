@@ -40,6 +40,10 @@ require_cmd docker
 require_cmd git
 require_cmd python3
 
+warn() {
+  echo "warning: $*" >&2
+}
+
 mode="shell"
 image_tag=""
 build_image=1
@@ -82,6 +86,7 @@ workspace_root="$(abs_path "$workspace_root")"
 
 git_dir_abs="$(git -C "$workspace_root" rev-parse --path-format=absolute --git-dir)"
 common_dir_abs="$(git -C "$workspace_root" rev-parse --path-format=absolute --git-common-dir)"
+origin_url="$(git -C "$workspace_root" remote get-url origin 2>/dev/null || true)"
 
 workspace_name="$(basename "$workspace_root")"
 if [[ -z "$image_tag" ]]; then
@@ -117,6 +122,41 @@ mounts=(
   --mount "type=bind,src=${workspace_root},dst=${workspace_root}"
   --mount "type=bind,src=${common_dir_abs},dst=${common_dir_abs}"
 )
+docker_env=(
+  -e XDG_RUNTIME_DIR=/tmp/xdg-runtime
+  -e XDG_STATE_HOME=/root/.quine
+  -e GIT_CONFIG_GLOBAL=/root/.gitconfig
+  -e GH_CONFIG_DIR=/root/.config/gh
+  -e LLM_PROVIDER="${LLM_PROVIDER:-openai}"
+  -e LLM_BASE_URL="${LLM_BASE_URL:-http://host.docker.internal:8000/v1}"
+  -e LLM_API_KEY="${LLM_API_KEY:-}"
+  -e LLM_MODEL="${LLM_MODEL:-gpt-5.4}"
+  -e LLM_CONTEXT_WINDOW="${LLM_CONTEXT_WINDOW:-}"
+  -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}"
+  -e ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}"
+  -e PERMISSION_LLM_ENABLED="${PERMISSION_LLM_ENABLED:-false}"
+  -e GIT_CONFIG_COUNT=10
+  -e GIT_CONFIG_KEY_0=safe.directory
+  -e GIT_CONFIG_VALUE_0=/workspace
+  -e GIT_CONFIG_KEY_1=safe.directory
+  -e GIT_CONFIG_VALUE_1="${workspace_root}"
+  -e GIT_CONFIG_KEY_2=credential.https://github.com.helper
+  -e GIT_CONFIG_VALUE_2=
+  -e GIT_CONFIG_KEY_3=credential.https://github.com.helper
+  -e "GIT_CONFIG_VALUE_3=!gh auth git-credential"
+  -e GIT_CONFIG_KEY_4=credential.https://gist.github.com.helper
+  -e GIT_CONFIG_VALUE_4=
+  -e GIT_CONFIG_KEY_5=credential.https://gist.github.com.helper
+  -e "GIT_CONFIG_VALUE_5=!gh auth git-credential"
+  -e GIT_CONFIG_KEY_6=user.name
+  -e GIT_CONFIG_VALUE_6="${GIT_AUTHOR_NAME:-runtianz}"
+  -e GIT_CONFIG_KEY_7=user.email
+  -e GIT_CONFIG_VALUE_7="${GIT_AUTHOR_EMAIL:-runtianz@users.noreply.github.com}"
+  -e GIT_CONFIG_KEY_8=commit.author
+  -e "GIT_CONFIG_VALUE_8=${GIT_AUTHOR_NAME:-runtianz} <${GIT_AUTHOR_EMAIL:-runtianz@users.noreply.github.com}>"
+  -e GIT_CONFIG_KEY_9=commit.committer
+  -e "GIT_CONFIG_VALUE_9=${GIT_COMMITTER_NAME:-${GIT_AUTHOR_NAME:-runtianz}} <${GIT_COMMITTER_EMAIL:-${GIT_AUTHOR_EMAIL:-runtianz@users.noreply.github.com}}>"
+)
 
 if [[ -d "${HOME}/.config/gh" ]]; then
   mounts+=(--mount "type=bind,src=${HOME}/.config/gh,dst=/root/.config/gh")
@@ -126,45 +166,39 @@ if [[ -f "${HOME}/.gitconfig" ]]; then
   mounts+=(--mount "type=bind,src=${HOME}/.gitconfig,dst=/root/.gitconfig,readonly")
 fi
 
+if [[ -d "${HOME}/.ssh" ]]; then
+  mounts+=(--mount "type=bind,src=${HOME}/.ssh,dst=/root/.ssh,readonly")
+fi
+
+if [[ "$origin_url" == https://github.com/* ]] && command -v gh >/dev/null 2>&1; then
+  if ! gh auth status -h github.com >/dev/null 2>&1; then
+    cat >&2 <<EOF
+error: parent GitHub CLI credential is invalid, so Docker cannot reuse it for git push.
+
+Host remediation:
+  gh auth login -h github.com
+
+After that, rerun:
+  bash scripts/run-docker-workspace.sh
+EOF
+    exit 1
+  fi
+elif [[ "$origin_url" == git@github.com:* || "$origin_url" == ssh://git@github.com/* ]]; then
+  if [[ -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK}" ]]; then
+    mounts+=(--mount "type=bind,src=${SSH_AUTH_SOCK},dst=/tmp/ssh-agent.sock")
+    docker_env+=(-e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
+  else
+    warn "origin uses SSH but SSH_AUTH_SOCK is not available; git push in Docker may fail"
+  fi
+fi
+
 echo "Starting container from workspace: $workspace_root"
 echo "Git common dir mounted from: $common_dir_abs"
 
 exec docker run --rm -it \
   --workdir /workspace \
   --add-host host.docker.internal:host-gateway \
-  -e XDG_RUNTIME_DIR=/tmp/xdg-runtime \
-  -e XDG_STATE_HOME=/root/.quine \
-  -e GIT_CONFIG_GLOBAL=/root/.gitconfig \
-  -e GH_CONFIG_DIR=/root/.config/gh \
-  -e LLM_PROVIDER="${LLM_PROVIDER:-openai}" \
-  -e LLM_BASE_URL="${LLM_BASE_URL:-http://host.docker.internal:8000/v1}" \
-  -e LLM_API_KEY="${LLM_API_KEY:-}" \
-  -e LLM_MODEL="${LLM_MODEL:-gpt-5.4}" \
-  -e LLM_CONTEXT_WINDOW="${LLM_CONTEXT_WINDOW:-}" \
-  -e ANTHROPIC_API_KEY="${ANTHROPIC_API_KEY:-}" \
-  -e ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL:-}" \
-  -e PERMISSION_LLM_ENABLED="${PERMISSION_LLM_ENABLED:-false}" \
-  -e GIT_CONFIG_COUNT=10 \
-  -e GIT_CONFIG_KEY_0=safe.directory \
-  -e GIT_CONFIG_VALUE_0=/workspace \
-  -e GIT_CONFIG_KEY_1=safe.directory \
-  -e GIT_CONFIG_VALUE_1="${workspace_root}" \
-  -e GIT_CONFIG_KEY_2=credential.https://github.com.helper \
-  -e GIT_CONFIG_VALUE_2= \
-  -e GIT_CONFIG_KEY_3=credential.https://github.com.helper \
-  -e GIT_CONFIG_VALUE_3='!gh auth git-credential' \
-  -e GIT_CONFIG_KEY_4=credential.https://gist.github.com.helper \
-  -e GIT_CONFIG_VALUE_4= \
-  -e GIT_CONFIG_KEY_5=credential.https://gist.github.com.helper \
-  -e GIT_CONFIG_VALUE_5='!gh auth git-credential' \
-  -e GIT_CONFIG_KEY_6=user.name \
-  -e GIT_CONFIG_VALUE_6="${GIT_AUTHOR_NAME:-runtianz}" \
-  -e GIT_CONFIG_KEY_7=user.email \
-  -e GIT_CONFIG_VALUE_7="${GIT_AUTHOR_EMAIL:-runtianz@users.noreply.github.com}" \
-  -e GIT_CONFIG_KEY_8=commit.author \
-  -e GIT_CONFIG_VALUE_8="${GIT_AUTHOR_NAME:-runtianz} <${GIT_AUTHOR_EMAIL:-runtianz@users.noreply.github.com}>" \
-  -e GIT_CONFIG_KEY_9=commit.committer \
-  -e GIT_CONFIG_VALUE_9="${GIT_COMMITTER_NAME:-${GIT_AUTHOR_NAME:-runtianz}} <${GIT_COMMITTER_EMAIL:-${GIT_AUTHOR_EMAIL:-runtianz@users.noreply.github.com}}>" \
+  "${docker_env[@]}" \
   "${entrypoint_args[@]}" \
   "${mounts[@]}" \
   "$image_tag" \
