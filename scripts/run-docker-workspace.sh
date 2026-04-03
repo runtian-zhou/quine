@@ -8,8 +8,11 @@ Usage: scripts/run-docker-workspace.sh [--chat] [--image TAG] [--no-build] [--] 
 
 Build a Quine Docker image from the current git workspace and run it with the
 workspace mounted at /workspace. For linked worktrees, the script also mounts
-the shared git common dir and rewrites /workspace/.git inside the container so
-git branch operations work against the main repository metadata.
+the shared git common dir and preserves the original git metadata paths so git
+branch operations work against the main repository metadata.
+
+GitHub CLI auth is stored in a persistent Docker volume. On first use, run
+`gh auth login -h github.com` inside the container to authorize it.
 
 Options:
   --chat        Run `cargo run --bin quine -- chat --auto-approve` instead of opening a shell.
@@ -92,6 +95,7 @@ workspace_name="$(basename "$workspace_root")"
 if [[ -z "$image_tag" ]]; then
   image_tag="quine-workspace:${workspace_name}"
 fi
+gh_auth_volume="${GH_AUTH_VOLUME:-quine-gh-auth-${workspace_name}}"
 
 if [[ ${#command_args[@]} -eq 0 ]]; then
   if [[ "$mode" == "chat" ]]; then
@@ -121,6 +125,7 @@ mounts=(
   --mount "type=bind,src=${workspace_root},dst=/workspace"
   --mount "type=bind,src=${workspace_root},dst=${workspace_root}"
   --mount "type=bind,src=${common_dir_abs},dst=${common_dir_abs}"
+  --mount "type=volume,src=${gh_auth_volume},dst=/root/.config/gh"
 )
 docker_env=(
   -e XDG_RUNTIME_DIR=/tmp/xdg-runtime
@@ -158,10 +163,6 @@ docker_env=(
   -e "GIT_CONFIG_VALUE_9=${GIT_COMMITTER_NAME:-${GIT_AUTHOR_NAME:-runtianz}} <${GIT_COMMITTER_EMAIL:-${GIT_AUTHOR_EMAIL:-runtianz@users.noreply.github.com}}>"
 )
 
-if [[ -d "${HOME}/.config/gh" ]]; then
-  mounts+=(--mount "type=bind,src=${HOME}/.config/gh,dst=/root/.config/gh")
-fi
-
 if [[ -f "${HOME}/.gitconfig" ]]; then
   mounts+=(--mount "type=bind,src=${HOME}/.gitconfig,dst=/root/.gitconfig,readonly")
 fi
@@ -170,20 +171,7 @@ if [[ -d "${HOME}/.ssh" ]]; then
   mounts+=(--mount "type=bind,src=${HOME}/.ssh,dst=/root/.ssh,readonly")
 fi
 
-if [[ "$origin_url" == https://github.com/* ]] && command -v gh >/dev/null 2>&1; then
-  if ! gh auth status -h github.com >/dev/null 2>&1; then
-    cat >&2 <<EOF
-error: parent GitHub CLI credential is invalid, so Docker cannot reuse it for git push.
-
-Host remediation:
-  gh auth login -h github.com
-
-After that, rerun:
-  bash scripts/run-docker-workspace.sh
-EOF
-    exit 1
-  fi
-elif [[ "$origin_url" == git@github.com:* || "$origin_url" == ssh://git@github.com/* ]]; then
+if [[ "$origin_url" == git@github.com:* || "$origin_url" == ssh://git@github.com/* ]]; then
   if [[ -n "${SSH_AUTH_SOCK:-}" && -S "${SSH_AUTH_SOCK}" ]]; then
     mounts+=(--mount "type=bind,src=${SSH_AUTH_SOCK},dst=/tmp/ssh-agent.sock")
     docker_env+=(-e SSH_AUTH_SOCK=/tmp/ssh-agent.sock)
@@ -194,6 +182,10 @@ fi
 
 echo "Starting container from workspace: $workspace_root"
 echo "Git common dir mounted from: $common_dir_abs"
+echo "GitHub auth volume: $gh_auth_volume"
+if [[ "$origin_url" == https://github.com/* ]]; then
+  echo "If this is the first run, authorize inside Docker with: gh auth login -h github.com"
+fi
 
 exec docker run --rm -it \
   --workdir /workspace \
