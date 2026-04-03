@@ -46,16 +46,17 @@ When the user enters `/plan`:
 
 Because current session mode is fixed at session creation time, the client will likely need a local helper that creates a replacement session and updates the in-memory `session_id` used for subsequent requests.
 
-### 3. Skill-Aware Command Prompting
+### 3. Direct Plan-Mode Entry Without Legacy Command Injection
 
-Quine already loads legacy Claude command files from `.claude/commands/` in `crates/quine-core/src/skill.rs`. `/plan` should use that compatibility path instead of inventing a separate hardcoded prompt.
+Quine already loads legacy Claude command files from `.claude/commands/` in `crates/quine-core/src/skill.rs`, and that compatibility must remain intact for normal slash-skill sessions. However, `/plan` itself should enter plan mode directly rather than depending on `.claude/commands/feature-request.md` or any dedicated command markdown file.
 
 Expected flow:
-- Resolve the `plan` skill/command through the existing skill-loading path.
-- Ensure the session receives the command prompt text associated with `.claude/commands/feature-request.md` or a dedicated `/plan` command file if one is introduced as part of the implementation.
-- Compose that prompt with the existing plan-mode system prompt from `crates/quine-core/src/engine.rs` so the resulting agent behavior stays read-only and produces a plan.
+- Recognize `/plan` locally in the interactive client.
+- Create or switch to a session with `plan_mode: true`.
+- Rely on the existing plan-mode system prompt composition in `crates/quine-core/src/engine.rs` so the resulting agent behavior stays read-only and produces a plan.
+- Preserve legacy `.claude/commands/` loading behavior for actual slash-skill commands such as `/review`.
 
-If the implementation introduces a dedicated `.claude/commands/plan.md`, the feature must document why that file is preferable to overloading `feature-request.md`, and it must continue to preserve compatibility with command-file loading patterns in `crates/quine-core/src/skill.rs`.
+A dedicated `.claude/commands/plan.md` is not required for this feature because the intended behavior is mode switching, not command-prompt injection.
 
 ### 4. Command-to-Session Wiring Across IPC Boundaries
 
