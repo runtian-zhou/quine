@@ -2,6 +2,10 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::memory::{
+    MemoryAuthorizationReason, MemoryConflictResolution, PersistentMemoryScope,
+    ScopedPersistentMemoryState,
+};
 use crate::persistence::PromptMemoryMode;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -89,6 +93,18 @@ impl Default for PromptMemoryDiagnostics {
 pub struct PersistentMemoryDiagnostics {
     pub enabled: bool,
     pub project_root: Option<PathBuf>,
+    #[serde(default)]
+    pub readable_scopes: Vec<PersistentMemoryScope>,
+    #[serde(default)]
+    pub writable_scope: Option<PersistentMemoryScope>,
+    #[serde(default)]
+    pub conflict_resolution: Option<MemoryConflictResolution>,
+    #[serde(default)]
+    pub conflict_winner_scope: Option<PersistentMemoryScope>,
+    #[serde(default)]
+    pub write_status: MemoryStatus,
+    #[serde(default)]
+    pub write_reason: Option<MemoryAuthorizationReason>,
     pub extraction: PersistentExtractionDiagnostics,
 }
 
@@ -132,9 +148,10 @@ pub struct MemorySkippedEntryDiagnostics {
     pub reason: MemoryDecisionReason,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryStatus {
+    #[default]
     NotRun,
     Succeeded,
     Skipped,
@@ -173,6 +190,7 @@ pub(crate) fn default_turn_diagnostics(
     prompt_memory_mode: PromptMemoryMode,
     project_root: PathBuf,
     persistent_enabled: bool,
+    scope_state: Option<&ScopedPersistentMemoryState>,
 ) -> MemoryTurnDiagnostics {
     MemoryTurnDiagnostics {
         session_memory: SessionMemoryDiagnostics {
@@ -189,6 +207,14 @@ pub(crate) fn default_turn_diagnostics(
         persistent_memory: PersistentMemoryDiagnostics {
             enabled: persistent_enabled,
             project_root: Some(project_root),
+            readable_scopes: scope_state
+                .map(|state| state.readable_scopes.clone())
+                .unwrap_or_default(),
+            writable_scope: scope_state.and_then(|state| state.writable_scope.clone()),
+            conflict_resolution: scope_state.map(|state| state.conflict_resolution),
+            conflict_winner_scope: None,
+            write_status: MemoryStatus::NotRun,
+            write_reason: None,
             extraction: PersistentExtractionDiagnostics::default(),
         },
     }
@@ -238,6 +264,12 @@ mod tests {
             persistent_memory: PersistentMemoryDiagnostics {
                 enabled: true,
                 project_root: Some(PathBuf::from("/repo")),
+                readable_scopes: vec![PersistentMemoryScope::project("project")],
+                writable_scope: Some(PersistentMemoryScope::project("project")),
+                conflict_resolution: Some(MemoryConflictResolution::PreferNarrowerScope),
+                conflict_winner_scope: Some(PersistentMemoryScope::project("project")),
+                write_status: MemoryStatus::Succeeded,
+                write_reason: None,
                 extraction: PersistentExtractionDiagnostics {
                     attempted: true,
                     status: MemoryStatus::Succeeded,

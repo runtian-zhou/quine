@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::memory::{MemoryPolicyConfig, ScopedPersistentMemoryState};
 use crate::planner::ActionPlan;
 use crate::session::{ExitStatus, SessionId, SessionState};
 
@@ -46,6 +47,12 @@ pub struct PersistedSessionConfig {
     pub plan_mode: bool,
     #[serde(default)]
     pub prompt_memory_mode: PromptMemoryMode,
+    #[serde(default)]
+    pub agent_key: Option<String>,
+    #[serde(default)]
+    pub team_key: Option<String>,
+    #[serde(default)]
+    pub memory_policy: MemoryPolicyConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -80,6 +87,8 @@ pub struct PersistedSessionMemoryState {
 pub struct PersistedPersistentMemoryState {
     pub enabled: bool,
     pub last_extracted_message_index: Option<usize>,
+    #[serde(default)]
+    pub scope_state: Option<ScopedPersistentMemoryState>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -230,6 +239,7 @@ mod tests {
             persistent_memory: Some(PersistedPersistentMemoryState {
                 enabled: true,
                 last_extracted_message_index: Some(6),
+                scope_state: None,
             }),
             prompt_memory: Some(PersistedPromptMemoryState {
                 mode: PromptMemoryMode::TargetedRecall,

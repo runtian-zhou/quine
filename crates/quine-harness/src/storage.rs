@@ -388,6 +388,7 @@ impl StorageManager {
 mod tests {
     use super::*;
     use chrono::Utc;
+    use quine_core::MemoryPolicyConfig;
     use quine_core::{
         CoreCheckpoint, PersistedPlanStore, PersistedSession, PersistedSessionConfig,
         PersistedSessionState, PersistedSessionTree, PromptMemoryMode, SessionId,
@@ -413,6 +414,9 @@ mod tests {
                     working_directory: PathBuf::from("/tmp/project"),
                     plan_mode: false,
                     prompt_memory_mode: quine_core::PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 history: vec![quine_llm::Message::user("hello")],
                 plan_store: PersistedPlanStore::default(),
@@ -452,6 +456,12 @@ mod tests {
                         persistent_memory: quine_core::PersistentMemoryDiagnostics {
                             enabled: true,
                             project_root: Some(PathBuf::from("/tmp/project")),
+                            readable_scopes: Vec::new(),
+                            writable_scope: None,
+                            conflict_resolution: None,
+                            conflict_winner_scope: None,
+                            write_status: quine_core::MemoryStatus::NotRun,
+                            write_reason: None,
                             extraction: Default::default(),
                         },
                     }),

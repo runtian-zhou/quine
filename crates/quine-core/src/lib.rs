@@ -20,10 +20,14 @@ pub use engine::{run_core_loop, run_core_loop_with_compaction};
 pub use error::CoreError;
 pub use filesystem::{DirEntry, FsError, NullFilesystem, OverlayFilesystem, SessionFilesystem};
 pub use memory::{
-    CompactionSourceDiagnostics, MemoryDecisionReason, MemorySelectionEntryDiagnostics,
-    MemorySkippedEntryDiagnostics, MemoryStatus, MemoryTurnDiagnostics,
-    PersistentExtractionDiagnostics, PersistentMemoryDiagnostics, PromptMemoryDiagnostics,
-    SessionMemoryDiagnostics, SessionRefreshDiagnostics,
+    authorize_memory_read, authorize_memory_write, build_memory_permission_context,
+    resolve_scoped_memory_paths, workspace_is_trusted, CompactionSourceDiagnostics,
+    MemoryAuthorizationReason, MemoryConflictResolution, MemoryDecisionReason, MemoryFeatureFlags,
+    MemoryPermissionContext, MemoryPolicyConfig, MemoryReadPolicy, MemorySelectionEntryDiagnostics,
+    MemorySkippedEntryDiagnostics, MemoryStatus, MemoryTurnDiagnostics, MemoryWritePolicy,
+    PersistentExtractionDiagnostics, PersistentMemoryDiagnostics, PersistentMemoryScope,
+    PromptMemoryDiagnostics, ScopeSelector, ScopedMemoryLookupOrder, ScopedMemoryPaths,
+    ScopedPersistentMemoryState, SessionMemoryDiagnostics, SessionRefreshDiagnostics,
 };
 pub use persistence::{
     CoreCheckpoint, PersistedMemoryState, PersistedPersistentMemoryState, PersistedPlanStore,

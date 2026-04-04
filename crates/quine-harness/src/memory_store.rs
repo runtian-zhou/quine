@@ -1,17 +1,21 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use quine_core::{
-    MemoryDecisionReason, MemoryStatus, PersistedPersistentMemoryState, PersistedSession,
-    PersistentExtractionDiagnostics,
+    authorize_memory_write, build_memory_permission_context, resolve_scoped_memory_paths,
+    workspace_is_trusted, MemoryAuthorizationReason, MemoryDecisionReason, MemoryPermissionContext,
+    MemoryStatus, PersistedPersistentMemoryState, PersistedSession,
+    PersistentExtractionDiagnostics, PersistentMemoryScope, ScopedMemoryPaths,
+    ScopedPersistentMemoryState,
 };
 use quine_llm::{Message, MessageContent, Role};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use tokio::fs;
 
+#[allow(dead_code)]
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PersistentMemoryPaths {
     pub root: PathBuf,
@@ -96,6 +100,9 @@ pub struct MemoryStore {
 pub struct ExtractionResult {
     pub state: Option<PersistedPersistentMemoryState>,
     pub diagnostics: PersistentExtractionDiagnostics,
+    pub writable_scope: Option<PersistentMemoryScope>,
+    pub write_status: MemoryStatus,
+    pub write_reason: Option<MemoryAuthorizationReason>,
 }
 
 impl MemoryStore {
@@ -103,7 +110,10 @@ impl MemoryStore {
         Self { root }
     }
 
-    pub fn project_paths(&self, project_root: &Path) -> PersistentMemoryPaths {
+    #[allow(dead_code)]
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub fn project_paths(&self, project_root: &std::path::Path) -> PersistentMemoryPaths {
         let key = project_key(project_root);
         let root = self.root.join("projects").join(&key);
         PersistentMemoryPaths {
@@ -132,6 +142,9 @@ impl MemoryStore {
                     tombstoned: 0,
                     ignored: 0,
                 },
+                writable_scope: None,
+                write_status: MemoryStatus::Skipped,
+                write_reason: Some(MemoryAuthorizationReason::ScopeUnavailable),
             });
         };
         let persistent =
@@ -141,6 +154,7 @@ impl MemoryStore {
                 .unwrap_or(PersistedPersistentMemoryState {
                     enabled: true,
                     last_extracted_message_index: None,
+                    scope_state: None,
                 });
         if !persistent.enabled {
             return Ok(ExtractionResult {
@@ -155,12 +169,31 @@ impl MemoryStore {
                     tombstoned: 0,
                     ignored: 0,
                 },
+                writable_scope: persistent
+                    .scope_state
+                    .and_then(|state| state.writable_scope),
+                write_status: MemoryStatus::Skipped,
+                write_reason: Some(MemoryAuthorizationReason::ScopeDisabled),
             });
         }
 
-        let project_root = resolve_project_root(&session.config.working_directory);
-        let paths = self.project_paths(&project_root);
-        let records = self.load_live_records(&paths).await?;
+        let resolution = resolve_scoped_memory_paths(
+            &self.root,
+            &session.config.memory_policy,
+            &session.config.working_directory,
+            session.config.agent_key.as_deref(),
+            session.config.team_key.as_deref(),
+        );
+        let writable_scope = resolution
+            .writable_scope
+            .as_ref()
+            .map(|item| item.scope.clone());
+        let write_context = build_memory_permission_context(
+            workspace_is_trusted(&session.config.working_directory),
+            false,
+            session.config.agent_key.as_deref(),
+            session.config.team_key.as_deref(),
+        );
         let start = persistent
             .last_extracted_message_index
             .map_or(0, |index| index.saturating_add(1));
@@ -177,18 +210,48 @@ impl MemoryStore {
                     tombstoned: 0,
                     ignored: 0,
                 },
+                writable_scope,
+                write_status: MemoryStatus::Skipped,
+                write_reason: None,
             });
         }
 
-        let mut live_records = records;
+        let paths = resolution.writable_scope.as_ref().cloned();
+        let mut live_records = match paths.as_ref() {
+            Some(paths) => self.load_live_records(paths).await?,
+            None => HashMap::new(),
+        };
         let mut changed = false;
         let mut created = 0usize;
         let mut updated = 0usize;
         let mut tombstoned = 0usize;
         let mut ignored = 0usize;
+        let mut write_reason = None;
+        let mut write_status = MemoryStatus::NotRun;
         for message in &session.history[start..] {
+            let explicit_user_memory_intent = is_explicit_user_memory_intent(message);
+            let message_permission_context = MemoryPermissionContext {
+                explicit_user_memory_intent,
+                ..write_context.clone()
+            };
             match self.decision_for_message(message, &live_records) {
                 ExtractionDecision::Upsert(record) => {
+                    let Some(paths) = paths.as_ref() else {
+                        write_status = MemoryStatus::Skipped;
+                        write_reason = Some(MemoryAuthorizationReason::ScopeUnavailable);
+                        ignored += 1;
+                        continue;
+                    };
+                    if let Err(reason) = authorize_memory_write(
+                        &session.config.memory_policy.write_policy,
+                        &paths.scope,
+                        &message_permission_context,
+                    ) {
+                        write_status = MemoryStatus::Skipped;
+                        write_reason = Some(reason);
+                        ignored += 1;
+                        continue;
+                    }
                     if live_records.contains_key(&record.frontmatter.entry_id) {
                         updated += 1;
                     } else {
@@ -198,8 +261,24 @@ impl MemoryStore {
                     changed = true;
                 }
                 ExtractionDecision::Tombstone { entry_id, reason } => {
+                    let Some(paths) = paths.as_ref() else {
+                        write_status = MemoryStatus::Skipped;
+                        write_reason = Some(MemoryAuthorizationReason::ScopeUnavailable);
+                        ignored += 1;
+                        continue;
+                    };
+                    if let Err(deny_reason) = authorize_memory_write(
+                        &session.config.memory_policy.write_policy,
+                        &paths.scope,
+                        &message_permission_context,
+                    ) {
+                        write_status = MemoryStatus::Skipped;
+                        write_reason = Some(deny_reason);
+                        ignored += 1;
+                        continue;
+                    }
                     if live_records.remove(&entry_id).is_some() {
-                        self.write_tombstone(&paths, &entry_id, &reason).await?;
+                        self.write_tombstone(paths, &entry_id, &reason).await?;
                         changed = true;
                         tombstoned += 1;
                     } else {
@@ -211,12 +290,26 @@ impl MemoryStore {
         }
 
         if changed {
-            self.persist_records(&paths, &live_records).await?;
+            let paths = paths.as_ref().expect("paths must exist for changed writes");
+            self.persist_records(paths, &live_records).await?;
+            write_status = MemoryStatus::Succeeded;
+        } else if write_reason.is_none() {
+            write_status = MemoryStatus::Skipped;
         }
 
         let state = PersistedPersistentMemoryState {
             enabled: true,
             last_extracted_message_index: Some(session.history.len().saturating_sub(1)),
+            scope_state: Some(ScopedPersistentMemoryState {
+                readable_scopes: resolution
+                    .readable_scopes
+                    .iter()
+                    .map(|item| item.scope.clone())
+                    .collect(),
+                writable_scope: writable_scope.clone(),
+                lookup_order: resolution.lookup_order,
+                conflict_resolution: resolution.conflict_resolution,
+            }),
         };
         Ok(ExtractionResult {
             state: Some(state.clone()),
@@ -238,6 +331,9 @@ impl MemoryStore {
                 tombstoned,
                 ignored,
             },
+            writable_scope,
+            write_status,
+            write_reason,
         })
     }
 
@@ -288,16 +384,14 @@ impl MemoryStore {
 
     async fn load_live_records(
         &self,
-        paths: &PersistentMemoryPaths,
+        paths: &ScopedMemoryPaths,
     ) -> Result<HashMap<String, PersistentMemoryRecord>> {
         let mut records = HashMap::new();
-        let read_dir = match fs::read_dir(&paths.entries_dir).await {
-            Ok(read_dir) => read_dir,
+        let mut dir = match fs::read_dir(&paths.entries_dir).await {
+            Ok(dir) => dir,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(records),
             Err(error) => return Err(error.into()),
         };
-        tokio::pin!(read_dir);
-        let mut dir = read_dir;
         while let Some(entry) = dir.next_entry().await? {
             if !entry.file_type().await?.is_file() {
                 continue;
@@ -313,7 +407,7 @@ impl MemoryStore {
 
     async fn persist_records(
         &self,
-        paths: &PersistentMemoryPaths,
+        paths: &ScopedMemoryPaths,
         records: &HashMap<String, PersistentMemoryRecord>,
     ) -> Result<()> {
         fs::create_dir_all(&paths.entries_dir).await?;
@@ -373,7 +467,7 @@ impl MemoryStore {
 
     async fn write_tombstone(
         &self,
-        paths: &PersistentMemoryPaths,
+        paths: &ScopedMemoryPaths,
         entry_id: &str,
         reason: &str,
     ) -> Result<()> {
@@ -389,7 +483,9 @@ impl MemoryStore {
     }
 }
 
-pub fn resolve_project_root(working_directory: &Path) -> PathBuf {
+#[allow(dead_code)]
+#[cfg(test)]
+pub fn resolve_project_root(working_directory: &std::path::Path) -> PathBuf {
     let mut current = working_directory.to_path_buf();
     loop {
         if current.join(".git").exists()
@@ -404,7 +500,9 @@ pub fn resolve_project_root(working_directory: &Path) -> PathBuf {
     }
 }
 
-pub fn project_key(project_root: &Path) -> String {
+#[cfg(test)]
+pub fn project_key(project_root: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
     let normalized = project_root.to_string_lossy().replace('\\', "/");
     let mut hasher = Sha256::new();
     hasher.update(normalized.as_bytes());
@@ -434,6 +532,16 @@ fn extract_explicit_forget<'a>(text: &'a str, lowercase: &str) -> Option<&'a str
         }
     }
     None
+}
+
+fn is_explicit_user_memory_intent(message: &Message) -> bool {
+    let MessageContent::Text(text) = &message.content else {
+        return false;
+    };
+    let normalized = text.trim();
+    let lowercase = normalized.to_ascii_lowercase();
+    extract_explicit_remember(normalized, &lowercase).is_some()
+        || extract_explicit_forget(normalized, &lowercase).is_some()
 }
 
 fn extract_heuristic_memory<'a>(text: &'a str, lowercase: &str) -> Option<&'a str> {
@@ -556,6 +664,7 @@ pub fn render_memory_index(index: &PersistentMemoryIndex) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn project_key_is_stable() {
@@ -619,7 +728,17 @@ mod tests {
         let root =
             std::env::temp_dir().join(format!("quine-memory-store-{}", uuid::Uuid::new_v4()));
         let store = MemoryStore::new(root.clone());
-        let paths = store.project_paths(Path::new("/tmp/project"));
+        let paths = quine_core::resolve_scoped_memory_paths(
+            &root,
+            &quine_core::MemoryPolicyConfig::default(),
+            std::path::Path::new("/tmp/project"),
+            None,
+            None,
+        )
+        .readable_scopes
+        .into_iter()
+        .next()
+        .unwrap();
         let mut records = HashMap::new();
         let record = build_record(
             "Use anyhow for app-level errors",
