@@ -279,6 +279,21 @@ async fn load_skills_from_config(skill_names: &[String]) -> Vec<Skill> {
     load_skills(&project_root, skill_names).await
 }
 
+impl LocalHarness {
+    #[cfg(test)]
+    pub(crate) async fn latest_checkpoint_for_tests(&self) -> Result<CoreCheckpoint, HarnessError> {
+        self._storage
+            .load_latest_checkpoint()
+            .await
+            .map_err(|error| HarnessError::Internal {
+                message: format!("failed to load checkpoint: {error}"),
+            })?
+            .ok_or_else(|| HarnessError::Internal {
+                message: "no checkpoint available".into(),
+            })
+    }
+}
+
 #[async_trait]
 impl HarnessService for LocalHarness {
     async fn create_session(&self, config: SessionConfig) -> Result<SessionId, HarnessError> {
@@ -635,6 +650,30 @@ mod tests {
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    #[tokio::test]
+    async fn create_session_bootstraps_permission_context_without_explicit_inputs() {
+        let harness = LocalHarness::new(Arc::new(MockProvider), Some(temp_storage()))
+            .await
+            .unwrap();
+
+        let session_id = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+
+        let snapshot = wait_for_context_snapshot(&harness, session_id).await;
+        let checkpoint = harness.latest_checkpoint_for_tests().await.unwrap();
+        let projected = session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new())
+            .expect("session snapshot should exist in checkpoint");
+
+        assert_eq!(snapshot.session_id, projected.session_id);
+        assert_eq!(snapshot.working_directory, projected.working_directory);
+        assert!(!snapshot.plan_mode);
+        assert!(!projected.plan_mode);
+
+        harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]

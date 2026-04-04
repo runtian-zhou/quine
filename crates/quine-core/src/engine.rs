@@ -24,6 +24,9 @@ use crate::memory::{
     MemoryDiagnostics, MemoryPolicyConfig, MemoryStatus, MemoryTurnDiagnostics,
     ScopedMemoryResolution, ScopedPersistentMemoryState, SessionMemoryState,
 };
+use crate::permission::{
+    exit_plan_mode as exit_permission_plan_mode, PermissionContext, PermissionPromptBehavior,
+};
 use crate::persistence::{
     CoreCheckpoint, PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
     PersistedSessionState, PromptMemoryMode,
@@ -262,6 +265,8 @@ struct SessionContext {
     /// Resolved durable-memory scope state for this session.
     scoped_memory_resolution: ScopedMemoryResolution,
     scoped_persistent_memory_state: ScopedPersistentMemoryState,
+    /// Internal permission bootstrap state for this session.
+    permission_context: PermissionContext,
 }
 
 #[derive(Clone)]
@@ -479,6 +484,11 @@ impl SessionContext {
             &persisted_config,
             &skills,
         );
+        let permission_context = PermissionContext::new(
+            working_directory.clone(),
+            persisted_config.plan_mode,
+            PermissionPromptBehavior::Interactive,
+        );
         let tools = tool_registry.tool_definitions();
 
         let combined_prompt =
@@ -527,6 +537,7 @@ impl SessionContext {
             last_prompt_memory_user_index: None,
             scoped_memory_resolution,
             scoped_persistent_memory_state,
+            permission_context,
         })
     }
 
@@ -703,6 +714,7 @@ impl SessionContext {
             return Ok(());
         }
         self.persisted_config.plan_mode = false;
+        let _ = exit_permission_plan_mode(&mut self.permission_context);
         self.rebuild_session_config(provider).await
     }
 }
@@ -3744,6 +3756,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
 mod tests {
     use super::*;
     use crate::channel::{create_channels, ChannelConfig};
+    use crate::permission::types::PermissionMode;
     use crate::session::{ExitStatus, InheritanceFlags};
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -3827,6 +3840,43 @@ mod tests {
                 Ok(LlmEvent::Done { usage: None }),
             ])))
         }
+    }
+
+    #[tokio::test]
+    async fn session_context_bootstraps_permission_foundation_from_plan_mode() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let temp_dir = TempDir::new().unwrap();
+        let working_directory = temp_dir.path().to_path_buf();
+        let session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: working_directory.clone(),
+                plan_mode: true,
+                initial_messages: Vec::new(),
+                archive_root: temp_dir.path().join("archive"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.permission_context.mode(), PermissionMode::Plan);
+        assert_eq!(session.permission_context.pre_plan_mode(), None);
+        assert_eq!(
+            session.permission_context.workspace_root(),
+            &working_directory
+        );
+        assert!(session
+            .permission_context
+            .additional_allowed_roots()
+            .is_empty());
     }
 
     fn compacted_summary_text(history: &[Message]) -> &str {

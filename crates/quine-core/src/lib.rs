@@ -5,6 +5,7 @@ pub mod error;
 pub mod filesystem;
 pub mod ipc;
 pub mod memory;
+pub mod permission;
 pub mod persistence;
 pub mod planner;
 mod scheduler;
