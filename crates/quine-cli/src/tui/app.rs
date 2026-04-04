@@ -570,6 +570,38 @@ fn parse_duration(input: &str) -> Result<Duration, String> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionStateNotification {
+    Idle,
+    Streaming,
+    AwaitingToolResult,
+    Waiting,
+    Paused,
+    Destroyed,
+}
+
+fn notification_session_id(notif: &JsonRpcNotification) -> Option<&str> {
+    notif.params
+        .as_ref()
+        .and_then(|params| params.get("session_id"))
+        .and_then(|value| value.as_str())
+}
+
+fn parse_session_state(value: &serde_json::Value) -> Option<SessionStateNotification> {
+    let state = value.as_str()?;
+    match state {
+        "Idle" | "idle" => Some(SessionStateNotification::Idle),
+        "Streaming" | "streaming" => Some(SessionStateNotification::Streaming),
+        "AwaitingToolResult" | "awaiting_tool_result" => {
+            Some(SessionStateNotification::AwaitingToolResult)
+        }
+        "Waiting" | "waiting" => Some(SessionStateNotification::Waiting),
+        "Paused" | "paused" => Some(SessionStateNotification::Paused),
+        "Destroyed" | "destroyed" => Some(SessionStateNotification::Destroyed),
+        _ => None,
+    }
+}
+
 impl App {
     pub fn new(session_id: String, plan_mode: bool, max_context_window: Option<u64>) -> Self {
         Self {
@@ -1190,6 +1222,10 @@ impl App {
 
     /// Apply an incoming notification from the daemon to app state.
     pub fn apply_notification(&mut self, notif: &JsonRpcNotification) {
+        if notification_session_id(notif).is_some_and(|session_id| session_id != self.session_id) {
+            return;
+        }
+
         match notif.method.as_str() {
             notifications::REASONING_DELTA => {
                 if notif
@@ -1375,6 +1411,34 @@ impl App {
                 self.push_message(ConversationEntry::TurnInfo { duration_us, usage });
                 self.set_phase(AgentPhase::Idle);
                 self.auto_scroll();
+            }
+            notifications::SESSION_STATE_CHANGED => {
+                if let Some(state) = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("state"))
+                    .and_then(parse_session_state)
+                {
+                    match state {
+                        SessionStateNotification::Idle => self.set_phase(AgentPhase::Idle),
+                        SessionStateNotification::Streaming => {
+                            if !self.streaming_buffer.is_empty() {
+                                self.set_phase(AgentPhase::Streaming);
+                            } else {
+                                self.set_phase(AgentPhase::Thinking);
+                            }
+                        }
+                        SessionStateNotification::AwaitingToolResult => {
+                            if !matches!(self.phase, AgentPhase::RunningTool(_)) {
+                                self.set_phase(AgentPhase::Thinking);
+                            }
+                        }
+                        SessionStateNotification::Waiting | SessionStateNotification::Paused => {
+                            self.set_phase(AgentPhase::Idle);
+                        }
+                        SessionStateNotification::Destroyed => self.set_phase(AgentPhase::Idle),
+                    }
+                }
             }
             notifications::PLAN_PROGRESS => {
                 if let Some(params) = &notif.params {
@@ -1800,6 +1864,39 @@ mod tests {
                 && *remaining == 2
                 && *total == 5
         ));
+    }
+
+    #[test]
+    fn session_state_changed_resets_streaming_phase_to_idle() {
+        let mut app = App::new("session-1".into(), false, None);
+        app.streaming_buffer = "partial output".into();
+        app.set_phase(AgentPhase::Streaming);
+
+        app.apply_notification(&make_notif(
+            notifications::SESSION_STATE_CHANGED,
+            serde_json::json!({
+                "session_id": "session-1",
+                "state": "idle"
+            }),
+        ));
+
+        assert_eq!(app.phase, AgentPhase::Idle);
+    }
+
+    #[test]
+    fn session_state_changed_ignores_other_sessions() {
+        let mut app = App::new("session-1".into(), false, None);
+        app.set_phase(AgentPhase::Streaming);
+
+        app.apply_notification(&make_notif(
+            notifications::SESSION_STATE_CHANGED,
+            serde_json::json!({
+                "session_id": "session-2",
+                "state": "idle"
+            }),
+        ));
+
+        assert_eq!(app.phase, AgentPhase::Streaming);
     }
 
     #[test]
