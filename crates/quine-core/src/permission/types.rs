@@ -20,6 +20,7 @@ pub(crate) enum PermissionDecision {
     Allow,
     Deny,
     Ask,
+    Defer,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]

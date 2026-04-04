@@ -25,7 +25,9 @@ use crate::memory::{
     ScopedMemoryResolution, ScopedPersistentMemoryState, SessionMemoryState,
 };
 use crate::permission::{
-    exit_plan_mode as exit_permission_plan_mode, PermissionContext, PermissionPromptBehavior,
+    evaluate_permission, exit_plan_mode as exit_permission_plan_mode, PermissionContext,
+    PermissionOutcome, PermissionPromptBehavior, PermissionRequest, PermissionResource,
+    PermissionScope, ToolLocalDecision,
 };
 use crate::persistence::{
     CoreCheckpoint, PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
@@ -267,6 +269,8 @@ struct SessionContext {
     scoped_persistent_memory_state: ScopedPersistentMemoryState,
     /// Internal permission bootstrap state for this session.
     permission_context: PermissionContext,
+    /// Latest evaluator result retained for future diagnostics work.
+    last_permission_outcome: Option<PermissionOutcome>,
 }
 
 #[derive(Clone)]
@@ -538,6 +542,7 @@ impl SessionContext {
             scoped_memory_resolution,
             scoped_persistent_memory_state,
             permission_context,
+            last_permission_outcome: None,
         })
     }
 
@@ -1338,6 +1343,98 @@ struct CompletedConcurrentToolCall {
     duration_us: u64,
 }
 
+fn build_permission_request(
+    call: &PendingToolCall,
+    tool: &dyn crate::tool::Tool,
+) -> (PermissionRequest, Option<ToolLocalDecision>) {
+    let scope = match call.tool_name.as_str() {
+        "read_file" | "find" => PermissionScope::Read,
+        "write_file" => PermissionScope::Write,
+        "bash" => PermissionScope::Execute,
+        "signal" => PermissionScope::ProcessControl,
+        "spawn" | "subagent" | "wait_child" | "send_message" | "recv_message" => {
+            PermissionScope::AgentControl
+        }
+        _ => {
+            if tool.is_read_only() {
+                PermissionScope::Read
+            } else {
+                PermissionScope::Write
+            }
+        }
+    };
+
+    let resource = match call.tool_name.as_str() {
+        "read_file" | "write_file" => call
+            .arguments
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|path| PermissionResource::Path {
+                path: PathBuf::from(path),
+            })
+            .unwrap_or(PermissionResource::None),
+        "bash" => call
+            .arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|command| PermissionResource::Command {
+                command: command.to_string(),
+            })
+            .unwrap_or(PermissionResource::None),
+        "signal" => call
+            .arguments
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|target| PermissionResource::Process {
+                target: target.to_string(),
+            })
+            .unwrap_or(PermissionResource::None),
+        "spawn" | "subagent" | "wait_child" | "send_message" | "recv_message" => {
+            PermissionResource::Agent {
+                target: call.tool_name.clone(),
+            }
+        }
+        _ => PermissionResource::None,
+    };
+
+    let local = if call.tool_name == "bash" {
+        call.arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|command| {
+                let trimmed = command.trim();
+                if trimmed == "rm -rf /" || trimmed.starts_with("rm -rf /") {
+                    ToolLocalDecision {
+                        decision: crate::permission::types::PermissionDecision::Deny,
+                        reason: Some("dangerous destructive shell command".into()),
+                    }
+                } else {
+                    ToolLocalDecision {
+                        decision: crate::permission::types::PermissionDecision::Defer,
+                        reason: Some(
+                            "bash delegates final permission decision to the shared engine".into(),
+                        ),
+                    }
+                }
+            })
+    } else {
+        Some(ToolLocalDecision {
+            decision: crate::permission::types::PermissionDecision::Defer,
+            reason: Some("tool defers to the shared permission engine".into()),
+        })
+    };
+
+    (
+        PermissionRequest {
+            tool_name: call.tool_name.clone(),
+            action: None,
+            scope,
+            resource,
+        },
+        local,
+    )
+}
+
 fn session_output(session: &SessionContext) -> Option<String> {
     session.history.iter().rev().find_map(|message| {
         if message.role != quine_llm::Role::Assistant {
@@ -1894,6 +1991,44 @@ async fn execute_tool_call(
         session_id,
         format!("starting tool execution for `{}`", call.tool_name),
     );
+
+    let tool = {
+        let Some(session) = sessions.get(&session_id) else {
+            return ToolOutcome::Error {
+                message: "session not found".into(),
+            };
+        };
+        let Some(tool) = session.tool_registry.get(&call.tool_name) else {
+            return ToolOutcome::Error {
+                message: format!("unknown tool: {}", call.tool_name),
+            };
+        };
+        Arc::clone(tool)
+    };
+
+    let permission_outcome = {
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return ToolOutcome::Error {
+                message: "session not found".into(),
+            };
+        };
+        let (request, local) = build_permission_request(call, tool.as_ref());
+        let outcome = evaluate_permission(&session.permission_context, request, local);
+        session.last_permission_outcome = Some(outcome.clone());
+        outcome
+    };
+
+    if !permission_outcome.is_allowed() {
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.cancel_tx = None;
+        }
+        return ToolOutcome::Error {
+            message: ToolError::PermissionDenied {
+                reason: permission_outcome.reason,
+            }
+            .to_string(),
+        };
+    }
 
     if call.tool_name == "spawn" {
         let task = match call.arguments.get("task").and_then(|v| v.as_str()) {
