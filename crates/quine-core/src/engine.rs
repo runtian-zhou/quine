@@ -25,7 +25,7 @@ use crate::memory::{
     ScopedMemoryResolution, ScopedPersistentMemoryState, SessionMemoryState,
 };
 use crate::permission::{
-    build_permission_approval_request, evaluate_permission,
+    analyze_command, build_permission_approval_request, evaluate_permission,
     exit_plan_mode as exit_permission_plan_mode, parse_permission_approval_response,
     PendingPermissionApproval, PermissionApprovalChoice, PermissionContext, PermissionOutcome,
     PermissionPromptBehavior, PermissionRequest, PermissionResource, PermissionScope,
@@ -1405,7 +1405,7 @@ fn build_permission_request(
             .get("command")
             .and_then(|v| v.as_str())
             .map(|command| PermissionResource::Command {
-                command: command.to_string(),
+                descriptor: analyze_command(command),
             })
             .unwrap_or(PermissionResource::None),
         "signal" => call
@@ -5573,6 +5573,54 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[tokio::test]
+    async fn build_permission_request_attaches_bash_command_risk_metadata() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        let tool = crate::tool::bash::BashTool;
+        let call = PendingToolCall {
+            tool_use_id: "toolu_bash".into(),
+            tool_name: "bash".into(),
+            arguments: serde_json::json!({"command": "pwd"}),
+        };
+
+        let (request, local) = build_permission_request(&session, &call, &tool);
+
+        assert_eq!(request.tool_name, "bash");
+        assert_eq!(
+            request.scope,
+            crate::permission::request::PermissionScope::Execute
+        );
+        assert!(matches!(
+            request.resource,
+            PermissionResource::Command { ref descriptor }
+                if descriptor.program.as_deref() == Some("pwd")
+                    && descriptor.risk == crate::permission::CommandRisk::ReadOnly
+        ));
+        assert_eq!(
+            local.expect("tool-local decision should exist").decision,
+            crate::permission::types::PermissionDecision::Defer
+        );
+    }
+
+    #[tokio::test]
     async fn build_permission_request_treats_ask_user_as_internal_interaction() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let session = SessionContext::new(
@@ -7192,7 +7240,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                         Ok(LlmEvent::ToolCall {
                             tool_use_id: "tc_1".into(),
                             tool_name: "bash".into(),
-                            arguments: serde_json::json!({"command": "echo hello_world"}),
+                            arguments: serde_json::json!({"command": "touch permission-prompt.txt"}),
                         }),
                         Ok(LlmEvent::Done { usage: None }),
                     ]
@@ -7281,6 +7329,115 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         assert!(saw_interaction_needed, "bash tool should require approval");
         assert!(saw_text_complete, "turn should complete after approval");
+        assert!(saw_turn_complete, "turn should complete successfully");
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn bash_read_only_command_completes_without_permission_prompt() {
+        struct ToolThenTextProvider {
+            call_count: std::sync::atomic::AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for ToolThenTextProvider {
+            async fn send(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+            {
+                let count = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let events = if count == 0 {
+                    vec![
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_pwd".into(),
+                            tool_name: "bash".into(),
+                            arguments: serde_json::json!({"command": "pwd"}),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else {
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            text: "Done!".into(),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let provider = ToolThenTextProvider {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        };
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        let _ = output.recv().await.unwrap();
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "run pwd".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut saw_interaction_needed = false;
+        let mut saw_text_complete = false;
+        let mut saw_turn_complete = false;
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
+                Ok(Some(CoreOutput::InteractionNeeded { .. })) => {
+                    saw_interaction_needed = true;
+                }
+                Ok(Some(CoreOutput::TextComplete { full_text, .. })) => {
+                    assert_eq!(full_text, "Done!");
+                    saw_text_complete = true;
+                }
+                Ok(Some(CoreOutput::TurnComplete { .. })) => {
+                    saw_turn_complete = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timeout waiting for events"),
+            }
+        }
+
+        assert!(
+            !saw_interaction_needed,
+            "read-only bash should not require approval"
+        );
+        assert!(saw_text_complete, "turn should complete without approval");
         assert!(saw_turn_complete, "turn should complete successfully");
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
