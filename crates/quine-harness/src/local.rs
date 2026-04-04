@@ -192,12 +192,22 @@ impl LocalHarness {
                     let mut checkpoint = checkpoint.clone();
                     for session in &mut checkpoint.sessions {
                         match memory_store.extract_and_persist_for_session(session).await {
-                            Ok(Some(persistent_state)) => {
+                            Ok(result) => {
                                 let mut state = session.memory_state.clone().unwrap_or_default();
-                                state.persistent_memory = Some(persistent_state);
+                                state.persistent_memory = result.state;
+                                let diagnostics = state
+                                    .memory_diagnostics
+                                    .get_or_insert_with(quine_core::MemoryTurnDiagnostics::default);
+                                diagnostics.persistent_memory.enabled = state
+                                    .persistent_memory
+                                    .as_ref()
+                                    .map(|persistent| persistent.enabled)
+                                    .unwrap_or(false);
+                                diagnostics.persistent_memory.project_root =
+                                    Some(session.config.working_directory.clone());
+                                diagnostics.persistent_memory.extraction = result.diagnostics;
                                 session.memory_state = Some(state);
                             }
-                            Ok(None) => {}
                             Err(error) => {
                                 let _ = event_tx.send(CoreOutput::SessionError {
                                     session_id: session.session_id,
@@ -856,6 +866,27 @@ mod tests {
         .expect("session context should become available")
     }
 
+    async fn wait_for_context_snapshot_matching<F>(
+        harness: &LocalHarness,
+        session_id: SessionId,
+        predicate: F,
+    ) -> crate::storage::SessionContextSnapshot
+    where
+        F: Fn(&crate::storage::SessionContextSnapshot) -> bool,
+    {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = wait_for_context_snapshot(harness, session_id).await;
+                if predicate(&snapshot) {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session context should satisfy predicate")
+    }
+
     #[tokio::test]
     async fn local_harness_restores_checkpointed_session() {
         let storage = temp_storage();
@@ -1016,6 +1047,25 @@ mod tests {
         .await
         .unwrap();
 
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .memory_diagnostics
+                .as_ref()
+                .map(|diagnostics| diagnostics.persistent_memory.extraction.created == 1)
+                .unwrap_or(false)
+        })
+        .await;
+        let extraction = &snapshot
+            .memory_diagnostics
+            .as_ref()
+            .expect("memory diagnostics should be present")
+            .persistent_memory
+            .extraction;
+        assert!(extraction.attempted);
+        assert_eq!(extraction.status, quine_core::MemoryStatus::Succeeded);
+        assert_eq!(extraction.created, 1);
+        assert_eq!(extraction.tombstoned, 0);
+
         let memory_root = storage.root().join("memory");
         let project_key = crate::memory_store::project_key(&project_dir);
         let memory_dir = memory_root.join("projects").join(&project_key);
@@ -1063,6 +1113,24 @@ mod tests {
         })
         .await
         .unwrap();
+
+        let snapshot = wait_for_context_snapshot_matching(&restored, session_id, |snapshot| {
+            snapshot
+                .memory_diagnostics
+                .as_ref()
+                .map(|diagnostics| diagnostics.persistent_memory.extraction.tombstoned == 1)
+                .unwrap_or(false)
+        })
+        .await;
+        let extraction = &snapshot
+            .memory_diagnostics
+            .as_ref()
+            .expect("memory diagnostics should be present")
+            .persistent_memory
+            .extraction;
+        assert!(extraction.attempted);
+        assert_eq!(extraction.status, quine_core::MemoryStatus::Succeeded);
+        assert_eq!(extraction.tombstoned, 1);
 
         let index_after = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -1176,6 +1244,82 @@ mod tests {
         assert!(!session_restored.config.plan_mode);
 
         restored.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
+    async fn local_harness_context_reports_memory_diagnostics_after_turn() {
+        let _env_guard = PROMPT_MEMORY_ENV_LOCK.lock().await;
+        let previous_mode = std::env::var_os("QUINE_PROMPT_MEMORY_MODE");
+        unsafe {
+            std::env::set_var("QUINE_PROMPT_MEMORY_MODE", "disabled");
+        }
+        let storage = temp_storage();
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let session_id = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+        let mut rx = harness.subscribe();
+
+        harness
+            .send_message(session_id, "FEATURE-041 refresh diagnostics".into())
+            .await
+            .unwrap();
+        let reply = wait_for_turn(&mut rx, session_id).await;
+        assert_eq!(reply, "FEATURE-041 refresh diagnostics");
+
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .memory_diagnostics
+                .as_ref()
+                .map(|diagnostics| {
+                    diagnostics.session_memory.refresh.status == quine_core::MemoryStatus::Succeeded
+                        && diagnostics
+                            .persistent_memory
+                            .extraction
+                            .last_extracted_message_index
+                            .is_some()
+                })
+                .unwrap_or(false)
+        })
+        .await;
+
+        let diagnostics = snapshot
+            .memory_diagnostics
+            .expect("memory diagnostics should be present");
+        assert!(diagnostics.session_memory.enabled);
+        assert!(diagnostics.session_memory.refresh.attempted);
+        assert_eq!(
+            diagnostics.session_memory.refresh.status,
+            quine_core::MemoryStatus::Succeeded
+        );
+        assert!(diagnostics
+            .session_memory
+            .refresh
+            .last_summarized_message_index
+            .is_some());
+        assert_eq!(
+            diagnostics.prompt_memory.status,
+            quine_core::MemoryStatus::Skipped
+        );
+        assert_eq!(
+            diagnostics.prompt_memory.reason,
+            Some(quine_core::MemoryDecisionReason::Disabled)
+        );
+        assert!(diagnostics.persistent_memory.enabled);
+        assert_eq!(
+            diagnostics.persistent_memory.extraction.reason,
+            Some(quine_core::MemoryDecisionReason::NoChanges)
+        );
+
+        harness.shutdown().await.unwrap();
+        match previous_mode {
+            Some(value) => unsafe { std::env::set_var("QUINE_PROMPT_MEMORY_MODE", value) },
+            None => unsafe { std::env::remove_var("QUINE_PROMPT_MEMORY_MODE") },
+        }
         let _ = fs::remove_dir_all(storage.root());
     }
 
@@ -1302,22 +1446,14 @@ mod tests {
             "observed-memory:rust-test-command|last-user:What command should I run to execute the Rust test suite? Answer with only the command."
         );
 
-        let snapshot = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let snapshot = wait_for_context_snapshot(&harness, session_id).await;
-                if snapshot
-                    .prompt_memory
-                    .as_ref()
-                    .map(|summary| summary.selected_entry_ids.clone())
-                    == Some(vec!["rust-test-command".to_string()])
-                {
-                    break snapshot;
-                }
-                tokio::task::yield_now().await;
-            }
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .prompt_memory
+                .as_ref()
+                .map(|summary| summary.selected_entry_ids.clone())
+                == Some(vec!["rust-test-command".to_string()])
         })
-        .await
-        .expect("prompt memory selection should persist for round 2");
+        .await;
         let prompt_memory = snapshot
             .prompt_memory
             .expect("prompt memory summary should persist");
@@ -1352,22 +1488,14 @@ mod tests {
             "observed-memory:rust-build-command|last-user:What command should I run to build the workspace? Answer with only the command."
         );
 
-        let snapshot = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let snapshot = wait_for_context_snapshot(&harness, session_id).await;
-                if snapshot
-                    .prompt_memory
-                    .as_ref()
-                    .map(|summary| summary.selected_entry_ids.clone())
-                    == Some(vec!["rust-build-command".to_string()])
-                {
-                    break snapshot;
-                }
-                tokio::task::yield_now().await;
-            }
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .prompt_memory
+                .as_ref()
+                .map(|summary| summary.selected_entry_ids.clone())
+                == Some(vec!["rust-build-command".to_string()])
         })
-        .await
-        .expect("prompt memory selection should persist for round 3");
+        .await;
         let prompt_memory = snapshot
             .prompt_memory
             .expect("prompt memory summary should persist");

@@ -1590,6 +1590,7 @@ mod tests {
             loaded_skills: vec![],
             plans: vec![],
             prompt_memory: None,
+            memory_diagnostics: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1642,6 +1643,7 @@ mod tests {
             }],
             plans: vec![],
             prompt_memory: None,
+            memory_diagnostics: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),

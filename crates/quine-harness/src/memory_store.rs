@@ -3,7 +3,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use quine_core::{PersistedPersistentMemoryState, PersistedSession};
+use quine_core::{
+    MemoryDecisionReason, MemoryStatus, PersistedPersistentMemoryState, PersistedSession,
+    PersistentExtractionDiagnostics,
+};
 use quine_llm::{Message, MessageContent, Role};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -89,6 +92,12 @@ pub struct MemoryStore {
     root: PathBuf,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtractionResult {
+    pub state: Option<PersistedPersistentMemoryState>,
+    pub diagnostics: PersistentExtractionDiagnostics,
+}
+
 impl MemoryStore {
     pub fn new(root: PathBuf) -> Self {
         Self { root }
@@ -109,9 +118,21 @@ impl MemoryStore {
     pub async fn extract_and_persist_for_session(
         &self,
         session: &PersistedSession,
-    ) -> Result<Option<PersistedPersistentMemoryState>> {
+    ) -> Result<ExtractionResult> {
         let Some(memory_state) = session.memory_state.as_ref() else {
-            return Ok(None);
+            return Ok(ExtractionResult {
+                state: None,
+                diagnostics: PersistentExtractionDiagnostics {
+                    attempted: false,
+                    status: MemoryStatus::Skipped,
+                    reason: Some(MemoryDecisionReason::NotAttempted),
+                    last_extracted_message_index: None,
+                    created: 0,
+                    updated: 0,
+                    tombstoned: 0,
+                    ignored: 0,
+                },
+            });
         };
         let persistent =
             memory_state
@@ -122,7 +143,19 @@ impl MemoryStore {
                     last_extracted_message_index: None,
                 });
         if !persistent.enabled {
-            return Ok(Some(persistent));
+            return Ok(ExtractionResult {
+                state: Some(persistent.clone()),
+                diagnostics: PersistentExtractionDiagnostics {
+                    attempted: false,
+                    status: MemoryStatus::Skipped,
+                    reason: Some(MemoryDecisionReason::Disabled),
+                    last_extracted_message_index: persistent.last_extracted_message_index,
+                    created: 0,
+                    updated: 0,
+                    tombstoned: 0,
+                    ignored: 0,
+                },
+            });
         }
 
         let project_root = resolve_project_root(&session.config.working_directory);
@@ -132,14 +165,35 @@ impl MemoryStore {
             .last_extracted_message_index
             .map_or(0, |index| index.saturating_add(1));
         if start >= session.history.len() {
-            return Ok(Some(persistent));
+            return Ok(ExtractionResult {
+                state: Some(persistent.clone()),
+                diagnostics: PersistentExtractionDiagnostics {
+                    attempted: false,
+                    status: MemoryStatus::Skipped,
+                    reason: Some(MemoryDecisionReason::NoNewMessages),
+                    last_extracted_message_index: persistent.last_extracted_message_index,
+                    created: 0,
+                    updated: 0,
+                    tombstoned: 0,
+                    ignored: 0,
+                },
+            });
         }
 
         let mut live_records = records;
         let mut changed = false;
+        let mut created = 0usize;
+        let mut updated = 0usize;
+        let mut tombstoned = 0usize;
+        let mut ignored = 0usize;
         for message in &session.history[start..] {
             match self.decision_for_message(message, &live_records) {
                 ExtractionDecision::Upsert(record) => {
+                    if live_records.contains_key(&record.frontmatter.entry_id) {
+                        updated += 1;
+                    } else {
+                        created += 1;
+                    }
                     live_records.insert(record.frontmatter.entry_id.clone(), record);
                     changed = true;
                 }
@@ -147,9 +201,12 @@ impl MemoryStore {
                     if live_records.remove(&entry_id).is_some() {
                         self.write_tombstone(&paths, &entry_id, &reason).await?;
                         changed = true;
+                        tombstoned += 1;
+                    } else {
+                        ignored += 1;
                     }
                 }
-                ExtractionDecision::Ignore => {}
+                ExtractionDecision::Ignore => ignored += 1,
             }
         }
 
@@ -157,10 +214,31 @@ impl MemoryStore {
             self.persist_records(&paths, &live_records).await?;
         }
 
-        Ok(Some(PersistedPersistentMemoryState {
+        let state = PersistedPersistentMemoryState {
             enabled: true,
             last_extracted_message_index: Some(session.history.len().saturating_sub(1)),
-        }))
+        };
+        Ok(ExtractionResult {
+            state: Some(state.clone()),
+            diagnostics: PersistentExtractionDiagnostics {
+                attempted: true,
+                status: if changed {
+                    MemoryStatus::Succeeded
+                } else {
+                    MemoryStatus::Skipped
+                },
+                reason: if changed {
+                    None
+                } else {
+                    Some(MemoryDecisionReason::NoChanges)
+                },
+                last_extracted_message_index: state.last_extracted_message_index,
+                created,
+                updated,
+                tombstoned,
+                ignored,
+            },
+        })
     }
 
     fn decision_for_message(

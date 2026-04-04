@@ -7,6 +7,10 @@ use quine_llm::{Message, Role};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
+use super::{
+    MemoryDecisionReason, MemorySelectionEntryDiagnostics, MemorySkippedEntryDiagnostics,
+    MemoryStatus,
+};
 use crate::persistence::{PersistedPromptMemoryState, PromptMemoryMode};
 
 const INDEX_ONLY_CHAR_BUDGET: usize = 2_000;
@@ -52,12 +56,24 @@ struct PersistentMemoryRecord {
     body: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PromptMemoryRunDiagnostics {
+    pub(crate) mode: PromptMemoryMode,
+    pub(crate) injection_ran: bool,
+    pub(crate) status: MemoryStatus,
+    pub(crate) reason: Option<MemoryDecisionReason>,
+    pub(crate) selected_entries: Vec<MemorySelectionEntryDiagnostics>,
+    pub(crate) skipped_entries: Vec<MemorySkippedEntryDiagnostics>,
+    pub(crate) truncated: bool,
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct PromptMemoryInjection {
     pub(crate) system_prompt_suffix: Option<String>,
     pub(crate) inserted_messages: Vec<Message>,
     pub(crate) summary: PersistedPromptMemoryState,
     pub(crate) latest_user_index: Option<usize>,
+    pub(crate) diagnostics: PromptMemoryRunDiagnostics,
 }
 
 pub(crate) async fn build_prompt_memory_injection(
@@ -68,7 +84,7 @@ pub(crate) async fn build_prompt_memory_injection(
     previously_selected_entry_ids: &[String],
 ) -> Result<PromptMemoryInjection> {
     let latest_user_index = latest_user_message_index(history);
-    let empty = PromptMemoryInjection {
+    let empty = |reason: Option<MemoryDecisionReason>| PromptMemoryInjection {
         system_prompt_suffix: None,
         inserted_messages: Vec::new(),
         summary: PersistedPromptMemoryState {
@@ -76,13 +92,26 @@ pub(crate) async fn build_prompt_memory_injection(
             ..PersistedPromptMemoryState::default()
         },
         latest_user_index,
+        diagnostics: PromptMemoryRunDiagnostics {
+            mode,
+            injection_ran: false,
+            status: match reason {
+                Some(MemoryDecisionReason::Disabled) => MemoryStatus::Skipped,
+                Some(_) => MemoryStatus::Skipped,
+                None => MemoryStatus::NotRun,
+            },
+            reason,
+            selected_entries: Vec::new(),
+            skipped_entries: Vec::new(),
+            truncated: false,
+        },
     };
 
     match mode {
-        PromptMemoryMode::Disabled => Ok(empty),
+        PromptMemoryMode::Disabled => Ok(empty(Some(MemoryDecisionReason::Disabled))),
         PromptMemoryMode::IndexOnly => {
             let Some(memory_md) = load_memory_md(archive_root, working_directory).await? else {
-                return Ok(empty);
+                return Ok(empty(Some(MemoryDecisionReason::NoIndex)));
             };
             let (truncated, body) = truncate_chars(&memory_md, INDEX_ONLY_CHAR_BUDGET);
             Ok(PromptMemoryInjection {
@@ -96,18 +125,27 @@ pub(crate) async fn build_prompt_memory_injection(
                     ..PersistedPromptMemoryState::default()
                 },
                 latest_user_index,
+                diagnostics: PromptMemoryRunDiagnostics {
+                    mode,
+                    injection_ran: true,
+                    status: MemoryStatus::Succeeded,
+                    reason: None,
+                    selected_entries: Vec::new(),
+                    skipped_entries: Vec::new(),
+                    truncated,
+                },
             })
         }
         PromptMemoryMode::TargetedRecall => {
             let Some(query) = latest_user_text(history) else {
-                return Ok(empty);
+                return Ok(empty(Some(MemoryDecisionReason::NoQuery)));
             };
             let Some(index) = load_memory_index(archive_root, working_directory).await? else {
-                return Ok(empty);
+                return Ok(empty(Some(MemoryDecisionReason::NoIndex)));
             };
             let normalized_query = tokenize(&query);
             if normalized_query.is_empty() {
-                return Ok(empty);
+                return Ok(empty(Some(MemoryDecisionReason::NoQuery)));
             }
 
             let exclude: HashSet<&str> = previously_selected_entry_ids
@@ -117,13 +155,23 @@ pub(crate) async fn build_prompt_memory_injection(
             let mut candidates: Vec<_> = index
                 .entries
                 .into_iter()
-                .filter(|entry| !exclude.contains(entry.entry_id.as_str()))
-                .filter_map(|entry| {
+                .map(|entry| {
+                    if exclude.contains(entry.entry_id.as_str()) {
+                        return (entry, 0usize, Some(MemoryDecisionReason::Duplicate));
+                    }
                     let overlap = candidate_overlap_score(&normalized_query, &entry);
-                    (overlap > 0).then_some((entry, overlap))
+                    if overlap > 0 {
+                        (entry, overlap, None)
+                    } else {
+                        (
+                            entry,
+                            overlap,
+                            Some(MemoryDecisionReason::NoMatchingEntries),
+                        )
+                    }
                 })
                 .collect();
-            candidates.sort_by(|(left, left_overlap), (right, right_overlap)| {
+            candidates.sort_by(|(left, left_overlap, _), (right, right_overlap, _)| {
                 right_overlap
                     .cmp(left_overlap)
                     .then_with(|| right.pinned.cmp(&left.pinned))
@@ -137,11 +185,32 @@ pub(crate) async fn build_prompt_memory_injection(
             let mut selected_entry_ids = Vec::new();
             let mut selected_titles = Vec::new();
             let mut skipped_reasons = Vec::new();
+            let mut selected_entries = Vec::new();
+            let mut skipped_entries = Vec::new();
             let mut truncated = false;
 
-            for (entry, _) in candidates {
+            for (entry, overlap, preset_reason) in candidates {
+                if let Some(reason) = preset_reason {
+                    skipped_reasons.push(format!(
+                        "{}:{}",
+                        entry.entry_id,
+                        decision_reason_code(reason)
+                    ));
+                    skipped_entries.push(MemorySkippedEntryDiagnostics {
+                        entry_id: entry.entry_id,
+                        reason,
+                    });
+                    continue;
+                }
+                if overlap == 0 {
+                    continue;
+                }
                 if selected_entry_ids.len() >= TARGETED_MAX_ENTRIES {
                     skipped_reasons.push(format!("{}:budget", entry.entry_id));
+                    skipped_entries.push(MemorySkippedEntryDiagnostics {
+                        entry_id: entry.entry_id,
+                        reason: MemoryDecisionReason::Budget,
+                    });
                     continue;
                 }
                 let record = load_record(&base_dir, &entry.path).await?;
@@ -154,17 +223,37 @@ pub(crate) async fn build_prompt_memory_injection(
                 let reminder_chars = reminder.chars().count();
                 if total_chars + reminder_chars > TARGETED_TOTAL_CHAR_BUDGET {
                     skipped_reasons.push(format!("{}:budget", entry.entry_id));
+                    skipped_entries.push(MemorySkippedEntryDiagnostics {
+                        entry_id: entry.entry_id,
+                        reason: MemoryDecisionReason::Budget,
+                    });
                     continue;
                 }
                 total_chars += reminder_chars;
                 truncated |= entry_truncated;
                 selected_entry_ids.push(record.frontmatter.entry_id.clone());
                 selected_titles.push(record.frontmatter.title.clone());
+                selected_entries.push(MemorySelectionEntryDiagnostics {
+                    entry_id: record.frontmatter.entry_id.clone(),
+                    title: record.frontmatter.title.clone(),
+                    path: entry.path.clone(),
+                });
                 inserted_messages.push(Message {
                     role: Role::System,
                     content: quine_llm::MessageContent::Text(reminder),
                 });
             }
+
+            let status = if selected_entry_ids.is_empty() {
+                MemoryStatus::Skipped
+            } else {
+                MemoryStatus::Succeeded
+            };
+            let reason = if selected_entry_ids.is_empty() {
+                Some(MemoryDecisionReason::NoMatchingEntries)
+            } else {
+                None
+            };
 
             Ok(PromptMemoryInjection {
                 system_prompt_suffix: None,
@@ -177,6 +266,15 @@ pub(crate) async fn build_prompt_memory_injection(
                     truncated,
                 },
                 latest_user_index,
+                diagnostics: PromptMemoryRunDiagnostics {
+                    mode,
+                    injection_ran: true,
+                    status,
+                    reason,
+                    selected_entries,
+                    skipped_entries,
+                    truncated,
+                },
             })
         }
     }
@@ -275,6 +373,29 @@ fn parse_record(content: &str) -> Result<PersistentMemoryRecord> {
         frontmatter,
         body: body.trim().to_string(),
     })
+}
+
+fn decision_reason_code(reason: MemoryDecisionReason) -> &'static str {
+    match reason {
+        MemoryDecisionReason::Disabled => "disabled",
+        MemoryDecisionReason::NoActivityYet => "no_activity_yet",
+        MemoryDecisionReason::NoNewMessages => "no_new_messages",
+        MemoryDecisionReason::NoChanges => "no_changes",
+        MemoryDecisionReason::NoQuery => "no_query",
+        MemoryDecisionReason::NoIndex => "no_index",
+        MemoryDecisionReason::NoMatchingEntries => "no_matching_entries",
+        MemoryDecisionReason::Duplicate => "duplicate",
+        MemoryDecisionReason::Budget => "budget",
+        MemoryDecisionReason::RefreshNotNeeded => "refresh_not_needed",
+        MemoryDecisionReason::MissingSummary => "missing_summary",
+        MemoryDecisionReason::InvalidBoundary => "invalid_boundary",
+        MemoryDecisionReason::Fallback => "fallback",
+        MemoryDecisionReason::NotAttempted => "not_attempted",
+    }
+}
+
+pub(crate) fn project_root_for_prompt_memory(working_directory: &Path) -> PathBuf {
+    resolve_project_root(working_directory)
 }
 
 fn memory_project_root(archive_root: &Path, working_directory: &Path) -> PathBuf {
