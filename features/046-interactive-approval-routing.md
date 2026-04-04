@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Interactive Approval Routing
