@@ -8,7 +8,7 @@ Short summary: Turn `ask` permission outcomes into a concrete pause/resume appro
 
 ## Agreement Status
 
-pending — Re-reviewed the latest `features/plans/046-interactive-approval-routing-qa.md` revision. Scope alignment is good, but agreement remains blocked until the QA doc adds the concrete daemon commands, exact chat messages, operator responses, and expected outputs required by `.claude/commands/feature-planning.md`.
+agreed — Re-reviewed `features/plans/046-interactive-approval-routing-qa.md`. The QA plan now includes concrete daemon commands, operator responses, and expected outputs aligned with this implementation scope.
 
 ## Proposed Design
 

@@ -386,10 +386,20 @@ async fn handle_interaction(
                 .collect()
         })
         .unwrap_or_default();
+    let source_label = notif
+        .params
+        .as_ref()
+        .and_then(|p| p.get("source_label"))
+        .and_then(|v| v.as_str());
+    let prompt_tag = if source_label.is_some_and(|label| label.starts_with("permission:")) {
+        "permission"
+    } else {
+        "ask_user"
+    };
 
     let mut stderr = tokio::io::stderr();
     stderr
-        .write_all(format!("\n[ask_user] {prompt}\n").as_bytes())
+        .write_all(format!("\n[{prompt_tag}] {prompt}\n").as_bytes())
         .await?;
 
     // Show numbered options if present.

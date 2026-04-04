@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -25,9 +25,11 @@ use crate::memory::{
     ScopedMemoryResolution, ScopedPersistentMemoryState, SessionMemoryState,
 };
 use crate::permission::{
-    evaluate_permission, exit_plan_mode as exit_permission_plan_mode, PermissionContext,
-    PermissionOutcome, PermissionPromptBehavior, PermissionRequest, PermissionResource,
-    PermissionScope, ToolLocalDecision,
+    build_permission_approval_request, evaluate_permission,
+    exit_plan_mode as exit_permission_plan_mode, parse_permission_approval_response,
+    PendingPermissionApproval, PermissionApprovalChoice, PermissionContext, PermissionOutcome,
+    PermissionPromptBehavior, PermissionRequest, PermissionResource, PermissionScope,
+    ToolLocalDecision,
 };
 use crate::persistence::{
     CoreCheckpoint, PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
@@ -271,6 +273,8 @@ struct SessionContext {
     permission_context: PermissionContext,
     /// Latest evaluator result retained for future diagnostics work.
     last_permission_outcome: Option<PermissionOutcome>,
+    /// Pending permission approval request, if any.
+    pending_permission_approval: Option<PendingPermissionApproval>,
 }
 
 #[derive(Clone)]
@@ -543,6 +547,7 @@ impl SessionContext {
             scoped_persistent_memory_state,
             permission_context,
             last_permission_outcome: None,
+            pending_permission_approval: None,
         })
     }
 
@@ -1343,18 +1348,33 @@ struct CompletedConcurrentToolCall {
     duration_us: u64,
 }
 
+fn resolved_permission_path(
+    session: &SessionContext,
+    raw_path: Option<&str>,
+    fallback: &str,
+) -> PermissionResource {
+    let candidate = raw_path.unwrap_or(fallback);
+    match session.filesystem.resolve_path(Path::new(candidate)) {
+        Ok(path) => PermissionResource::Path { path },
+        Err(_) => PermissionResource::Path {
+            path: PathBuf::from(candidate),
+        },
+    }
+}
+
 fn build_permission_request(
+    session: &SessionContext,
     call: &PendingToolCall,
     tool: &dyn crate::tool::Tool,
 ) -> (PermissionRequest, Option<ToolLocalDecision>) {
     let scope = match call.tool_name.as_str() {
         "read_file" | "find" => PermissionScope::Read,
-        "write_file" => PermissionScope::Write,
+        "apply_patch" => PermissionScope::Write,
         "bash" => PermissionScope::Execute,
         "signal" => PermissionScope::ProcessControl,
-        "spawn" | "subagent" | "wait_child" | "send_message" | "recv_message" => {
-            PermissionScope::AgentControl
-        }
+        "spawn" | "subagent" | "wait_child" => PermissionScope::AgentControl,
+        "send_message" | "recv_message" => PermissionScope::Read,
+        "ask_user" | "plan" => PermissionScope::Read,
         _ => {
             if tool.is_read_only() {
                 PermissionScope::Read
@@ -1365,14 +1385,16 @@ fn build_permission_request(
     };
 
     let resource = match call.tool_name.as_str() {
-        "read_file" | "write_file" => call
-            .arguments
-            .get("file_path")
-            .and_then(|v| v.as_str())
-            .map(|path| PermissionResource::Path {
-                path: PathBuf::from(path),
-            })
-            .unwrap_or(PermissionResource::None),
+        "read_file" | "apply_patch" => resolved_permission_path(
+            session,
+            call.arguments.get("file_path").and_then(|v| v.as_str()),
+            ".",
+        ),
+        "find" => resolved_permission_path(
+            session,
+            call.arguments.get("path").and_then(|v| v.as_str()),
+            ".",
+        ),
         "bash" => call
             .arguments
             .get("command")
@@ -1389,11 +1411,11 @@ fn build_permission_request(
                 target: target.to_string(),
             })
             .unwrap_or(PermissionResource::None),
-        "spawn" | "subagent" | "wait_child" | "send_message" | "recv_message" => {
-            PermissionResource::Agent {
-                target: call.tool_name.clone(),
-            }
-        }
+        "spawn" | "subagent" | "wait_child" => PermissionResource::Agent {
+            target: call.tool_name.clone(),
+        },
+        "send_message" | "recv_message" => PermissionResource::None,
+        "ask_user" | "plan" => PermissionResource::None,
         _ => PermissionResource::None,
     };
 
@@ -1462,6 +1484,7 @@ fn interrupt_session(
         }
         session.cancel_tx = None;
         session.pending_interaction.take();
+        session.pending_permission_approval = None;
     }
 
     deferred_inputs.retain(|input| {
@@ -2012,22 +2035,106 @@ async fn execute_tool_call(
                 message: "session not found".into(),
             };
         };
-        let (request, local) = build_permission_request(call, tool.as_ref());
+        let (request, local) = build_permission_request(session, call, tool.as_ref());
         let outcome = evaluate_permission(&session.permission_context, request, local);
         session.last_permission_outcome = Some(outcome.clone());
         outcome
     };
 
     if !permission_outcome.is_allowed() {
-        if let Some(session) = sessions.get_mut(&session_id) {
-            session.cancel_tx = None;
-        }
-        return ToolOutcome::Error {
-            message: ToolError::PermissionDenied {
-                reason: permission_outcome.reason,
+        if permission_outcome.kind
+            == crate::permission::outcome::PermissionOutcomeKind::RequiresApproval
+        {
+            let (pending, request) = build_permission_approval_request(&permission_outcome);
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.pending_permission_approval = Some(pending);
             }
-            .to_string(),
-        };
+            let _ = io
+                .output
+                .send(CoreOutput::InteractionNeeded {
+                    session_id,
+                    request,
+                })
+                .await;
+
+            loop {
+                match io.input.recv().await {
+                    Some(CoreInput::InteractionResponse {
+                        session_id: resp_sid,
+                        response,
+                    }) if resp_sid == session_id => {
+                        let choice = parse_permission_approval_response(&response);
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.pending_permission_approval = None;
+                        }
+                        match choice {
+                            Some(PermissionApprovalChoice::ApproveOnce) => break,
+                            Some(PermissionApprovalChoice::DenyOnce) | None => {
+                                if let Some(session) = sessions.get_mut(&session_id) {
+                                    session.cancel_tx = None;
+                                }
+                                return ToolOutcome::Error {
+                                    message: ToolError::PermissionDenied {
+                                        reason: permission_outcome.reason,
+                                    }
+                                    .to_string(),
+                                };
+                            }
+                        }
+                    }
+                    Some(CoreInput::Cancel {
+                        session_id: cancel_sid,
+                    }) if cancel_sid == session_id => {
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.pending_permission_approval = None;
+                        }
+                        interrupt_session(sessions, io.deferred_inputs, session_id);
+                        return ToolOutcome::Cancelled;
+                    }
+                    Some(CoreInput::Signal {
+                        session_id: signal_sid,
+                        signal,
+                    }) if signal_sid == session_id
+                        && matches!(
+                            signal,
+                            SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill
+                        ) =>
+                    {
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.pending_permission_approval = None;
+                        }
+                        interrupt_session(sessions, io.deferred_inputs, session_id);
+                        return ToolOutcome::Cancelled;
+                    }
+                    Some(other) => io.deferred_inputs.push_back(other),
+                    None => {
+                        if let Some(session) = sessions.get_mut(&session_id) {
+                            session.pending_permission_approval = None;
+                            session.cancel_tx = None;
+                        }
+                        return ToolOutcome::Error {
+                            message: ToolError::PermissionDenied {
+                                reason: format!(
+                                    "{}; approval response channel closed",
+                                    permission_outcome.reason
+                                ),
+                            }
+                            .to_string(),
+                        };
+                    }
+                }
+            }
+        } else {
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.cancel_tx = None;
+            }
+            return ToolOutcome::Error {
+                message: ToolError::PermissionDenied {
+                    reason: permission_outcome.reason,
+                }
+                .to_string(),
+            };
+        }
     }
 
     if call.tool_name == "spawn" {
@@ -5316,11 +5423,6 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         cancelled: Arc<AtomicBool>,
     }
 
-    struct ExecutionFlagTool {
-        name: &'static str,
-        executed: Arc<AtomicBool>,
-    }
-
     #[async_trait::async_trait]
     impl crate::tool::Tool for CancellableProbeTool {
         fn name(&self) -> &str {
@@ -5352,30 +5454,6 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             context.cancellation.cancelled().await;
             self.cancelled.store(true, Ordering::SeqCst);
             Err(crate::tool::ToolError::Cancelled)
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl crate::tool::Tool for ExecutionFlagTool {
-        fn name(&self) -> &str {
-            self.name
-        }
-
-        fn description(&self) -> &str {
-            "Test execution flag tool"
-        }
-
-        fn parameters_schema(&self) -> serde_json::Value {
-            serde_json::json!({"type": "object"})
-        }
-
-        async fn execute(
-            &self,
-            _arguments: serde_json::Value,
-            _context: &ExecutionContext,
-        ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
-            self.executed.store(true, Ordering::SeqCst);
-            Ok(crate::tool::ToolOutput::success("executed"))
         }
     }
 
@@ -5529,90 +5607,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[tokio::test]
-    async fn execute_tool_call_records_permission_outcome_before_execution() {
-        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
-        let session_id = SessionId::new();
-        let mut session = SessionContext::new(
-            session_id,
-            SessionInit {
-                system_prompt: None,
-                skills: Vec::new(),
-                working_directory: std::env::current_dir().unwrap_or_default(),
-                plan_mode: false,
-                initial_messages: Vec::new(),
-                archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
-                max_context_window: None,
-                prompt_memory_mode: PromptMemoryMode::Disabled,
-                agent_key: None,
-                team_key: None,
-                memory_policy: MemoryPolicyConfig::default(),
-            },
-            &provider,
-        )
-        .await
-        .unwrap();
-
-        let executed = Arc::new(AtomicBool::new(false));
-        session.tool_registry.register(Arc::new(ExecutionFlagTool {
-            name: "write_probe",
-            executed: Arc::clone(&executed),
-        }));
-        session.tools = session.tool_registry.tool_definitions();
-
-        let mut sessions = HashMap::from([(session_id, session)]);
-        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(4);
-        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
-        let mut deferred_inputs = VecDeque::new();
-        let mut io = CoreIo {
-            output: &output_tx,
-            input: &mut input_rx,
-            input_tx: &input_tx,
-            deferred_inputs: &mut deferred_inputs,
-        };
-        let mut session_tree = SessionTree::new();
-        let mut engine = EngineState {
-            provider: &provider,
-            session_tree: &mut session_tree,
-        };
-        let call = PendingToolCall {
-            tool_use_id: "toolu_permission".into(),
-            tool_name: "write_probe".into(),
-            arguments: serde_json::json!({}),
-        };
-
-        let outcome =
-            execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine).await;
-
-        assert!(
-            matches!(outcome, ToolOutcome::Error { ref message } if message.contains("permission denied"))
-        );
-        assert!(!executed.load(Ordering::SeqCst));
-        let session = sessions
-            .get(&session_id)
-            .expect("session should remain available");
-        let permission_outcome = session
-            .last_permission_outcome
-            .as_ref()
-            .expect("permission outcome should be recorded");
-        assert_eq!(
-            permission_outcome.kind,
-            crate::permission::outcome::PermissionOutcomeKind::RequiresApproval
-        );
-        assert_eq!(
-            permission_outcome.final_decision,
-            crate::permission::types::PermissionDecision::Ask
-        );
-        assert_eq!(
-            permission_outcome.source.kind,
-            crate::permission::request::PermissionMatchKind::ModeDefault
-        );
-        assert_eq!(permission_outcome.request.tool_name, "write_probe");
-    }
-
-    #[tokio::test]
     async fn execute_tool_call_consumes_cancel_for_non_interactive_tool() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
-        let session = SessionContext::new(
+        let mut session = SessionContext::new(
             SessionId::new(),
             SessionInit {
                 system_prompt: None,
@@ -5631,11 +5628,18 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         )
         .await
         .unwrap();
+        session
+            .tool_registry
+            .register(Arc::new(CancellableProbeTool {
+                name: "read_probe",
+                started: Arc::new(Barrier::new(1)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }));
 
         let call = PendingToolCall {
             tool_use_id: "toolu_cancel".into(),
-            tool_name: "bash".into(),
-            arguments: serde_json::json!({"command": "sleep 5"}),
+            tool_name: "read_probe".into(),
+            arguments: serde_json::json!({}),
         };
 
         let (output_tx, _output_rx) = tokio::sync::mpsc::channel(4);
@@ -5672,7 +5676,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     #[tokio::test]
     async fn execute_tool_call_buffers_unrelated_input_while_waiting_for_cancel() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
-        let session = SessionContext::new(
+        let mut session = SessionContext::new(
             SessionId::new(),
             SessionInit {
                 system_prompt: None,
@@ -5691,11 +5695,18 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         )
         .await
         .unwrap();
+        session
+            .tool_registry
+            .register(Arc::new(CancellableProbeTool {
+                name: "read_probe",
+                started: Arc::new(Barrier::new(1)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }));
 
         let call = PendingToolCall {
             tool_use_id: "toolu_cancel".into(),
-            tool_name: "bash".into(),
-            arguments: serde_json::json!({"command": "sleep 5"}),
+            tool_name: "read_probe".into(),
+            arguments: serde_json::json!({}),
         };
 
         let (output_tx, _output_rx) = tokio::sync::mpsc::channel(4);
@@ -5742,9 +5753,259 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[tokio::test]
+    async fn execute_tool_call_records_permission_outcome_before_execution() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session_id = SessionId::new();
+        let mut session = SessionContext::new(
+            session_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.tool_registry.register(Arc::new(MutatingProbeTool {
+            name: "write_probe",
+        }));
+
+        let call = PendingToolCall {
+            tool_use_id: "toolu_permission".into(),
+            tool_name: "write_probe".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(4);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            session_tree: &mut session_tree,
+        };
+
+        let execute = execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine);
+        let deny = async {
+            match output_rx.recv().await {
+                Some(CoreOutput::InteractionNeeded { .. }) => {
+                    input_tx
+                        .send(CoreInput::InteractionResponse {
+                            session_id,
+                            response: InteractionResponse {
+                                response: "deny once".into(),
+                                selected_indices: vec![1],
+                            },
+                        })
+                        .await
+                        .unwrap();
+                }
+                other => panic!("expected permission interaction, got {other:?}"),
+            }
+        };
+        let (outcome, ()) = tokio::join!(execute, deny);
+
+        assert!(
+            matches!(outcome, ToolOutcome::Error { ref message } if message.contains("permission denied")),
+            "expected permission-denied error, got {outcome:?}"
+        );
+        let permission_outcome = sessions
+            .get(&session_id)
+            .and_then(|session| session.last_permission_outcome.clone())
+            .expect("permission outcome should be recorded");
+        assert_eq!(
+            permission_outcome.kind,
+            crate::permission::outcome::PermissionOutcomeKind::RequiresApproval
+        );
+        assert_eq!(
+            permission_outcome.final_decision,
+            crate::permission::types::PermissionDecision::Ask
+        );
+        assert_eq!(
+            permission_outcome.source.kind,
+            crate::permission::request::PermissionMatchKind::ModeDefault
+        );
+        assert_eq!(permission_outcome.request.tool_name, "write_probe");
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_waits_for_permission_approval_and_resumes_on_approve() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session_id = SessionId::new();
+        let mut session = SessionContext::new(
+            session_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.tool_registry.register(Arc::new(MutatingProbeTool {
+            name: "write_probe",
+        }));
+
+        let call = PendingToolCall {
+            tool_use_id: "toolu_permission_approve".into(),
+            tool_name: "write_probe".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(4);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            session_tree: &mut session_tree,
+        };
+
+        let execute = execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine);
+        let approve = async {
+            match output_rx.recv().await {
+                Some(CoreOutput::InteractionNeeded { request, .. }) => {
+                    assert!(request
+                        .source_label
+                        .as_deref()
+                        .is_some_and(|label| label.starts_with("permission:")));
+                    input_tx
+                        .send(CoreInput::InteractionResponse {
+                            session_id,
+                            response: InteractionResponse {
+                                response: "approve once".into(),
+                                selected_indices: vec![0],
+                            },
+                        })
+                        .await
+                        .unwrap();
+                }
+                other => panic!("expected permission interaction, got {other:?}"),
+            }
+        };
+
+        let (outcome, ()) = tokio::join!(execute, approve);
+
+        assert!(matches!(outcome, ToolOutcome::Success { ref output } if output == "mutated"));
+        assert!(sessions
+            .get(&session_id)
+            .is_some_and(|session| session.pending_permission_approval.is_none()));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_resolves_permission_approval_to_denial() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session_id = SessionId::new();
+        let mut session = SessionContext::new(
+            session_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.tool_registry.register(Arc::new(MutatingProbeTool {
+            name: "write_probe",
+        }));
+
+        let call = PendingToolCall {
+            tool_use_id: "toolu_permission_deny".into(),
+            tool_name: "write_probe".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(4);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            session_tree: &mut session_tree,
+        };
+
+        let execute = execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine);
+        let deny = async {
+            match output_rx.recv().await {
+                Some(CoreOutput::InteractionNeeded { .. }) => {
+                    input_tx
+                        .send(CoreInput::InteractionResponse {
+                            session_id,
+                            response: InteractionResponse {
+                                response: "deny once".into(),
+                                selected_indices: vec![1],
+                            },
+                        })
+                        .await
+                        .unwrap();
+                }
+                other => panic!("expected permission interaction, got {other:?}"),
+            }
+        };
+
+        let (outcome, ()) = tokio::join!(execute, deny);
+
+        assert!(
+            matches!(outcome, ToolOutcome::Error { ref message } if message.contains("permission denied"))
+        );
+        assert!(sessions
+            .get(&session_id)
+            .is_some_and(|session| session.pending_permission_approval.is_none()));
+    }
+
+    #[tokio::test]
     async fn execute_tool_call_consumes_stop_signal_for_non_interactive_tool() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
-        let session = SessionContext::new(
+        let mut session = SessionContext::new(
             SessionId::new(),
             SessionInit {
                 system_prompt: None,
@@ -5763,11 +6024,18 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         )
         .await
         .unwrap();
+        session
+            .tool_registry
+            .register(Arc::new(CancellableProbeTool {
+                name: "read_probe",
+                started: Arc::new(Barrier::new(1)),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }));
 
         let call = PendingToolCall {
             tool_use_id: "toolu_signal_cancel".into(),
-            tool_name: "bash".into(),
-            arguments: serde_json::json!({"command": "sleep 5"}),
+            tool_name: "read_probe".into(),
+            arguments: serde_json::json!({}),
         };
 
         let (output_tx, _output_rx) = tokio::sync::mpsc::channel(4);
@@ -6565,8 +6833,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[tokio::test]
-    async fn tool_call_executed_in_core() {
-        // Provider that returns a tool call for read_file on first send, then text on second
+    async fn tool_call_executed_in_core_after_permission_approval() {
         struct ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32,
         }
@@ -6645,6 +6912,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         // Collect events until TurnComplete
         let mut got_tool_request = false;
+        let mut got_interaction_needed = false;
         let mut got_text_complete = false;
         let mut got_turn_complete = false;
 
@@ -6654,6 +6922,20 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     CoreOutput::ToolRequest { tool_name, .. } => {
                         assert_eq!(tool_name, "bash");
                         got_tool_request = true;
+                    }
+                    CoreOutput::InteractionNeeded { .. } => {
+                        got_interaction_needed = true;
+                        harness
+                            .input
+                            .send(CoreInput::InteractionResponse {
+                                session_id,
+                                response: InteractionResponse {
+                                    response: "approve once".into(),
+                                    selected_indices: vec![0],
+                                },
+                            })
+                            .await
+                            .unwrap();
                     }
                     CoreOutput::TextComplete { full_text, .. } => {
                         assert_eq!(full_text, "Done!");
@@ -6671,6 +6953,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         }
 
         assert!(got_tool_request, "should have received ToolRequest");
+        assert!(got_interaction_needed, "should have required approval");
         assert!(got_text_complete, "should have received TextComplete");
         assert!(got_turn_complete, "should have received TurnComplete");
 
@@ -6682,7 +6965,6 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     async fn stop_signal_interrupts_running_tool_and_skips_remaining_tool_calls() {
         struct TwoToolProvider {
             call_count: std::sync::atomic::AtomicU32,
-            marker_path: std::path::PathBuf,
         }
 
         #[async_trait::async_trait]
@@ -6699,19 +6981,14 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 let events = if count == 0 {
                     vec![
                         Ok(LlmEvent::ToolCall {
-                            tool_use_id: "tc_sleep".into(),
-                            tool_name: "bash".into(),
-                            arguments: serde_json::json!({"command": "sleep 5"}),
+                            tool_use_id: "tc_blocking".into(),
+                            tool_name: "read_probe_one".into(),
+                            arguments: serde_json::json!({}),
                         }),
                         Ok(LlmEvent::ToolCall {
                             tool_use_id: "tc_marker".into(),
-                            tool_name: "bash".into(),
-                            arguments: serde_json::json!({
-                                "command": format!(
-                                    "python -c \"from pathlib import Path; Path(r#\\\"{}\\\"#).write_text('ran')\"",
-                                    self.marker_path.display()
-                                )
-                            }),
+                            tool_name: "read_probe_two".into(),
+                            arguments: serde_json::json!({}),
                         }),
                         Ok(LlmEvent::Done { usage: None }),
                     ]
@@ -6727,100 +7004,108 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             }
         }
 
-        let temp_dir = TempDir::new().unwrap();
-        let marker_path = temp_dir.path().join("interrupt-marker.txt");
-        let (harness, core) = create_channels(ChannelConfig::default());
-        let mut output = harness.output;
-        let provider = TwoToolProvider {
+        let provider: Arc<dyn LlmProvider> = Arc::new(TwoToolProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
-            marker_path: marker_path.clone(),
-        };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
-
+        });
+        let started = Arc::new(Barrier::new(2));
+        let marker_ran = Arc::new(AtomicBool::new(false));
         let session_id = SessionId::new();
-        let (reply_tx, reply_rx) = oneshot::channel();
-        harness
-            .input
-            .send(CoreInput::CreateSession {
-                session_id,
+        let mut session = SessionContext::new(
+            session_id,
+            SessionInit {
                 system_prompt: None,
-                working_directory: None,
                 skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
-                initial_messages: Vec::new(),
+                initial_messages: vec![Message::user("run tools")],
+                archive_root: std::env::temp_dir().join("quine-core-interrupt-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
-                reply: reply_tx,
-            })
-            .await
-            .unwrap();
-        reply_rx.await.unwrap().unwrap();
-        let _ = output.recv().await.unwrap();
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session
+            .tool_registry
+            .register(Arc::new(CancellableProbeTool {
+                name: "read_probe_one",
+                started: Arc::clone(&started),
+                cancelled: Arc::new(AtomicBool::new(false)),
+            }));
+        session.tool_registry.register(Arc::new(MarkerProbeTool {
+            name: "read_probe_two",
+            ran: Arc::clone(&marker_ran),
+        }));
+        session.tools = session.tool_registry.tool_definitions();
+        session.state = SessionState::Streaming;
 
-        harness
-            .input
-            .send(CoreInput::UserMessage {
-                session_id,
-                content: "run tools".into(),
-            })
-            .await
-            .unwrap();
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(32);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(8);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            session_tree: &mut session_tree,
+        };
 
-        let mut saw_sleep_tool = false;
-        let mut saw_marker_tool = false;
+        let send_stop = async {
+            started.wait().await;
+            input_tx
+                .send(CoreInput::Signal {
+                    session_id,
+                    signal: SessionSignal::Stop,
+                })
+                .await
+                .unwrap();
+        };
+        let (outcome, ()) = tokio::join!(
+            handle_llm_turn(&mut sessions, session_id, &mut io, &mut engine),
+            send_stop
+        );
+
+        assert!(matches!(outcome, TurnOutcome::Cancelled));
+        assert!(!marker_ran.load(Ordering::SeqCst));
+
+        let mut saw_first_tool = false;
+        let mut saw_second_tool = false;
         let mut saw_turn_complete = false;
-
-        loop {
-            match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
-                Ok(Some(CoreOutput::ToolRequest { tool_use_id, .. }))
-                    if tool_use_id == "tc_sleep" =>
-                {
-                    saw_sleep_tool = true;
-                    harness
-                        .input
-                        .send(CoreInput::Signal {
-                            session_id,
-                            signal: SessionSignal::Stop,
-                        })
-                        .await
-                        .unwrap();
+        while let Ok(event) = output_rx.try_recv() {
+            match event {
+                CoreOutput::ToolRequest { tool_use_id, .. } if tool_use_id == "tc_blocking" => {
+                    saw_first_tool = true;
                 }
-                Ok(Some(CoreOutput::ToolRequest { tool_use_id, .. }))
-                    if tool_use_id == "tc_marker" =>
-                {
-                    saw_marker_tool = true;
+                CoreOutput::ToolRequest { tool_use_id, .. } if tool_use_id == "tc_marker" => {
+                    saw_second_tool = true;
                 }
-                Ok(Some(CoreOutput::TurnComplete { .. })) => {
-                    saw_turn_complete = true;
-                    break;
-                }
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => panic!("timeout waiting for interrupt flow events"),
+                CoreOutput::TurnComplete { .. } => saw_turn_complete = true,
+                _ => {}
             }
         }
 
         assert!(
-            saw_sleep_tool,
+            saw_first_tool,
             "expected first tool request before interrupt"
         );
         assert!(
-            !saw_marker_tool,
+            !saw_second_tool,
             "second tool should not run after interrupt"
         );
         assert!(saw_turn_complete, "interrupted turn should still complete");
-        assert!(
-            !marker_path.exists(),
-            "remaining pending tool work should not run after interrupt"
-        );
-
-        harness.input.send(CoreInput::Shutdown).await.unwrap();
-        loop_handle.await.unwrap();
     }
 
     #[tokio::test]
-    async fn bash_tool_runs_without_permission_prompt() {
+    async fn bash_tool_emits_permission_prompt_before_completion() {
         struct ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32,
         }
@@ -6895,12 +7180,28 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .unwrap();
 
         let mut saw_interaction_needed = false;
+        let mut saw_text_complete = false;
         let mut saw_turn_complete = false;
 
         loop {
             match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
                 Ok(Some(CoreOutput::InteractionNeeded { .. })) => {
                     saw_interaction_needed = true;
+                    harness
+                        .input
+                        .send(CoreInput::InteractionResponse {
+                            session_id,
+                            response: InteractionResponse {
+                                response: "approve once".into(),
+                                selected_indices: vec![0],
+                            },
+                        })
+                        .await
+                        .unwrap();
+                }
+                Ok(Some(CoreOutput::TextComplete { full_text, .. })) => {
+                    assert_eq!(full_text, "Done!");
+                    saw_text_complete = true;
                 }
                 Ok(Some(CoreOutput::TurnComplete { .. })) => {
                     saw_turn_complete = true;
@@ -6912,7 +7213,8 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             }
         }
 
-        assert!(!saw_interaction_needed, "bash tool should no longer prompt");
+        assert!(saw_interaction_needed, "bash tool should require approval");
+        assert!(saw_text_complete, "turn should complete after approval");
         assert!(saw_turn_complete, "turn should complete successfully");
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
