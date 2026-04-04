@@ -1,5 +1,5 @@
 ---
-status: in-progress
+status: done
 ---
 
 # Persistent Memory Store and Durable Extraction
