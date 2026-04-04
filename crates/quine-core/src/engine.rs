@@ -5316,6 +5316,11 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         cancelled: Arc<AtomicBool>,
     }
 
+    struct ExecutionFlagTool {
+        name: &'static str,
+        executed: Arc<AtomicBool>,
+    }
+
     #[async_trait::async_trait]
     impl crate::tool::Tool for CancellableProbeTool {
         fn name(&self) -> &str {
@@ -5348,6 +5353,111 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             self.cancelled.store(true, Ordering::SeqCst);
             Err(crate::tool::ToolError::Cancelled)
         }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for ExecutionFlagTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Test execution flag tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _context: &ExecutionContext,
+        ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+            self.executed.store(true, Ordering::SeqCst);
+            Ok(crate::tool::ToolOutput::success("executed"))
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_records_permission_outcome_before_execution() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session_id = SessionId::new();
+        let mut session = SessionContext::new(
+            session_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let executed = Arc::new(AtomicBool::new(false));
+        session.tool_registry.register(Arc::new(ExecutionFlagTool {
+            name: "write_probe",
+            executed: Arc::clone(&executed),
+        }));
+        session.tools = session.tool_registry.tool_definitions();
+
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(4);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            session_tree: &mut session_tree,
+        };
+        let call = PendingToolCall {
+            tool_use_id: "toolu_permission".into(),
+            tool_name: "write_probe".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let outcome =
+            execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine).await;
+
+        assert!(
+            matches!(outcome, ToolOutcome::Error { ref message } if message.contains("permission denied"))
+        );
+        assert!(!executed.load(Ordering::SeqCst));
+        let session = sessions
+            .get(&session_id)
+            .expect("session should remain available");
+        let permission_outcome = session
+            .last_permission_outcome
+            .as_ref()
+            .expect("permission outcome should be recorded");
+        assert_eq!(
+            permission_outcome.kind,
+            crate::permission::outcome::PermissionOutcomeKind::RequiresApproval
+        );
+        assert_eq!(
+            permission_outcome.final_decision,
+            crate::permission::types::PermissionDecision::Ask
+        );
+        assert_eq!(
+            permission_outcome.source.kind,
+            crate::permission::request::PermissionMatchKind::ModeDefault
+        );
+        assert_eq!(permission_outcome.request.tool_name, "write_probe");
     }
 
     #[tokio::test]
