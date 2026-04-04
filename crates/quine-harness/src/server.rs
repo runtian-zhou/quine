@@ -369,12 +369,39 @@ async fn handle_request(
                 .unwrap_or_default()
                 .unwrap_or_default();
 
+            let agent_key = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("agent_key"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let team_key = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("team_key"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            let memory_policy = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("memory_policy"))
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .unwrap_or_default()
+                .unwrap_or_default();
+
             let config = crate::config::SessionConfig {
                 system_prompt,
                 working_directory: None,
                 skills,
                 plan_mode,
                 initial_messages,
+                agent_key,
+                team_key,
+                memory_policy,
             };
 
             match service.create_session(config).await {

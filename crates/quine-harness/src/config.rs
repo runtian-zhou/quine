@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use quine_core::MemoryPolicyConfig;
 use quine_llm::anthropic::AnthropicConfig;
 use quine_llm::config::ProviderConfig;
 use quine_llm::openai_compat::OpenAiCompatConfig;
@@ -23,6 +24,15 @@ pub struct SessionConfig {
     /// Seed the session with these messages after the system prompt.
     #[serde(default)]
     pub initial_messages: Vec<Message>,
+    /// Optional custom agent memory scope key.
+    #[serde(default)]
+    pub agent_key: Option<String>,
+    /// Optional team memory scope key.
+    #[serde(default)]
+    pub team_key: Option<String>,
+    /// Memory scope and policy configuration for this session.
+    #[serde(default)]
+    pub memory_policy: MemoryPolicyConfig,
 }
 
 /// Configuration for the harness daemon.
@@ -208,6 +218,9 @@ mod tests {
             skills: Vec::new(),
             plan_mode: false,
             initial_messages: Vec::new(),
+            agent_key: None,
+            team_key: None,
+            memory_policy: MemoryPolicyConfig::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: SessionConfig = serde_json::from_str(&json).unwrap();

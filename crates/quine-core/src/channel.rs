@@ -27,6 +27,12 @@ pub enum CoreInput {
         plan_mode: bool,
         /// Seed the new session with these messages after the system prompt.
         initial_messages: Vec<Message>,
+        /// Optional custom-agent durable memory key.
+        agent_key: Option<String>,
+        /// Optional team durable memory key.
+        team_key: Option<String>,
+        /// Session memory scope and policy configuration.
+        memory_policy: crate::memory::MemoryPolicyConfig,
         /// Acknowledges session creation.
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -388,6 +394,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: crate::memory::MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await

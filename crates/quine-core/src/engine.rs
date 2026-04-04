@@ -17,11 +17,21 @@ use crate::compaction::{self, CompactionTrigger};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
 use crate::memory::{
-    refresh_summary_from_history, restore_memory_state, should_refresh_summary,
-    snapshot_memory_state, MemoryDiagnostics, SessionMemoryState,
+    build_prompt_memory_injection, default_turn_diagnostics, project_root_for_prompt_memory,
+    refresh_summary_from_history, resolve_scoped_memory_paths, restore_memory_state,
+    should_refresh_summary, snapshot_memory_state, snapshot_scoped_persistent_memory_state,
+    splice_prompt_memory_messages, CompactionSourceDiagnostics, MemoryDecisionReason,
+    MemoryDiagnostics, MemoryPolicyConfig, MemoryStatus, MemoryTurnDiagnostics,
+    ScopedMemoryResolution, ScopedPersistentMemoryState, SessionMemoryState,
+};
+use crate::permission::{
+    evaluate_permission, exit_plan_mode as exit_permission_plan_mode, PermissionContext,
+    PermissionOutcome, PermissionPromptBehavior, PermissionRequest, PermissionResource,
+    PermissionScope, ToolLocalDecision,
 };
 use crate::persistence::{
-    CoreCheckpoint, PersistedSession, PersistedSessionConfig, PersistedSessionState,
+    CoreCheckpoint, PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
+    PersistedSessionState, PromptMemoryMode,
 };
 use crate::planner::scheduler::{get_ready_actions, render_plan};
 use crate::scheduler::spawn_scheduler;
@@ -66,9 +76,46 @@ fn schedule_session_memory_refresh(
     session_id: SessionId,
     input_tx: mpsc::Sender<CoreInput>,
 ) {
-    if !should_refresh_summary(&session.session_memory, &session.history) {
+    let refresh_outcome = if !session.session_memory.enabled {
+        Some((
+            false,
+            MemoryStatus::Skipped,
+            Some(MemoryDecisionReason::Disabled),
+        ))
+    } else if session.session_memory.refresh_in_flight {
+        Some((
+            false,
+            MemoryStatus::Skipped,
+            Some(MemoryDecisionReason::NotAttempted),
+        ))
+    } else if session.history.is_empty() {
+        Some((
+            false,
+            MemoryStatus::Skipped,
+            Some(MemoryDecisionReason::NoActivityYet),
+        ))
+    } else if !should_refresh_summary(&session.session_memory, &session.history) {
+        Some((
+            false,
+            MemoryStatus::Skipped,
+            Some(MemoryDecisionReason::RefreshNotNeeded),
+        ))
+    } else {
+        None
+    };
+
+    if let Some((attempted, status, reason)) = refresh_outcome {
+        let diagnostics = ensure_turn_diagnostics(session);
+        diagnostics.session_memory.refresh.attempted = attempted;
+        diagnostics.session_memory.refresh.status = status;
+        diagnostics.session_memory.refresh.reason = reason;
         return;
     }
+
+    let diagnostics = ensure_turn_diagnostics(session);
+    diagnostics.session_memory.refresh.attempted = true;
+    diagnostics.session_memory.refresh.status = MemoryStatus::NotRun;
+    diagnostics.session_memory.refresh.reason = None;
 
     let history = session.history.clone();
     let memory_state = session.session_memory.clone();
@@ -98,6 +145,34 @@ fn schedule_session_memory_refresh(
             .await;
         debug_log_session(session_id, "session memory refresh finished");
     });
+}
+
+fn default_turn_diagnostics_for_session(session: &SessionContext) -> MemoryTurnDiagnostics {
+    default_turn_diagnostics(
+        &session.session_memory.paths.summary_path,
+        &session.session_memory.paths.metadata_path,
+        session.persisted_config.prompt_memory_mode,
+        project_root_for_prompt_memory(&session.persisted_config.working_directory),
+        session.session_memory.persistent_enabled,
+        Some(&session.scoped_persistent_memory_state),
+    )
+}
+
+fn ensure_turn_diagnostics(session: &mut SessionContext) -> &mut MemoryTurnDiagnostics {
+    let default = default_turn_diagnostics_for_session(session);
+    session.last_memory_diagnostics.get_or_insert(default)
+}
+
+fn refresh_scoped_memory_state(session: &mut SessionContext) {
+    session.scoped_memory_resolution = resolve_scoped_memory_paths(
+        &session.archive_root.join("memory"),
+        &session.persisted_config.memory_policy,
+        &session.persisted_config.working_directory,
+        session.persisted_config.agent_key.as_deref(),
+        session.persisted_config.team_key.as_deref(),
+    );
+    session.scoped_persistent_memory_state =
+        snapshot_scoped_persistent_memory_state(&session.scoped_memory_resolution);
 }
 
 /// System prompt prepended in plan mode to restrict the agent to planning-only work.
@@ -184,6 +259,18 @@ struct SessionContext {
     #[allow(dead_code)]
     /// Session memory diagnostics.
     memory_diagnostics: MemoryDiagnostics,
+    last_memory_diagnostics: Option<MemoryTurnDiagnostics>,
+    /// Last prompt-time memory injection summary.
+    last_prompt_memory: PersistedPromptMemoryState,
+    /// Latest user-message index used for prompt-memory de-duplication.
+    last_prompt_memory_user_index: Option<usize>,
+    /// Resolved durable-memory scope state for this session.
+    scoped_memory_resolution: ScopedMemoryResolution,
+    scoped_persistent_memory_state: ScopedPersistentMemoryState,
+    /// Internal permission bootstrap state for this session.
+    permission_context: PermissionContext,
+    /// Latest evaluator result retained for future diagnostics work.
+    last_permission_outcome: Option<PermissionOutcome>,
 }
 
 #[derive(Clone)]
@@ -243,6 +330,10 @@ struct SessionInit {
     initial_messages: Vec<Message>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
+    prompt_memory_mode: PromptMemoryMode,
+    agent_key: Option<String>,
+    team_key: Option<String>,
+    memory_policy: MemoryPolicyConfig,
 }
 
 impl SessionInit {
@@ -256,6 +347,10 @@ impl SessionInit {
                 .collect(),
             working_directory: self.working_directory.clone(),
             plan_mode: self.plan_mode,
+            prompt_memory_mode: self.prompt_memory_mode,
+            agent_key: self.agent_key.clone(),
+            team_key: self.team_key.clone(),
+            memory_policy: self.memory_policy.clone(),
         }
     }
 }
@@ -292,10 +387,23 @@ fn build_tool_registry_for_session(
     tool_registry
 }
 
+fn prompt_memory_mode_from_env() -> PromptMemoryMode {
+    match std::env::var("QUINE_PROMPT_MEMORY_MODE")
+        .unwrap_or_else(|_| "disabled".into())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "index_only" | "index" => PromptMemoryMode::IndexOnly,
+        "targeted_recall" | "targeted" | "recall" => PromptMemoryMode::TargetedRecall,
+        _ => PromptMemoryMode::Disabled,
+    }
+}
+
 fn build_combined_system_prompt(
     working_directory: &std::path::Path,
     persisted_config: &PersistedSessionConfig,
     skills: &[Skill],
+    prompt_memory_suffix: Option<&str>,
 ) -> Option<String> {
     let mut prompt_parts = Vec::new();
 
@@ -320,6 +428,10 @@ fn build_combined_system_prompt(
         }
     }
 
+    if let Some(suffix) = prompt_memory_suffix {
+        prompt_parts.push(suffix.to_string());
+    }
+
     if prompt_parts.is_empty() {
         prompt_parts.push(DEFAULT_SYSTEM_PROMPT.to_string());
     }
@@ -342,6 +454,10 @@ impl SessionContext {
             initial_messages,
             archive_root,
             max_context_window,
+            agent_key,
+            team_key,
+            memory_policy,
+            ..
         } = init;
         let filesystem = Arc::new(
             OverlayFilesystem::new(working_directory.clone(), working_directory.clone())
@@ -353,6 +469,18 @@ impl SessionContext {
 
         let plan_store = crate::tool::plan::new_plan_store();
         let session_memory = restore_memory_state(&archive_root, session_id, None);
+        let persistent_enabled = session_memory.persistent_enabled;
+        let summary_path = session_memory.paths.summary_path.clone();
+        let metadata_path = session_memory.paths.metadata_path.clone();
+        let scoped_memory_resolution = resolve_scoped_memory_paths(
+            &archive_root.join("memory"),
+            &memory_policy,
+            &working_directory,
+            agent_key.as_deref(),
+            team_key.as_deref(),
+        );
+        let scoped_persistent_memory_state =
+            snapshot_scoped_persistent_memory_state(&scoped_memory_resolution);
 
         let tool_registry = build_tool_registry_for_session(
             provider,
@@ -360,10 +488,15 @@ impl SessionContext {
             &persisted_config,
             &skills,
         );
+        let permission_context = PermissionContext::new(
+            working_directory.clone(),
+            persisted_config.plan_mode,
+            PermissionPromptBehavior::Interactive,
+        );
         let tools = tool_registry.tool_definitions();
 
         let combined_prompt =
-            build_combined_system_prompt(&working_directory, &persisted_config, &skills);
+            build_combined_system_prompt(&working_directory, &persisted_config, &skills, None);
 
         let mut history = Vec::new();
         if let Some(prompt) = &combined_prompt {
@@ -387,12 +520,29 @@ impl SessionContext {
             archive_root,
             max_context_window,
             compaction_generation: 0,
-            persisted_config,
+            persisted_config: persisted_config.clone(),
             created_at: Utc::now(),
             mailbox: VecDeque::new(),
             suspended_wait: None,
             session_memory,
             memory_diagnostics: MemoryDiagnostics::default(),
+            last_memory_diagnostics: Some(default_turn_diagnostics(
+                &summary_path,
+                &metadata_path,
+                persisted_config.prompt_memory_mode,
+                project_root_for_prompt_memory(&persisted_config.working_directory),
+                persistent_enabled,
+                Some(&scoped_persistent_memory_state),
+            )),
+            last_prompt_memory: PersistedPromptMemoryState {
+                mode: persisted_config.prompt_memory_mode,
+                ..PersistedPromptMemoryState::default()
+            },
+            last_prompt_memory_user_index: None,
+            scoped_memory_resolution,
+            scoped_persistent_memory_state,
+            permission_context,
+            last_permission_outcome: None,
         })
     }
 
@@ -423,6 +573,10 @@ impl SessionContext {
                 initial_messages: Vec::new(),
                 archive_root,
                 max_context_window,
+                prompt_memory_mode: config.prompt_memory_mode,
+                agent_key: config.agent_key.clone(),
+                team_key: config.team_key.clone(),
+                memory_policy: config.memory_policy.clone(),
             },
             provider,
         )
@@ -463,6 +617,25 @@ impl SessionContext {
         session.created_at = created_at;
         session.session_memory =
             restore_memory_state(&session.archive_root, session_id, memory_state.as_ref());
+        session.last_prompt_memory = memory_state
+            .as_ref()
+            .and_then(|state| state.prompt_memory.clone())
+            .unwrap_or(PersistedPromptMemoryState {
+                mode: session.persisted_config.prompt_memory_mode,
+                ..PersistedPromptMemoryState::default()
+            });
+        session.last_memory_diagnostics = memory_state
+            .as_ref()
+            .and_then(|state| state.memory_diagnostics.clone());
+        if let Some(scope_state) = memory_state
+            .as_ref()
+            .and_then(|state| state.persistent_memory.as_ref())
+            .and_then(|state| state.scope_state.clone())
+        {
+            session.scoped_persistent_memory_state = scope_state;
+        } else {
+            refresh_scoped_memory_state(&mut session);
+        }
         Ok((session_id, session))
     }
 
@@ -475,7 +648,15 @@ impl SessionContext {
             config: self.persisted_config.clone(),
             history: self.history.clone(),
             plan_store: crate::tool::plan::snapshot_plan_store(&self.plan_store).await,
-            memory_state: Some(snapshot_memory_state(&self.session_memory)),
+            memory_state: Some({
+                let mut memory_state = snapshot_memory_state(&self.session_memory);
+                memory_state.prompt_memory = Some(self.last_prompt_memory.clone());
+                memory_state.memory_diagnostics = self.last_memory_diagnostics.clone();
+                if let Some(persistent) = memory_state.persistent_memory.as_mut() {
+                    persistent.scope_state = Some(self.scoped_persistent_memory_state.clone());
+                }
+                memory_state
+            }),
         })
     }
 
@@ -499,7 +680,9 @@ impl SessionContext {
             &self.persisted_config.working_directory,
             &self.persisted_config,
             &skills,
+            None,
         );
+        refresh_scoped_memory_state(self);
 
         match &self.system_prompt {
             Some(prompt) => {
@@ -536,6 +719,7 @@ impl SessionContext {
             return Ok(());
         }
         self.persisted_config.plan_mode = false;
+        let _ = exit_permission_plan_mode(&mut self.permission_context);
         self.rebuild_session_config(provider).await
     }
 }
@@ -773,11 +957,11 @@ async fn handle_send_message_input(
 #[allow(dead_code)]
 async fn call_llm(
     provider: &dyn LlmProvider,
-    session: &SessionContext,
+    session: &mut SessionContext,
     session_id: SessionId,
     output: &tokio::sync::mpsc::Sender<CoreOutput>,
 ) -> Result<LlmCallResult, CoreError> {
-    let messages = compaction::build_micro_compacted_history(&session.history);
+    let messages = build_provider_messages(session).await?;
     call_llm_with_messages(
         provider,
         &messages,
@@ -786,6 +970,74 @@ async fn call_llm(
         Some(output),
     )
     .await
+}
+
+async fn build_provider_messages(session: &mut SessionContext) -> Result<Vec<Message>, CoreError> {
+    refresh_scoped_memory_state(session);
+    let previous_selection =
+        if session.last_prompt_memory_user_index == latest_user_message_index(&session.history) {
+            session.last_prompt_memory.selected_entry_ids.clone()
+        } else {
+            Vec::new()
+        };
+    let injection = build_prompt_memory_injection(
+        &session.scoped_memory_resolution.readable_scopes,
+        session.persisted_config.prompt_memory_mode,
+        &session.history,
+        &previous_selection,
+        session.scoped_memory_resolution.conflict_resolution,
+    )
+    .await
+    .map_err(|error| CoreError::Internal {
+        message: format!("failed to build prompt memory injection: {error}"),
+    })?;
+    session.last_prompt_memory = injection.summary.clone();
+    session.last_prompt_memory_user_index = injection.latest_user_index;
+    let mut diagnostics = session
+        .last_memory_diagnostics
+        .clone()
+        .unwrap_or_else(|| default_turn_diagnostics_for_session(session));
+    diagnostics.prompt_memory.mode = injection.diagnostics.mode;
+    diagnostics.prompt_memory.injection_ran = injection.diagnostics.injection_ran;
+    diagnostics.prompt_memory.status = injection.diagnostics.status;
+    diagnostics.prompt_memory.reason = injection.diagnostics.reason;
+    diagnostics.prompt_memory.selected_entries = injection.diagnostics.selected_entries.clone();
+    diagnostics.prompt_memory.skipped_entries = injection.diagnostics.skipped_entries.clone();
+    diagnostics.prompt_memory.truncated = injection.diagnostics.truncated;
+    diagnostics.persistent_memory.readable_scopes = session
+        .scoped_persistent_memory_state
+        .readable_scopes
+        .clone();
+    diagnostics.persistent_memory.writable_scope = session
+        .scoped_persistent_memory_state
+        .writable_scope
+        .clone();
+    diagnostics.persistent_memory.conflict_resolution =
+        Some(session.scoped_persistent_memory_state.conflict_resolution);
+    diagnostics.persistent_memory.conflict_winner_scope =
+        injection.diagnostics.conflict_winner_scope.clone();
+    session.last_memory_diagnostics = Some(diagnostics);
+
+    let mut messages = compaction::build_micro_compacted_history(&session.history);
+    if let Some(system_suffix) = injection.system_prompt_suffix.as_deref() {
+        if let Some(first) = messages.first_mut() {
+            if first.role == quine_llm::Role::System {
+                if let MessageContent::Text(text) = &mut first.content {
+                    text.push_str("\n\n");
+                    text.push_str(system_suffix);
+                }
+            }
+        }
+    }
+    Ok(splice_prompt_memory_messages(&messages, &injection))
+}
+
+fn latest_user_message_index(history: &[Message]) -> Option<usize> {
+    history
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| (message.role == quine_llm::Role::User).then_some(index))
 }
 
 async fn call_llm_with_messages(
@@ -1091,6 +1343,98 @@ struct CompletedConcurrentToolCall {
     duration_us: u64,
 }
 
+fn build_permission_request(
+    call: &PendingToolCall,
+    tool: &dyn crate::tool::Tool,
+) -> (PermissionRequest, Option<ToolLocalDecision>) {
+    let scope = match call.tool_name.as_str() {
+        "read_file" | "find" => PermissionScope::Read,
+        "write_file" => PermissionScope::Write,
+        "bash" => PermissionScope::Execute,
+        "signal" => PermissionScope::ProcessControl,
+        "spawn" | "subagent" | "wait_child" | "send_message" | "recv_message" => {
+            PermissionScope::AgentControl
+        }
+        _ => {
+            if tool.is_read_only() {
+                PermissionScope::Read
+            } else {
+                PermissionScope::Write
+            }
+        }
+    };
+
+    let resource = match call.tool_name.as_str() {
+        "read_file" | "write_file" => call
+            .arguments
+            .get("file_path")
+            .and_then(|v| v.as_str())
+            .map(|path| PermissionResource::Path {
+                path: PathBuf::from(path),
+            })
+            .unwrap_or(PermissionResource::None),
+        "bash" => call
+            .arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|command| PermissionResource::Command {
+                command: command.to_string(),
+            })
+            .unwrap_or(PermissionResource::None),
+        "signal" => call
+            .arguments
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|target| PermissionResource::Process {
+                target: target.to_string(),
+            })
+            .unwrap_or(PermissionResource::None),
+        "spawn" | "subagent" | "wait_child" | "send_message" | "recv_message" => {
+            PermissionResource::Agent {
+                target: call.tool_name.clone(),
+            }
+        }
+        _ => PermissionResource::None,
+    };
+
+    let local = if call.tool_name == "bash" {
+        call.arguments
+            .get("command")
+            .and_then(|v| v.as_str())
+            .map(|command| {
+                let trimmed = command.trim();
+                if trimmed == "rm -rf /" || trimmed.starts_with("rm -rf /") {
+                    ToolLocalDecision {
+                        decision: crate::permission::types::PermissionDecision::Deny,
+                        reason: Some("dangerous destructive shell command".into()),
+                    }
+                } else {
+                    ToolLocalDecision {
+                        decision: crate::permission::types::PermissionDecision::Defer,
+                        reason: Some(
+                            "bash delegates final permission decision to the shared engine".into(),
+                        ),
+                    }
+                }
+            })
+    } else {
+        Some(ToolLocalDecision {
+            decision: crate::permission::types::PermissionDecision::Defer,
+            reason: Some("tool defers to the shared permission engine".into()),
+        })
+    };
+
+    (
+        PermissionRequest {
+            tool_name: call.tool_name.clone(),
+            action: None,
+            scope,
+            resource,
+        },
+        local,
+    )
+}
+
 fn session_output(session: &SessionContext) -> Option<String> {
     session.history.iter().rev().find_map(|message| {
         if message.role != quine_llm::Role::Assistant {
@@ -1352,11 +1696,24 @@ async fn compact_session_history(
     let plan = if let Some(plan) =
         compaction::session_memory_compaction_plan(&session.session_memory, &session.history).await
     {
+        let diagnostics = ensure_turn_diagnostics(session);
+        diagnostics.session_memory.compaction.status = MemoryStatus::Succeeded;
+        diagnostics.session_memory.compaction.source =
+            Some(CompactionSourceDiagnostics::SessionMemory);
+        diagnostics.session_memory.compaction.reason = None;
+        diagnostics.session_memory.compaction.tail_start = Some(plan.tail_start);
         plan
     } else {
         let summary =
             summarize_history(provider, session_id, &archive_ref, trigger, &prefix).await?;
-        compaction::legacy_compaction_plan(&session.history, summary)
+        let plan = compaction::legacy_compaction_plan(&session.history, summary);
+        let diagnostics = ensure_turn_diagnostics(session);
+        diagnostics.session_memory.compaction.status = MemoryStatus::Skipped;
+        diagnostics.session_memory.compaction.source =
+            Some(CompactionSourceDiagnostics::LegacySummarizer);
+        diagnostics.session_memory.compaction.reason = Some(MemoryDecisionReason::Fallback);
+        diagnostics.session_memory.compaction.tail_start = Some(plan.tail_start);
+        plan
     };
     if plan.source == compaction::CompactionSource::LegacySummarizer {
         debug_log_session(session_id, "compaction used legacy summarizer");
@@ -1561,6 +1918,10 @@ async fn start_child_session(
             initial_messages: Vec::new(),
             archive_root,
             max_context_window,
+            prompt_memory_mode: PromptMemoryMode::Disabled,
+            agent_key: None,
+            team_key: None,
+            memory_policy: MemoryPolicyConfig::default(),
         },
         engine.provider,
     )
@@ -1630,6 +1991,44 @@ async fn execute_tool_call(
         session_id,
         format!("starting tool execution for `{}`", call.tool_name),
     );
+
+    let tool = {
+        let Some(session) = sessions.get(&session_id) else {
+            return ToolOutcome::Error {
+                message: "session not found".into(),
+            };
+        };
+        let Some(tool) = session.tool_registry.get(&call.tool_name) else {
+            return ToolOutcome::Error {
+                message: format!("unknown tool: {}", call.tool_name),
+            };
+        };
+        Arc::clone(tool)
+    };
+
+    let permission_outcome = {
+        let Some(session) = sessions.get_mut(&session_id) else {
+            return ToolOutcome::Error {
+                message: "session not found".into(),
+            };
+        };
+        let (request, local) = build_permission_request(call, tool.as_ref());
+        let outcome = evaluate_permission(&session.permission_context, request, local);
+        session.last_permission_outcome = Some(outcome.clone());
+        outcome
+    };
+
+    if !permission_outcome.is_allowed() {
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.cancel_tx = None;
+        }
+        return ToolOutcome::Error {
+            message: ToolError::PermissionDenied {
+                reason: permission_outcome.reason,
+            }
+            .to_string(),
+        };
+    }
 
     if call.tool_name == "spawn" {
         let task = match call.arguments.get("task").and_then(|v| v.as_str()) {
@@ -2287,8 +2686,23 @@ async fn handle_llm_turn(
                 .await;
             return TurnOutcome::Cancelled;
         }
-        let history = session.history.clone();
-        let tools = session.tools.clone();
+        let history = match sessions.get_mut(&session_id) {
+            Some(session) => match build_provider_messages(session).await {
+                Ok(history) => history,
+                Err(error) => {
+                    let _ = io
+                        .output
+                        .send(CoreOutput::SessionError { session_id, error })
+                        .await;
+                    return TurnOutcome::Failed("session error".into());
+                }
+            },
+            None => return TurnOutcome::Failed("session not found".into()),
+        };
+        let tools = match sessions.get(&session_id) {
+            Some(session) => session.tools.clone(),
+            None => return TurnOutcome::Failed("session not found".into()),
+        };
         match call_llm_interruptible(&**engine.provider, history, tools, session_id, io, sessions)
             .await
         {
@@ -2833,6 +3247,9 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 skills,
                 plan_mode,
                 initial_messages,
+                agent_key,
+                team_key,
+                memory_policy,
                 reply,
             } => {
                 debug_log_session(
@@ -2862,6 +3279,10 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         initial_messages,
                         archive_root: archive_root.clone(),
                         max_context_window,
+                        prompt_memory_mode: prompt_memory_mode_from_env(),
+                        agent_key,
+                        team_key,
+                        memory_policy,
                     },
                     &provider,
                 )
@@ -2933,6 +3354,8 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         session.suspended_wait = None;
                         session.state = SessionState::Streaming;
                         session.history.push(Message::user(&content));
+                        session.last_memory_diagnostics =
+                            Some(default_turn_diagnostics_for_session(session));
                     }
                     let _ = handle
                         .output
@@ -3214,6 +3637,24 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     if let Some(timestamp) = refreshed_at {
                         session.session_memory.last_refresh_at = Some(timestamp);
                     }
+                    let diagnostics = ensure_turn_diagnostics(session);
+                    diagnostics.session_memory.refresh.attempted = true;
+                    if let Some(index) = last_summarized_message_index {
+                        diagnostics.session_memory.refresh.status = MemoryStatus::Succeeded;
+                        diagnostics.session_memory.refresh.reason = None;
+                        diagnostics
+                            .session_memory
+                            .refresh
+                            .last_summarized_message_index = Some(index);
+                    } else {
+                        diagnostics.session_memory.refresh.status = MemoryStatus::FailedBestEffort;
+                        diagnostics.session_memory.refresh.reason =
+                            Some(MemoryDecisionReason::MissingSummary);
+                    }
+                    if let Some(timestamp) = refreshed_at {
+                        diagnostics.session_memory.refresh.refreshed_at =
+                            Some(timestamp.to_rfc3339());
+                    }
                     emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
                 }
             }
@@ -3450,6 +3891,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
 mod tests {
     use super::*;
     use crate::channel::{create_channels, ChannelConfig};
+    use crate::permission::types::PermissionMode;
     use crate::session::{ExitStatus, InheritanceFlags};
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -3460,6 +3902,7 @@ mod tests {
     use tokio::time::Duration as TokioDuration;
 
     use crate::memory::load_summary_metadata;
+    use sha2::{Digest, Sha256};
 
     /// A mock LLM provider that returns a fixed text response.
     struct MockProvider {
@@ -3534,6 +3977,43 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn session_context_bootstraps_permission_foundation_from_plan_mode() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let temp_dir = TempDir::new().unwrap();
+        let working_directory = temp_dir.path().to_path_buf();
+        let session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: working_directory.clone(),
+                plan_mode: true,
+                initial_messages: Vec::new(),
+                archive_root: temp_dir.path().join("archive"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(session.permission_context.mode(), PermissionMode::Plan);
+        assert_eq!(session.permission_context.pre_plan_mode(), None);
+        assert_eq!(
+            session.permission_context.workspace_root(),
+            &working_directory
+        );
+        assert!(session
+            .permission_context
+            .additional_allowed_roots()
+            .is_empty());
+    }
+
     fn compacted_summary_text(history: &[Message]) -> &str {
         match history.get(1).map(|message| &message.content) {
             Some(MessageContent::Text(text)) => text,
@@ -3557,6 +4037,10 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root,
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             provider,
         )
@@ -3564,6 +4048,34 @@ mod tests {
         .unwrap();
         session.history = history;
         (session_id, session)
+    }
+
+    fn write_persistent_memory_fixture(
+        archive_root: &std::path::Path,
+        working_directory: &std::path::Path,
+        memory_md: &str,
+        index_json: &str,
+        entries: &[(&str, &str)],
+    ) {
+        let normalized = working_directory.to_string_lossy().replace('\\', "/");
+        let mut hasher = Sha256::new();
+        hasher.update(normalized.as_bytes());
+        let digest = hasher.finalize();
+        let project_key = hex::encode(&digest[..16]);
+        let project_dir = archive_root
+            .join("memory")
+            .join("projects")
+            .join(project_key);
+        std::fs::create_dir_all(project_dir.join("entries")).unwrap();
+        std::fs::write(project_dir.join("MEMORY.md"), memory_md).unwrap();
+        std::fs::write(project_dir.join("index.json"), index_json).unwrap();
+        for (relative_path, content) in entries {
+            let path = project_dir.join(relative_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
     }
 
     fn write_session_memory_fixture(
@@ -3583,6 +4095,102 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_provider_messages_injects_targeted_prompt_memory_without_persisting_it() {
+        let tempdir = TempDir::new().unwrap();
+        let archive_root = tempdir.path().join("archive");
+        let working_directory = tempdir.path().join("workspace");
+        std::fs::create_dir_all(working_directory.join(".git")).unwrap();
+
+        let index_json = r#"{
+  "entries": [
+    {
+      "entry_id": "cargo-test",
+      "title": "Cargo test command",
+      "summary": "Use cargo test for the Rust test suite",
+      "slug": "cargo-test-command",
+      "path": "entries/cargo-test.md",
+      "updated_at": "2025-01-01T00:00:00Z",
+      "keywords": ["cargo", "test", "rust"],
+      "pinned": true
+    }
+  ]
+}"#;
+        let entry = r#"---
+entry_id: cargo-test
+title: Cargo test command
+summary: Use cargo test for the Rust test suite
+keywords:
+  - cargo
+  - test
+  - rust
+updated_at: 2025-01-01T00:00:00Z
+pinned: true
+---
+Run `cargo test` from the workspace root to execute the Rust test suite.
+"#;
+        write_persistent_memory_fixture(
+            &archive_root,
+            &working_directory,
+            "# Durable Memory\n\n- Use cargo test",
+            index_json,
+            &[("entries/cargo-test.md", entry)],
+        );
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let mut session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: Some("base system prompt".into()),
+                skills: Vec::new(),
+                working_directory: working_directory.clone(),
+                plan_mode: false,
+                initial_messages: vec![Message::user("How do I run the Rust test suite?")],
+                archive_root,
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.persisted_config.prompt_memory_mode = PromptMemoryMode::TargetedRecall;
+
+        let provider_messages = build_provider_messages(&mut session).await.unwrap();
+        assert_eq!(
+            session.last_prompt_memory.mode,
+            PromptMemoryMode::TargetedRecall
+        );
+        assert_eq!(
+            session.last_prompt_memory.selected_entry_ids,
+            vec!["cargo-test"]
+        );
+        assert_eq!(session.history.len(), 2);
+        assert_eq!(provider_messages.len(), 3);
+        assert_eq!(provider_messages[1].role, quine_llm::Role::System);
+        let injected_text = match &provider_messages[1].content {
+            MessageContent::Text(text) => text,
+            other => panic!("expected text message, got {other:?}"),
+        };
+        assert!(injected_text.contains("Relevant durable memory `cargo-test`:"));
+        assert!(injected_text.contains("cargo test"));
+        assert_eq!(provider_messages[2].role, quine_llm::Role::User);
+        match &provider_messages[2].content {
+            MessageContent::Text(text) => assert_eq!(text, "How do I run the Rust test suite?"),
+            other => panic!("expected text message, got {other:?}"),
+        }
+        assert!(session
+            .history
+            .iter()
+            .all(|message| match &message.content {
+                MessageContent::Text(text) => !text.contains("Relevant durable memory"),
+                _ => true,
+            }));
     }
 
     #[tokio::test]
@@ -3621,6 +4229,18 @@ mod tests {
         assert!(summary.contains("Memory summary from summary.md"));
         assert!(summary.contains("Context compacted from archive"));
         assert_eq!(session.history.len(), 4);
+        let diagnostics = session
+            .last_memory_diagnostics
+            .as_ref()
+            .expect("compaction diagnostics should be recorded");
+        assert_eq!(
+            diagnostics.session_memory.compaction.status,
+            MemoryStatus::Succeeded
+        );
+        assert_eq!(
+            diagnostics.session_memory.compaction.source,
+            Some(CompactionSourceDiagnostics::SessionMemory)
+        );
         let archive_dir = temp
             .path()
             .join("compactions")
@@ -3656,6 +4276,22 @@ mod tests {
         assert_eq!(provider.call_count(), 1);
         let summary = compacted_summary_text(&session.history);
         assert!(summary.contains("legacy summary"));
+        let diagnostics = session
+            .last_memory_diagnostics
+            .as_ref()
+            .expect("fallback diagnostics should be recorded");
+        assert_eq!(
+            diagnostics.session_memory.compaction.status,
+            MemoryStatus::Skipped
+        );
+        assert_eq!(
+            diagnostics.session_memory.compaction.source,
+            Some(CompactionSourceDiagnostics::LegacySummarizer)
+        );
+        assert_eq!(
+            diagnostics.session_memory.compaction.reason,
+            Some(MemoryDecisionReason::Fallback)
+        );
     }
 
     #[tokio::test]
@@ -3746,6 +4382,266 @@ mod tests {
         assert!(compacted_summary_text(&session.history).contains("legacy summary"));
     }
 
+    fn prompt_memory_project_dir(
+        archive_root: &std::path::Path,
+        working_directory: &std::path::Path,
+    ) -> PathBuf {
+        use sha2::{Digest, Sha256};
+
+        let mut current = working_directory.to_path_buf();
+        while !(current.join(".git").exists()
+            || current.join("CLAUDE.md").exists()
+            || current.join("Cargo.toml").exists())
+        {
+            if !current.pop() {
+                current = working_directory.to_path_buf();
+                break;
+            }
+        }
+        let normalized = current.to_string_lossy().replace('\\', "/");
+        let mut hasher = Sha256::new();
+        hasher.update(normalized.as_bytes());
+        let digest = hasher.finalize();
+        archive_root
+            .join("memory")
+            .join("projects")
+            .join(hex::encode(&digest[..16]))
+    }
+
+    fn write_prompt_memory_fixture(
+        archive_root: &std::path::Path,
+        working_directory: &std::path::Path,
+        index_json: &serde_json::Value,
+        entry_files: &[(&str, &str)],
+        memory_md: &str,
+    ) {
+        let project_dir = prompt_memory_project_dir(archive_root, working_directory);
+        std::fs::create_dir_all(project_dir.join("entries")).unwrap();
+        std::fs::write(
+            project_dir.join("index.json"),
+            serde_json::to_vec_pretty(index_json).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project_dir.join("MEMORY.md"), memory_md).unwrap();
+        for (path, content) in entry_files {
+            std::fs::write(project_dir.join(path), content).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_memory_disabled_mode_is_request_equivalent_to_legacy_path() {
+        let temp = TempDir::new().unwrap();
+        let provider = Arc::new(CountingProvider::new("ok"));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let history = vec![
+            Message::system("system"),
+            Message::user("hello"),
+            Message::assistant("world"),
+        ];
+        let (_session_id, mut session) =
+            make_session_for_compaction(&provider_dyn, temp.path().to_path_buf(), history.clone())
+                .await;
+        session.persisted_config.prompt_memory_mode = PromptMemoryMode::Disabled;
+
+        let built = build_provider_messages(&mut session).await.unwrap();
+        let expected = compaction::build_micro_compacted_history(&history);
+        assert_eq!(built.len(), expected.len());
+        for (left, right) in built.iter().zip(expected.iter()) {
+            assert_eq!(left.role, right.role);
+            if let (MessageContent::Text(a), MessageContent::Text(b)) =
+                (&left.content, &right.content)
+            {
+                assert_eq!(a, b);
+            }
+        }
+        assert!(session.last_prompt_memory.selected_entry_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn targeted_recall_prompt_assembly_inserts_ephemeral_reminders_before_latest_user_message(
+    ) {
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("CLAUDE.md"), "# project\n").unwrap();
+
+        let provider = Arc::new(CountingProvider::new("ok"));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let history = vec![
+            Message::system("system"),
+            Message::user("earlier"),
+            Message::assistant("reply"),
+            Message::user("What should I run to execute all tests in this repo?"),
+        ];
+        let (_session_id, mut session) =
+            make_session_for_compaction(&provider_dyn, temp.path().to_path_buf(), history.clone())
+                .await;
+        session.persisted_config.working_directory = project_dir.clone();
+        session.persisted_config.prompt_memory_mode = PromptMemoryMode::TargetedRecall;
+        write_prompt_memory_fixture(
+            temp.path(),
+            &project_dir,
+            &serde_json::json!({
+                "entries": [{
+                    "entry_id": "rust-test-command",
+                    "title": "Run tests",
+                    "summary": "Use cargo test to run the Rust test suite",
+                    "slug": "rust-test-command",
+                    "path": "entries/rust-test-command.md",
+                    "updated_at": Utc::now(),
+                    "keywords": ["cargo", "test", "rust"],
+                    "pinned": false
+                }]
+            }),
+            &[(
+                "entries/rust-test-command.md",
+                "---\nentry_id: rust-test-command\ntitle: Run tests\nsummary: Use cargo test to run the Rust test suite\nkeywords:\n  - cargo\n  - test\nupdated_at: 2026-04-04T00:00:00Z\npinned: false\n---\n\nUse `cargo test` to run the Rust test suite.\n",
+            )],
+            "# MEMORY\n\n- [Run tests](entries/rust-test-command.md) - Use cargo test\n",
+        );
+
+        let built = build_provider_messages(&mut session).await.unwrap();
+        assert_eq!(session.history.len(), history.len());
+        match &session.history[3].content {
+            MessageContent::Text(text) => {
+                assert_eq!(text, "What should I run to execute all tests in this repo?")
+            }
+            other => panic!("expected latest user text, got {other:?}"),
+        }
+        assert_eq!(
+            session.last_prompt_memory.selected_entry_ids,
+            vec!["rust-test-command"]
+        );
+        let latest_user_index = built
+            .iter()
+            .rposition(|message| message.role == quine_llm::Role::User)
+            .unwrap();
+        assert!(latest_user_index > 0);
+        match &built[latest_user_index - 1].content {
+            MessageContent::Text(text) => assert!(text.contains("rust-test-command")),
+            other => panic!("expected injected reminder, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn targeted_recall_prefers_agent_scope_when_configured_for_narrower_conflicts() {
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("CLAUDE.md"), "# project\n").unwrap();
+
+        let provider = Arc::new(CountingProvider::new("ok"));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let history = vec![
+            Message::system("system"),
+            Message::user("What editor should I use for this task?"),
+        ];
+        let (_session_id, mut session) =
+            make_session_for_compaction(&provider_dyn, temp.path().to_path_buf(), history).await;
+        session.persisted_config.working_directory = project_dir.clone();
+        session.persisted_config.prompt_memory_mode = PromptMemoryMode::TargetedRecall;
+        session.persisted_config.agent_key = Some("planner".into());
+        session.persisted_config.memory_policy = MemoryPolicyConfig {
+            flags: crate::memory::MemoryFeatureFlags {
+                advanced_scopes_enabled: true,
+                agent_memory_enabled: true,
+                ..crate::memory::MemoryFeatureFlags::default()
+            },
+            read_policy: crate::memory::MemoryReadPolicy {
+                allow_cross_scope_recall: false,
+                ..crate::memory::MemoryReadPolicy::default()
+            },
+            lookup_order: crate::memory::ScopedMemoryLookupOrder::ProjectThenAgent,
+            conflict_resolution: crate::memory::MemoryConflictResolution::PreferNarrowerScope,
+            ..MemoryPolicyConfig::default()
+        };
+
+        let project_root = temp
+            .path()
+            .join("memory")
+            .join("projects")
+            .join(crate::memory::project_key(&project_dir));
+        let agent_root = temp
+            .path()
+            .join("memory")
+            .join("agents")
+            .join(crate::memory::project_key(&project_dir))
+            .join("planner");
+        std::fs::create_dir_all(project_root.join("entries")).unwrap();
+        std::fs::create_dir_all(agent_root.join("entries")).unwrap();
+        std::fs::write(
+            project_root.join("index.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "entries": [{
+                    "entry_id": "editor-style",
+                    "title": "Preferred editor",
+                    "summary": "Preferred editor: vim",
+                    "slug": "editor-style",
+                    "path": "entries/editor-style.md",
+                    "updated_at": "2026-04-04T00:00:00Z",
+                    "keywords": ["editor", "vim"],
+                    "pinned": false
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_root.join("index.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "entries": [{
+                    "entry_id": "editor-style",
+                    "title": "Preferred editor",
+                    "summary": "Preferred editor: helix",
+                    "slug": "editor-style",
+                    "path": "entries/editor-style.md",
+                    "updated_at": "2026-04-04T00:00:00Z",
+                    "keywords": ["editor", "helix"],
+                    "pinned": false
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            project_root.join("entries/editor-style.md"),
+            "---\nentry_id: editor-style\ntitle: Preferred editor\nsummary: \"Preferred editor: vim\"\nkeywords:\n  - editor\n  - vim\nupdated_at: 2026-04-04T00:00:00Z\npinned: false\n---\n\nPreferred editor: vim\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent_root.join("entries/editor-style.md"),
+            "---\nentry_id: editor-style\ntitle: Preferred editor\nsummary: \"Preferred editor: helix\"\nkeywords:\n  - editor\n  - helix\nupdated_at: 2026-04-04T00:00:00Z\npinned: false\n---\n\nPreferred editor: helix\n",
+        )
+        .unwrap();
+
+        let built = build_provider_messages(&mut session).await.unwrap();
+        assert_eq!(
+            session.last_prompt_memory.selected_entry_ids,
+            vec!["editor-style"]
+        );
+        let latest_user_index = built
+            .iter()
+            .rposition(|message| message.role == quine_llm::Role::User)
+            .unwrap();
+        match &built[latest_user_index - 1].content {
+            MessageContent::Text(text) => assert!(text.contains("helix")),
+            other => panic!("expected injected reminder, got {other:?}"),
+        }
+        assert_eq!(
+            session
+                .last_memory_diagnostics
+                .as_ref()
+                .and_then(|diagnostics| diagnostics
+                    .persistent_memory
+                    .conflict_winner_scope
+                    .clone()),
+            Some(crate::memory::PersistentMemoryScope::agent(
+                crate::memory::project_key(&project_dir),
+                "planner",
+            ))
+        );
+    }
+
     #[test]
     fn wait_graph_cycle_detection_catches_indirect_cycles() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
@@ -3765,6 +4661,10 @@ mod tests {
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-a"),
                     max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 &provider,
             ))
@@ -3780,6 +4680,10 @@ mod tests {
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-b"),
                     max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 &provider,
             ))
@@ -3795,6 +4699,10 @@ mod tests {
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-c"),
                     max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 &provider,
             ))
@@ -3846,6 +4754,10 @@ mod tests {
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-timeout-a"),
                     max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 &provider,
             ))
@@ -3861,6 +4773,10 @@ mod tests {
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-timeout-b"),
                     max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 &provider,
             ))
@@ -3897,6 +4813,10 @@ mod tests {
                 initial_messages: vec![Message::assistant_tool_use(None, vec![])],
                 archive_root: std::env::temp_dir().join("quine-core-timeout-resume"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -3966,6 +4886,10 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-mailbox-resume"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4033,6 +4957,10 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4112,6 +5040,10 @@ mod tests {
                 initial_messages: vec![Message::user("inspect")],
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4212,6 +5144,10 @@ mod tests {
                 initial_messages: vec![Message::user("inspect")],
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4427,6 +5363,10 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4483,6 +5423,10 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4551,6 +5495,10 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4609,6 +5557,10 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4647,6 +5599,10 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: archive_root.clone(),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4702,6 +5658,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: create_reply_tx,
             })
             .await
@@ -4775,6 +5734,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -4810,6 +5772,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -4889,6 +5854,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -4955,6 +5923,9 @@ mod tests {
                     skills: Vec::new(),
                     plan_mode: false,
                     initial_messages: Vec::new(),
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                     reply: reply_tx,
                 })
                 .await
@@ -5003,6 +5974,10 @@ mod tests {
                     skill_names: Vec::new(),
                     working_directory: std::env::current_dir().unwrap_or_default(),
                     plan_mode: false,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 history: vec![
                     Message::user("seed session memory"),
@@ -5018,7 +5993,10 @@ mod tests {
                     persistent_memory: Some(crate::persistence::PersistedPersistentMemoryState {
                         enabled: true,
                         last_extracted_message_index: Some(1),
+                        scope_state: None,
                     }),
+                    prompt_memory: None,
+                    memory_diagnostics: None,
                 }),
             }],
             crate::persistence::PersistedSessionTree {
@@ -5109,6 +6087,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5160,6 +6141,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5217,6 +6201,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5233,6 +6220,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5262,6 +6252,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5371,6 +6364,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5493,6 +6489,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5617,6 +6616,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5676,6 +6678,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: vec![seeded_message.clone()],
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5707,6 +6712,9 @@ mod tests {
                     skills: Vec::new(),
                     plan_mode: false,
                     initial_messages: Vec::new(),
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                     reply: reply_tx,
                 })
                 .await
@@ -5843,6 +6851,9 @@ mod tests {
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await

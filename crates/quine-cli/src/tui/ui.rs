@@ -1283,6 +1283,8 @@ mod tests {
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
+            prompt_memory: None,
+            memory_diagnostics: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1324,6 +1326,8 @@ mod tests {
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
+            prompt_memory: None,
+            memory_diagnostics: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1369,6 +1373,8 @@ mod tests {
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
+            prompt_memory: None,
+            memory_diagnostics: None,
             history: vec![HistoryEntry::Text {
                 role: "user".into(),
                 text: "hello world".into(),
@@ -1411,6 +1417,8 @@ mod tests {
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
+            prompt_memory: None,
+            memory_diagnostics: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1461,6 +1469,8 @@ mod tests {
             }],
             loaded_skills: vec![],
             plans: vec![],
+            prompt_memory: None,
+            memory_diagnostics: None,
             history: vec![
                 HistoryEntry::ToolUse {
                     role: "assistant".into(),
@@ -1511,6 +1521,8 @@ mod tests {
             }],
             loaded_skills: vec![],
             plans: vec![],
+            prompt_memory: None,
+            memory_diagnostics: None,
             history: vec![],
         };
         let mut app = App::new("test".into(), false, None);
@@ -1547,6 +1559,8 @@ mod tests {
                 tool_names: vec!["read_file".into(), "bash".into()],
             }],
             plans: vec![],
+            prompt_memory: None,
+            memory_diagnostics: None,
             history: vec![],
         };
         let mut app = App::new("test".into(), false, None);
@@ -1588,6 +1602,8 @@ mod tests {
                     result: Some("Wiring tabs".into()),
                 }],
             }],
+            prompt_memory: None,
+            memory_diagnostics: None,
             history: vec![],
         };
         let mut app = App::new("test".into(), false, None);
@@ -1840,7 +1856,9 @@ mod tests {
             tool_use_id: "tc1".into(),
             summary: "create_plan: Demo".into(),
             status: ToolStatus::Success { duration_us: 42 },
-            result_preview: Some("Plan created (ID: 123)\n\nPlan: Branch, commit, and attempt PR flow".into()),
+            result_preview: Some(
+                "Plan created (ID: 123)\n\nPlan: Branch, commit, and attempt PR flow".into(),
+            ),
         });
 
         let lines = build_conversation_lines(&app, 100);

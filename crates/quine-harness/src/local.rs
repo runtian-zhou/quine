@@ -192,12 +192,37 @@ impl LocalHarness {
                     let mut checkpoint = checkpoint.clone();
                     for session in &mut checkpoint.sessions {
                         match memory_store.extract_and_persist_for_session(session).await {
-                            Ok(Some(persistent_state)) => {
+                            Ok(result) => {
                                 let mut state = session.memory_state.clone().unwrap_or_default();
-                                state.persistent_memory = Some(persistent_state);
+                                state.persistent_memory = result.state;
+                                let diagnostics = state
+                                    .memory_diagnostics
+                                    .get_or_insert_with(quine_core::MemoryTurnDiagnostics::default);
+                                diagnostics.persistent_memory.enabled = state
+                                    .persistent_memory
+                                    .as_ref()
+                                    .map(|persistent| persistent.enabled)
+                                    .unwrap_or(false);
+                                diagnostics.persistent_memory.project_root =
+                                    Some(session.config.working_directory.clone());
+                                diagnostics.persistent_memory.readable_scopes = state
+                                    .persistent_memory
+                                    .as_ref()
+                                    .and_then(|persistent| persistent.scope_state.as_ref())
+                                    .map(|scope_state| scope_state.readable_scopes.clone())
+                                    .unwrap_or_default();
+                                diagnostics.persistent_memory.writable_scope =
+                                    result.writable_scope.clone();
+                                diagnostics.persistent_memory.conflict_resolution = state
+                                    .persistent_memory
+                                    .as_ref()
+                                    .and_then(|persistent| persistent.scope_state.as_ref())
+                                    .map(|scope_state| scope_state.conflict_resolution);
+                                diagnostics.persistent_memory.write_status = result.write_status;
+                                diagnostics.persistent_memory.write_reason = result.write_reason;
+                                diagnostics.persistent_memory.extraction = result.diagnostics;
                                 session.memory_state = Some(state);
                             }
-                            Ok(None) => {}
                             Err(error) => {
                                 let _ = event_tx.send(CoreOutput::SessionError {
                                     session_id: session.session_id,
@@ -254,6 +279,21 @@ async fn load_skills_from_config(skill_names: &[String]) -> Vec<Skill> {
     load_skills(&project_root, skill_names).await
 }
 
+impl LocalHarness {
+    #[cfg(test)]
+    pub(crate) async fn latest_checkpoint_for_tests(&self) -> Result<CoreCheckpoint, HarnessError> {
+        self._storage
+            .load_latest_checkpoint()
+            .await
+            .map_err(|error| HarnessError::Internal {
+                message: format!("failed to load checkpoint: {error}"),
+            })?
+            .ok_or_else(|| HarnessError::Internal {
+                message: "no checkpoint available".into(),
+            })
+    }
+}
+
 #[async_trait]
 impl HarnessService for LocalHarness {
     async fn create_session(&self, config: SessionConfig) -> Result<SessionId, HarnessError> {
@@ -269,6 +309,9 @@ impl HarnessService for LocalHarness {
                 skills,
                 plan_mode: config.plan_mode,
                 initial_messages: config.initial_messages,
+                agent_key: config.agent_key,
+                team_key: config.team_key,
+                memory_policy: config.memory_policy,
                 reply: reply_tx,
             })
             .await
@@ -571,11 +614,17 @@ impl HarnessService for LocalHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::session_context_from_checkpoint;
     use quine_core::{CoreOutput, SessionState};
     use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, Role, ToolDefinition};
+    use std::collections::HashMap;
     use std::fs;
     use std::pin::Pin;
+    use std::sync::LazyLock;
     use tokio::fs as async_fs;
+    use tokio::sync::Mutex;
+
+    static PROMPT_MEMORY_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn temp_storage() -> StorageManager {
         StorageManager::new(
@@ -601,6 +650,30 @@ mod tests {
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    #[tokio::test]
+    async fn create_session_bootstraps_permission_context_without_explicit_inputs() {
+        let harness = LocalHarness::new(Arc::new(MockProvider), Some(temp_storage()))
+            .await
+            .unwrap();
+
+        let session_id = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+
+        let snapshot = wait_for_context_snapshot(&harness, session_id).await;
+        let checkpoint = harness.latest_checkpoint_for_tests().await.unwrap();
+        let projected = session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new())
+            .expect("session snapshot should exist in checkpoint");
+
+        assert_eq!(snapshot.session_id, projected.session_id);
+        assert_eq!(snapshot.working_directory, projected.working_directory);
+        assert!(!snapshot.plan_mode);
+        assert!(!projected.plan_mode);
+
+        harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -665,6 +738,210 @@ mod tests {
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    struct ObservedMemoryProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ObservedMemoryProvider {
+        async fn send(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            let observed_memory = messages
+                .iter()
+                .filter(|message| message.role == Role::System)
+                .filter_map(|message| match &message.content {
+                    MessageContent::Text(text) => text
+                        .strip_prefix("Relevant durable memory `")
+                        .and_then(|text| text.split_once("`:\n"))
+                        .map(|(entry_id, _)| entry_id.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let last_user = messages
+                .iter()
+                .rev()
+                .find_map(|message| match (&message.role, &message.content) {
+                    (Role::User, MessageContent::Text(text)) => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let text = format!("observed-memory:{observed_memory}|last-user:{last_user}");
+            let events = vec![
+                Ok(LlmEvent::TextDelta { text }),
+                Ok(LlmEvent::Done { usage: None }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    async fn wait_for_turn(
+        rx: &mut tokio::sync::broadcast::Receiver<CoreOutput>,
+        session_id: SessionId,
+    ) -> String {
+        let mut full_text = None;
+        let mut saw_turn_complete = false;
+
+        while !saw_turn_complete {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(CoreOutput::TextComplete {
+                    session_id: event_session_id,
+                    full_text: text,
+                })) if event_session_id == session_id => full_text = Some(text),
+                Ok(Ok(CoreOutput::TurnComplete {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => saw_turn_complete = true,
+                Ok(Ok(CoreOutput::ToolRequest {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => {
+                    panic!("turn should not emit tool requests")
+                }
+                Ok(Ok(CoreOutput::InteractionNeeded {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => {
+                    panic!("turn should not emit interaction requests")
+                }
+                Ok(Ok(CoreOutput::SessionError {
+                    session_id: event_session_id,
+                    error,
+                })) if event_session_id == session_id => {
+                    panic!("turn should not emit session errors: {error:?}")
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("event stream closed unexpectedly: {error}"),
+                Err(_) => panic!("timeout waiting for turn completion"),
+            }
+        }
+
+        full_text.expect("turn should emit text completion")
+    }
+
+    async fn write_prompt_memory_fixture(
+        storage: &StorageManager,
+        project_dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let project_key = crate::memory_store::project_key(project_dir);
+        let memory_dir = storage
+            .root()
+            .join("memory")
+            .join("projects")
+            .join(project_key);
+        async_fs::create_dir_all(memory_dir.join("entries"))
+            .await
+            .unwrap();
+        async_fs::write(
+            memory_dir.join("MEMORY.md"),
+            "# Durable Memory Index\n\n- rust-test-command\n- rust-build-command\n- editor-preference\n",
+        )
+        .await
+        .unwrap();
+        async_fs::write(
+            memory_dir.join("index.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "entries": [
+                    {
+                        "entry_id": "rust-test-command",
+                        "title": "Rust tests",
+                        "summary": "Use cargo test for Rust test suite",
+                        "slug": "rust-tests",
+                        "path": "entries/rust-test-command.md",
+                        "updated_at": "2026-04-04T00:00:00Z",
+                        "keywords": ["cargo", "test", "rust"],
+                        "pinned": false
+                    },
+                    {
+                        "entry_id": "rust-build-command",
+                        "title": "Workspace build",
+                        "summary": "Use cargo build to compile workspace",
+                        "slug": "workspace-build",
+                        "path": "entries/rust-build-command.md",
+                        "updated_at": "2026-04-04T00:00:01Z",
+                        "keywords": ["cargo", "build", "workspace"],
+                        "pinned": false
+                    },
+                    {
+                        "entry_id": "editor-preference",
+                        "title": "Editor preference",
+                        "summary": "Prefer concise diffs in reviews",
+                        "slug": "editor-preference",
+                        "path": "entries/editor-preference.md",
+                        "updated_at": "2026-04-04T00:00:02Z",
+                        "keywords": ["editor", "review"],
+                        "pinned": false
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        async_fs::write(
+            memory_dir.join("entries/rust-test-command.md"),
+            "---\nentry_id: rust-test-command\ntitle: Rust tests\nsummary: Use cargo test for Rust test suite\nkeywords:\n  - cargo\n  - test\n  - rust\ncreated_at: 2026-04-04T00:00:00Z\nupdated_at: 2026-04-04T00:00:00Z\nsource: explicit\nstatus: active\npinned: false\n---\n\nUse `cargo test` to run the Rust test suite.\n",
+        )
+        .await
+        .unwrap();
+        async_fs::write(
+            memory_dir.join("entries/rust-build-command.md"),
+            "---\nentry_id: rust-build-command\ntitle: Workspace build\nsummary: Use cargo build to compile workspace\nkeywords:\n  - cargo\n  - build\n  - workspace\ncreated_at: 2026-04-04T00:00:01Z\nupdated_at: 2026-04-04T00:00:01Z\nsource: explicit\nstatus: active\npinned: false\n---\n\nUse `cargo build` to compile workspace.\n",
+        )
+        .await
+        .unwrap();
+        async_fs::write(
+            memory_dir.join("entries/editor-preference.md"),
+            "---\nentry_id: editor-preference\ntitle: Editor preference\nsummary: Prefer concise diffs in reviews\nkeywords:\n  - editor\n  - review\ncreated_at: 2026-04-04T00:00:02Z\nupdated_at: 2026-04-04T00:00:02Z\nsource: explicit\nstatus: active\npinned: false\n---\n\nThe user prefers concise diffs in reviews.\n",
+        )
+        .await
+        .unwrap();
+        memory_dir
+    }
+
+    async fn wait_for_context_snapshot(
+        harness: &LocalHarness,
+        session_id: SessionId,
+    ) -> crate::storage::SessionContextSnapshot {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(checkpoint) = harness.get_session_context(session_id).await {
+                    if let Some(snapshot) =
+                        session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new())
+                    {
+                        break snapshot;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session context should become available")
+    }
+
+    async fn wait_for_context_snapshot_matching<F>(
+        harness: &LocalHarness,
+        session_id: SessionId,
+        predicate: F,
+    ) -> crate::storage::SessionContextSnapshot
+    where
+        F: Fn(&crate::storage::SessionContextSnapshot) -> bool,
+    {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = wait_for_context_snapshot(harness, session_id).await;
+                if predicate(&snapshot) {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session context should satisfy predicate")
     }
 
     #[tokio::test]
@@ -827,6 +1104,25 @@ mod tests {
         .await
         .unwrap();
 
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .memory_diagnostics
+                .as_ref()
+                .map(|diagnostics| diagnostics.persistent_memory.extraction.created == 1)
+                .unwrap_or(false)
+        })
+        .await;
+        let extraction = &snapshot
+            .memory_diagnostics
+            .as_ref()
+            .expect("memory diagnostics should be present")
+            .persistent_memory
+            .extraction;
+        assert!(extraction.attempted);
+        assert_eq!(extraction.status, quine_core::MemoryStatus::Succeeded);
+        assert_eq!(extraction.created, 1);
+        assert_eq!(extraction.tombstoned, 0);
+
         let memory_root = storage.root().join("memory");
         let project_key = crate::memory_store::project_key(&project_dir);
         let memory_dir = memory_root.join("projects").join(&project_key);
@@ -874,6 +1170,24 @@ mod tests {
         })
         .await
         .unwrap();
+
+        let snapshot = wait_for_context_snapshot_matching(&restored, session_id, |snapshot| {
+            snapshot
+                .memory_diagnostics
+                .as_ref()
+                .map(|diagnostics| diagnostics.persistent_memory.extraction.tombstoned == 1)
+                .unwrap_or(false)
+        })
+        .await;
+        let extraction = &snapshot
+            .memory_diagnostics
+            .as_ref()
+            .expect("memory diagnostics should be present")
+            .persistent_memory
+            .extraction;
+        assert!(extraction.attempted);
+        assert_eq!(extraction.status, quine_core::MemoryStatus::Succeeded);
+        assert_eq!(extraction.tombstoned, 1);
 
         let index_after = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
@@ -991,6 +1305,172 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn local_harness_context_reports_memory_diagnostics_after_turn() {
+        let _env_guard = PROMPT_MEMORY_ENV_LOCK.lock().await;
+        let previous_mode = std::env::var_os("QUINE_PROMPT_MEMORY_MODE");
+        unsafe {
+            std::env::set_var("QUINE_PROMPT_MEMORY_MODE", "disabled");
+        }
+        let storage = temp_storage();
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let session_id = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+        let mut rx = harness.subscribe();
+
+        harness
+            .send_message(session_id, "FEATURE-041 refresh diagnostics".into())
+            .await
+            .unwrap();
+        let reply = wait_for_turn(&mut rx, session_id).await;
+        assert_eq!(reply, "FEATURE-041 refresh diagnostics");
+
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .memory_diagnostics
+                .as_ref()
+                .map(|diagnostics| {
+                    diagnostics.session_memory.refresh.status == quine_core::MemoryStatus::Succeeded
+                        && diagnostics
+                            .persistent_memory
+                            .extraction
+                            .last_extracted_message_index
+                            .is_some()
+                })
+                .unwrap_or(false)
+        })
+        .await;
+
+        let diagnostics = snapshot
+            .memory_diagnostics
+            .expect("memory diagnostics should be present");
+        assert!(diagnostics.session_memory.enabled);
+        assert!(diagnostics.session_memory.refresh.attempted);
+        assert_eq!(
+            diagnostics.session_memory.refresh.status,
+            quine_core::MemoryStatus::Succeeded
+        );
+        assert!(diagnostics
+            .session_memory
+            .refresh
+            .last_summarized_message_index
+            .is_some());
+        assert_eq!(
+            diagnostics.prompt_memory.status,
+            quine_core::MemoryStatus::Skipped
+        );
+        assert_eq!(
+            diagnostics.prompt_memory.reason,
+            Some(quine_core::MemoryDecisionReason::Disabled)
+        );
+        assert!(diagnostics.persistent_memory.enabled);
+        assert_eq!(
+            diagnostics.persistent_memory.extraction.reason,
+            Some(quine_core::MemoryDecisionReason::NoChanges)
+        );
+
+        harness.shutdown().await.unwrap();
+        match previous_mode {
+            Some(value) => unsafe { std::env::set_var("QUINE_PROMPT_MEMORY_MODE", value) },
+            None => unsafe { std::env::remove_var("QUINE_PROMPT_MEMORY_MODE") },
+        }
+        let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
+    async fn advanced_memory_policy_denies_agent_writes_without_fallback() {
+        let storage = temp_storage();
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let working_directory = storage.root().join("untrusted-project");
+        std::fs::create_dir_all(&working_directory).unwrap();
+
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(working_directory.clone()),
+                agent_key: Some("planner".into()),
+                team_key: Some("infra".into()),
+                memory_policy: quine_core::MemoryPolicyConfig {
+                    flags: quine_core::MemoryFeatureFlags {
+                        advanced_scopes_enabled: true,
+                        agent_memory_enabled: true,
+                        team_memory_enabled: true,
+                        ..quine_core::MemoryFeatureFlags::default()
+                    },
+                    default_write_scope: Some(quine_core::ScopeSelector::Agent),
+                    write_policy: quine_core::MemoryWritePolicy {
+                        require_trusted_workspace_for_writes: true,
+                        require_explicit_user_intent_for_agent_writes: true,
+                        ..quine_core::MemoryWritePolicy::default()
+                    },
+                    ..quine_core::MemoryPolicyConfig::default()
+                },
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+        let mut rx = harness.subscribe();
+
+        harness
+            .send_message(
+                session_id,
+                "Remember: my deployment region is us-west-2.".into(),
+            )
+            .await
+            .unwrap();
+        let reply = wait_for_turn(&mut rx, session_id).await;
+        assert_eq!(reply, "Remember: my deployment region is us-west-2.");
+
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .memory_diagnostics
+                .as_ref()
+                .map(|diagnostics| {
+                    diagnostics
+                        .persistent_memory
+                        .extraction
+                        .last_extracted_message_index
+                        .is_some()
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        let diagnostics = snapshot.memory_diagnostics.unwrap();
+        assert_eq!(
+            diagnostics.persistent_memory.writable_scope,
+            Some(quine_core::PersistentMemoryScope::agent(
+                crate::memory_store::project_key(&working_directory),
+                "planner",
+            ))
+        );
+        assert_eq!(
+            diagnostics.persistent_memory.write_status,
+            quine_core::MemoryStatus::Skipped
+        );
+
+        let agent_root = storage
+            .root()
+            .join("memory")
+            .join("agents")
+            .join(crate::memory_store::project_key(&working_directory))
+            .join("planner");
+        let project_root = storage
+            .root()
+            .join("memory")
+            .join("projects")
+            .join(crate::memory_store::project_key(&working_directory));
+        assert!(!agent_root.exists());
+        assert!(!project_root.exists());
+
+        harness.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
     async fn local_harness_persists_plan_mode_in_session_listing() {
         let storage = temp_storage();
         let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
@@ -1037,6 +1517,159 @@ mod tests {
 
         harness.shutdown().await.unwrap();
         let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
+    async fn prompt_time_persistent_recall_multi_round_local_daemon() {
+        let _env_guard = PROMPT_MEMORY_ENV_LOCK.lock().await;
+        let previous_mode = std::env::var_os("QUINE_PROMPT_MEMORY_MODE");
+        unsafe {
+            std::env::set_var("QUINE_PROMPT_MEMORY_MODE", "targeted_recall");
+        }
+
+        let storage = temp_storage();
+        let project_dir =
+            std::env::temp_dir().join(format!("quine-project-{}", uuid::Uuid::new_v4()));
+        async_fs::create_dir_all(&project_dir).await.unwrap();
+        async_fs::write(project_dir.join("CLAUDE.md"), "# test project\n")
+            .await
+            .unwrap();
+        let _memory_dir = write_prompt_memory_fixture(&storage, &project_dir).await;
+
+        let harness = LocalHarness::new(Arc::new(ObservedMemoryProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(project_dir.clone()),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+        let mut rx = harness.subscribe();
+
+        harness
+            .send_message(session_id, "Say exactly: round-1 acknowledged.".into())
+            .await
+            .unwrap();
+        let round_1 = wait_for_turn(&mut rx, session_id).await;
+        assert_eq!(
+            round_1,
+            "observed-memory:|last-user:Say exactly: round-1 acknowledged."
+        );
+
+        let snapshot = wait_for_context_snapshot(&harness, session_id).await;
+        let prompt_memory = snapshot
+            .prompt_memory
+            .expect("prompt memory summary should persist");
+        assert_eq!(
+            prompt_memory.mode,
+            quine_core::PromptMemoryMode::TargetedRecall
+        );
+        assert!(prompt_memory.selected_entry_ids.is_empty());
+        assert!(snapshot.history.iter().all(|entry| match entry {
+            crate::storage::HistoryEntry::Text { text, .. } => {
+                !text.contains("Relevant durable memory `")
+            }
+            crate::storage::HistoryEntry::ToolUse { text, .. } => text
+                .as_deref()
+                .map(|text| !text.contains("Relevant durable memory `"))
+                .unwrap_or(true),
+            crate::storage::HistoryEntry::ToolResult { output, .. } => {
+                !output.contains("Relevant durable memory `")
+            }
+        }));
+
+        harness
+            .send_message(
+                session_id,
+                "What command should I run to execute the Rust test suite? Answer with only the command.".into(),
+            )
+            .await
+            .unwrap();
+        let round_2 = wait_for_turn(&mut rx, session_id).await;
+        assert_eq!(
+            round_2,
+            "observed-memory:rust-test-command|last-user:What command should I run to execute the Rust test suite? Answer with only the command."
+        );
+
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .prompt_memory
+                .as_ref()
+                .map(|summary| summary.selected_entry_ids.clone())
+                == Some(vec!["rust-test-command".to_string()])
+        })
+        .await;
+        let prompt_memory = snapshot
+            .prompt_memory
+            .expect("prompt memory summary should persist");
+        assert_eq!(
+            prompt_memory.selected_entry_ids,
+            vec!["rust-test-command".to_string()]
+        );
+        assert!(snapshot.history.iter().all(|entry| match entry {
+            crate::storage::HistoryEntry::Text { text, .. } => {
+                !text.contains("Relevant durable memory `")
+            }
+            crate::storage::HistoryEntry::ToolUse { text, .. } => text
+                .as_deref()
+                .map(|text| !text.contains("Relevant durable memory `"))
+                .unwrap_or(true),
+            crate::storage::HistoryEntry::ToolResult { output, .. } => {
+                !output.contains("Relevant durable memory `")
+            }
+        }));
+
+        harness
+            .send_message(
+                session_id,
+                "What command should I run to build the workspace? Answer with only the command."
+                    .into(),
+            )
+            .await
+            .unwrap();
+        let round_3 = wait_for_turn(&mut rx, session_id).await;
+        assert_eq!(
+            round_3,
+            "observed-memory:rust-build-command|last-user:What command should I run to build the workspace? Answer with only the command."
+        );
+
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .prompt_memory
+                .as_ref()
+                .map(|summary| summary.selected_entry_ids.clone())
+                == Some(vec!["rust-build-command".to_string()])
+        })
+        .await;
+        let prompt_memory = snapshot
+            .prompt_memory
+            .expect("prompt memory summary should persist");
+        assert_eq!(
+            prompt_memory.selected_entry_ids,
+            vec!["rust-build-command".to_string()]
+        );
+        assert!(snapshot.history.iter().all(|entry| match entry {
+            crate::storage::HistoryEntry::Text { text, .. } => {
+                !text.contains("Relevant durable memory `")
+            }
+            crate::storage::HistoryEntry::ToolUse { text, .. } => text
+                .as_deref()
+                .map(|text| !text.contains("Relevant durable memory `"))
+                .unwrap_or(true),
+            crate::storage::HistoryEntry::ToolResult { output, .. } => {
+                !output.contains("Relevant durable memory `")
+            }
+        }));
+
+        harness.shutdown().await.unwrap();
+        match previous_mode {
+            Some(value) => unsafe { std::env::set_var("QUINE_PROMPT_MEMORY_MODE", value) },
+            None => unsafe { std::env::remove_var("QUINE_PROMPT_MEMORY_MODE") },
+        }
+        let _ = fs::remove_dir_all(storage.root());
+        let _ = fs::remove_dir_all(project_dir);
     }
 
     #[tokio::test]

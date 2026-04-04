@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Prompt-Time Persistent Memory Injection and Recall

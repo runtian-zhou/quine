@@ -1,0 +1,115 @@
+use std::path::PathBuf;
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionMode {
+    Default,
+    AcceptEdits,
+    Plan,
+    Bypass,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionDecision {
+    Allow,
+    Deny,
+    Ask,
+    Defer,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionRuleEffect {
+    Allow,
+    Deny,
+    Ask,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionRuleSource {
+    BuiltIn,
+    Session,
+    User,
+    Workspace,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionScope {
+    Session,
+    Workspace,
+    Global,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PermissionTarget {
+    Any,
+    Tool { name: String },
+    Path { path: PathBuf },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PermissionRule {
+    pub effect: PermissionRuleEffect,
+    pub scope: PermissionScope,
+    pub target: PermissionTarget,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PermissionRuleSet {
+    pub built_in: Vec<PermissionRule>,
+    pub session: Vec<PermissionRule>,
+    pub user: Vec<PermissionRule>,
+    pub workspace: Vec<PermissionRule>,
+}
+
+impl PermissionRuleSet {
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn rules_for_source_mut(
+        &mut self,
+        source: PermissionRuleSource,
+    ) -> &mut Vec<PermissionRule> {
+        match source {
+            PermissionRuleSource::BuiltIn => &mut self.built_in,
+            PermissionRuleSource::Session => &mut self.session,
+            PermissionRuleSource::User => &mut self.user,
+            PermissionRuleSource::Workspace => &mut self.workspace,
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn rules_for_source(&self, source: PermissionRuleSource) -> &[PermissionRule] {
+        match source {
+            PermissionRuleSource::BuiltIn => &self.built_in,
+            PermissionRuleSource::Session => &self.session,
+            PermissionRuleSource::User => &self.user,
+            PermissionRuleSource::Workspace => &self.workspace,
+        }
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionPromptBehavior {
+    Interactive,
+    Headless,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub(crate) struct ApprovalRequestId(pub Uuid);

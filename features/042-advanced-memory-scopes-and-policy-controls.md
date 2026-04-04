@@ -1,5 +1,5 @@
 ---
-status: pending
+status: done
 ---
 
 # Advanced Memory Scopes and Policy Controls

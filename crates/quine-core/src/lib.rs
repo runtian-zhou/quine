@@ -4,7 +4,8 @@ pub mod engine;
 pub mod error;
 pub mod filesystem;
 pub mod ipc;
-mod memory;
+pub mod memory;
+pub mod permission;
 pub mod persistence;
 pub mod planner;
 mod scheduler;
@@ -19,10 +20,21 @@ pub use channel::{
 pub use engine::{run_core_loop, run_core_loop_with_compaction};
 pub use error::CoreError;
 pub use filesystem::{DirEntry, FsError, NullFilesystem, OverlayFilesystem, SessionFilesystem};
+pub use memory::{
+    authorize_memory_read, authorize_memory_write, build_memory_permission_context,
+    resolve_scoped_memory_paths, workspace_is_trusted, CompactionSourceDiagnostics,
+    MemoryAuthorizationReason, MemoryConflictResolution, MemoryDecisionReason, MemoryFeatureFlags,
+    MemoryPermissionContext, MemoryPolicyConfig, MemoryReadPolicy, MemorySelectionEntryDiagnostics,
+    MemorySkippedEntryDiagnostics, MemoryStatus, MemoryTurnDiagnostics, MemoryWritePolicy,
+    PersistentExtractionDiagnostics, PersistentMemoryDiagnostics, PersistentMemoryScope,
+    PromptMemoryDiagnostics, ScopeSelector, ScopedMemoryLookupOrder, ScopedMemoryPaths,
+    ScopedPersistentMemoryState, SessionMemoryDiagnostics, SessionRefreshDiagnostics,
+};
 pub use persistence::{
     CoreCheckpoint, PersistedMemoryState, PersistedPersistentMemoryState, PersistedPlanStore,
-    PersistedSession, PersistedSessionConfig, PersistedSessionMemoryState, PersistedSessionState,
-    PersistedSessionTree, CORE_CHECKPOINT_FORMAT_VERSION,
+    PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
+    PersistedSessionMemoryState, PersistedSessionState, PersistedSessionTree, PromptMemoryMode,
+    CORE_CHECKPOINT_FORMAT_VERSION,
 };
 pub use session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 pub use skill::{
