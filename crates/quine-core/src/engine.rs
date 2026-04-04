@@ -4115,7 +4115,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(session.permission_context.mode(), PermissionMode::Plan);
-        assert_eq!(session.permission_context.pre_plan_mode(), None);
+        assert_eq!(
+            session.permission_context.pre_plan_mode(),
+            Some(PermissionMode::Default)
+        );
         assert_eq!(
             session.permission_context.workspace_root(),
             &working_directory
@@ -4124,6 +4127,37 @@ mod tests {
             .permission_context
             .additional_allowed_roots()
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_restores_default_permission_mode() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let temp_dir = TempDir::new().unwrap();
+        let mut session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: temp_dir.path().to_path_buf(),
+                plan_mode: true,
+                initial_messages: Vec::new(),
+                archive_root: temp_dir.path().join("archive"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        session.exit_plan_mode(&provider).await.unwrap();
+
+        assert!(!session.persisted_config.plan_mode);
+        assert_eq!(session.permission_context.mode(), PermissionMode::Default);
+        assert_eq!(session.permission_context.pre_plan_mode(), None);
     }
 
     fn compacted_summary_text(history: &[Message]) -> &str {
@@ -7439,6 +7473,237 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         );
         assert!(saw_text_complete, "turn should complete without approval");
         assert!(saw_turn_complete, "turn should complete successfully");
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plan_mode_read_only_tool_completes_without_permission_prompt() {
+        struct ToolThenTextProvider {
+            call_count: std::sync::atomic::AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for ToolThenTextProvider {
+            async fn send(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+            {
+                let count = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let events = if count == 0 {
+                    vec![
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_read_plan".into(),
+                            tool_name: "read_file".into(),
+                            arguments: serde_json::json!({"file_path": "notes.txt"}),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else {
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            text: "Plan complete".into(),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let workspace = TempDir::new().unwrap();
+        std::fs::write(workspace.path().join("notes.txt"), "plan-only-read").unwrap();
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let provider = ToolThenTextProvider {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        };
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: Some(workspace.path().to_path_buf()),
+                skills: Vec::new(),
+                plan_mode: true,
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        let _ = output.recv().await.unwrap();
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "inspect the note".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut saw_interaction_needed = false;
+        let mut saw_successful_read = false;
+        let mut saw_turn_complete = false;
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
+                Ok(Some(CoreOutput::InteractionNeeded { .. })) => {
+                    saw_interaction_needed = true;
+                }
+                Ok(Some(CoreOutput::ToolResult {
+                    tool_name,
+                    is_error,
+                    content,
+                    ..
+                })) if tool_name == "read_file" => {
+                    assert!(!is_error, "read_file should succeed in plan mode");
+                    assert!(content.contains("plan-only-read"));
+                    saw_successful_read = true;
+                }
+                Ok(Some(CoreOutput::TurnComplete { .. })) => {
+                    saw_turn_complete = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timeout waiting for plan-mode read events"),
+            }
+        }
+
+        assert!(!saw_interaction_needed, "plan-mode read should not prompt");
+        assert!(saw_successful_read, "read_file should run in plan mode");
+        assert!(saw_turn_complete, "plan-mode read turn should complete");
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn plan_mode_mutating_bash_request_is_denied_without_running() {
+        struct ToolThenTextProvider {
+            call_count: std::sync::atomic::AtomicU32,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for ToolThenTextProvider {
+            async fn send(
+                &self,
+                _messages: &[Message],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+            {
+                let count = self
+                    .call_count
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let events = if count == 0 {
+                    vec![
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_plan_write".into(),
+                            tool_name: "bash".into(),
+                            arguments: serde_json::json!({"command": "touch blocked.txt"}),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else {
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            text: "Plan complete".into(),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let workspace = TempDir::new().unwrap();
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let provider = ToolThenTextProvider {
+            call_count: std::sync::atomic::AtomicU32::new(0),
+        };
+        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: Some(workspace.path().to_path_buf()),
+                skills: Vec::new(),
+                plan_mode: true,
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        let _ = output.recv().await.unwrap();
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "try to mutate in plan mode".into(),
+            })
+            .await
+            .unwrap();
+
+        let mut saw_interaction_needed = false;
+        let mut saw_denied_tool_result = false;
+        let mut saw_turn_complete = false;
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
+                Ok(Some(CoreOutput::InteractionNeeded { .. })) => {
+                    saw_interaction_needed = true;
+                }
+                Ok(Some(CoreOutput::ToolResult {
+                    tool_name,
+                    is_error,
+                    content,
+                    ..
+                })) if tool_name == "bash" => {
+                    assert!(is_error, "bash mutation should not run in plan mode");
+                    assert!(content.contains("permission denied"));
+                    saw_denied_tool_result = true;
+                }
+                Ok(Some(CoreOutput::TurnComplete { .. })) => {
+                    saw_turn_complete = true;
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timeout waiting for plan-mode write events"),
+            }
+        }
+
+        assert!(
+            !saw_interaction_needed,
+            "plan-mode mutation should deny, not prompt"
+        );
+        assert!(saw_denied_tool_result, "mutating bash should be denied");
+        assert!(!workspace.path().join("blocked.txt").exists());
+        assert!(saw_turn_complete, "plan-mode denied turn should complete");
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();

@@ -23,13 +23,14 @@ impl PermissionContext {
         plan_mode: bool,
         prompt_behavior: PermissionPromptBehavior,
     ) -> Self {
+        let (mode, pre_plan_mode) = if plan_mode {
+            (PermissionMode::Plan, Some(PermissionMode::Default))
+        } else {
+            (PermissionMode::Default, None)
+        };
         Self {
-            mode: if plan_mode {
-                PermissionMode::Plan
-            } else {
-                PermissionMode::Default
-            },
-            pre_plan_mode: None,
+            mode,
+            pre_plan_mode,
             rules: PermissionRuleSet::default(),
             workspace_root,
             additional_allowed_roots: Vec::new(),
@@ -179,5 +180,17 @@ mod tests {
         assert!(context.rules().session.is_empty());
         assert!(context.rules().user.is_empty());
         assert!(context.rules().workspace.is_empty());
+    }
+
+    #[test]
+    fn plan_mode_bootstrap_tracks_default_pre_plan_mode() {
+        let context = PermissionContext::new(
+            PathBuf::from("/workspace"),
+            true,
+            PermissionPromptBehavior::Interactive,
+        );
+
+        assert_eq!(context.mode(), PermissionMode::Plan);
+        assert_eq!(context.pre_plan_mode(), Some(PermissionMode::Default));
     }
 }
