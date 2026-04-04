@@ -3451,6 +3451,7 @@ mod tests {
     use super::*;
     use crate::channel::{create_channels, ChannelConfig};
     use crate::session::{ExitStatus, InheritanceFlags};
+    use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -3496,6 +3497,253 @@ mod tests {
             };
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    struct CountingProvider {
+        response_text: String,
+        calls: AtomicUsize,
+    }
+
+    impl CountingProvider {
+        fn new(text: impl Into<String>) -> Self {
+            Self {
+                response_text: text.into(),
+                calls: AtomicUsize::new(0),
+            }
+        }
+
+        fn call_count(&self) -> usize {
+            self.calls.load(Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for CountingProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let text = self.response_text.clone();
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LlmEvent::TextDelta { text }),
+                Ok(LlmEvent::Done { usage: None }),
+            ])))
+        }
+    }
+
+    fn compacted_summary_text(history: &[Message]) -> &str {
+        match history.get(1).map(|message| &message.content) {
+            Some(MessageContent::Text(text)) => text,
+            other => panic!("expected compacted assistant summary, got {other:?}"),
+        }
+    }
+
+    async fn make_session_for_compaction(
+        provider: &Arc<dyn LlmProvider>,
+        archive_root: PathBuf,
+        history: Vec<Message>,
+    ) -> (SessionId, SessionContext) {
+        let session_id = SessionId::new();
+        let mut session = SessionContext::new(
+            session_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root,
+                max_context_window: None,
+            },
+            provider,
+        )
+        .await
+        .unwrap();
+        session.history = history;
+        (session_id, session)
+    }
+
+    fn write_session_memory_fixture(
+        session: &SessionContext,
+        summary: &str,
+        last_summarized_message_index: usize,
+    ) {
+        std::fs::create_dir_all(&session.session_memory.paths.directory).unwrap();
+        std::fs::write(&session.session_memory.paths.summary_path, summary).unwrap();
+        std::fs::write(
+            &session.session_memory.paths.metadata_path,
+            serde_json::to_string(&crate::memory::SessionSummaryMetadata {
+                last_summarized_message_index,
+                updated_at: Utc::now(),
+                template_version: session.session_memory.template_version,
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn valid_session_memory_compaction_uses_summary_md() {
+        let temp = TempDir::new().unwrap();
+        let provider = Arc::new(CountingProvider::new("legacy summary"));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let history = vec![
+            Message::system("system"),
+            Message::user("old request"),
+            Message::assistant("old answer"),
+            Message::user("keep this"),
+            Message::assistant("latest state"),
+        ];
+        let (session_id, mut session) =
+            make_session_for_compaction(&provider_dyn, temp.path().to_path_buf(), history).await;
+        session.session_memory.last_summarized_message_index = Some(2);
+        write_session_memory_fixture(
+            &session,
+            "## Current State\n\n- Memory summary from summary.md\n",
+            2,
+        );
+
+        let compacted = compact_session_history(
+            provider_dyn.as_ref(),
+            &mut session,
+            session_id,
+            CompactionTrigger::Manual,
+        )
+        .await
+        .unwrap();
+
+        assert!(compacted);
+        assert_eq!(provider.call_count(), 0);
+        let summary = compacted_summary_text(&session.history);
+        assert!(summary.contains("Memory summary from summary.md"));
+        assert!(summary.contains("Context compacted from archive"));
+        assert_eq!(session.history.len(), 4);
+        let archive_dir = temp
+            .path()
+            .join("compactions")
+            .join(session_id_string(session_id));
+        assert!(archive_dir.join("0001.json").exists());
+    }
+
+    #[tokio::test]
+    async fn invalid_session_memory_compaction_falls_back() {
+        let temp = TempDir::new().unwrap();
+        let provider = Arc::new(CountingProvider::new("legacy summary"));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let history = vec![
+            Message::system("system"),
+            Message::user("old request"),
+            Message::assistant("old answer"),
+            Message::user("live tail"),
+        ];
+        let (session_id, mut session) =
+            make_session_for_compaction(&provider_dyn, temp.path().to_path_buf(), history).await;
+        session.session_memory.last_summarized_message_index = Some(3);
+        write_session_memory_fixture(&session, "## Current State\n\n- Stale summary\n", 3);
+
+        compact_session_history(
+            provider_dyn.as_ref(),
+            &mut session,
+            session_id,
+            CompactionTrigger::Manual,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(provider.call_count(), 1);
+        let summary = compacted_summary_text(&session.history);
+        assert!(summary.contains("legacy summary"));
+    }
+
+    #[tokio::test]
+    async fn compaction_waits_for_refresh_when_join_is_available() {
+        let temp = TempDir::new().unwrap();
+        let provider = Arc::new(CountingProvider::new("legacy summary"));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let history = vec![
+            Message::system("system"),
+            Message::user("old request"),
+            Message::assistant("old answer"),
+            Message::user("preserve after boundary"),
+        ];
+        let (session_id, mut session) =
+            make_session_for_compaction(&provider_dyn, temp.path().to_path_buf(), history).await;
+        session.session_memory.refresh_in_flight = true;
+
+        let paths = session.session_memory.paths.clone();
+        let template_version = session.session_memory.template_version;
+        let refresh_handle = session.session_memory.refresh_handle.clone();
+        let writer = tokio::spawn(async move {
+            let _guard = refresh_handle.lock.lock().await;
+            tokio::time::sleep(TokioDuration::from_millis(20)).await;
+            std::fs::create_dir_all(&paths.directory).unwrap();
+            std::fs::write(
+                &paths.summary_path,
+                "## Current State\n\n- Fresh session memory\n",
+            )
+            .unwrap();
+            std::fs::write(
+                &paths.metadata_path,
+                serde_json::to_string(&crate::memory::SessionSummaryMetadata {
+                    last_summarized_message_index: 2,
+                    updated_at: Utc::now(),
+                    template_version,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        });
+
+        compact_session_history(
+            provider_dyn.as_ref(),
+            &mut session,
+            session_id,
+            CompactionTrigger::Manual,
+        )
+        .await
+        .unwrap();
+        writer.await.unwrap();
+
+        assert_eq!(provider.call_count(), 0);
+        assert!(compacted_summary_text(&session.history).contains("Fresh session memory"));
+    }
+
+    #[tokio::test]
+    async fn compaction_falls_back_when_refresh_snapshot_is_not_safely_available() {
+        let temp = TempDir::new().unwrap();
+        let provider = Arc::new(CountingProvider::new("legacy summary"));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let history = vec![
+            Message::system("system"),
+            Message::user("old request"),
+            Message::assistant("old answer"),
+            Message::user("preserve after boundary"),
+        ];
+        let (session_id, mut session) =
+            make_session_for_compaction(&provider_dyn, temp.path().to_path_buf(), history).await;
+        session.session_memory.refresh_in_flight = true;
+
+        let refresh_handle = session.session_memory.refresh_handle.clone();
+        let blocker = tokio::spawn(async move {
+            let _guard = refresh_handle.lock.lock().await;
+            tokio::time::sleep(TokioDuration::from_millis(400)).await;
+        });
+
+        compact_session_history(
+            provider_dyn.as_ref(),
+            &mut session,
+            session_id,
+            CompactionTrigger::Manual,
+        )
+        .await
+        .unwrap();
+        blocker.await.unwrap();
+
+        assert_eq!(provider.call_count(), 1);
+        assert!(compacted_summary_text(&session.history).contains("legacy summary"));
     }
 
     #[test]

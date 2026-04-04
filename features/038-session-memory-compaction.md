@@ -1,5 +1,5 @@
 ---
-status: pending
+status: in-progress
 ---
 
 # Session-Memory-Driven Compaction

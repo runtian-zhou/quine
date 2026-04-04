@@ -5,12 +5,18 @@ use chrono::Utc;
 use quine_llm::{Message, MessageContent, Role};
 use serde::Serialize;
 use tokio::fs;
+use tokio::time::Duration;
+
+use crate::memory::{
+    load_compaction_snapshot, SessionMemoryCompactionSnapshot, SessionMemoryState,
+};
 
 pub const AUTO_COMPACT_THRESHOLD_NUMERATOR: u64 = 3;
 pub const AUTO_COMPACT_THRESHOLD_DENOMINATOR: u64 = 5;
 pub const MAX_TOOL_RESULT_CHARS_IN_HISTORY: usize = 256_000;
 const TOOL_RESULT_PREVIEW_HEAD_CHARS: usize = 8_000;
 const TOOL_RESULT_PREVIEW_TAIL_CHARS: usize = 2_000;
+const SESSION_MEMORY_REFRESH_WAIT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionTrigger {
@@ -25,6 +31,19 @@ impl CompactionTrigger {
             Self::Manual => "manual",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionSource {
+    SessionMemory,
+    LegacySummarizer,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionPlan {
+    pub(crate) source: CompactionSource,
+    pub(crate) summary: String,
+    pub(crate) tail_start: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +159,38 @@ pub fn compacted_history(
     )));
     compacted.extend(tail.iter().cloned());
     compacted
+}
+
+pub(crate) async fn session_memory_compaction_plan(
+    state: &SessionMemoryState,
+    history: &[Message],
+) -> Option<CompactionPlan> {
+    let snapshot = load_compaction_snapshot(state, SESSION_MEMORY_REFRESH_WAIT)
+        .await
+        .ok()
+        .flatten()?;
+    compaction_plan_from_snapshot(state, history, snapshot)
+}
+
+pub(crate) fn legacy_compaction_plan(history: &[Message], summary: String) -> CompactionPlan {
+    CompactionPlan {
+        source: CompactionSource::LegacySummarizer,
+        summary,
+        tail_start: live_tail_start(history).unwrap_or(history.len()),
+    }
+}
+
+pub(crate) fn apply_compaction_plan(
+    history: &[Message],
+    archive_ref: &str,
+    plan: &CompactionPlan,
+) -> Vec<Message> {
+    compacted_history(
+        history,
+        &plan.summary,
+        archive_ref,
+        &history[plan.tail_start..],
+    )
 }
 
 pub async fn archive_history(
@@ -279,6 +330,36 @@ fn live_tail_start(history: &[Message]) -> Option<usize> {
         MessageContent::Text(_) if last.role == Role::User => Some(history.len() - 1),
         _ => None,
     }
+}
+
+fn compaction_plan_from_snapshot(
+    state: &SessionMemoryState,
+    history: &[Message],
+    snapshot: SessionMemoryCompactionSnapshot,
+) -> Option<CompactionPlan> {
+    let live_tail_start = live_tail_start(history).unwrap_or(history.len());
+    let tail_start = snapshot
+        .metadata
+        .last_summarized_message_index
+        .checked_add(1)
+        .unwrap_or(history.len());
+
+    if tail_start > history.len() || tail_start > live_tail_start {
+        return None;
+    }
+
+    if state
+        .last_summarized_message_index
+        .is_some_and(|index| index != snapshot.metadata.last_summarized_message_index)
+    {
+        return None;
+    }
+
+    Some(CompactionPlan {
+        source: CompactionSource::SessionMemory,
+        summary: snapshot.summary_markdown.trim().to_string(),
+        tail_start,
+    })
 }
 
 fn tool_name_map(history: &[Message]) -> HashMap<String, String> {
