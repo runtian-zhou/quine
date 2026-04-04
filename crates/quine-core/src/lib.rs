@@ -21,8 +21,9 @@ pub use error::CoreError;
 pub use filesystem::{DirEntry, FsError, NullFilesystem, OverlayFilesystem, SessionFilesystem};
 pub use persistence::{
     CoreCheckpoint, PersistedMemoryState, PersistedPersistentMemoryState, PersistedPlanStore,
-    PersistedSession, PersistedSessionConfig, PersistedSessionMemoryState, PersistedSessionState,
-    PersistedSessionTree, CORE_CHECKPOINT_FORMAT_VERSION,
+    PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
+    PersistedSessionMemoryState, PersistedSessionState, PersistedSessionTree, PromptMemoryMode,
+    CORE_CHECKPOINT_FORMAT_VERSION,
 };
 pub use session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 pub use skill::{

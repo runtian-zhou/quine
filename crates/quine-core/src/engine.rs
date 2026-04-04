@@ -17,11 +17,13 @@ use crate::compaction::{self, CompactionTrigger};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
 use crate::memory::{
-    refresh_summary_from_history, restore_memory_state, should_refresh_summary,
-    snapshot_memory_state, MemoryDiagnostics, SessionMemoryState,
+    build_prompt_memory_injection, refresh_summary_from_history, restore_memory_state,
+    should_refresh_summary, snapshot_memory_state, splice_prompt_memory_messages,
+    MemoryDiagnostics, SessionMemoryState,
 };
 use crate::persistence::{
-    CoreCheckpoint, PersistedSession, PersistedSessionConfig, PersistedSessionState,
+    CoreCheckpoint, PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
+    PersistedSessionState, PromptMemoryMode,
 };
 use crate::planner::scheduler::{get_ready_actions, render_plan};
 use crate::scheduler::spawn_scheduler;
@@ -184,6 +186,10 @@ struct SessionContext {
     #[allow(dead_code)]
     /// Session memory diagnostics.
     memory_diagnostics: MemoryDiagnostics,
+    /// Last prompt-time memory injection summary.
+    last_prompt_memory: PersistedPromptMemoryState,
+    /// Latest user-message index used for prompt-memory de-duplication.
+    last_prompt_memory_user_index: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -243,6 +249,7 @@ struct SessionInit {
     initial_messages: Vec<Message>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
+    prompt_memory_mode: PromptMemoryMode,
 }
 
 impl SessionInit {
@@ -256,6 +263,7 @@ impl SessionInit {
                 .collect(),
             working_directory: self.working_directory.clone(),
             plan_mode: self.plan_mode,
+            prompt_memory_mode: self.prompt_memory_mode,
         }
     }
 }
@@ -292,10 +300,23 @@ fn build_tool_registry_for_session(
     tool_registry
 }
 
+fn prompt_memory_mode_from_env() -> PromptMemoryMode {
+    match std::env::var("QUINE_PROMPT_MEMORY_MODE")
+        .unwrap_or_else(|_| "disabled".into())
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "index_only" | "index" => PromptMemoryMode::IndexOnly,
+        "targeted_recall" | "targeted" | "recall" => PromptMemoryMode::TargetedRecall,
+        _ => PromptMemoryMode::Disabled,
+    }
+}
+
 fn build_combined_system_prompt(
     working_directory: &std::path::Path,
     persisted_config: &PersistedSessionConfig,
     skills: &[Skill],
+    prompt_memory_suffix: Option<&str>,
 ) -> Option<String> {
     let mut prompt_parts = Vec::new();
 
@@ -320,6 +341,10 @@ fn build_combined_system_prompt(
         }
     }
 
+    if let Some(suffix) = prompt_memory_suffix {
+        prompt_parts.push(suffix.to_string());
+    }
+
     if prompt_parts.is_empty() {
         prompt_parts.push(DEFAULT_SYSTEM_PROMPT.to_string());
     }
@@ -342,6 +367,7 @@ impl SessionContext {
             initial_messages,
             archive_root,
             max_context_window,
+            ..
         } = init;
         let filesystem = Arc::new(
             OverlayFilesystem::new(working_directory.clone(), working_directory.clone())
@@ -363,7 +389,7 @@ impl SessionContext {
         let tools = tool_registry.tool_definitions();
 
         let combined_prompt =
-            build_combined_system_prompt(&working_directory, &persisted_config, &skills);
+            build_combined_system_prompt(&working_directory, &persisted_config, &skills, None);
 
         let mut history = Vec::new();
         if let Some(prompt) = &combined_prompt {
@@ -387,12 +413,17 @@ impl SessionContext {
             archive_root,
             max_context_window,
             compaction_generation: 0,
-            persisted_config,
+            persisted_config: persisted_config.clone(),
             created_at: Utc::now(),
             mailbox: VecDeque::new(),
             suspended_wait: None,
             session_memory,
             memory_diagnostics: MemoryDiagnostics::default(),
+            last_prompt_memory: PersistedPromptMemoryState {
+                mode: persisted_config.prompt_memory_mode,
+                ..PersistedPromptMemoryState::default()
+            },
+            last_prompt_memory_user_index: None,
         })
     }
 
@@ -423,6 +454,7 @@ impl SessionContext {
                 initial_messages: Vec::new(),
                 archive_root,
                 max_context_window,
+                prompt_memory_mode: config.prompt_memory_mode,
             },
             provider,
         )
@@ -463,6 +495,13 @@ impl SessionContext {
         session.created_at = created_at;
         session.session_memory =
             restore_memory_state(&session.archive_root, session_id, memory_state.as_ref());
+        session.last_prompt_memory = memory_state
+            .as_ref()
+            .and_then(|state| state.prompt_memory.clone())
+            .unwrap_or(PersistedPromptMemoryState {
+                mode: session.persisted_config.prompt_memory_mode,
+                ..PersistedPromptMemoryState::default()
+            });
         Ok((session_id, session))
     }
 
@@ -475,7 +514,11 @@ impl SessionContext {
             config: self.persisted_config.clone(),
             history: self.history.clone(),
             plan_store: crate::tool::plan::snapshot_plan_store(&self.plan_store).await,
-            memory_state: Some(snapshot_memory_state(&self.session_memory)),
+            memory_state: Some({
+                let mut memory_state = snapshot_memory_state(&self.session_memory);
+                memory_state.prompt_memory = Some(self.last_prompt_memory.clone());
+                memory_state
+            }),
         })
     }
 
@@ -499,6 +542,7 @@ impl SessionContext {
             &self.persisted_config.working_directory,
             &self.persisted_config,
             &skills,
+            None,
         );
 
         match &self.system_prompt {
@@ -773,11 +817,11 @@ async fn handle_send_message_input(
 #[allow(dead_code)]
 async fn call_llm(
     provider: &dyn LlmProvider,
-    session: &SessionContext,
+    session: &mut SessionContext,
     session_id: SessionId,
     output: &tokio::sync::mpsc::Sender<CoreOutput>,
 ) -> Result<LlmCallResult, CoreError> {
-    let messages = compaction::build_micro_compacted_history(&session.history);
+    let messages = build_provider_messages(session).await?;
     call_llm_with_messages(
         provider,
         &messages,
@@ -786,6 +830,49 @@ async fn call_llm(
         Some(output),
     )
     .await
+}
+
+async fn build_provider_messages(session: &mut SessionContext) -> Result<Vec<Message>, CoreError> {
+    let previous_selection =
+        if session.last_prompt_memory_user_index == latest_user_message_index(&session.history) {
+            session.last_prompt_memory.selected_entry_ids.clone()
+        } else {
+            Vec::new()
+        };
+    let injection = build_prompt_memory_injection(
+        &session.archive_root,
+        &session.persisted_config.working_directory,
+        session.persisted_config.prompt_memory_mode,
+        &session.history,
+        &previous_selection,
+    )
+    .await
+    .map_err(|error| CoreError::Internal {
+        message: format!("failed to build prompt memory injection: {error}"),
+    })?;
+    session.last_prompt_memory = injection.summary.clone();
+    session.last_prompt_memory_user_index = injection.latest_user_index;
+
+    let mut messages = compaction::build_micro_compacted_history(&session.history);
+    if let Some(system_suffix) = injection.system_prompt_suffix.as_deref() {
+        if let Some(first) = messages.first_mut() {
+            if first.role == quine_llm::Role::System {
+                if let MessageContent::Text(text) = &mut first.content {
+                    text.push_str("\n\n");
+                    text.push_str(system_suffix);
+                }
+            }
+        }
+    }
+    Ok(splice_prompt_memory_messages(&messages, &injection))
+}
+
+fn latest_user_message_index(history: &[Message]) -> Option<usize> {
+    history
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, message)| (message.role == quine_llm::Role::User).then_some(index))
 }
 
 async fn call_llm_with_messages(
@@ -1561,6 +1648,7 @@ async fn start_child_session(
             initial_messages: Vec::new(),
             archive_root,
             max_context_window,
+            prompt_memory_mode: PromptMemoryMode::Disabled,
         },
         engine.provider,
     )
@@ -2287,8 +2375,23 @@ async fn handle_llm_turn(
                 .await;
             return TurnOutcome::Cancelled;
         }
-        let history = session.history.clone();
-        let tools = session.tools.clone();
+        let history = match sessions.get_mut(&session_id) {
+            Some(session) => match build_provider_messages(session).await {
+                Ok(history) => history,
+                Err(error) => {
+                    let _ = io
+                        .output
+                        .send(CoreOutput::SessionError { session_id, error })
+                        .await;
+                    return TurnOutcome::Failed("session error".into());
+                }
+            },
+            None => return TurnOutcome::Failed("session not found".into()),
+        };
+        let tools = match sessions.get(&session_id) {
+            Some(session) => session.tools.clone(),
+            None => return TurnOutcome::Failed("session not found".into()),
+        };
         match call_llm_interruptible(&**engine.provider, history, tools, session_id, io, sessions)
             .await
         {
@@ -2862,6 +2965,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         initial_messages,
                         archive_root: archive_root.clone(),
                         max_context_window,
+                        prompt_memory_mode: prompt_memory_mode_from_env(),
                     },
                     &provider,
                 )
@@ -3460,6 +3564,7 @@ mod tests {
     use tokio::time::Duration as TokioDuration;
 
     use crate::memory::load_summary_metadata;
+    use sha2::{Digest, Sha256};
 
     /// A mock LLM provider that returns a fixed text response.
     struct MockProvider {
@@ -3557,6 +3662,7 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root,
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             provider,
         )
@@ -3564,6 +3670,34 @@ mod tests {
         .unwrap();
         session.history = history;
         (session_id, session)
+    }
+
+    fn write_persistent_memory_fixture(
+        archive_root: &std::path::Path,
+        working_directory: &std::path::Path,
+        memory_md: &str,
+        index_json: &str,
+        entries: &[(&str, &str)],
+    ) {
+        let normalized = working_directory.to_string_lossy().replace('\\', "/");
+        let mut hasher = Sha256::new();
+        hasher.update(normalized.as_bytes());
+        let digest = hasher.finalize();
+        let project_key = hex::encode(&digest[..16]);
+        let project_dir = archive_root
+            .join("memory")
+            .join("projects")
+            .join(project_key);
+        std::fs::create_dir_all(project_dir.join("entries")).unwrap();
+        std::fs::write(project_dir.join("MEMORY.md"), memory_md).unwrap();
+        std::fs::write(project_dir.join("index.json"), index_json).unwrap();
+        for (relative_path, content) in entries {
+            let path = project_dir.join(relative_path);
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).unwrap();
+            }
+            std::fs::write(path, content).unwrap();
+        }
     }
 
     fn write_session_memory_fixture(
@@ -3583,6 +3717,99 @@ mod tests {
             .unwrap(),
         )
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn build_provider_messages_injects_targeted_prompt_memory_without_persisting_it() {
+        let tempdir = TempDir::new().unwrap();
+        let archive_root = tempdir.path().join("archive");
+        let working_directory = tempdir.path().join("workspace");
+        std::fs::create_dir_all(working_directory.join(".git")).unwrap();
+
+        let index_json = r#"{
+  "entries": [
+    {
+      "entry_id": "cargo-test",
+      "title": "Cargo test command",
+      "summary": "Use cargo test for the Rust test suite",
+      "slug": "cargo-test-command",
+      "path": "entries/cargo-test.md",
+      "updated_at": "2025-01-01T00:00:00Z",
+      "keywords": ["cargo", "test", "rust"],
+      "pinned": true
+    }
+  ]
+}"#;
+        let entry = r#"---
+entry_id: cargo-test
+title: Cargo test command
+summary: Use cargo test for the Rust test suite
+keywords:
+  - cargo
+  - test
+  - rust
+updated_at: 2025-01-01T00:00:00Z
+pinned: true
+---
+Run `cargo test` from the workspace root to execute the Rust test suite.
+"#;
+        write_persistent_memory_fixture(
+            &archive_root,
+            &working_directory,
+            "# Durable Memory\n\n- Use cargo test",
+            index_json,
+            &[("entries/cargo-test.md", entry)],
+        );
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let mut session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: Some("base system prompt".into()),
+                skills: Vec::new(),
+                working_directory: working_directory.clone(),
+                plan_mode: false,
+                initial_messages: vec![Message::user("How do I run the Rust test suite?")],
+                archive_root,
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.persisted_config.prompt_memory_mode = PromptMemoryMode::TargetedRecall;
+
+        let provider_messages = build_provider_messages(&mut session).await.unwrap();
+        assert_eq!(
+            session.last_prompt_memory.mode,
+            PromptMemoryMode::TargetedRecall
+        );
+        assert_eq!(
+            session.last_prompt_memory.selected_entry_ids,
+            vec!["cargo-test"]
+        );
+        assert_eq!(session.history.len(), 2);
+        assert_eq!(provider_messages.len(), 3);
+        assert_eq!(provider_messages[1].role, quine_llm::Role::System);
+        let injected_text = match &provider_messages[1].content {
+            MessageContent::Text(text) => text,
+            other => panic!("expected text message, got {other:?}"),
+        };
+        assert!(injected_text.contains("Relevant durable memory `cargo-test`:"));
+        assert!(injected_text.contains("cargo test"));
+        assert_eq!(provider_messages[2].role, quine_llm::Role::User);
+        match &provider_messages[2].content {
+            MessageContent::Text(text) => assert_eq!(text, "How do I run the Rust test suite?"),
+            other => panic!("expected text message, got {other:?}"),
+        }
+        assert!(session
+            .history
+            .iter()
+            .all(|message| match &message.content {
+                MessageContent::Text(text) => !text.contains("Relevant durable memory"),
+                _ => true,
+            }));
     }
 
     #[tokio::test]
@@ -3746,6 +3973,147 @@ mod tests {
         assert!(compacted_summary_text(&session.history).contains("legacy summary"));
     }
 
+    fn prompt_memory_project_dir(
+        archive_root: &std::path::Path,
+        working_directory: &std::path::Path,
+    ) -> PathBuf {
+        use sha2::{Digest, Sha256};
+
+        let mut current = working_directory.to_path_buf();
+        while !(current.join(".git").exists()
+            || current.join("CLAUDE.md").exists()
+            || current.join("Cargo.toml").exists())
+        {
+            if !current.pop() {
+                current = working_directory.to_path_buf();
+                break;
+            }
+        }
+        let normalized = current.to_string_lossy().replace('\\', "/");
+        let mut hasher = Sha256::new();
+        hasher.update(normalized.as_bytes());
+        let digest = hasher.finalize();
+        archive_root
+            .join("memory")
+            .join("projects")
+            .join(hex::encode(&digest[..16]))
+    }
+
+    fn write_prompt_memory_fixture(
+        archive_root: &std::path::Path,
+        working_directory: &std::path::Path,
+        index_json: &serde_json::Value,
+        entry_files: &[(&str, &str)],
+        memory_md: &str,
+    ) {
+        let project_dir = prompt_memory_project_dir(archive_root, working_directory);
+        std::fs::create_dir_all(project_dir.join("entries")).unwrap();
+        std::fs::write(
+            project_dir.join("index.json"),
+            serde_json::to_vec_pretty(index_json).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(project_dir.join("MEMORY.md"), memory_md).unwrap();
+        for (path, content) in entry_files {
+            std::fs::write(project_dir.join(path), content).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn prompt_memory_disabled_mode_is_request_equivalent_to_legacy_path() {
+        let temp = TempDir::new().unwrap();
+        let provider = Arc::new(CountingProvider::new("ok"));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let history = vec![
+            Message::system("system"),
+            Message::user("hello"),
+            Message::assistant("world"),
+        ];
+        let (_session_id, mut session) =
+            make_session_for_compaction(&provider_dyn, temp.path().to_path_buf(), history.clone())
+                .await;
+        session.persisted_config.prompt_memory_mode = PromptMemoryMode::Disabled;
+
+        let built = build_provider_messages(&mut session).await.unwrap();
+        let expected = compaction::build_micro_compacted_history(&history);
+        assert_eq!(built.len(), expected.len());
+        for (left, right) in built.iter().zip(expected.iter()) {
+            assert_eq!(left.role, right.role);
+            if let (MessageContent::Text(a), MessageContent::Text(b)) =
+                (&left.content, &right.content)
+            {
+                assert_eq!(a, b);
+            }
+        }
+        assert!(session.last_prompt_memory.selected_entry_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn targeted_recall_prompt_assembly_inserts_ephemeral_reminders_before_latest_user_message(
+    ) {
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("CLAUDE.md"), "# project\n").unwrap();
+
+        let provider = Arc::new(CountingProvider::new("ok"));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let history = vec![
+            Message::system("system"),
+            Message::user("earlier"),
+            Message::assistant("reply"),
+            Message::user("What should I run to execute all tests in this repo?"),
+        ];
+        let (_session_id, mut session) =
+            make_session_for_compaction(&provider_dyn, temp.path().to_path_buf(), history.clone())
+                .await;
+        session.persisted_config.working_directory = project_dir.clone();
+        session.persisted_config.prompt_memory_mode = PromptMemoryMode::TargetedRecall;
+        write_prompt_memory_fixture(
+            temp.path(),
+            &project_dir,
+            &serde_json::json!({
+                "entries": [{
+                    "entry_id": "rust-test-command",
+                    "title": "Run tests",
+                    "summary": "Use cargo test to run the Rust test suite",
+                    "slug": "rust-test-command",
+                    "path": "entries/rust-test-command.md",
+                    "updated_at": Utc::now(),
+                    "keywords": ["cargo", "test", "rust"],
+                    "pinned": false
+                }]
+            }),
+            &[(
+                "entries/rust-test-command.md",
+                "---\nentry_id: rust-test-command\ntitle: Run tests\nsummary: Use cargo test to run the Rust test suite\nkeywords:\n  - cargo\n  - test\nupdated_at: 2026-04-04T00:00:00Z\npinned: false\n---\n\nUse `cargo test` to run the Rust test suite.\n",
+            )],
+            "# MEMORY\n\n- [Run tests](entries/rust-test-command.md) - Use cargo test\n",
+        );
+
+        let built = build_provider_messages(&mut session).await.unwrap();
+        assert_eq!(session.history.len(), history.len());
+        match &session.history[3].content {
+            MessageContent::Text(text) => {
+                assert_eq!(text, "What should I run to execute all tests in this repo?")
+            }
+            other => panic!("expected latest user text, got {other:?}"),
+        }
+        assert_eq!(
+            session.last_prompt_memory.selected_entry_ids,
+            vec!["rust-test-command"]
+        );
+        let latest_user_index = built
+            .iter()
+            .rposition(|message| message.role == quine_llm::Role::User)
+            .unwrap();
+        assert!(latest_user_index > 0);
+        match &built[latest_user_index - 1].content {
+            MessageContent::Text(text) => assert!(text.contains("rust-test-command")),
+            other => panic!("expected injected reminder, got {other:?}"),
+        }
+    }
+
     #[test]
     fn wait_graph_cycle_detection_catches_indirect_cycles() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
@@ -3765,6 +4133,7 @@ mod tests {
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-a"),
                     max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
                 },
                 &provider,
             ))
@@ -3780,6 +4149,7 @@ mod tests {
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-b"),
                     max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
                 },
                 &provider,
             ))
@@ -3795,6 +4165,7 @@ mod tests {
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-c"),
                     max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
                 },
                 &provider,
             ))
@@ -3846,6 +4217,7 @@ mod tests {
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-timeout-a"),
                     max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
                 },
                 &provider,
             ))
@@ -3861,6 +4233,7 @@ mod tests {
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-timeout-b"),
                     max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
                 },
                 &provider,
             ))
@@ -3897,6 +4270,7 @@ mod tests {
                 initial_messages: vec![Message::assistant_tool_use(None, vec![])],
                 archive_root: std::env::temp_dir().join("quine-core-timeout-resume"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             &provider,
         )
@@ -3966,6 +4340,7 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-mailbox-resume"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             &provider,
         )
@@ -4033,6 +4408,7 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             &provider,
         )
@@ -4112,6 +4488,7 @@ mod tests {
                 initial_messages: vec![Message::user("inspect")],
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             &provider,
         )
@@ -4212,6 +4589,7 @@ mod tests {
                 initial_messages: vec![Message::user("inspect")],
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             &provider,
         )
@@ -4427,6 +4805,7 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             &provider,
         )
@@ -4483,6 +4862,7 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             &provider,
         )
@@ -4551,6 +4931,7 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             &provider,
         )
@@ -4609,6 +4990,7 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             &provider,
         )
@@ -4647,6 +5029,7 @@ mod tests {
                 initial_messages: Vec::new(),
                 archive_root: archive_root.clone(),
                 max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
             },
             &provider,
         )
@@ -5003,6 +5386,7 @@ mod tests {
                     skill_names: Vec::new(),
                     working_directory: std::env::current_dir().unwrap_or_default(),
                     plan_mode: false,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
                 },
                 history: vec![
                     Message::user("seed session memory"),
@@ -5019,6 +5403,7 @@ mod tests {
                         enabled: true,
                         last_extracted_message_index: Some(1),
                     }),
+                    prompt_memory: None,
                 }),
             }],
             crate::persistence::PersistedSessionTree {

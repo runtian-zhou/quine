@@ -44,6 +44,8 @@ pub struct PersistedSessionConfig {
     pub skill_names: Vec<String>,
     pub working_directory: PathBuf,
     pub plan_mode: bool,
+    #[serde(default)]
+    pub prompt_memory_mode: PromptMemoryMode,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -52,6 +54,17 @@ pub struct PersistedMemoryState {
     pub session_memory: Option<PersistedSessionMemoryState>,
     #[serde(default)]
     pub persistent_memory: Option<PersistedPersistentMemoryState>,
+    #[serde(default)]
+    pub prompt_memory: Option<PersistedPromptMemoryState>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptMemoryMode {
+    #[default]
+    Disabled,
+    IndexOnly,
+    TargetedRecall,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -65,6 +78,19 @@ pub struct PersistedSessionMemoryState {
 pub struct PersistedPersistentMemoryState {
     pub enabled: bool,
     pub last_extracted_message_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedPromptMemoryState {
+    pub mode: PromptMemoryMode,
+    #[serde(default)]
+    pub selected_entry_ids: Vec<String>,
+    #[serde(default)]
+    pub selected_titles: Vec<String>,
+    #[serde(default)]
+    pub skipped_reasons: Vec<String>,
+    #[serde(default)]
+    pub truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -181,7 +207,8 @@ mod tests {
                 "system_prompt": null,
                 "skill_names": [],
                 "working_directory": ".",
-                "plan_mode": false
+                "plan_mode": false,
+                "prompt_memory_mode": "disabled"
             },
             "history": [],
             "plan_store": { "plans": [] }
@@ -202,6 +229,13 @@ mod tests {
                 enabled: true,
                 last_extracted_message_index: Some(6),
             }),
+            prompt_memory: Some(PersistedPromptMemoryState {
+                mode: PromptMemoryMode::TargetedRecall,
+                selected_entry_ids: vec!["entry-a".into()],
+                selected_titles: vec!["Entry A".into()],
+                skipped_reasons: vec!["budget".into()],
+                truncated: true,
+            }),
         };
         let json = serde_json::to_value(&state).unwrap();
         assert!(json.get("summary").is_none());
@@ -213,6 +247,10 @@ mod tests {
                 .as_ref()
                 .and_then(|state| state.last_extracted_message_index),
             Some(6)
+        );
+        assert_eq!(
+            roundtrip.prompt_memory.as_ref().map(|state| state.mode),
+            Some(PromptMemoryMode::TargetedRecall)
         );
     }
 }

@@ -107,6 +107,7 @@ pub(crate) fn snapshot_memory_state(state: &SessionMemoryState) -> PersistedMemo
             enabled: state.persistent_enabled,
             last_extracted_message_index: state.last_persistent_extracted_message_index,
         }),
+        prompt_memory: None,
     }
 }
 
@@ -205,6 +206,7 @@ mod tests {
                 enabled: true,
                 last_extracted_message_index: Some(11),
             }),
+            prompt_memory: None,
         };
         let state = restore_memory_state(&root, session_id, Some(&persisted));
         assert!(!state.enabled);

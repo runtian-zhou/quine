@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use quine_core::{
     built_in_tool_definitions,
     planner::{ActionPlan, ActionStatus},
-    skill, CoreCheckpoint, PersistedSession, SessionId,
+    skill, CoreCheckpoint, PersistedPromptMemoryState, PersistedSession, SessionId,
 };
 use quine_llm::{Message, MessageContent, Role, ToolDefinition};
 use serde::{Deserialize, Serialize};
@@ -61,6 +61,7 @@ pub struct SessionContextSnapshot {
     pub available_tools: Vec<ToolDefinition>,
     pub loaded_skills: Vec<SkillSnapshot>,
     pub plans: Vec<PlanSnapshot>,
+    pub prompt_memory: Option<PersistedPromptMemoryState>,
     pub history: Vec<HistoryEntry>,
 }
 
@@ -126,6 +127,10 @@ fn snapshot_from_persisted(
             .iter()
             .map(plan_snapshot_from_action_plan)
             .collect(),
+        prompt_memory: session
+            .memory_state
+            .as_ref()
+            .and_then(|state| state.prompt_memory.clone()),
         history: session
             .history
             .iter()
@@ -401,6 +406,7 @@ mod tests {
                     skill_names: Vec::new(),
                     working_directory: PathBuf::from("/tmp/project"),
                     plan_mode: false,
+                    prompt_memory_mode: quine_core::PromptMemoryMode::Disabled,
                 },
                 history: vec![quine_llm::Message::user("hello")],
                 plan_store: PersistedPlanStore::default(),
