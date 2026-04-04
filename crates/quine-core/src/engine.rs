@@ -1326,7 +1326,7 @@ async fn compact_session_history(
     session_id: SessionId,
     trigger: CompactionTrigger,
 ) -> Result<bool, CoreError> {
-    let (prefix, tail) = compaction::split_history_for_compaction(&session.history);
+    let (prefix, _) = compaction::split_history_for_compaction(&session.history);
     let non_system_messages = prefix
         .iter()
         .filter(|message| message.role != quine_llm::Role::System)
@@ -1349,9 +1349,21 @@ async fn compact_session_history(
         message: format!("failed to archive transcript: {error}"),
     })?;
     let archive_ref = archived.path.display().to_string();
-    let summary = summarize_history(provider, session_id, &archive_ref, trigger, &prefix).await?;
-    session.history =
-        compaction::compacted_history(&session.history, &summary, &archive_ref, &tail);
+    let plan = if let Some(plan) =
+        compaction::session_memory_compaction_plan(&session.session_memory, &session.history).await
+    {
+        plan
+    } else {
+        let summary =
+            summarize_history(provider, session_id, &archive_ref, trigger, &prefix).await?;
+        compaction::legacy_compaction_plan(&session.history, summary)
+    };
+    if plan.source == compaction::CompactionSource::LegacySummarizer {
+        debug_log_session(session_id, "compaction used legacy summarizer");
+    } else {
+        debug_log_session(session_id, "compaction used session memory");
+    }
+    session.history = compaction::apply_compaction_plan(&session.history, &archive_ref, &plan);
     session.last_input_tokens = None;
     session.compaction_generation = archived.generation;
     Ok(true)
@@ -4754,6 +4766,10 @@ mod tests {
                         enabled: true,
                         last_summarized_message_index: Some(1),
                         template_version: 1,
+                    }),
+                    persistent_memory: Some(crate::persistence::PersistedPersistentMemoryState {
+                        enabled: true,
+                        last_extracted_message_index: Some(1),
                     }),
                 }),
             }],

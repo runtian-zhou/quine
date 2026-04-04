@@ -12,10 +12,15 @@ use quine_llm::LlmProvider;
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::Duration;
 
-use crate::config::{default_state_dir, max_context_window_from_env, SessionConfig};
+use crate::config::{
+    default_memory_dir_from_state_dir, default_state_dir, max_context_window_from_env,
+    SessionConfig,
+};
+
 use crate::error::HarnessError;
 use crate::service::HarnessService;
 use crate::storage::{session_context_from_checkpoint, StorageManager};
+use crate::MemoryStore;
 
 /// Local in-process harness implementation.
 ///
@@ -72,9 +77,24 @@ impl LocalHarness {
         // Broadcast channel for fanning out core events.
         let (event_tx, _) = broadcast::channel::<CoreOutput>(256);
         let event_tx_clone = event_tx.clone();
-        let archive_root = archive_root.unwrap_or_else(default_state_dir);
-        let storage =
-            Arc::new(storage.unwrap_or_else(|| StorageManager::new(archive_root.clone())));
+        let (archive_root, storage) = match (archive_root, storage) {
+            (Some(archive_root), Some(storage)) => (archive_root, Arc::new(storage)),
+            (Some(archive_root), None) => (
+                archive_root.clone(),
+                Arc::new(StorageManager::new(archive_root)),
+            ),
+            (None, Some(storage)) => (storage.root().to_path_buf(), Arc::new(storage)),
+            (None, None) => {
+                let archive_root = default_state_dir();
+                (
+                    archive_root.clone(),
+                    Arc::new(StorageManager::new(archive_root)),
+                )
+            }
+        };
+        let memory_store = Arc::new(MemoryStore::new(default_memory_dir_from_state_dir(
+            &archive_root,
+        )));
         let restored_checkpoint =
             storage
                 .load_latest_checkpoint()
@@ -123,6 +143,7 @@ impl LocalHarness {
             event_tx_clone,
             Arc::clone(&storage),
             Arc::clone(&sessions),
+            memory_store,
         ));
 
         Ok(Self {
@@ -162,12 +183,34 @@ impl LocalHarness {
         event_tx: broadcast::Sender<CoreOutput>,
         storage: Arc<StorageManager>,
         sessions: Arc<Mutex<HashMap<SessionId, SessionListing>>>,
+        memory_store: Arc<MemoryStore>,
     ) {
         let mut output = output.into_inner();
         while let Some(event) = output.recv().await {
             match &event {
                 CoreOutput::CheckpointRequested { checkpoint } => {
-                    if let Err(error) = storage.commit_checkpoint(checkpoint).await {
+                    let mut checkpoint = checkpoint.clone();
+                    for session in &mut checkpoint.sessions {
+                        match memory_store.extract_and_persist_for_session(session).await {
+                            Ok(Some(persistent_state)) => {
+                                let mut state = session.memory_state.clone().unwrap_or_default();
+                                state.persistent_memory = Some(persistent_state);
+                                session.memory_state = Some(state);
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                let _ = event_tx.send(CoreOutput::SessionError {
+                                    session_id: session.session_id,
+                                    error: quine_core::CoreError::Internal {
+                                        message: format!(
+                                            "persistent memory extraction failed: {error}"
+                                        ),
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    if let Err(error) = storage.commit_checkpoint(&checkpoint).await {
                         let _ = event_tx.send(CoreOutput::SessionError {
                             session_id: SessionId::default(),
                             error: quine_core::CoreError::Internal {
@@ -532,6 +575,7 @@ mod tests {
     use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, Role, ToolDefinition};
     use std::fs;
     use std::pin::Pin;
+    use tokio::fs as async_fs;
 
     fn temp_storage() -> StorageManager {
         StorageManager::new(
@@ -742,6 +786,128 @@ mod tests {
 
         restored.shutdown().await.unwrap();
         let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
+    async fn persistent_memory_extracts_explicit_remember_and_forget_across_restart() {
+        let storage = temp_storage();
+        let project_dir =
+            std::env::temp_dir().join(format!("quine-project-{}", uuid::Uuid::new_v4()));
+        async_fs::create_dir_all(&project_dir).await.unwrap();
+        async_fs::write(project_dir.join("CLAUDE.md"), "# test project\n")
+            .await
+            .unwrap();
+
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(project_dir.clone()),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+        harness
+            .send_message(
+                session_id,
+                "Remember this: use concise bullets in final responses".into(),
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut rx = harness.subscribe();
+            loop {
+                if matches!(rx.recv().await.unwrap(), CoreOutput::TurnComplete { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let memory_root = storage.root().join("memory");
+        let project_key = crate::memory_store::project_key(&project_dir);
+        let memory_dir = memory_root.join("projects").join(&project_key);
+        let index_path = memory_dir.join("MEMORY.md");
+        let entries_dir = memory_dir.join("entries");
+        let index_before = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = async_fs::read_to_string(&index_path).await {
+                    if contents.contains("use concise bullets in final responses") {
+                        break contents;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(index_before.contains("use concise bullets in final responses"));
+        let mut dir = async_fs::read_dir(&entries_dir).await.unwrap();
+        let mut entry_count = 0usize;
+        while (dir.next_entry().await.unwrap()).is_some() {
+            entry_count += 1;
+        }
+        assert_eq!(entry_count, 1);
+
+        harness.shutdown().await.unwrap();
+
+        let restored = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        restored
+            .send_message(
+                session_id,
+                "Forget this: use concise bullets in final responses".into(),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut rx = restored.subscribe();
+            loop {
+                if matches!(rx.recv().await.unwrap(), CoreOutput::TurnComplete { .. }) {
+                    break;
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let index_after = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(contents) = async_fs::read_to_string(&index_path).await {
+                    if !contents.contains("use concise bullets in final responses") {
+                        break contents;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!index_after.contains("use concise bullets in final responses"));
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if async_fs::read_dir(memory_dir.join("tombstones"))
+                    .await
+                    .unwrap()
+                    .next_entry()
+                    .await
+                    .unwrap()
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        restored.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(storage.root());
+        let _ = fs::remove_dir_all(project_dir);
     }
 
     #[tokio::test]

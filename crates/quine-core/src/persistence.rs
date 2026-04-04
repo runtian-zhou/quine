@@ -50,6 +50,8 @@ pub struct PersistedSessionConfig {
 pub struct PersistedMemoryState {
     #[serde(default)]
     pub session_memory: Option<PersistedSessionMemoryState>,
+    #[serde(default)]
+    pub persistent_memory: Option<PersistedPersistentMemoryState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -57,6 +59,12 @@ pub struct PersistedSessionMemoryState {
     pub enabled: bool,
     pub last_summarized_message_index: Option<usize>,
     pub template_version: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PersistedPersistentMemoryState {
+    pub enabled: bool,
+    pub last_extracted_message_index: Option<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,10 +198,21 @@ mod tests {
                 last_summarized_message_index: Some(4),
                 template_version: 1,
             }),
+            persistent_memory: Some(PersistedPersistentMemoryState {
+                enabled: true,
+                last_extracted_message_index: Some(6),
+            }),
         };
         let json = serde_json::to_value(&state).unwrap();
         assert!(json.get("summary").is_none());
         let roundtrip: PersistedMemoryState = serde_json::from_value(json).unwrap();
         assert_eq!(roundtrip, state);
+        assert_eq!(
+            roundtrip
+                .persistent_memory
+                .as_ref()
+                .and_then(|state| state.last_extracted_message_index),
+            Some(6)
+        );
     }
 }

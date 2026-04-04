@@ -20,8 +20,8 @@ pub use engine::{run_core_loop, run_core_loop_with_compaction};
 pub use error::CoreError;
 pub use filesystem::{DirEntry, FsError, NullFilesystem, OverlayFilesystem, SessionFilesystem};
 pub use persistence::{
-    CoreCheckpoint, PersistedMemoryState, PersistedPlanStore, PersistedSession,
-    PersistedSessionConfig, PersistedSessionMemoryState, PersistedSessionState,
+    CoreCheckpoint, PersistedMemoryState, PersistedPersistentMemoryState, PersistedPlanStore,
+    PersistedSession, PersistedSessionConfig, PersistedSessionMemoryState, PersistedSessionState,
     PersistedSessionTree, CORE_CHECKPOINT_FORMAT_VERSION,
 };
 pub use session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};

@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use quine_harness::{create_provider_from_env, HarnessConfig, LocalHarness};
+use quine_harness::{
+    create_provider_from_env, default_memory_dir_from_state_dir, HarnessConfig, LocalHarness,
+};
 
 #[derive(Parser)]
 #[command(name = "quine-harness", about = "Quine harness daemon")]
@@ -29,13 +31,15 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Commands::Start { socket, state_dir } => {
+            let state_dir = state_dir
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(quine_harness::default_state_dir);
             let config = HarnessConfig {
                 socket_path: socket
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(quine_harness::default_socket_path),
-                state_dir: state_dir
-                    .map(std::path::PathBuf::from)
-                    .unwrap_or_else(quine_harness::default_state_dir),
+                memory_dir: default_memory_dir_from_state_dir(&state_dir),
+                state_dir,
             };
 
             let provider = create_provider_from_env();
