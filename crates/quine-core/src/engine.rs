@@ -1354,10 +1354,15 @@ fn resolved_permission_path(
     fallback: &str,
 ) -> PermissionResource {
     let candidate = raw_path.unwrap_or(fallback);
-    match session.filesystem.resolve_path(Path::new(candidate)) {
+    let candidate_path = Path::new(candidate);
+    match session.filesystem.resolve_path(candidate_path) {
         Ok(path) => PermissionResource::Path { path },
         Err(_) => PermissionResource::Path {
-            path: PathBuf::from(candidate),
+            path: if candidate_path.is_absolute() {
+                candidate_path.to_path_buf()
+            } else {
+                session.working_directory.join(candidate_path)
+            },
         },
     }
 }
@@ -6000,6 +6005,67 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         assert!(sessions
             .get(&session_id)
             .is_some_and(|session| session.pending_permission_approval.is_none()));
+    }
+
+    #[tokio::test]
+    async fn execute_tool_call_denies_outside_workspace_write_boundary() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let workspace = tempfile::TempDir::new().unwrap();
+        let session_id = SessionId::new();
+        let session = SessionContext::new(
+            session_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: workspace.path().to_path_buf(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let call = PendingToolCall {
+            tool_use_id: "toolu_outside_write".into(),
+            tool_name: "apply_patch".into(),
+            arguments: serde_json::json!({
+                "file_path": "../forbidden.txt",
+                "new_file_content": "forbidden"
+            }),
+        };
+
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(4);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            session_tree: &mut session_tree,
+        };
+
+        let outcome =
+            execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine).await;
+
+        assert!(
+            matches!(outcome, ToolOutcome::Error { ref message } if message.contains("permission denied"))
+        );
+        assert!(output_rx.try_recv().is_err());
+        let outside_path = workspace.path().parent().unwrap().join("forbidden.txt");
+        assert!(!outside_path.exists());
     }
 
     #[tokio::test]

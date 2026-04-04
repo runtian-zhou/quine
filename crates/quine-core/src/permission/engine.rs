@@ -1,5 +1,6 @@
 use super::context::PermissionContext;
 use super::outcome::{PermissionOutcome, PermissionOutcomeKind};
+use super::path::authorize_path;
 use super::request::{
     MatchedPermissionSource, PermissionMatchKind, PermissionRequest, PermissionResource,
     PermissionScope, ToolLocalDecision,
@@ -28,6 +29,21 @@ pub(crate) fn evaluate_permission(
                 .unwrap_or_else(|| "tool-local policy denied request".into()),
             context.prompt_behavior(),
         );
+    }
+
+    if let PermissionResource::Path { path } = &request.resource {
+        if let Err(reason) = authorize_path(context, request.scope, path) {
+            return outcome_for(
+                request,
+                PermissionDecision::Deny,
+                MatchedPermissionSource {
+                    kind: PermissionMatchKind::FilesystemBoundary,
+                    rule_source: None,
+                },
+                reason,
+                context.prompt_behavior(),
+            );
+        }
     }
 
     if let Some((source, _rule)) =
@@ -186,6 +202,7 @@ mod tests {
         PermissionPromptBehavior, PermissionRule, PermissionRuleEffect, PermissionRuleSource,
         PermissionScope as RuleScope, PermissionTarget,
     };
+    use tempfile::TempDir;
 
     fn request(scope: PermissionScope) -> PermissionRequest {
         PermissionRequest {
@@ -354,5 +371,30 @@ mod tests {
         assert_eq!(json["kind"], "allowed");
         assert_eq!(json["source"]["kind"], "mode_default");
         assert_eq!(json["request"]["tool_name"], "bash");
+    }
+
+    #[test]
+    fn filesystem_boundary_denies_outside_root_before_mode_default() {
+        let workspace = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let context = PermissionContext::new(
+            workspace.path().to_path_buf(),
+            false,
+            PermissionPromptBehavior::Interactive,
+        );
+        let request = PermissionRequest {
+            tool_name: "apply_patch".into(),
+            action: None,
+            scope: PermissionScope::Write,
+            resource: PermissionResource::Path {
+                path: outside.path().join("forbidden.txt"),
+            },
+        };
+
+        let outcome = evaluate_permission(&context, request, None);
+
+        assert_eq!(outcome.kind, PermissionOutcomeKind::Denied);
+        assert_eq!(outcome.source.kind, PermissionMatchKind::FilesystemBoundary);
+        assert!(outcome.reason.contains("outside approved roots"));
     }
 }

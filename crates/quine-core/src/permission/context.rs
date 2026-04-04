@@ -86,6 +86,14 @@ impl PermissionContext {
     pub(crate) fn add_allowed_root(&mut self, path: PathBuf) {
         self.additional_allowed_roots.push(path);
     }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn approved_roots(&self) -> Vec<PathBuf> {
+        let mut roots = Vec::with_capacity(1 + self.additional_allowed_roots.len());
+        roots.push(self.workspace_root.clone());
+        roots.extend(self.additional_allowed_roots.iter().cloned());
+        roots
+    }
 }
 
 #[cfg(test)]
