@@ -5,7 +5,8 @@ use chrono::{DateTime, Utc};
 use quine_core::{
     built_in_tool_definitions,
     planner::{ActionPlan, ActionStatus},
-    skill, CoreCheckpoint, PersistedPromptMemoryState, PersistedSession, SessionId,
+    skill, CoreCheckpoint, MemoryTurnDiagnostics, PersistedPromptMemoryState, PersistedSession,
+    SessionId,
 };
 use quine_llm::{Message, MessageContent, Role, ToolDefinition};
 use serde::{Deserialize, Serialize};
@@ -62,6 +63,7 @@ pub struct SessionContextSnapshot {
     pub loaded_skills: Vec<SkillSnapshot>,
     pub plans: Vec<PlanSnapshot>,
     pub prompt_memory: Option<PersistedPromptMemoryState>,
+    pub memory_diagnostics: Option<MemoryTurnDiagnostics>,
     pub history: Vec<HistoryEntry>,
 }
 
@@ -131,6 +133,10 @@ fn snapshot_from_persisted(
             .memory_state
             .as_ref()
             .and_then(|state| state.prompt_memory.clone()),
+        memory_diagnostics: session
+            .memory_state
+            .as_ref()
+            .and_then(|state| state.memory_diagnostics.clone()),
         history: session
             .history
             .iter()
@@ -384,7 +390,7 @@ mod tests {
     use chrono::Utc;
     use quine_core::{
         CoreCheckpoint, PersistedPlanStore, PersistedSession, PersistedSessionConfig,
-        PersistedSessionState, PersistedSessionTree, SessionId,
+        PersistedSessionState, PersistedSessionTree, PromptMemoryMode, SessionId,
     };
 
     fn make_temp_storage() -> StorageManager {
@@ -410,7 +416,46 @@ mod tests {
                 },
                 history: vec![quine_llm::Message::user("hello")],
                 plan_store: PersistedPlanStore::default(),
-                memory_state: None,
+                memory_state: Some(quine_core::PersistedMemoryState {
+                    session_memory: None,
+                    persistent_memory: None,
+                    prompt_memory: Some(quine_core::PersistedPromptMemoryState {
+                        mode: PromptMemoryMode::Disabled,
+                        selected_entry_ids: Vec::new(),
+                        selected_titles: Vec::new(),
+                        skipped_reasons: Vec::new(),
+                        truncated: false,
+                    }),
+                    memory_diagnostics: Some(quine_core::MemoryTurnDiagnostics {
+                        session_memory: quine_core::SessionMemoryDiagnostics {
+                            enabled: true,
+                            summary_path: Some(PathBuf::from("/tmp/project/summary.md")),
+                            metadata_path: Some(PathBuf::from("/tmp/project/summary.meta.json")),
+                            refresh: quine_core::SessionRefreshDiagnostics {
+                                attempted: false,
+                                status: quine_core::MemoryStatus::NotRun,
+                                reason: Some(quine_core::MemoryDecisionReason::NoActivityYet),
+                                last_summarized_message_index: None,
+                                refreshed_at: None,
+                            },
+                            compaction: Default::default(),
+                        },
+                        prompt_memory: quine_core::PromptMemoryDiagnostics {
+                            mode: PromptMemoryMode::Disabled,
+                            injection_ran: false,
+                            status: quine_core::MemoryStatus::Skipped,
+                            reason: Some(quine_core::MemoryDecisionReason::Disabled),
+                            selected_entries: Vec::new(),
+                            skipped_entries: Vec::new(),
+                            truncated: false,
+                        },
+                        persistent_memory: quine_core::PersistentMemoryDiagnostics {
+                            enabled: true,
+                            project_root: Some(PathBuf::from("/tmp/project")),
+                            extraction: Default::default(),
+                        },
+                    }),
+                }),
             }],
             PersistedSessionTree {
                 parents: Default::default(),
@@ -449,7 +494,7 @@ mod tests {
             .any(|tool| tool.name == "write_file"));
         assert!(snapshot.loaded_skills.is_empty());
         assert!(snapshot.plans.is_empty());
-        assert_eq!(snapshot.history.len(), 1);
+        assert!(snapshot.memory_diagnostics.is_some());
         match &snapshot.history[0] {
             super::HistoryEntry::Text { role, text } => {
                 assert_eq!(role, "user");

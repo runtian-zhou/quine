@@ -17,9 +17,11 @@ use crate::compaction::{self, CompactionTrigger};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
 use crate::memory::{
-    build_prompt_memory_injection, refresh_summary_from_history, restore_memory_state,
-    should_refresh_summary, snapshot_memory_state, splice_prompt_memory_messages,
-    MemoryDiagnostics, SessionMemoryState,
+    build_prompt_memory_injection, default_turn_diagnostics, project_root_for_prompt_memory,
+    refresh_summary_from_history, restore_memory_state, should_refresh_summary,
+    snapshot_memory_state, splice_prompt_memory_messages, CompactionSourceDiagnostics,
+    MemoryDecisionReason, MemoryDiagnostics, MemoryStatus, MemoryTurnDiagnostics,
+    SessionMemoryState,
 };
 use crate::persistence::{
     CoreCheckpoint, PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
@@ -68,9 +70,46 @@ fn schedule_session_memory_refresh(
     session_id: SessionId,
     input_tx: mpsc::Sender<CoreInput>,
 ) {
-    if !should_refresh_summary(&session.session_memory, &session.history) {
+    let refresh_outcome = if !session.session_memory.enabled {
+        Some((
+            false,
+            MemoryStatus::Skipped,
+            Some(MemoryDecisionReason::Disabled),
+        ))
+    } else if session.session_memory.refresh_in_flight {
+        Some((
+            false,
+            MemoryStatus::Skipped,
+            Some(MemoryDecisionReason::NotAttempted),
+        ))
+    } else if session.history.is_empty() {
+        Some((
+            false,
+            MemoryStatus::Skipped,
+            Some(MemoryDecisionReason::NoActivityYet),
+        ))
+    } else if !should_refresh_summary(&session.session_memory, &session.history) {
+        Some((
+            false,
+            MemoryStatus::Skipped,
+            Some(MemoryDecisionReason::RefreshNotNeeded),
+        ))
+    } else {
+        None
+    };
+
+    if let Some((attempted, status, reason)) = refresh_outcome {
+        let diagnostics = ensure_turn_diagnostics(session);
+        diagnostics.session_memory.refresh.attempted = attempted;
+        diagnostics.session_memory.refresh.status = status;
+        diagnostics.session_memory.refresh.reason = reason;
         return;
     }
+
+    let diagnostics = ensure_turn_diagnostics(session);
+    diagnostics.session_memory.refresh.attempted = true;
+    diagnostics.session_memory.refresh.status = MemoryStatus::NotRun;
+    diagnostics.session_memory.refresh.reason = None;
 
     let history = session.history.clone();
     let memory_state = session.session_memory.clone();
@@ -100,6 +139,21 @@ fn schedule_session_memory_refresh(
             .await;
         debug_log_session(session_id, "session memory refresh finished");
     });
+}
+
+fn default_turn_diagnostics_for_session(session: &SessionContext) -> MemoryTurnDiagnostics {
+    default_turn_diagnostics(
+        &session.session_memory.paths.summary_path,
+        &session.session_memory.paths.metadata_path,
+        session.persisted_config.prompt_memory_mode,
+        project_root_for_prompt_memory(&session.persisted_config.working_directory),
+        session.session_memory.persistent_enabled,
+    )
+}
+
+fn ensure_turn_diagnostics(session: &mut SessionContext) -> &mut MemoryTurnDiagnostics {
+    let default = default_turn_diagnostics_for_session(session);
+    session.last_memory_diagnostics.get_or_insert(default)
 }
 
 /// System prompt prepended in plan mode to restrict the agent to planning-only work.
@@ -186,6 +240,7 @@ struct SessionContext {
     #[allow(dead_code)]
     /// Session memory diagnostics.
     memory_diagnostics: MemoryDiagnostics,
+    last_memory_diagnostics: Option<MemoryTurnDiagnostics>,
     /// Last prompt-time memory injection summary.
     last_prompt_memory: PersistedPromptMemoryState,
     /// Latest user-message index used for prompt-memory de-duplication.
@@ -379,6 +434,9 @@ impl SessionContext {
 
         let plan_store = crate::tool::plan::new_plan_store();
         let session_memory = restore_memory_state(&archive_root, session_id, None);
+        let persistent_enabled = session_memory.persistent_enabled;
+        let summary_path = session_memory.paths.summary_path.clone();
+        let metadata_path = session_memory.paths.metadata_path.clone();
 
         let tool_registry = build_tool_registry_for_session(
             provider,
@@ -419,6 +477,13 @@ impl SessionContext {
             suspended_wait: None,
             session_memory,
             memory_diagnostics: MemoryDiagnostics::default(),
+            last_memory_diagnostics: Some(default_turn_diagnostics(
+                &summary_path,
+                &metadata_path,
+                persisted_config.prompt_memory_mode,
+                project_root_for_prompt_memory(&persisted_config.working_directory),
+                persistent_enabled,
+            )),
             last_prompt_memory: PersistedPromptMemoryState {
                 mode: persisted_config.prompt_memory_mode,
                 ..PersistedPromptMemoryState::default()
@@ -502,6 +567,9 @@ impl SessionContext {
                 mode: session.persisted_config.prompt_memory_mode,
                 ..PersistedPromptMemoryState::default()
             });
+        session.last_memory_diagnostics = memory_state
+            .as_ref()
+            .and_then(|state| state.memory_diagnostics.clone());
         Ok((session_id, session))
     }
 
@@ -517,6 +585,7 @@ impl SessionContext {
             memory_state: Some({
                 let mut memory_state = snapshot_memory_state(&self.session_memory);
                 memory_state.prompt_memory = Some(self.last_prompt_memory.clone());
+                memory_state.memory_diagnostics = self.last_memory_diagnostics.clone();
                 memory_state
             }),
         })
@@ -852,6 +921,18 @@ async fn build_provider_messages(session: &mut SessionContext) -> Result<Vec<Mes
     })?;
     session.last_prompt_memory = injection.summary.clone();
     session.last_prompt_memory_user_index = injection.latest_user_index;
+    let mut diagnostics = session
+        .last_memory_diagnostics
+        .clone()
+        .unwrap_or_else(|| default_turn_diagnostics_for_session(session));
+    diagnostics.prompt_memory.mode = injection.diagnostics.mode;
+    diagnostics.prompt_memory.injection_ran = injection.diagnostics.injection_ran;
+    diagnostics.prompt_memory.status = injection.diagnostics.status;
+    diagnostics.prompt_memory.reason = injection.diagnostics.reason;
+    diagnostics.prompt_memory.selected_entries = injection.diagnostics.selected_entries.clone();
+    diagnostics.prompt_memory.skipped_entries = injection.diagnostics.skipped_entries.clone();
+    diagnostics.prompt_memory.truncated = injection.diagnostics.truncated;
+    session.last_memory_diagnostics = Some(diagnostics);
 
     let mut messages = compaction::build_micro_compacted_history(&session.history);
     if let Some(system_suffix) = injection.system_prompt_suffix.as_deref() {
@@ -1439,11 +1520,24 @@ async fn compact_session_history(
     let plan = if let Some(plan) =
         compaction::session_memory_compaction_plan(&session.session_memory, &session.history).await
     {
+        let diagnostics = ensure_turn_diagnostics(session);
+        diagnostics.session_memory.compaction.status = MemoryStatus::Succeeded;
+        diagnostics.session_memory.compaction.source =
+            Some(CompactionSourceDiagnostics::SessionMemory);
+        diagnostics.session_memory.compaction.reason = None;
+        diagnostics.session_memory.compaction.tail_start = Some(plan.tail_start);
         plan
     } else {
         let summary =
             summarize_history(provider, session_id, &archive_ref, trigger, &prefix).await?;
-        compaction::legacy_compaction_plan(&session.history, summary)
+        let plan = compaction::legacy_compaction_plan(&session.history, summary);
+        let diagnostics = ensure_turn_diagnostics(session);
+        diagnostics.session_memory.compaction.status = MemoryStatus::Skipped;
+        diagnostics.session_memory.compaction.source =
+            Some(CompactionSourceDiagnostics::LegacySummarizer);
+        diagnostics.session_memory.compaction.reason = Some(MemoryDecisionReason::Fallback);
+        diagnostics.session_memory.compaction.tail_start = Some(plan.tail_start);
+        plan
     };
     if plan.source == compaction::CompactionSource::LegacySummarizer {
         debug_log_session(session_id, "compaction used legacy summarizer");
@@ -3037,6 +3131,8 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         session.suspended_wait = None;
                         session.state = SessionState::Streaming;
                         session.history.push(Message::user(&content));
+                        session.last_memory_diagnostics =
+                            Some(default_turn_diagnostics_for_session(session));
                     }
                     let _ = handle
                         .output
@@ -3317,6 +3413,24 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     }
                     if let Some(timestamp) = refreshed_at {
                         session.session_memory.last_refresh_at = Some(timestamp);
+                    }
+                    let diagnostics = ensure_turn_diagnostics(session);
+                    diagnostics.session_memory.refresh.attempted = true;
+                    if let Some(index) = last_summarized_message_index {
+                        diagnostics.session_memory.refresh.status = MemoryStatus::Succeeded;
+                        diagnostics.session_memory.refresh.reason = None;
+                        diagnostics
+                            .session_memory
+                            .refresh
+                            .last_summarized_message_index = Some(index);
+                    } else {
+                        diagnostics.session_memory.refresh.status = MemoryStatus::FailedBestEffort;
+                        diagnostics.session_memory.refresh.reason =
+                            Some(MemoryDecisionReason::MissingSummary);
+                    }
+                    if let Some(timestamp) = refreshed_at {
+                        diagnostics.session_memory.refresh.refreshed_at =
+                            Some(timestamp.to_rfc3339());
                     }
                     emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
                 }
@@ -3848,6 +3962,18 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         assert!(summary.contains("Memory summary from summary.md"));
         assert!(summary.contains("Context compacted from archive"));
         assert_eq!(session.history.len(), 4);
+        let diagnostics = session
+            .last_memory_diagnostics
+            .as_ref()
+            .expect("compaction diagnostics should be recorded");
+        assert_eq!(
+            diagnostics.session_memory.compaction.status,
+            MemoryStatus::Succeeded
+        );
+        assert_eq!(
+            diagnostics.session_memory.compaction.source,
+            Some(CompactionSourceDiagnostics::SessionMemory)
+        );
         let archive_dir = temp
             .path()
             .join("compactions")
@@ -3883,6 +4009,22 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         assert_eq!(provider.call_count(), 1);
         let summary = compacted_summary_text(&session.history);
         assert!(summary.contains("legacy summary"));
+        let diagnostics = session
+            .last_memory_diagnostics
+            .as_ref()
+            .expect("fallback diagnostics should be recorded");
+        assert_eq!(
+            diagnostics.session_memory.compaction.status,
+            MemoryStatus::Skipped
+        );
+        assert_eq!(
+            diagnostics.session_memory.compaction.source,
+            Some(CompactionSourceDiagnostics::LegacySummarizer)
+        );
+        assert_eq!(
+            diagnostics.session_memory.compaction.reason,
+            Some(MemoryDecisionReason::Fallback)
+        );
     }
 
     #[tokio::test]
@@ -5404,6 +5546,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                         last_extracted_message_index: Some(1),
                     }),
                     prompt_memory: None,
+                    memory_diagnostics: None,
                 }),
             }],
             crate::persistence::PersistedSessionTree {

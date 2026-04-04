@@ -56,6 +56,8 @@ pub struct PersistedMemoryState {
     pub persistent_memory: Option<PersistedPersistentMemoryState>,
     #[serde(default)]
     pub prompt_memory: Option<PersistedPromptMemoryState>,
+    #[serde(default)]
+    pub memory_diagnostics: Option<crate::memory::MemoryTurnDiagnostics>,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -236,6 +238,7 @@ mod tests {
                 skipped_reasons: vec!["budget".into()],
                 truncated: true,
             }),
+            memory_diagnostics: None,
         };
         let json = serde_json::to_value(&state).unwrap();
         assert!(json.get("summary").is_none());

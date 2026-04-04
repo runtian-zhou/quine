@@ -4,7 +4,7 @@ pub mod engine;
 pub mod error;
 pub mod filesystem;
 pub mod ipc;
-mod memory;
+pub mod memory;
 pub mod persistence;
 pub mod planner;
 mod scheduler;
@@ -19,6 +19,12 @@ pub use channel::{
 pub use engine::{run_core_loop, run_core_loop_with_compaction};
 pub use error::CoreError;
 pub use filesystem::{DirEntry, FsError, NullFilesystem, OverlayFilesystem, SessionFilesystem};
+pub use memory::{
+    CompactionSourceDiagnostics, MemoryDecisionReason, MemorySelectionEntryDiagnostics,
+    MemorySkippedEntryDiagnostics, MemoryStatus, MemoryTurnDiagnostics,
+    PersistentExtractionDiagnostics, PersistentMemoryDiagnostics, PromptMemoryDiagnostics,
+    SessionMemoryDiagnostics, SessionRefreshDiagnostics,
+};
 pub use persistence::{
     CoreCheckpoint, PersistedMemoryState, PersistedPersistentMemoryState, PersistedPlanStore,
     PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
