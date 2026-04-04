@@ -326,7 +326,7 @@ fn push_conversation_entry_lines(
             lines.push(Line::from(spans));
             if tool_name == "plan" {
                 if let Some(preview) = result_preview {
-                    for line in preview.lines() {
+                    for line in preview.lines().filter(|line| !line.trim().is_empty()) {
                         let style = if line.starts_with("Plan:") {
                             Style::default()
                                 .fg(Color::White)
@@ -470,6 +470,7 @@ fn is_tool_group_entry(entry: &ConversationEntry) -> bool {
         entry,
         ConversationEntry::ToolCall { .. }
             | ConversationEntry::PatchPreview(_)
+            | ConversationEntry::PlanBox(_)
             | ConversationEntry::PlanProgress { .. }
             | ConversationEntry::TurnInfo { .. }
     )
@@ -1803,6 +1804,58 @@ mod tests {
 
         assert_eq!(turn_info_index - tool_index, 1);
         assert!(!rendered[tool_index + 1].is_empty());
+    }
+
+    #[test]
+    fn draw_groups_tool_call_and_plan_box_without_blank_lines() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "plan".into(),
+            tool_use_id: "tc1".into(),
+            summary: "create_plan: Demo".into(),
+            status: ToolStatus::Success { duration_us: 42 },
+            result_preview: None,
+        });
+        app.messages.push(ConversationEntry::PlanBox(
+            "Plan: Demo\n🟢 [a1] First task\n✅ [a2] Done task".into(),
+        ));
+
+        let lines = build_conversation_lines(&app, 60);
+        let rendered: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        let tool_index = rendered
+            .iter()
+            .position(|line| line.contains("plan: create_plan: Demo"))
+            .unwrap();
+        let plan_top_index = rendered.iter().position(|line| line.contains("┌")).unwrap();
+
+        assert_eq!(plan_top_index - tool_index, 1);
+        assert!(!rendered[tool_index + 1].is_empty());
+    }
+
+    #[test]
+    fn draw_skips_blank_line_in_plan_tool_preview() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "plan".into(),
+            tool_use_id: "tc1".into(),
+            summary: "create_plan: Demo".into(),
+            status: ToolStatus::Success { duration_us: 42 },
+            result_preview: Some("Plan created (ID: 123)\n\nPlan: Branch, commit, and attempt PR flow".into()),
+        });
+
+        let lines = build_conversation_lines(&app, 100);
+        let rendered: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        let created_index = rendered
+            .iter()
+            .position(|line| line.contains("Plan created (ID: 123)"))
+            .unwrap();
+        let plan_index = rendered
+            .iter()
+            .position(|line| line.contains("Plan: Branch, commit, and attempt PR flow"))
+            .unwrap();
+
+        assert_eq!(plan_index - created_index, 1);
+        assert!(!rendered[created_index + 1].trim().is_empty());
     }
 
     #[test]
