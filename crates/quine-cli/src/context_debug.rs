@@ -103,6 +103,39 @@ pub(crate) enum MemoryDecisionReasonSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PersistentMemoryScopeSnapshot {
+    Project {
+        project_key: String,
+    },
+    Agent {
+        project_key: String,
+        agent_key: String,
+    },
+    Team {
+        team_key: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryConflictResolutionSnapshot {
+    PreferNarrowerScope,
+    PreferBroaderScope,
+    PreferMostRecentlyUpdated,
+    ErrorOnConflictingWrites,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum MemoryAuthorizationReasonSnapshot {
+    ScopeDisabled,
+    ScopeUnavailable,
+    TrustedWorkspaceRequired,
+    ExplicitIntentRequired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum CompactionSourceSnapshot {
     SessionMemory,
@@ -175,6 +208,12 @@ pub(crate) struct PersistentExtractionDiagnosticsSnapshot {
 pub(crate) struct PersistentMemoryDiagnosticsSnapshot {
     pub enabled: bool,
     pub project_root: Option<PathBuf>,
+    pub readable_scopes: Vec<PersistentMemoryScopeSnapshot>,
+    pub writable_scope: Option<PersistentMemoryScopeSnapshot>,
+    pub conflict_resolution: Option<MemoryConflictResolutionSnapshot>,
+    pub conflict_winner_scope: Option<PersistentMemoryScopeSnapshot>,
+    pub write_status: MemoryStatusSnapshot,
+    pub write_reason: Option<MemoryAuthorizationReasonSnapshot>,
     pub extraction: PersistentExtractionDiagnosticsSnapshot,
 }
 
@@ -302,6 +341,12 @@ mod tests {
                 "persistent_memory": {
                     "enabled": true,
                     "project_root": "/tmp/project",
+                    "readable_scopes": [],
+                    "writable_scope": null,
+                    "conflict_resolution": null,
+                    "conflict_winner_scope": null,
+                    "write_status": "not_run",
+                    "write_reason": null,
                     "extraction": {
                         "attempted": false,
                         "status": "not_run",

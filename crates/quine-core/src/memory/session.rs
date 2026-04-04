@@ -106,6 +106,7 @@ pub(crate) fn snapshot_memory_state(state: &SessionMemoryState) -> PersistedMemo
         persistent_memory: Some(PersistedPersistentMemoryState {
             enabled: state.persistent_enabled,
             last_extracted_message_index: state.last_persistent_extracted_message_index,
+            scope_state: None,
         }),
         prompt_memory: None,
         memory_diagnostics: None,
@@ -206,6 +207,7 @@ mod tests {
             persistent_memory: Some(PersistedPersistentMemoryState {
                 enabled: true,
                 last_extracted_message_index: Some(11),
+                scope_state: None,
             }),
             prompt_memory: None,
             memory_diagnostics: None,

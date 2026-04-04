@@ -18,10 +18,11 @@ use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
 use crate::memory::{
     build_prompt_memory_injection, default_turn_diagnostics, project_root_for_prompt_memory,
-    refresh_summary_from_history, restore_memory_state, should_refresh_summary,
-    snapshot_memory_state, splice_prompt_memory_messages, CompactionSourceDiagnostics,
-    MemoryDecisionReason, MemoryDiagnostics, MemoryStatus, MemoryTurnDiagnostics,
-    SessionMemoryState,
+    refresh_summary_from_history, resolve_scoped_memory_paths, restore_memory_state,
+    should_refresh_summary, snapshot_memory_state, snapshot_scoped_persistent_memory_state,
+    splice_prompt_memory_messages, CompactionSourceDiagnostics, MemoryDecisionReason,
+    MemoryDiagnostics, MemoryPolicyConfig, MemoryStatus, MemoryTurnDiagnostics,
+    ScopedMemoryResolution, ScopedPersistentMemoryState, SessionMemoryState,
 };
 use crate::persistence::{
     CoreCheckpoint, PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
@@ -148,12 +149,25 @@ fn default_turn_diagnostics_for_session(session: &SessionContext) -> MemoryTurnD
         session.persisted_config.prompt_memory_mode,
         project_root_for_prompt_memory(&session.persisted_config.working_directory),
         session.session_memory.persistent_enabled,
+        Some(&session.scoped_persistent_memory_state),
     )
 }
 
 fn ensure_turn_diagnostics(session: &mut SessionContext) -> &mut MemoryTurnDiagnostics {
     let default = default_turn_diagnostics_for_session(session);
     session.last_memory_diagnostics.get_or_insert(default)
+}
+
+fn refresh_scoped_memory_state(session: &mut SessionContext) {
+    session.scoped_memory_resolution = resolve_scoped_memory_paths(
+        &session.archive_root.join("memory"),
+        &session.persisted_config.memory_policy,
+        &session.persisted_config.working_directory,
+        session.persisted_config.agent_key.as_deref(),
+        session.persisted_config.team_key.as_deref(),
+    );
+    session.scoped_persistent_memory_state =
+        snapshot_scoped_persistent_memory_state(&session.scoped_memory_resolution);
 }
 
 /// System prompt prepended in plan mode to restrict the agent to planning-only work.
@@ -245,6 +259,9 @@ struct SessionContext {
     last_prompt_memory: PersistedPromptMemoryState,
     /// Latest user-message index used for prompt-memory de-duplication.
     last_prompt_memory_user_index: Option<usize>,
+    /// Resolved durable-memory scope state for this session.
+    scoped_memory_resolution: ScopedMemoryResolution,
+    scoped_persistent_memory_state: ScopedPersistentMemoryState,
 }
 
 #[derive(Clone)]
@@ -305,6 +322,9 @@ struct SessionInit {
     archive_root: PathBuf,
     max_context_window: Option<u64>,
     prompt_memory_mode: PromptMemoryMode,
+    agent_key: Option<String>,
+    team_key: Option<String>,
+    memory_policy: MemoryPolicyConfig,
 }
 
 impl SessionInit {
@@ -319,6 +339,9 @@ impl SessionInit {
             working_directory: self.working_directory.clone(),
             plan_mode: self.plan_mode,
             prompt_memory_mode: self.prompt_memory_mode,
+            agent_key: self.agent_key.clone(),
+            team_key: self.team_key.clone(),
+            memory_policy: self.memory_policy.clone(),
         }
     }
 }
@@ -422,6 +445,9 @@ impl SessionContext {
             initial_messages,
             archive_root,
             max_context_window,
+            agent_key,
+            team_key,
+            memory_policy,
             ..
         } = init;
         let filesystem = Arc::new(
@@ -437,6 +463,15 @@ impl SessionContext {
         let persistent_enabled = session_memory.persistent_enabled;
         let summary_path = session_memory.paths.summary_path.clone();
         let metadata_path = session_memory.paths.metadata_path.clone();
+        let scoped_memory_resolution = resolve_scoped_memory_paths(
+            &archive_root.join("memory"),
+            &memory_policy,
+            &working_directory,
+            agent_key.as_deref(),
+            team_key.as_deref(),
+        );
+        let scoped_persistent_memory_state =
+            snapshot_scoped_persistent_memory_state(&scoped_memory_resolution);
 
         let tool_registry = build_tool_registry_for_session(
             provider,
@@ -483,12 +518,15 @@ impl SessionContext {
                 persisted_config.prompt_memory_mode,
                 project_root_for_prompt_memory(&persisted_config.working_directory),
                 persistent_enabled,
+                Some(&scoped_persistent_memory_state),
             )),
             last_prompt_memory: PersistedPromptMemoryState {
                 mode: persisted_config.prompt_memory_mode,
                 ..PersistedPromptMemoryState::default()
             },
             last_prompt_memory_user_index: None,
+            scoped_memory_resolution,
+            scoped_persistent_memory_state,
         })
     }
 
@@ -520,6 +558,9 @@ impl SessionContext {
                 archive_root,
                 max_context_window,
                 prompt_memory_mode: config.prompt_memory_mode,
+                agent_key: config.agent_key.clone(),
+                team_key: config.team_key.clone(),
+                memory_policy: config.memory_policy.clone(),
             },
             provider,
         )
@@ -570,6 +611,15 @@ impl SessionContext {
         session.last_memory_diagnostics = memory_state
             .as_ref()
             .and_then(|state| state.memory_diagnostics.clone());
+        if let Some(scope_state) = memory_state
+            .as_ref()
+            .and_then(|state| state.persistent_memory.as_ref())
+            .and_then(|state| state.scope_state.clone())
+        {
+            session.scoped_persistent_memory_state = scope_state;
+        } else {
+            refresh_scoped_memory_state(&mut session);
+        }
         Ok((session_id, session))
     }
 
@@ -586,6 +636,9 @@ impl SessionContext {
                 let mut memory_state = snapshot_memory_state(&self.session_memory);
                 memory_state.prompt_memory = Some(self.last_prompt_memory.clone());
                 memory_state.memory_diagnostics = self.last_memory_diagnostics.clone();
+                if let Some(persistent) = memory_state.persistent_memory.as_mut() {
+                    persistent.scope_state = Some(self.scoped_persistent_memory_state.clone());
+                }
                 memory_state
             }),
         })
@@ -613,6 +666,7 @@ impl SessionContext {
             &skills,
             None,
         );
+        refresh_scoped_memory_state(self);
 
         match &self.system_prompt {
             Some(prompt) => {
@@ -902,6 +956,7 @@ async fn call_llm(
 }
 
 async fn build_provider_messages(session: &mut SessionContext) -> Result<Vec<Message>, CoreError> {
+    refresh_scoped_memory_state(session);
     let previous_selection =
         if session.last_prompt_memory_user_index == latest_user_message_index(&session.history) {
             session.last_prompt_memory.selected_entry_ids.clone()
@@ -909,11 +964,11 @@ async fn build_provider_messages(session: &mut SessionContext) -> Result<Vec<Mes
             Vec::new()
         };
     let injection = build_prompt_memory_injection(
-        &session.archive_root,
-        &session.persisted_config.working_directory,
+        &session.scoped_memory_resolution.readable_scopes,
         session.persisted_config.prompt_memory_mode,
         &session.history,
         &previous_selection,
+        session.scoped_memory_resolution.conflict_resolution,
     )
     .await
     .map_err(|error| CoreError::Internal {
@@ -932,6 +987,18 @@ async fn build_provider_messages(session: &mut SessionContext) -> Result<Vec<Mes
     diagnostics.prompt_memory.selected_entries = injection.diagnostics.selected_entries.clone();
     diagnostics.prompt_memory.skipped_entries = injection.diagnostics.skipped_entries.clone();
     diagnostics.prompt_memory.truncated = injection.diagnostics.truncated;
+    diagnostics.persistent_memory.readable_scopes = session
+        .scoped_persistent_memory_state
+        .readable_scopes
+        .clone();
+    diagnostics.persistent_memory.writable_scope = session
+        .scoped_persistent_memory_state
+        .writable_scope
+        .clone();
+    diagnostics.persistent_memory.conflict_resolution =
+        Some(session.scoped_persistent_memory_state.conflict_resolution);
+    diagnostics.persistent_memory.conflict_winner_scope =
+        injection.diagnostics.conflict_winner_scope.clone();
     session.last_memory_diagnostics = Some(diagnostics);
 
     let mut messages = compaction::build_micro_compacted_history(&session.history);
@@ -1743,6 +1810,9 @@ async fn start_child_session(
             archive_root,
             max_context_window,
             prompt_memory_mode: PromptMemoryMode::Disabled,
+            agent_key: None,
+            team_key: None,
+            memory_policy: MemoryPolicyConfig::default(),
         },
         engine.provider,
     )
@@ -3030,6 +3100,9 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 skills,
                 plan_mode,
                 initial_messages,
+                agent_key,
+                team_key,
+                memory_policy,
                 reply,
             } => {
                 debug_log_session(
@@ -3060,6 +3133,9 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         archive_root: archive_root.clone(),
                         max_context_window,
                         prompt_memory_mode: prompt_memory_mode_from_env(),
+                        agent_key,
+                        team_key,
+                        memory_policy,
                     },
                     &provider,
                 )
@@ -3777,6 +3853,9 @@ mod tests {
                 archive_root,
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             provider,
         )
@@ -3887,6 +3966,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root,
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4256,6 +4338,125 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         }
     }
 
+    #[tokio::test]
+    async fn targeted_recall_prefers_agent_scope_when_configured_for_narrower_conflicts() {
+        let temp = TempDir::new().unwrap();
+        let project_dir = temp.path().join("project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        std::fs::write(project_dir.join("CLAUDE.md"), "# project\n").unwrap();
+
+        let provider = Arc::new(CountingProvider::new("ok"));
+        let provider_dyn: Arc<dyn LlmProvider> = provider.clone();
+        let history = vec![
+            Message::system("system"),
+            Message::user("What editor should I use for this task?"),
+        ];
+        let (_session_id, mut session) =
+            make_session_for_compaction(&provider_dyn, temp.path().to_path_buf(), history).await;
+        session.persisted_config.working_directory = project_dir.clone();
+        session.persisted_config.prompt_memory_mode = PromptMemoryMode::TargetedRecall;
+        session.persisted_config.agent_key = Some("planner".into());
+        session.persisted_config.memory_policy = MemoryPolicyConfig {
+            flags: crate::memory::MemoryFeatureFlags {
+                advanced_scopes_enabled: true,
+                agent_memory_enabled: true,
+                ..crate::memory::MemoryFeatureFlags::default()
+            },
+            read_policy: crate::memory::MemoryReadPolicy {
+                allow_cross_scope_recall: false,
+                ..crate::memory::MemoryReadPolicy::default()
+            },
+            lookup_order: crate::memory::ScopedMemoryLookupOrder::ProjectThenAgent,
+            conflict_resolution: crate::memory::MemoryConflictResolution::PreferNarrowerScope,
+            ..MemoryPolicyConfig::default()
+        };
+
+        let project_root = temp
+            .path()
+            .join("memory")
+            .join("projects")
+            .join(crate::memory::project_key(&project_dir));
+        let agent_root = temp
+            .path()
+            .join("memory")
+            .join("agents")
+            .join(crate::memory::project_key(&project_dir))
+            .join("planner");
+        std::fs::create_dir_all(project_root.join("entries")).unwrap();
+        std::fs::create_dir_all(agent_root.join("entries")).unwrap();
+        std::fs::write(
+            project_root.join("index.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "entries": [{
+                    "entry_id": "editor-style",
+                    "title": "Preferred editor",
+                    "summary": "Preferred editor: vim",
+                    "slug": "editor-style",
+                    "path": "entries/editor-style.md",
+                    "updated_at": "2026-04-04T00:00:00Z",
+                    "keywords": ["editor", "vim"],
+                    "pinned": false
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            agent_root.join("index.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "entries": [{
+                    "entry_id": "editor-style",
+                    "title": "Preferred editor",
+                    "summary": "Preferred editor: helix",
+                    "slug": "editor-style",
+                    "path": "entries/editor-style.md",
+                    "updated_at": "2026-04-04T00:00:00Z",
+                    "keywords": ["editor", "helix"],
+                    "pinned": false
+                }]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(
+            project_root.join("entries/editor-style.md"),
+            "---\nentry_id: editor-style\ntitle: Preferred editor\nsummary: \"Preferred editor: vim\"\nkeywords:\n  - editor\n  - vim\nupdated_at: 2026-04-04T00:00:00Z\npinned: false\n---\n\nPreferred editor: vim\n",
+        )
+        .unwrap();
+        std::fs::write(
+            agent_root.join("entries/editor-style.md"),
+            "---\nentry_id: editor-style\ntitle: Preferred editor\nsummary: \"Preferred editor: helix\"\nkeywords:\n  - editor\n  - helix\nupdated_at: 2026-04-04T00:00:00Z\npinned: false\n---\n\nPreferred editor: helix\n",
+        )
+        .unwrap();
+
+        let built = build_provider_messages(&mut session).await.unwrap();
+        assert_eq!(
+            session.last_prompt_memory.selected_entry_ids,
+            vec!["editor-style"]
+        );
+        let latest_user_index = built
+            .iter()
+            .rposition(|message| message.role == quine_llm::Role::User)
+            .unwrap();
+        match &built[latest_user_index - 1].content {
+            MessageContent::Text(text) => assert!(text.contains("helix")),
+            other => panic!("expected injected reminder, got {other:?}"),
+        }
+        assert_eq!(
+            session
+                .last_memory_diagnostics
+                .as_ref()
+                .and_then(|diagnostics| diagnostics
+                    .persistent_memory
+                    .conflict_winner_scope
+                    .clone()),
+            Some(crate::memory::PersistentMemoryScope::agent(
+                crate::memory::project_key(&project_dir),
+                "planner",
+            ))
+        );
+    }
+
     #[test]
     fn wait_graph_cycle_detection_catches_indirect_cycles() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
@@ -4276,6 +4477,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-a"),
                     max_context_window: None,
                     prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 &provider,
             ))
@@ -4292,6 +4496,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-b"),
                     max_context_window: None,
                     prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 &provider,
             ))
@@ -4308,6 +4515,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-c"),
                     max_context_window: None,
                     prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 &provider,
             ))
@@ -4360,6 +4570,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     archive_root: std::env::temp_dir().join("quine-core-timeout-a"),
                     max_context_window: None,
                     prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 &provider,
             ))
@@ -4376,6 +4589,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     archive_root: std::env::temp_dir().join("quine-core-timeout-b"),
                     max_context_window: None,
                     prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 &provider,
             ))
@@ -4413,6 +4629,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root: std::env::temp_dir().join("quine-core-timeout-resume"),
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4483,6 +4702,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root: std::env::temp_dir().join("quine-core-mailbox-resume"),
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4551,6 +4773,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4631,6 +4856,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4732,6 +4960,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -4948,6 +5179,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -5005,6 +5239,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -5074,6 +5311,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -5133,6 +5373,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -5172,6 +5415,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 archive_root: archive_root.clone(),
                 max_context_window: None,
                 prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
             },
             &provider,
         )
@@ -5227,6 +5473,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: create_reply_tx,
             })
             .await
@@ -5300,6 +5549,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5335,6 +5587,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5414,6 +5669,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5480,6 +5738,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     skills: Vec::new(),
                     plan_mode: false,
                     initial_messages: Vec::new(),
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                     reply: reply_tx,
                 })
                 .await
@@ -5529,6 +5790,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     working_directory: std::env::current_dir().unwrap_or_default(),
                     plan_mode: false,
                     prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                 },
                 history: vec![
                     Message::user("seed session memory"),
@@ -5544,6 +5808,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     persistent_memory: Some(crate::persistence::PersistedPersistentMemoryState {
                         enabled: true,
                         last_extracted_message_index: Some(1),
+                        scope_state: None,
                     }),
                     prompt_memory: None,
                     memory_diagnostics: None,
@@ -5637,6 +5902,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5688,6 +5956,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5745,6 +6016,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5761,6 +6035,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5790,6 +6067,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -5899,6 +6179,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -6021,6 +6304,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -6145,6 +6431,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -6204,6 +6493,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: vec![seeded_message.clone()],
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await
@@ -6235,6 +6527,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     skills: Vec::new(),
                     plan_mode: false,
                     initial_messages: Vec::new(),
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
                     reply: reply_tx,
                 })
                 .await
@@ -6371,6 +6666,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
             .await

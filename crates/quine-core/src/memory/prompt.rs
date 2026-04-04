@@ -5,11 +5,11 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use quine_llm::{Message, Role};
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 use super::{
-    MemoryDecisionReason, MemorySelectionEntryDiagnostics, MemorySkippedEntryDiagnostics,
-    MemoryStatus,
+    compare_scope_priority, MemoryConflictResolution, MemoryDecisionReason,
+    MemorySelectionEntryDiagnostics, MemorySkippedEntryDiagnostics, MemoryStatus,
+    PersistentMemoryScope, ScopedMemoryPaths,
 };
 use crate::persistence::{PersistedPromptMemoryState, PromptMemoryMode};
 
@@ -57,6 +57,13 @@ struct PersistentMemoryRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct ScopedPersistentMemoryIndexEntry {
+    scope: PersistentMemoryScope,
+    root: std::path::PathBuf,
+    entry: PersistentMemoryIndexEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PromptMemoryRunDiagnostics {
     pub(crate) mode: PromptMemoryMode,
     pub(crate) injection_ran: bool,
@@ -65,6 +72,7 @@ pub(crate) struct PromptMemoryRunDiagnostics {
     pub(crate) selected_entries: Vec<MemorySelectionEntryDiagnostics>,
     pub(crate) skipped_entries: Vec<MemorySkippedEntryDiagnostics>,
     pub(crate) truncated: bool,
+    pub(crate) conflict_winner_scope: Option<PersistentMemoryScope>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,11 +85,11 @@ pub(crate) struct PromptMemoryInjection {
 }
 
 pub(crate) async fn build_prompt_memory_injection(
-    archive_root: &Path,
-    working_directory: &Path,
+    readable_scopes: &[ScopedMemoryPaths],
     mode: PromptMemoryMode,
     history: &[Message],
     previously_selected_entry_ids: &[String],
+    conflict_resolution: MemoryConflictResolution,
 ) -> Result<PromptMemoryInjection> {
     let latest_user_index = latest_user_message_index(history);
     let empty = |reason: Option<MemoryDecisionReason>| PromptMemoryInjection {
@@ -104,13 +112,14 @@ pub(crate) async fn build_prompt_memory_injection(
             selected_entries: Vec::new(),
             skipped_entries: Vec::new(),
             truncated: false,
+            conflict_winner_scope: None,
         },
     };
 
     match mode {
         PromptMemoryMode::Disabled => Ok(empty(Some(MemoryDecisionReason::Disabled))),
         PromptMemoryMode::IndexOnly => {
-            let Some(memory_md) = load_memory_md(archive_root, working_directory).await? else {
+            let Some(memory_md) = load_memory_md(readable_scopes).await? else {
                 return Ok(empty(Some(MemoryDecisionReason::NoIndex)));
             };
             let (truncated, body) = truncate_chars(&memory_md, INDEX_ONLY_CHAR_BUDGET);
@@ -133,6 +142,7 @@ pub(crate) async fn build_prompt_memory_injection(
                     selected_entries: Vec::new(),
                     skipped_entries: Vec::new(),
                     truncated,
+                    conflict_winner_scope: None,
                 },
             })
         }
@@ -140,9 +150,10 @@ pub(crate) async fn build_prompt_memory_injection(
             let Some(query) = latest_user_text(history) else {
                 return Ok(empty(Some(MemoryDecisionReason::NoQuery)));
             };
-            let Some(index) = load_memory_index(archive_root, working_directory).await? else {
+            let scoped_entries = load_memory_index_entries(readable_scopes).await?;
+            if scoped_entries.is_empty() {
                 return Ok(empty(Some(MemoryDecisionReason::NoIndex)));
-            };
+            }
             let normalized_query = tokenize(&query);
             if normalized_query.is_empty() {
                 return Ok(empty(Some(MemoryDecisionReason::NoQuery)));
@@ -152,14 +163,15 @@ pub(crate) async fn build_prompt_memory_injection(
                 .iter()
                 .map(String::as_str)
                 .collect();
-            let mut candidates: Vec<_> = index
-                .entries
+            let (resolved_entries, conflict_winner_scope) =
+                resolve_conflicts(scoped_entries, conflict_resolution);
+            let mut candidates: Vec<_> = resolved_entries
                 .into_iter()
                 .map(|entry| {
-                    if exclude.contains(entry.entry_id.as_str()) {
+                    if exclude.contains(entry.entry.entry_id.as_str()) {
                         return (entry, 0usize, Some(MemoryDecisionReason::Duplicate));
                     }
-                    let overlap = candidate_overlap_score(&normalized_query, &entry);
+                    let overlap = candidate_overlap_score(&normalized_query, &entry.entry);
                     if overlap > 0 {
                         (entry, overlap, None)
                     } else {
@@ -174,12 +186,11 @@ pub(crate) async fn build_prompt_memory_injection(
             candidates.sort_by(|(left, left_overlap, _), (right, right_overlap, _)| {
                 right_overlap
                     .cmp(left_overlap)
-                    .then_with(|| right.pinned.cmp(&left.pinned))
-                    .then_with(|| right.updated_at.cmp(&left.updated_at))
-                    .then_with(|| left.entry_id.cmp(&right.entry_id))
+                    .then_with(|| right.entry.pinned.cmp(&left.entry.pinned))
+                    .then_with(|| right.entry.updated_at.cmp(&left.entry.updated_at))
+                    .then_with(|| left.entry.entry_id.cmp(&right.entry.entry_id))
             });
 
-            let base_dir = memory_project_root(archive_root, working_directory);
             let mut total_chars = 0usize;
             let mut inserted_messages = Vec::new();
             let mut selected_entry_ids = Vec::new();
@@ -193,11 +204,11 @@ pub(crate) async fn build_prompt_memory_injection(
                 if let Some(reason) = preset_reason {
                     skipped_reasons.push(format!(
                         "{}:{}",
-                        entry.entry_id,
+                        entry.entry.entry_id,
                         decision_reason_code(reason)
                     ));
                     skipped_entries.push(MemorySkippedEntryDiagnostics {
-                        entry_id: entry.entry_id,
+                        entry_id: entry.entry.entry_id,
                         reason,
                     });
                     continue;
@@ -206,14 +217,14 @@ pub(crate) async fn build_prompt_memory_injection(
                     continue;
                 }
                 if selected_entry_ids.len() >= TARGETED_MAX_ENTRIES {
-                    skipped_reasons.push(format!("{}:budget", entry.entry_id));
+                    skipped_reasons.push(format!("{}:budget", entry.entry.entry_id));
                     skipped_entries.push(MemorySkippedEntryDiagnostics {
-                        entry_id: entry.entry_id,
+                        entry_id: entry.entry.entry_id,
                         reason: MemoryDecisionReason::Budget,
                     });
                     continue;
                 }
-                let record = load_record(&base_dir, &entry.path).await?;
+                let record = load_record(&entry.root, &entry.entry.path).await?;
                 let (entry_truncated, body) =
                     truncate_chars(&record.body, TARGETED_ENTRY_CHAR_BUDGET);
                 let reminder = format!(
@@ -222,9 +233,9 @@ pub(crate) async fn build_prompt_memory_injection(
                 );
                 let reminder_chars = reminder.chars().count();
                 if total_chars + reminder_chars > TARGETED_TOTAL_CHAR_BUDGET {
-                    skipped_reasons.push(format!("{}:budget", entry.entry_id));
+                    skipped_reasons.push(format!("{}:budget", entry.entry.entry_id));
                     skipped_entries.push(MemorySkippedEntryDiagnostics {
-                        entry_id: entry.entry_id,
+                        entry_id: entry.entry.entry_id,
                         reason: MemoryDecisionReason::Budget,
                     });
                     continue;
@@ -236,7 +247,7 @@ pub(crate) async fn build_prompt_memory_injection(
                 selected_entries.push(MemorySelectionEntryDiagnostics {
                     entry_id: record.frontmatter.entry_id.clone(),
                     title: record.frontmatter.title.clone(),
-                    path: entry.path.clone(),
+                    path: entry.entry.path.clone(),
                 });
                 inserted_messages.push(Message {
                     role: Role::System,
@@ -274,6 +285,7 @@ pub(crate) async fn build_prompt_memory_injection(
                     selected_entries,
                     skipped_entries,
                     truncated,
+                    conflict_winner_scope,
                 },
             })
         }
@@ -331,26 +343,49 @@ fn truncate_chars(text: &str, max_chars: usize) -> (bool, String) {
     (true, format!("{clipped}…"))
 }
 
-async fn load_memory_md(archive_root: &Path, working_directory: &Path) -> Result<Option<String>> {
-    let path = memory_project_root(archive_root, working_directory).join("MEMORY.md");
-    match tokio::fs::read_to_string(path).await {
-        Ok(content) => Ok(Some(content)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
+async fn load_memory_md(readable_scopes: &[ScopedMemoryPaths]) -> Result<Option<String>> {
+    let mut sections = Vec::new();
+    for scope in readable_scopes {
+        match tokio::fs::read_to_string(&scope.index_markdown_path).await {
+            Ok(content) => sections.push(format!(
+                "## {} Scope\n\n{}",
+                scope.scope.label(),
+                content.trim()
+            )),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    if sections.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(sections.join("\n\n")))
     }
 }
 
-async fn load_memory_index(
-    archive_root: &Path,
-    working_directory: &Path,
-) -> Result<Option<PersistentMemoryIndex>> {
-    let path = memory_project_root(archive_root, working_directory).join("index.json");
-    let raw = match tokio::fs::read_to_string(path).await {
-        Ok(content) => content,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
-    };
-    Ok(Some(serde_json::from_str(&raw)?))
+async fn load_memory_index_entries(
+    readable_scopes: &[ScopedMemoryPaths],
+) -> Result<Vec<ScopedPersistentMemoryIndexEntry>> {
+    let mut entries = Vec::new();
+    for scope in readable_scopes {
+        let raw = match tokio::fs::read_to_string(&scope.index_json_path).await {
+            Ok(content) => content,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        let index: PersistentMemoryIndex = serde_json::from_str(&raw)?;
+        entries.extend(
+            index
+                .entries
+                .into_iter()
+                .map(|entry| ScopedPersistentMemoryIndexEntry {
+                    scope: scope.scope.clone(),
+                    root: scope.root.clone(),
+                    entry,
+                }),
+        );
+    }
+    Ok(entries)
 }
 
 async fn load_record(base_dir: &Path, relative_path: &str) -> Result<PersistentMemoryRecord> {
@@ -361,7 +396,8 @@ async fn load_record(base_dir: &Path, relative_path: &str) -> Result<PersistentM
 }
 
 fn parse_record(content: &str) -> Result<PersistentMemoryRecord> {
-    let trimmed = content.trim_start();
+    let normalized = content.replace("\r\n", "\n");
+    let trimmed = normalized.trim_start_matches('\u{feff}').trim_start();
     let Some(rest) = trimmed.strip_prefix("---\n") else {
         anyhow::bail!("missing frontmatter delimiter");
     };
@@ -395,37 +431,56 @@ fn decision_reason_code(reason: MemoryDecisionReason) -> &'static str {
 }
 
 pub(crate) fn project_root_for_prompt_memory(working_directory: &Path) -> PathBuf {
-    resolve_project_root(working_directory)
+    super::resolve_project_root(working_directory)
 }
 
-fn memory_project_root(archive_root: &Path, working_directory: &Path) -> PathBuf {
-    archive_root
-        .join("memory")
-        .join("projects")
-        .join(project_key(&resolve_project_root(working_directory)))
-}
-
-fn resolve_project_root(working_directory: &Path) -> PathBuf {
-    let mut current = working_directory.to_path_buf();
-    loop {
-        if current.join(".git").exists()
-            || current.join("CLAUDE.md").exists()
-            || current.join("Cargo.toml").exists()
-        {
-            return current;
-        }
-        if !current.pop() {
-            return working_directory.to_path_buf();
-        }
+fn resolve_conflicts(
+    entries: Vec<ScopedPersistentMemoryIndexEntry>,
+    strategy: MemoryConflictResolution,
+) -> (
+    Vec<ScopedPersistentMemoryIndexEntry>,
+    Option<PersistentMemoryScope>,
+) {
+    let mut grouped: std::collections::BTreeMap<String, Vec<ScopedPersistentMemoryIndexEntry>> =
+        std::collections::BTreeMap::new();
+    for entry in entries {
+        grouped
+            .entry(entry.entry.entry_id.clone())
+            .or_default()
+            .push(entry);
     }
-}
 
-fn project_key(project_root: &Path) -> String {
-    let normalized = project_root.to_string_lossy().replace('\\', "/");
-    let mut hasher = Sha256::new();
-    hasher.update(normalized.as_bytes());
-    let digest = hasher.finalize();
-    hex::encode(&digest[..16])
+    let mut resolved = Vec::new();
+    let mut conflict_winner_scope = None;
+    for mut group in grouped.into_values() {
+        if group.len() == 1 {
+            resolved.push(group.remove(0));
+            continue;
+        }
+        group.sort_by(|left, right| {
+            if matches!(
+                strategy,
+                MemoryConflictResolution::PreferMostRecentlyUpdated
+                    | MemoryConflictResolution::ErrorOnConflictingWrites
+            ) {
+                right
+                    .entry
+                    .updated_at
+                    .cmp(&left.entry.updated_at)
+                    .then_with(|| compare_scope_priority(&left.scope, &right.scope, strategy))
+            } else {
+                compare_scope_priority(&left.scope, &right.scope, strategy)
+            }
+        });
+        if matches!(strategy, MemoryConflictResolution::ErrorOnConflictingWrites) {
+            continue;
+        }
+        if conflict_winner_scope.is_none() {
+            conflict_winner_scope = Some(group[0].scope.clone());
+        }
+        resolved.push(group.remove(0));
+    }
+    (resolved, conflict_winner_scope)
 }
 
 pub(crate) fn splice_prompt_memory_messages(

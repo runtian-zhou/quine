@@ -205,6 +205,21 @@ impl LocalHarness {
                                     .unwrap_or(false);
                                 diagnostics.persistent_memory.project_root =
                                     Some(session.config.working_directory.clone());
+                                diagnostics.persistent_memory.readable_scopes = state
+                                    .persistent_memory
+                                    .as_ref()
+                                    .and_then(|persistent| persistent.scope_state.as_ref())
+                                    .map(|scope_state| scope_state.readable_scopes.clone())
+                                    .unwrap_or_default();
+                                diagnostics.persistent_memory.writable_scope =
+                                    result.writable_scope.clone();
+                                diagnostics.persistent_memory.conflict_resolution = state
+                                    .persistent_memory
+                                    .as_ref()
+                                    .and_then(|persistent| persistent.scope_state.as_ref())
+                                    .map(|scope_state| scope_state.conflict_resolution);
+                                diagnostics.persistent_memory.write_status = result.write_status;
+                                diagnostics.persistent_memory.write_reason = result.write_reason;
                                 diagnostics.persistent_memory.extraction = result.diagnostics;
                                 session.memory_state = Some(state);
                             }
@@ -279,6 +294,9 @@ impl HarnessService for LocalHarness {
                 skills,
                 plan_mode: config.plan_mode,
                 initial_messages: config.initial_messages,
+                agent_key: config.agent_key,
+                team_key: config.team_key,
+                memory_policy: config.memory_policy,
                 reply: reply_tx,
             })
             .await
@@ -1320,6 +1338,96 @@ mod tests {
             Some(value) => unsafe { std::env::set_var("QUINE_PROMPT_MEMORY_MODE", value) },
             None => unsafe { std::env::remove_var("QUINE_PROMPT_MEMORY_MODE") },
         }
+        let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
+    async fn advanced_memory_policy_denies_agent_writes_without_fallback() {
+        let storage = temp_storage();
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let working_directory = storage.root().join("untrusted-project");
+        std::fs::create_dir_all(&working_directory).unwrap();
+
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(working_directory.clone()),
+                agent_key: Some("planner".into()),
+                team_key: Some("infra".into()),
+                memory_policy: quine_core::MemoryPolicyConfig {
+                    flags: quine_core::MemoryFeatureFlags {
+                        advanced_scopes_enabled: true,
+                        agent_memory_enabled: true,
+                        team_memory_enabled: true,
+                        ..quine_core::MemoryFeatureFlags::default()
+                    },
+                    default_write_scope: Some(quine_core::ScopeSelector::Agent),
+                    write_policy: quine_core::MemoryWritePolicy {
+                        require_trusted_workspace_for_writes: true,
+                        require_explicit_user_intent_for_agent_writes: true,
+                        ..quine_core::MemoryWritePolicy::default()
+                    },
+                    ..quine_core::MemoryPolicyConfig::default()
+                },
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+        let mut rx = harness.subscribe();
+
+        harness
+            .send_message(
+                session_id,
+                "Remember: my deployment region is us-west-2.".into(),
+            )
+            .await
+            .unwrap();
+        let reply = wait_for_turn(&mut rx, session_id).await;
+        assert_eq!(reply, "Remember: my deployment region is us-west-2.");
+
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .memory_diagnostics
+                .as_ref()
+                .map(|diagnostics| {
+                    diagnostics
+                        .persistent_memory
+                        .extraction
+                        .last_extracted_message_index
+                        .is_some()
+                })
+                .unwrap_or(false)
+        })
+        .await;
+        let diagnostics = snapshot.memory_diagnostics.unwrap();
+        assert_eq!(
+            diagnostics.persistent_memory.writable_scope,
+            Some(quine_core::PersistentMemoryScope::agent(
+                crate::memory_store::project_key(&working_directory),
+                "planner",
+            ))
+        );
+        assert_eq!(
+            diagnostics.persistent_memory.write_status,
+            quine_core::MemoryStatus::Skipped
+        );
+
+        let agent_root = storage
+            .root()
+            .join("memory")
+            .join("agents")
+            .join(crate::memory_store::project_key(&working_directory))
+            .join("planner");
+        let project_root = storage
+            .root()
+            .join("memory")
+            .join("projects")
+            .join(crate::memory_store::project_key(&working_directory));
+        assert!(!agent_root.exists());
+        assert!(!project_root.exists());
+
+        harness.shutdown().await.unwrap();
         let _ = fs::remove_dir_all(storage.root());
     }
 
