@@ -32,13 +32,17 @@ pub struct HarnessConfig {
     pub socket_path: PathBuf,
     /// Root directory for durable harness state such as checkpoints and compacted transcripts.
     pub state_dir: PathBuf,
+    /// Root directory for project-scoped persistent memory.
+    pub memory_dir: PathBuf,
 }
 
 impl Default for HarnessConfig {
     fn default() -> Self {
+        let state_dir = default_state_dir();
         Self {
             socket_path: default_socket_path(),
-            state_dir: default_state_dir(),
+            memory_dir: default_memory_dir_from_state_dir(&state_dir),
+            state_dir,
         }
     }
 }
@@ -65,6 +69,15 @@ pub fn default_state_dir() -> PathBuf {
     } else {
         PathBuf::from("/tmp").join("quine-state")
     }
+}
+
+/// Returns the default root for durable project-scoped memory.
+pub fn default_memory_dir() -> PathBuf {
+    default_memory_dir_from_state_dir(&default_state_dir())
+}
+
+pub fn default_memory_dir_from_state_dir(state_dir: &std::path::Path) -> PathBuf {
+    state_dir.join("memory")
 }
 
 /// Build an LLM `ProviderConfig` from environment variables.
@@ -172,6 +185,7 @@ fn openai_compat_context_window(model: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn default_config_has_socket_path() {
@@ -224,5 +238,14 @@ mod tests {
     #[test]
     fn default_state_dir_is_non_empty() {
         assert!(!default_state_dir().as_os_str().is_empty());
+    }
+
+    #[test]
+    fn default_memory_dir_extends_state_dir() {
+        let state_dir = Path::new("/tmp/quine-state");
+        assert_eq!(
+            default_memory_dir_from_state_dir(state_dir),
+            PathBuf::from("/tmp/quine-state/memory")
+        );
     }
 }

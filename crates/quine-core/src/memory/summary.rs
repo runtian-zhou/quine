@@ -281,6 +281,8 @@ mod tests {
             last_refresh_at: None,
             template_version: SESSION_MEMORY_TEMPLATE_VERSION,
             refresh_handle: Default::default(),
+            persistent_enabled: true,
+            last_persistent_extracted_message_index: None,
         };
         let history = vec![Message::user("a"), Message::assistant("b")];
         assert!(!should_refresh_summary(&state, &history));
@@ -310,6 +312,8 @@ mod tests {
             last_refresh_at: None,
             template_version: SESSION_MEMORY_TEMPLATE_VERSION,
             refresh_handle: Default::default(),
+            persistent_enabled: true,
+            last_persistent_extracted_message_index: None,
         };
         let history = vec![
             Message::user("inspect crates/quine-core/src/engine.rs"),
