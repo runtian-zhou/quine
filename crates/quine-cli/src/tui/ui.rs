@@ -465,13 +465,31 @@ fn append_live_lines(lines: &mut Vec<Line<'static>>, app: &App) {
     }
 }
 
+fn is_tool_group_entry(entry: &ConversationEntry) -> bool {
+    matches!(
+        entry,
+        ConversationEntry::ToolCall { .. }
+            | ConversationEntry::PatchPreview(_)
+            | ConversationEntry::PlanProgress { .. }
+            | ConversationEntry::TurnInfo { .. }
+    )
+}
+
+fn should_insert_separator(previous: &ConversationEntry, current: &ConversationEntry) -> bool {
+    !(is_tool_group_entry(previous) && is_tool_group_entry(current))
+}
+
 fn build_conversation_lines(app: &App, area_width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (i, entry) in app.messages.iter().enumerate() {
-        if i > 0 {
-            lines.push(Line::from(""));
+    let mut previous_entry: Option<&ConversationEntry> = None;
+    for entry in &app.messages {
+        if let Some(previous) = previous_entry {
+            if should_insert_separator(previous, entry) {
+                lines.push(Line::from(""));
+            }
         }
         push_conversation_entry_lines(&mut lines, entry, area_width, app.max_context_window);
+        previous_entry = Some(entry);
     }
     append_live_lines(&mut lines, app);
     lines
@@ -1720,6 +1738,71 @@ mod tests {
 
         assert_eq!(tool_index - assistant_index, 2);
         assert!(lines[assistant_index + 1].is_empty());
+    }
+
+    #[test]
+    fn draw_groups_adjacent_tool_entries_without_blank_lines() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "bash".into(),
+            tool_use_id: "tc1".into(),
+            summary: "echo test".into(),
+            status: ToolStatus::Success { duration_us: 42 },
+            result_preview: None,
+        });
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "read_file".into(),
+            tool_use_id: "tc2".into(),
+            summary: "src/main.rs".into(),
+            status: ToolStatus::Success { duration_us: 24 },
+            result_preview: None,
+        });
+
+        let backend = ratatui::backend::TestBackend::new(60, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        let first_tool_index = lines
+            .iter()
+            .position(|line| line.contains("bash: echo test"))
+            .unwrap();
+        let second_tool_index = lines
+            .iter()
+            .position(|line| line.contains("read_file: src/main.rs"))
+            .unwrap();
+
+        assert_eq!(second_tool_index - first_tool_index, 1);
+    }
+
+    #[test]
+    fn draw_groups_tool_call_and_turn_info_without_blank_lines() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "bash".into(),
+            tool_use_id: "tc1".into(),
+            summary: "echo test".into(),
+            status: ToolStatus::Success { duration_us: 42 },
+            result_preview: None,
+        });
+        app.messages.push(ConversationEntry::TurnInfo {
+            duration_us: 5_000,
+            usage: None,
+        });
+
+        let lines = build_conversation_lines(&app, 60);
+        let rendered: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        let tool_index = rendered
+            .iter()
+            .position(|line| line.contains("bash: echo test"))
+            .unwrap();
+        let turn_info_index = rendered
+            .iter()
+            .position(|line| line.contains("──"))
+            .unwrap();
+
+        assert_eq!(turn_info_index - tool_index, 1);
+        assert!(!rendered[tool_index + 1].is_empty());
     }
 
     #[test]
