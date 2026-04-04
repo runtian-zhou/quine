@@ -87,8 +87,10 @@ pub(crate) fn build_summary_update(
         return None;
     }
 
-    let slice = &history[from..=to];
-    let document = summarize_messages(slice);
+    // Keep session memory cumulative across refreshes so compaction can
+    // preserve continuity for the whole summarized prefix, not just the
+    // most recent incremental slice.
+    let document = summarize_messages(&history[..=to]);
     let metadata = SessionSummaryMetadata {
         last_summarized_message_index: to,
         updated_at: Utc::now(),
@@ -333,5 +335,47 @@ mod tests {
         assert_eq!(written.to_message_index, 1);
         assert!(paths.summary_path.exists());
         assert!(paths.metadata_path.exists());
+    }
+
+    #[test]
+    fn refresh_keeps_earlier_continuity_across_multiple_updates() {
+        let temp = TempDir::new().unwrap();
+        let paths = session_memory_paths(temp.path(), SessionId::new());
+        let mut state = SessionMemoryState {
+            enabled: true,
+            paths: paths.clone(),
+            refresh_in_flight: false,
+            last_summarized_message_index: None,
+            last_refresh_at: None,
+            template_version: SESSION_MEMORY_TEMPLATE_VERSION,
+            refresh_handle: Default::default(),
+            persistent_enabled: true,
+            last_persistent_extracted_message_index: None,
+        };
+
+        let first_history = vec![
+            Message::user("remember fact one"),
+            Message::assistant("ACK ROUND 1"),
+        ];
+        let first = refresh_summary_from_history(&state, &first_history)
+            .unwrap()
+            .unwrap();
+        state.last_summarized_message_index = Some(first.metadata.last_summarized_message_index);
+
+        let second_history = vec![
+            Message::user("remember fact one"),
+            Message::assistant("ACK ROUND 1"),
+            Message::user("remember fact two"),
+            Message::assistant("ACK ROUND 2"),
+        ];
+        let second = refresh_summary_from_history(&state, &second_history)
+            .unwrap()
+            .unwrap();
+        let markdown = second.document.render_markdown();
+
+        assert!(markdown.contains("remember fact one"));
+        assert!(markdown.contains("remember fact two"));
+        assert!(markdown.contains("ACK ROUND 1"));
+        assert!(markdown.contains("ACK ROUND 2"));
     }
 }

@@ -26,9 +26,9 @@ mod tests {
     #[test]
     fn create_openai_compat_provider() {
         let config = ProviderConfig::OpenAiCompat(OpenAiCompatConfig {
-            base_url: "http://127.0.0.1:1234/v1".into(),
+            base_url: "http://127.0.0.1:8000/v1".into(),
             api_key: None,
-            model: "qwen-3.5".into(),
+            model: "gpt-5.4".into(),
             max_tokens: Some(2048),
         });
         let _provider = create_provider(config);
