@@ -58,6 +58,23 @@ pub(crate) struct SkillSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PromptMemoryMode {
+    Disabled,
+    IndexOnly,
+    TargetedRecall,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PromptMemorySnapshot {
+    pub mode: PromptMemoryMode,
+    pub selected_entry_ids: Vec<String>,
+    pub selected_titles: Vec<String>,
+    pub skipped_reasons: Vec<String>,
+    pub truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionContextSnapshot {
     pub session_id: String,
     pub created_at: DateTime<Utc>,
@@ -69,6 +86,7 @@ pub(crate) struct SessionContextSnapshot {
     pub available_tools: Vec<ToolDefinition>,
     pub loaded_skills: Vec<SkillSnapshot>,
     pub plans: Vec<PlanSnapshot>,
+    pub prompt_memory: Option<PromptMemorySnapshot>,
     pub history: Vec<HistoryEntry>,
 }
 

@@ -581,7 +581,8 @@ enum SessionStateNotification {
 }
 
 fn notification_session_id(notif: &JsonRpcNotification) -> Option<&str> {
-    notif.params
+    notif
+        .params
         .as_ref()
         .and_then(|params| params.get("session_id"))
         .and_then(|value| value.as_str())
@@ -1588,6 +1589,7 @@ mod tests {
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
+            prompt_memory: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1639,6 +1641,7 @@ mod tests {
                 tool_names: vec!["read_file".into()],
             }],
             plans: vec![],
+            prompt_memory: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),

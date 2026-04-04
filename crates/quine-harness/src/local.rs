@@ -571,11 +571,17 @@ impl HarnessService for LocalHarness {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::session_context_from_checkpoint;
     use quine_core::{CoreOutput, SessionState};
     use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, Role, ToolDefinition};
+    use std::collections::HashMap;
     use std::fs;
     use std::pin::Pin;
+    use std::sync::LazyLock;
     use tokio::fs as async_fs;
+    use tokio::sync::Mutex;
+
+    static PROMPT_MEMORY_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn temp_storage() -> StorageManager {
         StorageManager::new(
@@ -665,6 +671,189 @@ mod tests {
             ];
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    struct ObservedMemoryProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ObservedMemoryProvider {
+        async fn send(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            let observed_memory = messages
+                .iter()
+                .filter(|message| message.role == Role::System)
+                .filter_map(|message| match &message.content {
+                    MessageContent::Text(text) => text
+                        .strip_prefix("Relevant durable memory `")
+                        .and_then(|text| text.split_once("`:\n"))
+                        .map(|(entry_id, _)| entry_id.to_string()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let last_user = messages
+                .iter()
+                .rev()
+                .find_map(|message| match (&message.role, &message.content) {
+                    (Role::User, MessageContent::Text(text)) => Some(text.clone()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let text = format!("observed-memory:{observed_memory}|last-user:{last_user}");
+            let events = vec![
+                Ok(LlmEvent::TextDelta { text }),
+                Ok(LlmEvent::Done { usage: None }),
+            ];
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    async fn wait_for_turn(
+        rx: &mut tokio::sync::broadcast::Receiver<CoreOutput>,
+        session_id: SessionId,
+    ) -> String {
+        let mut full_text = None;
+        let mut saw_turn_complete = false;
+
+        while !saw_turn_complete {
+            match tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(CoreOutput::TextComplete {
+                    session_id: event_session_id,
+                    full_text: text,
+                })) if event_session_id == session_id => full_text = Some(text),
+                Ok(Ok(CoreOutput::TurnComplete {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => saw_turn_complete = true,
+                Ok(Ok(CoreOutput::ToolRequest {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => {
+                    panic!("turn should not emit tool requests")
+                }
+                Ok(Ok(CoreOutput::InteractionNeeded {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => {
+                    panic!("turn should not emit interaction requests")
+                }
+                Ok(Ok(CoreOutput::SessionError {
+                    session_id: event_session_id,
+                    error,
+                })) if event_session_id == session_id => {
+                    panic!("turn should not emit session errors: {error:?}")
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("event stream closed unexpectedly: {error}"),
+                Err(_) => panic!("timeout waiting for turn completion"),
+            }
+        }
+
+        full_text.expect("turn should emit text completion")
+    }
+
+    async fn write_prompt_memory_fixture(
+        storage: &StorageManager,
+        project_dir: &std::path::Path,
+    ) -> std::path::PathBuf {
+        let project_key = crate::memory_store::project_key(project_dir);
+        let memory_dir = storage
+            .root()
+            .join("memory")
+            .join("projects")
+            .join(project_key);
+        async_fs::create_dir_all(memory_dir.join("entries"))
+            .await
+            .unwrap();
+        async_fs::write(
+            memory_dir.join("MEMORY.md"),
+            "# Durable Memory Index\n\n- rust-test-command\n- rust-build-command\n- editor-preference\n",
+        )
+        .await
+        .unwrap();
+        async_fs::write(
+            memory_dir.join("index.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "entries": [
+                    {
+                        "entry_id": "rust-test-command",
+                        "title": "Rust tests",
+                        "summary": "Use cargo test for Rust test suite",
+                        "slug": "rust-tests",
+                        "path": "entries/rust-test-command.md",
+                        "updated_at": "2026-04-04T00:00:00Z",
+                        "keywords": ["cargo", "test", "rust"],
+                        "pinned": false
+                    },
+                    {
+                        "entry_id": "rust-build-command",
+                        "title": "Workspace build",
+                        "summary": "Use cargo build to compile workspace",
+                        "slug": "workspace-build",
+                        "path": "entries/rust-build-command.md",
+                        "updated_at": "2026-04-04T00:00:01Z",
+                        "keywords": ["cargo", "build", "workspace"],
+                        "pinned": false
+                    },
+                    {
+                        "entry_id": "editor-preference",
+                        "title": "Editor preference",
+                        "summary": "Prefer concise diffs in reviews",
+                        "slug": "editor-preference",
+                        "path": "entries/editor-preference.md",
+                        "updated_at": "2026-04-04T00:00:02Z",
+                        "keywords": ["editor", "review"],
+                        "pinned": false
+                    }
+                ]
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        async_fs::write(
+            memory_dir.join("entries/rust-test-command.md"),
+            "---\nentry_id: rust-test-command\ntitle: Rust tests\nsummary: Use cargo test for Rust test suite\nkeywords:\n  - cargo\n  - test\n  - rust\ncreated_at: 2026-04-04T00:00:00Z\nupdated_at: 2026-04-04T00:00:00Z\nsource: explicit\nstatus: active\npinned: false\n---\n\nUse `cargo test` to run the Rust test suite.\n",
+        )
+        .await
+        .unwrap();
+        async_fs::write(
+            memory_dir.join("entries/rust-build-command.md"),
+            "---\nentry_id: rust-build-command\ntitle: Workspace build\nsummary: Use cargo build to compile workspace\nkeywords:\n  - cargo\n  - build\n  - workspace\ncreated_at: 2026-04-04T00:00:01Z\nupdated_at: 2026-04-04T00:00:01Z\nsource: explicit\nstatus: active\npinned: false\n---\n\nUse `cargo build` to compile workspace.\n",
+        )
+        .await
+        .unwrap();
+        async_fs::write(
+            memory_dir.join("entries/editor-preference.md"),
+            "---\nentry_id: editor-preference\ntitle: Editor preference\nsummary: Prefer concise diffs in reviews\nkeywords:\n  - editor\n  - review\ncreated_at: 2026-04-04T00:00:02Z\nupdated_at: 2026-04-04T00:00:02Z\nsource: explicit\nstatus: active\npinned: false\n---\n\nThe user prefers concise diffs in reviews.\n",
+        )
+        .await
+        .unwrap();
+        memory_dir
+    }
+
+    async fn wait_for_context_snapshot(
+        harness: &LocalHarness,
+        session_id: SessionId,
+    ) -> crate::storage::SessionContextSnapshot {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Ok(checkpoint) = harness.get_session_context(session_id).await {
+                    if let Some(snapshot) =
+                        session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new())
+                    {
+                        break snapshot;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("session context should become available")
     }
 
     #[tokio::test]
@@ -1037,6 +1226,175 @@ mod tests {
 
         harness.shutdown().await.unwrap();
         let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
+    async fn prompt_time_persistent_recall_multi_round_local_daemon() {
+        let _env_guard = PROMPT_MEMORY_ENV_LOCK.lock().await;
+        let previous_mode = std::env::var_os("QUINE_PROMPT_MEMORY_MODE");
+        unsafe {
+            std::env::set_var("QUINE_PROMPT_MEMORY_MODE", "targeted_recall");
+        }
+
+        let storage = temp_storage();
+        let project_dir =
+            std::env::temp_dir().join(format!("quine-project-{}", uuid::Uuid::new_v4()));
+        async_fs::create_dir_all(&project_dir).await.unwrap();
+        async_fs::write(project_dir.join("CLAUDE.md"), "# test project\n")
+            .await
+            .unwrap();
+        let _memory_dir = write_prompt_memory_fixture(&storage, &project_dir).await;
+
+        let harness = LocalHarness::new(Arc::new(ObservedMemoryProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(project_dir.clone()),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+        let mut rx = harness.subscribe();
+
+        harness
+            .send_message(session_id, "Say exactly: round-1 acknowledged.".into())
+            .await
+            .unwrap();
+        let round_1 = wait_for_turn(&mut rx, session_id).await;
+        assert_eq!(
+            round_1,
+            "observed-memory:|last-user:Say exactly: round-1 acknowledged."
+        );
+
+        let snapshot = wait_for_context_snapshot(&harness, session_id).await;
+        let prompt_memory = snapshot
+            .prompt_memory
+            .expect("prompt memory summary should persist");
+        assert_eq!(
+            prompt_memory.mode,
+            quine_core::PromptMemoryMode::TargetedRecall
+        );
+        assert!(prompt_memory.selected_entry_ids.is_empty());
+        assert!(snapshot.history.iter().all(|entry| match entry {
+            crate::storage::HistoryEntry::Text { text, .. } => {
+                !text.contains("Relevant durable memory `")
+            }
+            crate::storage::HistoryEntry::ToolUse { text, .. } => text
+                .as_deref()
+                .map(|text| !text.contains("Relevant durable memory `"))
+                .unwrap_or(true),
+            crate::storage::HistoryEntry::ToolResult { output, .. } => {
+                !output.contains("Relevant durable memory `")
+            }
+        }));
+
+        harness
+            .send_message(
+                session_id,
+                "What command should I run to execute the Rust test suite? Answer with only the command.".into(),
+            )
+            .await
+            .unwrap();
+        let round_2 = wait_for_turn(&mut rx, session_id).await;
+        assert_eq!(
+            round_2,
+            "observed-memory:rust-test-command|last-user:What command should I run to execute the Rust test suite? Answer with only the command."
+        );
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = wait_for_context_snapshot(&harness, session_id).await;
+                if snapshot
+                    .prompt_memory
+                    .as_ref()
+                    .map(|summary| summary.selected_entry_ids.clone())
+                    == Some(vec!["rust-test-command".to_string()])
+                {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prompt memory selection should persist for round 2");
+        let prompt_memory = snapshot
+            .prompt_memory
+            .expect("prompt memory summary should persist");
+        assert_eq!(
+            prompt_memory.selected_entry_ids,
+            vec!["rust-test-command".to_string()]
+        );
+        assert!(snapshot.history.iter().all(|entry| match entry {
+            crate::storage::HistoryEntry::Text { text, .. } => {
+                !text.contains("Relevant durable memory `")
+            }
+            crate::storage::HistoryEntry::ToolUse { text, .. } => text
+                .as_deref()
+                .map(|text| !text.contains("Relevant durable memory `"))
+                .unwrap_or(true),
+            crate::storage::HistoryEntry::ToolResult { output, .. } => {
+                !output.contains("Relevant durable memory `")
+            }
+        }));
+
+        harness
+            .send_message(
+                session_id,
+                "What command should I run to build the workspace? Answer with only the command."
+                    .into(),
+            )
+            .await
+            .unwrap();
+        let round_3 = wait_for_turn(&mut rx, session_id).await;
+        assert_eq!(
+            round_3,
+            "observed-memory:rust-build-command|last-user:What command should I run to build the workspace? Answer with only the command."
+        );
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = wait_for_context_snapshot(&harness, session_id).await;
+                if snapshot
+                    .prompt_memory
+                    .as_ref()
+                    .map(|summary| summary.selected_entry_ids.clone())
+                    == Some(vec!["rust-build-command".to_string()])
+                {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prompt memory selection should persist for round 3");
+        let prompt_memory = snapshot
+            .prompt_memory
+            .expect("prompt memory summary should persist");
+        assert_eq!(
+            prompt_memory.selected_entry_ids,
+            vec!["rust-build-command".to_string()]
+        );
+        assert!(snapshot.history.iter().all(|entry| match entry {
+            crate::storage::HistoryEntry::Text { text, .. } => {
+                !text.contains("Relevant durable memory `")
+            }
+            crate::storage::HistoryEntry::ToolUse { text, .. } => text
+                .as_deref()
+                .map(|text| !text.contains("Relevant durable memory `"))
+                .unwrap_or(true),
+            crate::storage::HistoryEntry::ToolResult { output, .. } => {
+                !output.contains("Relevant durable memory `")
+            }
+        }));
+
+        harness.shutdown().await.unwrap();
+        match previous_mode {
+            Some(value) => unsafe { std::env::set_var("QUINE_PROMPT_MEMORY_MODE", value) },
+            None => unsafe { std::env::remove_var("QUINE_PROMPT_MEMORY_MODE") },
+        }
+        let _ = fs::remove_dir_all(storage.root());
+        let _ = fs::remove_dir_all(project_dir);
     }
 
     #[tokio::test]

@@ -1,9 +1,11 @@
 mod persistent;
+mod prompt;
 mod session;
 mod summary;
 mod template;
 
 pub(crate) use persistent::MemoryDiagnostics;
+pub(crate) use prompt::{build_prompt_memory_injection, splice_prompt_memory_messages};
 pub(crate) use session::{
     load_compaction_snapshot, restore_memory_state, snapshot_memory_state,
     SessionMemoryCompactionSnapshot, SessionMemoryState,
