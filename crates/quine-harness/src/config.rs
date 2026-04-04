@@ -100,9 +100,9 @@ fn config_from_env() -> ProviderConfig {
     } else {
         ProviderConfig::OpenAiCompat(OpenAiCompatConfig {
             base_url: std::env::var("LLM_BASE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:1234/v1".into()),
+                .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".into()),
             api_key: std::env::var("LLM_API_KEY").ok(),
-            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "qwen-3.5".into()),
+            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5.4".into()),
             max_tokens: Some(4096),
         })
     };
@@ -147,7 +147,7 @@ pub fn max_context_window_from_env() -> Option<u64> {
         if provider.eq_ignore_ascii_case("anthropic") {
             "claude-sonnet-4-20250514".into()
         } else {
-            "qwen-3.5".into()
+            "gpt-5.4".into()
         }
     });
 
