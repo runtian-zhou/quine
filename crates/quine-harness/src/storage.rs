@@ -50,6 +50,14 @@ pub struct SkillSnapshot {
     pub tool_names: Vec<String>,
 }
 
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SessionLineageSnapshot {
+    pub parent_id: Option<String>,
+    pub root_id: String,
+    pub depth: usize,
+    pub child_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionContextSnapshot {
     pub session_id: String,
@@ -62,7 +70,9 @@ pub struct SessionContextSnapshot {
     pub available_tools: Vec<ToolDefinition>,
     pub loaded_skills: Vec<SkillSnapshot>,
     pub plans: Vec<PlanSnapshot>,
+    pub lineage: SessionLineageSnapshot,
     pub prompt_memory: Option<PersistedPromptMemoryState>,
+    pub compact_memory_summary_markdown: Option<String>,
     pub memory_diagnostics: Option<MemoryTurnDiagnostics>,
     pub permission_diagnostics: Option<PermissionRuntimeSnapshot>,
     pub history: Vec<HistoryEntry>,
@@ -99,17 +109,20 @@ pub fn session_context_from_checkpoint(
     checkpoint: &CoreCheckpoint,
     session_id: SessionId,
     live_states: &HashMap<SessionId, String>,
+    state_root: Option<&Path>,
 ) -> Option<SessionContextSnapshot> {
     checkpoint
         .sessions
         .iter()
         .find(|session| session.session_id == session_id)
-        .map(|session| snapshot_from_persisted(session, live_states))
+        .map(|session| snapshot_from_persisted(checkpoint, session, live_states, state_root))
 }
 
 fn snapshot_from_persisted(
+    checkpoint: &CoreCheckpoint,
     session: &PersistedSession,
     live_states: &HashMap<SessionId, String>,
+    state_root: Option<&Path>,
 ) -> SessionContextSnapshot {
     SessionContextSnapshot {
         session_id: serialize_session_id(session.session_id),
@@ -130,10 +143,13 @@ fn snapshot_from_persisted(
             .iter()
             .map(plan_snapshot_from_action_plan)
             .collect(),
+        lineage: lineage_snapshot(checkpoint, session.session_id),
         prompt_memory: session
             .memory_state
             .as_ref()
             .and_then(|state| state.prompt_memory.clone()),
+        compact_memory_summary_markdown: state_root
+            .and_then(|root| load_compact_memory_summary(root, session.session_id)),
         memory_diagnostics: session
             .memory_state
             .as_ref()
@@ -145,6 +161,47 @@ fn snapshot_from_persisted(
             .map(history_entry_from_message)
             .collect(),
     }
+}
+
+fn lineage_snapshot(checkpoint: &CoreCheckpoint, session_id: SessionId) -> SessionLineageSnapshot {
+    let parent_id = checkpoint.session_tree.parents.get(&session_id).copied();
+    let mut root_id = session_id;
+    let mut depth = 0usize;
+    while let Some(parent) = checkpoint.session_tree.parents.get(&root_id).copied() {
+        root_id = parent;
+        depth += 1;
+    }
+    let mut child_ids = checkpoint
+        .session_tree
+        .children
+        .get(&session_id)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(serialize_session_id)
+        .collect::<Vec<_>>();
+    child_ids.sort();
+
+    SessionLineageSnapshot {
+        parent_id: parent_id.map(serialize_session_id),
+        root_id: serialize_session_id(root_id),
+        depth,
+        child_ids,
+    }
+}
+
+fn load_compact_memory_summary(state_root: &Path, session_id: SessionId) -> Option<String> {
+    let summary_path = state_root
+        .join("sessions")
+        .join(serialize_session_id(session_id))
+        .join("session-memory")
+        .join("summary.md");
+    let summary_markdown = std::fs::read_to_string(summary_path).ok()?;
+    let trimmed = summary_markdown.trim();
+    if trimmed.is_empty() || trimmed == "# Session Summary" {
+        return None;
+    }
+    Some(summary_markdown)
 }
 
 fn plan_snapshot_from_action_plan(plan: &ActionPlan) -> PlanSnapshot {
@@ -497,6 +554,7 @@ mod tests {
             &checkpoint,
             session_id,
             &HashMap::from([(session_id, "streaming".to_string())]),
+            None,
         )
         .unwrap();
 
@@ -519,6 +577,9 @@ mod tests {
         assert!(snapshot.plans.is_empty());
         assert!(snapshot.memory_diagnostics.is_some());
         assert!(snapshot.permission_diagnostics.is_some());
+        assert_eq!(snapshot.lineage.root_id, snapshot.session_id);
+        assert_eq!(snapshot.lineage.depth, 0);
+        assert!(snapshot.compact_memory_summary_markdown.is_none());
         match &snapshot.history[0] {
             super::HistoryEntry::Text { role, text } => {
                 assert_eq!(role, "user");
@@ -563,6 +624,7 @@ mod tests {
             &checkpoint,
             session_id,
             &HashMap::from([(session_id, "idle".to_string())]),
+            None,
         )
         .expect("session context should project from checkpoint");
         let diagnostics = snapshot
@@ -575,6 +637,78 @@ mod tests {
         assert_eq!(
             diagnostics.rules.workspace[0].source_path.as_deref(),
             Some(Path::new("/tmp/project/.quine/permissions.yaml"))
+        );
+    }
+
+    #[test]
+    fn session_context_snapshot_includes_lineage_and_compact_summary() {
+        let storage = make_temp_storage();
+        let parent_id = SessionId::new();
+        let child_id = SessionId::new();
+        let checkpoint = CoreCheckpoint::new(
+            vec![
+                PersistedSession {
+                    session_id: parent_id,
+                    ..sample_checkpoint().sessions.into_iter().next().unwrap()
+                },
+                PersistedSession {
+                    session_id: child_id,
+                    created_at: Utc::now(),
+                    state: PersistedSessionState::Idle,
+                    config: PersistedSessionConfig {
+                        system_prompt: None,
+                        skill_names: Vec::new(),
+                        working_directory: PathBuf::from("/tmp/project"),
+                        plan_mode: false,
+                        prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
+                        prompt_memory_mode: quine_core::PromptMemoryMode::Disabled,
+                        agent_key: None,
+                        team_key: None,
+                        memory_policy: MemoryPolicyConfig::default(),
+                    },
+                    history: Vec::new(),
+                    plan_store: PersistedPlanStore::default(),
+                    memory_state: None,
+                    permission_state: None,
+                },
+            ],
+            PersistedSessionTree {
+                parents: HashMap::from([(child_id, parent_id)]),
+                children: HashMap::from([(parent_id, vec![child_id])]),
+                exit_statuses: HashMap::new(),
+            },
+        );
+
+        let summary_dir = storage
+            .root()
+            .join("sessions")
+            .join(child_id.to_string())
+            .join("session-memory");
+        std::fs::create_dir_all(&summary_dir).unwrap();
+        std::fs::write(
+            summary_dir.join("summary.md"),
+            "# Session Summary\n\nCompact context body.\n",
+        )
+        .unwrap();
+
+        let snapshot = super::session_context_from_checkpoint(
+            &checkpoint,
+            child_id,
+            &HashMap::new(),
+            Some(storage.root()),
+        )
+        .expect("session context should project from checkpoint");
+
+        assert_eq!(
+            snapshot.lineage.parent_id.as_deref(),
+            Some(parent_id.to_string().as_str())
+        );
+        assert_eq!(snapshot.lineage.root_id, parent_id.to_string());
+        assert_eq!(snapshot.lineage.depth, 1);
+        assert_eq!(snapshot.lineage.child_ids, Vec::<String>::new());
+        assert_eq!(
+            snapshot.compact_memory_summary_markdown.as_deref(),
+            Some("# Session Summary\n\nCompact context body.\n")
         );
     }
 

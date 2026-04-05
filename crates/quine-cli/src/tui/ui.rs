@@ -257,6 +257,71 @@ fn render_plan_box(lines: &mut Vec<Line<'_>>, plan: &str, width: u16) {
     )));
 }
 
+fn render_bash_preview_box(lines: &mut Vec<Line<'static>>, preview: &str, width: u16) {
+    let inner_width = usize::from(width.saturating_sub(10)).max(1);
+    let top = format!("      ┌{}┐", "─".repeat(inner_width + 2));
+    let bottom = format!("      └{}┘", "─".repeat(inner_width + 2));
+    let mut wrapped = Vec::new();
+
+    for raw_line in preview.lines() {
+        let line = if raw_line.is_empty() { " " } else { raw_line };
+        let mut current = String::new();
+        let mut current_width = 0usize;
+        for ch in line.chars() {
+            let ch_width = ch.width().unwrap_or(0).max(1);
+            if current_width + ch_width > inner_width && !current.is_empty() {
+                wrapped.push(current);
+                current = String::new();
+                current_width = 0;
+            }
+            current.push(ch);
+            current_width += ch_width;
+        }
+        if current.is_empty() {
+            wrapped.push(" ".to_string());
+        } else {
+            wrapped.push(current);
+        }
+    }
+
+    let clipped = wrapped.len() > 6;
+    let visible = if clipped {
+        &wrapped[..6]
+    } else {
+        wrapped.as_slice()
+    };
+    lines.push(Line::from(Span::styled(
+        top,
+        Style::default().fg(Color::Cyan),
+    )));
+    for line in visible {
+        lines.push(Line::from(vec![
+            Span::styled("      │ ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{line:<width$}", width = inner_width),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(" │", Style::default().fg(Color::Cyan)),
+        ]));
+    }
+    if clipped {
+        lines.push(Line::from(vec![
+            Span::styled("      │ ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{:<width$}", "… output truncated …", width = inner_width),
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::DIM),
+            ),
+            Span::styled(" │", Style::default().fg(Color::Cyan)),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        bottom,
+        Style::default().fg(Color::Cyan),
+    )));
+}
+
 fn push_conversation_entry_lines(
     lines: &mut Vec<Line<'static>>,
     entry: &ConversationEntry,
@@ -339,6 +404,10 @@ fn push_conversation_entry_lines(
                             Span::styled(line.to_string(), style),
                         ]));
                     }
+                }
+            } else if tool_name == "bash" {
+                if let Some(preview) = result_preview {
+                    render_bash_preview_box(lines, preview, area_width);
                 }
             }
         }
@@ -835,6 +904,38 @@ fn format_plans_tab_lines(explorer: &ContextExplorerState) -> Vec<Line<'static>>
     lines
 }
 
+fn lineage_summary(snapshot: &crate::context_debug::SessionContextSnapshot) -> String {
+    let parent = snapshot.lineage.parent_id.as_deref().unwrap_or("<root>");
+    format!(
+        "lineage root {} | parent {} | depth {} | children {}",
+        snapshot.lineage.root_id,
+        parent,
+        snapshot.lineage.depth,
+        snapshot.lineage.child_ids.len()
+    )
+}
+
+fn compact_summary_lines(
+    snapshot: &crate::context_debug::SessionContextSnapshot,
+) -> Vec<Line<'static>> {
+    let Some(summary) = snapshot.compact_memory_summary_markdown.as_deref() else {
+        return vec![Line::from("session summary <none>")];
+    };
+
+    let mut lines = vec![Line::from("session summary")];
+    for line in summary
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && trimmed != "# Session Summary"
+        })
+        .take(2)
+    {
+        lines.push(Line::from(format!("  {line}")));
+    }
+    lines
+}
+
 fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplorerState) {
     let popup = centered_rect(90, 85, area);
     frame.render_widget(Clear, popup);
@@ -850,7 +951,7 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
     let sections = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4),
+            Constraint::Length(7),
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
@@ -884,7 +985,10 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
                 .filter(|value| !value.is_empty())
                 .unwrap_or("<none>")
         )),
+        Line::from(lineage_summary(&explorer.snapshot)),
     ];
+    let mut summary = summary;
+    summary.extend(compact_summary_lines(&explorer.snapshot));
     frame.render_widget(Clear, sections[0]);
     frame.render_widget(
         Paragraph::new(summary).wrap(Wrap { trim: false }),
@@ -1283,7 +1387,9 @@ mod tests {
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
             prompt_memory: None,
+            compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
             history: vec![
@@ -1327,7 +1433,9 @@ mod tests {
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
             prompt_memory: None,
+            compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
             history: vec![
@@ -1375,7 +1483,9 @@ mod tests {
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
             prompt_memory: None,
+            compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
             history: vec![HistoryEntry::Text {
@@ -1420,7 +1530,9 @@ mod tests {
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
             prompt_memory: None,
+            compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
             history: vec![
@@ -1473,7 +1585,9 @@ mod tests {
             }],
             loaded_skills: vec![],
             plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
             prompt_memory: None,
+            compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
             history: vec![
@@ -1526,7 +1640,9 @@ mod tests {
             }],
             loaded_skills: vec![],
             plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
             prompt_memory: None,
+            compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
             history: vec![],
@@ -1565,7 +1681,9 @@ mod tests {
                 tool_names: vec!["read_file".into(), "bash".into()],
             }],
             plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
             prompt_memory: None,
+            compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
             history: vec![],
@@ -1609,7 +1727,9 @@ mod tests {
                     result: Some("Wiring tabs".into()),
                 }],
             }],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
             prompt_memory: None,
+            compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
             history: vec![],
@@ -1630,6 +1750,81 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.contains("patch [in-progress] Patch renderer")));
+    }
+
+    #[test]
+    fn draw_renders_bash_preview_in_box() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "bash".into(),
+            tool_use_id: "tc1".into(),
+            summary: "pwd".into(),
+            status: ToolStatus::Success { duration_us: 150 },
+            result_preview: Some(
+                (0..10)
+                    .map(|index| format!("line {index}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        });
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = non_input_conversation_lines(terminal.backend(), &app, 80, 24);
+        assert!(lines.iter().any(|line| line.contains("┌")));
+        assert!(lines.iter().any(|line| line.contains("line 0")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("… output truncated …")));
+    }
+
+    #[test]
+    fn draw_context_explorer_renders_lineage_and_compact_summary() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-2".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec!["review".into()],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot {
+                parent_id: Some("session-1".into()),
+                root_id: "session-1".into(),
+                depth: 1,
+                child_ids: vec!["session-3".into()],
+            },
+            prompt_memory: None,
+            compact_memory_summary_markdown: Some(
+                "# Session Summary\n\nCompact body line.\nSecond line.\n".into(),
+            ),
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            history: vec![],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("lineage root session-1")));
+        let summary_lines = compact_summary_lines(&app.context_explorer.as_ref().unwrap().snapshot);
+        assert!(summary_lines
+            .iter()
+            .any(|line| line.to_string().contains("session summary")));
+        assert!(summary_lines
+            .iter()
+            .any(|line| line.to_string().contains("Compact body line.")));
     }
 
     #[test]

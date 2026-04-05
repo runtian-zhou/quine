@@ -391,6 +391,14 @@ pub(crate) struct PermissionDiagnosticsSnapshot {
     pub pending_approval: Option<PendingPermissionApprovalSnapshot>,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct SessionLineageSnapshot {
+    pub parent_id: Option<String>,
+    pub root_id: String,
+    pub depth: usize,
+    pub child_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionContextSnapshot {
     pub session_id: String,
@@ -403,7 +411,11 @@ pub(crate) struct SessionContextSnapshot {
     pub available_tools: Vec<ToolDefinition>,
     pub loaded_skills: Vec<SkillSnapshot>,
     pub plans: Vec<PlanSnapshot>,
+    #[serde(default)]
+    pub lineage: SessionLineageSnapshot,
     pub prompt_memory: Option<PromptMemorySnapshot>,
+    #[serde(default)]
+    pub compact_memory_summary_markdown: Option<String>,
     pub memory_diagnostics: Option<MemoryDiagnosticsSnapshot>,
     pub permission_diagnostics: Option<PermissionDiagnosticsSnapshot>,
     pub history: Vec<HistoryEntry>,

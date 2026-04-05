@@ -1365,7 +1365,7 @@ impl App {
                                 } else {
                                     ToolStatus::Success { duration_us }
                                 };
-                                if tool_name == "plan" {
+                                if tool_name == "plan" || tool_name == "bash" {
                                     let trimmed = trim_blank_lines(content);
                                     if !trimmed.is_empty() {
                                         *result_preview = Some(trimmed);
@@ -1589,7 +1589,9 @@ mod tests {
             available_tools: vec![],
             loaded_skills: vec![],
             plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
             prompt_memory: None,
+            compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
             history: vec![
@@ -1643,7 +1645,9 @@ mod tests {
                 tool_names: vec!["read_file".into()],
             }],
             plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
             prompt_memory: None,
+            compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
             history: vec![
@@ -1841,6 +1845,44 @@ mod tests {
             }) if tool_name == "plan" && preview.contains("[a1]") && preview.contains("[a2]")
         ));
         assert_eq!(app.phase, AgentPhase::Thinking);
+    }
+
+    #[test]
+    fn bash_tool_result_is_attached_to_tool_call() {
+        let mut app = App::new("test".into(), false, None);
+        let request = make_notif(
+            notifications::TOOL_REQUEST,
+            serde_json::json!({
+                "tool_name": "bash",
+                "tool_use_id": "toolu_bash",
+                "arguments": {
+                    "command": "pwd"
+                }
+            }),
+        );
+        app.apply_notification(&request);
+
+        let result = make_notif(
+            notifications::TOOL_RESULT,
+            serde_json::json!({
+                "tool_use_id": "toolu_bash",
+                "tool_name": "bash",
+                "content": "/tmp/project\nline two\nline three",
+                "is_error": false,
+                "duration_us": 42
+            }),
+        );
+        app.apply_notification(&result);
+
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::ToolCall {
+                tool_name,
+                status: ToolStatus::Success { duration_us: 42 },
+                result_preview: Some(preview),
+                ..
+            }) if tool_name == "bash" && preview.contains("/tmp/project") && preview.contains("line three")
+        ));
     }
 
     #[test]
