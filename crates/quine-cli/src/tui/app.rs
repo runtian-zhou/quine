@@ -1591,6 +1591,7 @@ mod tests {
             plans: vec![],
             prompt_memory: None,
             memory_diagnostics: None,
+            permission_diagnostics: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1644,6 +1645,7 @@ mod tests {
             plans: vec![],
             prompt_memory: None,
             memory_diagnostics: None,
+            permission_diagnostics: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),

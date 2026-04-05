@@ -6,7 +6,7 @@ use uuid::Uuid;
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PermissionMode {
+pub enum PermissionMode {
     Default,
     AcceptEdits,
     Plan,
@@ -16,7 +16,7 @@ pub(crate) enum PermissionMode {
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PermissionDecision {
+pub enum PermissionDecision {
     Allow,
     Deny,
     Ask,
@@ -26,7 +26,7 @@ pub(crate) enum PermissionDecision {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PermissionRuleEffect {
+pub enum PermissionRuleEffect {
     Allow,
     Deny,
     Ask,
@@ -35,7 +35,7 @@ pub(crate) enum PermissionRuleEffect {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PermissionRuleSource {
+pub enum PermissionRuleSource {
     BuiltIn,
     Session,
     User,
@@ -45,7 +45,7 @@ pub(crate) enum PermissionRuleSource {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PermissionScope {
+pub enum PermissionScope {
     Session,
     Workspace,
     Global,
@@ -54,7 +54,7 @@ pub(crate) enum PermissionScope {
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum PermissionTarget {
+pub enum PermissionTarget {
     Any,
     Tool { name: String },
     Path { path: PathBuf },
@@ -62,15 +62,19 @@ pub(crate) enum PermissionTarget {
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PermissionRule {
+pub struct PermissionRule {
     pub effect: PermissionRuleEffect,
     pub scope: PermissionScope,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_scope: Option<crate::permission::request::PermissionScope>,
     pub target: PermissionTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PermissionRuleSet {
+pub struct PermissionRuleSet {
     pub built_in: Vec<PermissionRule>,
     pub session: Vec<PermissionRule>,
     pub user: Vec<PermissionRule>,
@@ -128,4 +132,4 @@ impl PermissionPromptBehavior {
 
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub(crate) struct ApprovalRequestId(pub Uuid);
+pub struct ApprovalRequestId(pub Uuid);

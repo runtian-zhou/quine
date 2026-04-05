@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 use super::outcome::PermissionOutcome;
 use super::types::ApprovalRequestId;
 use crate::tool::{InteractionKind, InteractionRequest, InteractionResponse, SelectOption};
@@ -5,11 +7,10 @@ use crate::tool::{InteractionKind, InteractionRequest, InteractionResponse, Sele
 pub(crate) const APPROVE_ONCE_LABEL: &str = "approve once";
 pub(crate) const DENY_ONCE_LABEL: &str = "deny once";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct PendingPermissionApproval {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingPermissionApproval {
     pub request_id: ApprovalRequestId,
-    pub tool_name: String,
-    pub reason: String,
+    pub outcome: PermissionOutcome,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -23,8 +24,7 @@ pub(crate) fn build_permission_approval_request(
 ) -> (PendingPermissionApproval, InteractionRequest) {
     let pending = PendingPermissionApproval {
         request_id: ApprovalRequestId(uuid::Uuid::new_v4()),
-        tool_name: outcome.request.tool_name.clone(),
-        reason: outcome.reason.clone(),
+        outcome: outcome.clone(),
     };
     let request = InteractionRequest {
         prompt: format!(
@@ -83,6 +83,7 @@ mod tests {
                 scope: PermissionScope::Write,
                 resource: PermissionResource::None,
             },
+            matched_rule: None,
         }
     }
 
@@ -90,7 +91,7 @@ mod tests {
     fn builds_permission_approval_request_with_permission_source_label() {
         let (pending, request) = build_permission_approval_request(&sample_outcome());
 
-        assert_eq!(pending.tool_name, "apply_patch");
+        assert_eq!(pending.outcome.request.tool_name, "apply_patch");
         assert_eq!(request.kind, InteractionKind::SingleSelect);
         assert_eq!(request.options.len(), 2);
         assert!(request

@@ -863,6 +863,178 @@ mod tests {
         harness.shutdown().await.unwrap();
     }
 
+    #[tokio::test]
+    async fn get_session_context_includes_permission_diagnostics() {
+        let storage = temp_storage();
+        let workspace = storage.root().to_path_buf();
+        let harness = LocalHarness::new(Arc::new(MockProvider), Some(storage))
+            .await
+            .unwrap();
+
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(workspace.clone()),
+                prompt_behavior: PermissionPromptBehavior::Headless,
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        let snapshot = wait_for_context_snapshot(&harness, session_id).await;
+        let diagnostics = snapshot
+            .permission_diagnostics
+            .expect("permission diagnostics should be present");
+        assert_eq!(diagnostics.mode, quine_core::PermissionMode::Default);
+        assert_eq!(
+            diagnostics.prompt_behavior,
+            PermissionPromptBehavior::Headless
+        );
+        assert_eq!(diagnostics.workspace_root, workspace);
+        assert!(diagnostics.additional_allowed_roots.is_empty());
+        assert!(diagnostics.rules.session.is_empty());
+        assert!(diagnostics.last_decision.is_none());
+        assert!(diagnostics.pending_approval.is_none());
+
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn get_session_context_surfaces_pending_permission_approval_and_last_decision() {
+        let storage = temp_storage();
+        let workspace = storage.root().to_path_buf();
+        let harness = LocalHarness::new(
+            Arc::new(ApprovalProvider {
+                call_count: std::sync::atomic::AtomicU32::new(0),
+            }),
+            Some(storage),
+        )
+        .await
+        .unwrap();
+        let mut rx = harness.subscribe();
+
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(workspace),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        harness
+            .send_message(session_id, "create the approval test file".into())
+            .await
+            .unwrap();
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(CoreOutput::InteractionNeeded {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => {
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("event stream closed unexpectedly: {error}"),
+                Err(_) => panic!("timeout waiting for permission interaction"),
+            }
+        }
+
+        let pending_snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(checkpoint) = harness.get_session_context(session_id).await {
+                    if let Some(snapshot) =
+                        session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new())
+                    {
+                        if snapshot
+                            .permission_diagnostics
+                            .as_ref()
+                            .and_then(|diagnostics| diagnostics.pending_approval.as_ref())
+                            .is_some()
+                        {
+                            break snapshot;
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("pending approval should become visible in session context");
+        let pending = pending_snapshot
+            .permission_diagnostics
+            .and_then(|diagnostics| diagnostics.pending_approval)
+            .expect("pending approval should be visible");
+        assert_eq!(pending.outcome.request.tool_name, "apply_patch");
+        assert!(pending
+            .outcome
+            .reason
+            .contains("permission resolved by Default mode"));
+
+        harness
+            .submit_interaction_response(
+                session_id,
+                InteractionResponse {
+                    response: "deny once".into(),
+                    selected_indices: vec![1],
+                },
+            )
+            .await
+            .unwrap();
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(CoreOutput::TurnComplete {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => break,
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("event stream closed unexpectedly: {error}"),
+                Err(_) => panic!("timeout waiting for denied approval turn completion"),
+            }
+        }
+
+        let denied_snapshot = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Ok(checkpoint) = harness.get_session_context(session_id).await {
+                    if let Some(snapshot) =
+                        session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new())
+                    {
+                        if snapshot
+                            .permission_diagnostics
+                            .as_ref()
+                            .is_some_and(|diagnostics| {
+                                diagnostics.last_decision.is_some()
+                                    && diagnostics.pending_approval.is_none()
+                            })
+                        {
+                            break snapshot;
+                        }
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("last permission decision should become visible in session context");
+        let diagnostics = denied_snapshot
+            .permission_diagnostics
+            .expect("permission diagnostics should be present");
+        assert!(diagnostics.pending_approval.is_none());
+        let last_decision = diagnostics
+            .last_decision
+            .expect("last permission decision should be recorded");
+        assert_eq!(last_decision.request.tool_name, "apply_patch");
+        assert_eq!(
+            last_decision.source.kind,
+            quine_core::PermissionMatchKind::ModeDefault
+        );
+        assert!(last_decision
+            .reason
+            .contains("permission resolved by Default mode"));
+
+        harness.shutdown().await.unwrap();
+    }
+
     struct BackgroundApprovalProvider {
         call_count: std::sync::atomic::AtomicU32,
         marker_name: String,

@@ -1,5 +1,9 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
+use super::approval::PendingPermissionApproval;
+use super::outcome::PermissionOutcome;
 use super::types::{
     PermissionMode, PermissionPromptBehavior, PermissionRule, PermissionRuleSet,
     PermissionRuleSource,
@@ -14,6 +18,22 @@ pub(crate) struct PermissionContext {
     workspace_root: PathBuf,
     additional_allowed_roots: Vec<PathBuf>,
     prompt_behavior: PermissionPromptBehavior,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionRuntimeSnapshot {
+    pub mode: PermissionMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pre_plan_mode: Option<PermissionMode>,
+    pub rules: PermissionRuleSet,
+    pub workspace_root: PathBuf,
+    #[serde(default)]
+    pub additional_allowed_roots: Vec<PathBuf>,
+    pub prompt_behavior: PermissionPromptBehavior,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_decision: Option<PermissionOutcome>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_approval: Option<PendingPermissionApproval>,
 }
 
 impl PermissionContext {
@@ -95,6 +115,34 @@ impl PermissionContext {
         roots.extend(self.additional_allowed_roots.iter().cloned());
         roots
     }
+
+    pub(crate) fn snapshot(
+        &self,
+        last_decision: Option<PermissionOutcome>,
+        pending_approval: Option<PendingPermissionApproval>,
+    ) -> PermissionRuntimeSnapshot {
+        PermissionRuntimeSnapshot {
+            mode: self.mode,
+            pre_plan_mode: self.pre_plan_mode,
+            rules: self.rules.clone(),
+            workspace_root: self.workspace_root.clone(),
+            additional_allowed_roots: self.additional_allowed_roots.clone(),
+            prompt_behavior: self.prompt_behavior,
+            last_decision,
+            pending_approval,
+        }
+    }
+
+    pub(crate) fn from_snapshot(snapshot: &PermissionRuntimeSnapshot) -> Self {
+        Self {
+            mode: snapshot.mode,
+            pre_plan_mode: snapshot.pre_plan_mode,
+            rules: snapshot.rules.clone(),
+            workspace_root: snapshot.workspace_root.clone(),
+            additional_allowed_roots: snapshot.additional_allowed_roots.clone(),
+            prompt_behavior: snapshot.prompt_behavior,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -137,14 +185,18 @@ mod tests {
         let built_in_rule = PermissionRule {
             effect: PermissionRuleEffect::Allow,
             scope: PermissionScope::Workspace,
+            request_scope: None,
             target: PermissionTarget::Tool {
                 name: "read_file".into(),
             },
+            source_path: None,
         };
         let user_rule = PermissionRule {
             effect: PermissionRuleEffect::Ask,
             scope: PermissionScope::Session,
+            request_scope: None,
             target: PermissionTarget::Any,
+            source_path: None,
         };
 
         context.add_rule(PermissionRuleSource::BuiltIn, built_in_rule.clone());
@@ -192,5 +244,42 @@ mod tests {
 
         assert_eq!(context.mode(), PermissionMode::Plan);
         assert_eq!(context.pre_plan_mode(), Some(PermissionMode::Default));
+    }
+
+    #[test]
+    fn permission_runtime_snapshot_round_trips_context_state() {
+        let mut context = PermissionContext::new(
+            PathBuf::from("/workspace"),
+            false,
+            PermissionPromptBehavior::Headless,
+        );
+        context.set_mode(PermissionMode::AcceptEdits);
+        context.set_pre_plan_mode(Some(PermissionMode::Default));
+        context.add_allowed_root(PathBuf::from("/tmp/extra"));
+        context.add_rule(
+            PermissionRuleSource::Workspace,
+            PermissionRule {
+                effect: PermissionRuleEffect::Deny,
+                scope: PermissionScope::Workspace,
+                request_scope: Some(crate::permission::request::PermissionScope::Write),
+                target: PermissionTarget::Any,
+                source_path: Some(PathBuf::from("/workspace/.quine/permissions.yaml")),
+            },
+        );
+
+        let snapshot = context.snapshot(None, None);
+        let restored = PermissionContext::from_snapshot(&snapshot);
+
+        assert_eq!(restored.mode(), PermissionMode::AcceptEdits);
+        assert_eq!(restored.pre_plan_mode(), Some(PermissionMode::Default));
+        assert_eq!(
+            restored.prompt_behavior(),
+            PermissionPromptBehavior::Headless
+        );
+        assert_eq!(
+            restored.additional_allowed_roots(),
+            &[PathBuf::from("/tmp/extra")]
+        );
+        assert_eq!(restored.rules(), context.rules());
     }
 }

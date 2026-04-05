@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::client::IpcClient;
 use crate::render::Renderer;
 use quine_harness::protocol::methods;
+use quine_harness::PermissionPromptBehavior;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct PlanSnapshot {
@@ -225,6 +226,172 @@ pub(crate) struct MemoryDiagnosticsSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionModeSnapshot {
+    Default,
+    AcceptEdits,
+    Plan,
+    Bypass,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionDecisionSnapshot {
+    Allow,
+    Deny,
+    Ask,
+    Defer,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionRuleEffectSnapshot {
+    Allow,
+    Deny,
+    Ask,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionRuleSourceSnapshot {
+    BuiltIn,
+    Session,
+    User,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionRuleScopeSnapshot {
+    Session,
+    Workspace,
+    Global,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionRequestScopeSnapshot {
+    Read,
+    Write,
+    Execute,
+    ProcessControl,
+    AgentControl,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PermissionTargetSnapshot {
+    Any,
+    Tool { name: String },
+    Path { path: PathBuf },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PermissionRuleSnapshot {
+    pub effect: PermissionRuleEffectSnapshot,
+    pub scope: PermissionRuleScopeSnapshot,
+    pub request_scope: Option<PermissionRequestScopeSnapshot>,
+    pub target: PermissionTargetSnapshot,
+    pub source_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PermissionRuleSetSnapshot {
+    pub built_in: Vec<PermissionRuleSnapshot>,
+    pub session: Vec<PermissionRuleSnapshot>,
+    pub user: Vec<PermissionRuleSnapshot>,
+    pub workspace: Vec<PermissionRuleSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PermissionMatchKindSnapshot {
+    ToolLocal,
+    FilesystemBoundary,
+    Rule,
+    ModeDefault,
+    HeadlessFallback,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct MatchedPermissionSourceSnapshot {
+    pub kind: PermissionMatchKindSnapshot,
+    pub rule_source: Option<PermissionRuleSourceSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PermissionResourceSnapshot {
+    None,
+    Path {
+        path: PathBuf,
+    },
+    Command {
+        descriptor: PermissionCommandDescriptorSnapshot,
+    },
+    Process {
+        target: String,
+    },
+    Agent {
+        target: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum CommandRiskSnapshot {
+    ReadOnly,
+    Mutating,
+    NestedShell,
+    Interpreter,
+    Unknown,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PermissionCommandDescriptorSnapshot {
+    pub command: String,
+    pub program: Option<String>,
+    pub argv: Vec<String>,
+    pub risk: CommandRiskSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PermissionRequestSnapshot {
+    pub tool_name: String,
+    pub action: Option<String>,
+    pub scope: PermissionRequestScopeSnapshot,
+    pub resource: PermissionResourceSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PermissionOutcomeSnapshot {
+    pub kind: String,
+    pub final_decision: PermissionDecisionSnapshot,
+    pub source: MatchedPermissionSourceSnapshot,
+    pub reason: String,
+    pub request: PermissionRequestSnapshot,
+    pub matched_rule: Option<PermissionRuleSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PendingPermissionApprovalSnapshot {
+    pub request_id: String,
+    pub outcome: PermissionOutcomeSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct PermissionDiagnosticsSnapshot {
+    pub mode: PermissionModeSnapshot,
+    pub pre_plan_mode: Option<PermissionModeSnapshot>,
+    pub prompt_behavior: PermissionPromptBehavior,
+    pub workspace_root: PathBuf,
+    pub additional_allowed_roots: Vec<PathBuf>,
+    pub rules: PermissionRuleSetSnapshot,
+    pub last_decision: Option<PermissionOutcomeSnapshot>,
+    pub pending_approval: Option<PendingPermissionApprovalSnapshot>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionContextSnapshot {
     pub session_id: String,
     pub created_at: DateTime<Utc>,
@@ -238,6 +405,7 @@ pub(crate) struct SessionContextSnapshot {
     pub plans: Vec<PlanSnapshot>,
     pub prompt_memory: Option<PromptMemorySnapshot>,
     pub memory_diagnostics: Option<MemoryDiagnosticsSnapshot>,
+    pub permission_diagnostics: Option<PermissionDiagnosticsSnapshot>,
     pub history: Vec<HistoryEntry>,
 }
 
@@ -359,10 +527,26 @@ mod tests {
                     }
                 }
             },
+            "permission_diagnostics": {
+                "mode": "default",
+                "pre_plan_mode": null,
+                "prompt_behavior": "interactive",
+                "workspace_root": "/tmp/project",
+                "additional_allowed_roots": [],
+                "rules": {
+                    "built_in": [],
+                    "session": [],
+                    "user": [],
+                    "workspace": []
+                },
+                "last_decision": null,
+                "pending_approval": null
+            },
             "history": []
         });
 
         let snapshot: SessionContextSnapshot = serde_json::from_value(value).unwrap();
         assert!(snapshot.memory_diagnostics.is_some());
+        assert!(snapshot.permission_diagnostics.is_some());
     }
 }

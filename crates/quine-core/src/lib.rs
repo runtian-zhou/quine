@@ -31,6 +31,13 @@ pub use memory::{
     ScopedPersistentMemoryState, SessionMemoryDiagnostics, SessionRefreshDiagnostics,
 };
 pub use permission::PermissionPromptBehavior;
+pub use permission::{
+    ApprovalRequestId, CommandDescriptor, CommandRisk, MatchedPermissionSource,
+    PendingPermissionApproval, PermissionDecision, PermissionMatchKind, PermissionMode,
+    PermissionOutcome, PermissionOutcomeKind, PermissionRequest, PermissionResource,
+    PermissionRule, PermissionRuleEffect, PermissionRuleSet, PermissionRuleSource,
+    PermissionRuntimeSnapshot, PermissionScope, RuleScope, ToolLocalDecision,
+};
 pub use persistence::{
     CoreCheckpoint, PersistedMemoryState, PersistedPersistentMemoryState, PersistedPlanStore,
     PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,

@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::{MemoryPolicyConfig, ScopedPersistentMemoryState};
-use crate::permission::PermissionPromptBehavior;
+use crate::permission::{PermissionPromptBehavior, PermissionRuntimeSnapshot};
 use crate::planner::ActionPlan;
 use crate::session::{ExitStatus, SessionId, SessionState};
 
@@ -38,6 +38,8 @@ pub struct PersistedSession {
     pub plan_store: PersistedPlanStore,
     #[serde(default)]
     pub memory_state: Option<PersistedMemoryState>,
+    #[serde(default)]
+    pub permission_state: Option<PermissionRuntimeSnapshot>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -233,6 +235,7 @@ mod tests {
         });
         let roundtrip: PersistedSession = serde_json::from_value(json).unwrap();
         assert!(roundtrip.memory_state.is_none());
+        assert!(roundtrip.permission_state.is_none());
     }
 
     #[test]
