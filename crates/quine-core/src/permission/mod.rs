@@ -3,6 +3,7 @@ pub(crate) mod context;
 pub(crate) mod engine;
 pub(crate) mod mode;
 pub(crate) mod outcome;
+pub(crate) mod path;
 pub(crate) mod request;
 pub(crate) mod types;
 

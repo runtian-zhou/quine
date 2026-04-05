@@ -36,6 +36,7 @@ pub(crate) struct PermissionRequest {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum PermissionMatchKind {
     ToolLocal,
+    FilesystemBoundary,
     Rule,
     ModeDefault,
     HeadlessFallback,
