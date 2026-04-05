@@ -212,7 +212,7 @@ impl PlanTool {
         store.insert(plan_id, plan);
 
         Ok(ToolOutput::success(format!(
-            "Plan created (ID: {plan_id})\n\n{rendered}"
+            "Plan created (ID: {plan_id})\nplan_id: {plan_id}\n\n{rendered}"
         )))
     }
 
@@ -330,8 +330,16 @@ mod tests {
         let result = tool.execute(args, &ctx).await.unwrap();
         assert!(!result.is_error);
         assert!(result.content.contains("Plan created"));
+        let created_plan_id = {
+            let store_locked = store.lock().await;
+            let plan_id = store_locked.keys().next().unwrap().to_string();
+            drop(store_locked);
+            plan_id
+        };
+        assert!(result
+            .content
+            .contains(&format!("plan_id: {created_plan_id}")));
         assert!(result.content.contains("Test Plan"));
-
         let store_locked = store.lock().await;
         assert_eq!(store_locked.len(), 1);
     }

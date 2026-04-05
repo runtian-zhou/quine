@@ -2780,8 +2780,9 @@ async fn handle_plan_progress(
             let prompt = format!(
                 "Execute the next action from your plan: {}. \
                  When done, use the `plan` tool with operation `update_plan` \
-                 to mark it as completed.",
-                prompt_parts.join("; ")
+                 to mark it as completed. Reuse this exact plan_id: {}",
+                prompt_parts.join("; "),
+                plan_id_str,
             );
             session.history.push(Message::user(prompt));
         }
@@ -5529,6 +5530,83 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         }
         assert_eq!(tool_result_ids, vec!["toolu_read", "toolu_find"]);
         assert!(saw_turn_complete);
+    }
+
+    #[tokio::test]
+    async fn handle_plan_progress_prompt_includes_exact_plan_id() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let mut session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                initial_messages: vec![Message::user("plan this")],
+                archive_root: std::env::temp_dir().join("quine-core-plan-progress-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let plan_id = crate::planner::PlanId::new();
+        {
+            let mut store = session.plan_store.lock().await;
+            store.insert(
+                plan_id,
+                crate::planner::ActionPlan {
+                    plan_id,
+                    title: "Test plan".into(),
+                    actions: vec![
+                        crate::planner::Action {
+                            action_id: crate::planner::ActionId::new("a1"),
+                            title: "First".into(),
+                            description: "do first".into(),
+                            depends_on: vec![],
+                            status: crate::planner::ActionStatus::Completed,
+                            result: Some("done".into()),
+                        },
+                        crate::planner::Action {
+                            action_id: crate::planner::ActionId::new("a2"),
+                            title: "Second".into(),
+                            description: "do second".into(),
+                            depends_on: vec![crate::planner::ActionId::new("a1")],
+                            status: crate::planner::ActionStatus::Pending,
+                            result: None,
+                        },
+                    ],
+                },
+            );
+        }
+
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(8);
+        let session_id = SessionId::new();
+        handle_plan_progress(
+            &mut session,
+            session_id,
+            &output_tx,
+            &plan_id.to_string(),
+            "a1",
+        )
+        .await;
+
+        let prompt = session
+            .history
+            .last()
+            .and_then(|message| match &message.content {
+                MessageContent::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .expect("ready-action prompt should be appended");
+        assert!(prompt.contains("update_plan"));
+        assert!(prompt.contains(&format!("Reuse this exact plan_id: {plan_id}")));
     }
 
     struct ToolCallThenTextProvider {
