@@ -5,8 +5,8 @@ use chrono::{DateTime, Utc};
 use quine_core::{
     built_in_tool_definitions,
     planner::{ActionPlan, ActionStatus},
-    skill, CoreCheckpoint, MemoryTurnDiagnostics, PersistedPromptMemoryState, PersistedSession,
-    SessionId,
+    skill, CoreCheckpoint, MemoryTurnDiagnostics, PermissionRuntimeSnapshot,
+    PersistedPromptMemoryState, PersistedSession, SessionId,
 };
 use quine_llm::{Message, MessageContent, Role, ToolDefinition};
 use serde::{Deserialize, Serialize};
@@ -64,6 +64,7 @@ pub struct SessionContextSnapshot {
     pub plans: Vec<PlanSnapshot>,
     pub prompt_memory: Option<PersistedPromptMemoryState>,
     pub memory_diagnostics: Option<MemoryTurnDiagnostics>,
+    pub permission_diagnostics: Option<PermissionRuntimeSnapshot>,
     pub history: Vec<HistoryEntry>,
 }
 
@@ -137,6 +138,7 @@ fn snapshot_from_persisted(
             .memory_state
             .as_ref()
             .and_then(|state| state.memory_diagnostics.clone()),
+        permission_diagnostics: session.permission_state.clone(),
         history: session
             .history
             .iter()
@@ -467,6 +469,16 @@ mod tests {
                         },
                     }),
                 }),
+                permission_state: Some(quine_core::PermissionRuntimeSnapshot {
+                    mode: quine_core::PermissionMode::Default,
+                    pre_plan_mode: None,
+                    rules: quine_core::PermissionRuleSet::default(),
+                    workspace_root: PathBuf::from("/tmp/project"),
+                    additional_allowed_roots: Vec::new(),
+                    prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
+                    last_decision: None,
+                    pending_approval: None,
+                }),
             }],
             PersistedSessionTree {
                 parents: Default::default(),
@@ -506,6 +518,7 @@ mod tests {
         assert!(snapshot.loaded_skills.is_empty());
         assert!(snapshot.plans.is_empty());
         assert!(snapshot.memory_diagnostics.is_some());
+        assert!(snapshot.permission_diagnostics.is_some());
         match &snapshot.history[0] {
             super::HistoryEntry::Text { role, text } => {
                 assert_eq!(role, "user");

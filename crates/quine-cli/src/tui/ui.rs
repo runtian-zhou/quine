@@ -1285,6 +1285,7 @@ mod tests {
             plans: vec![],
             prompt_memory: None,
             memory_diagnostics: None,
+            permission_diagnostics: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1328,6 +1329,7 @@ mod tests {
             plans: vec![],
             prompt_memory: None,
             memory_diagnostics: None,
+            permission_diagnostics: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1375,6 +1377,7 @@ mod tests {
             plans: vec![],
             prompt_memory: None,
             memory_diagnostics: None,
+            permission_diagnostics: None,
             history: vec![HistoryEntry::Text {
                 role: "user".into(),
                 text: "hello world".into(),
@@ -1419,6 +1422,7 @@ mod tests {
             plans: vec![],
             prompt_memory: None,
             memory_diagnostics: None,
+            permission_diagnostics: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1471,6 +1475,7 @@ mod tests {
             plans: vec![],
             prompt_memory: None,
             memory_diagnostics: None,
+            permission_diagnostics: None,
             history: vec![
                 HistoryEntry::ToolUse {
                     role: "assistant".into(),
@@ -1523,6 +1528,7 @@ mod tests {
             plans: vec![],
             prompt_memory: None,
             memory_diagnostics: None,
+            permission_diagnostics: None,
             history: vec![],
         };
         let mut app = App::new("test".into(), false, None);
@@ -1561,6 +1567,7 @@ mod tests {
             plans: vec![],
             prompt_memory: None,
             memory_diagnostics: None,
+            permission_diagnostics: None,
             history: vec![],
         };
         let mut app = App::new("test".into(), false, None);
@@ -1604,6 +1611,7 @@ mod tests {
             }],
             prompt_memory: None,
             memory_diagnostics: None,
+            permission_diagnostics: None,
             history: vec![],
         };
         let mut app = App::new("test".into(), false, None);

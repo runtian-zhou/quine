@@ -7,7 +7,7 @@ use super::types::{PermissionDecision, PermissionRuleSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PermissionScope {
+pub enum PermissionScope {
     Read,
     Write,
     Execute,
@@ -17,7 +17,7 @@ pub(crate) enum PermissionScope {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum PermissionResource {
+pub enum PermissionResource {
     None,
     Path { path: PathBuf },
     Command { descriptor: CommandDescriptor },
@@ -26,7 +26,7 @@ pub(crate) enum PermissionResource {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PermissionRequest {
+pub struct PermissionRequest {
     pub tool_name: String,
     pub action: Option<String>,
     pub scope: PermissionScope,
@@ -35,7 +35,7 @@ pub(crate) struct PermissionRequest {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PermissionMatchKind {
+pub enum PermissionMatchKind {
     ToolLocal,
     FilesystemBoundary,
     Rule,
@@ -44,13 +44,13 @@ pub(crate) enum PermissionMatchKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct MatchedPermissionSource {
+pub struct MatchedPermissionSource {
     pub kind: PermissionMatchKind,
     pub rule_source: Option<PermissionRuleSource>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ToolLocalDecision {
+pub struct ToolLocalDecision {
     pub decision: PermissionDecision,
     pub reason: Option<String>,
 }

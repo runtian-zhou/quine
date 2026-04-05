@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum CommandRisk {
+pub enum CommandRisk {
     ReadOnly,
     Mutating,
     NestedShell,
@@ -23,7 +23,7 @@ impl CommandRisk {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CommandDescriptor {
+pub struct CommandDescriptor {
     pub command: String,
     pub program: Option<String>,
     #[serde(default)]

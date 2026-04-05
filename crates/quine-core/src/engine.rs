@@ -568,6 +568,7 @@ impl SessionContext {
             history,
             plan_store,
             memory_state,
+            permission_state,
         } = persisted;
         let skills =
             crate::skill::load_skills(&config.working_directory, &config.skill_names).await;
@@ -645,6 +646,11 @@ impl SessionContext {
         } else {
             refresh_scoped_memory_state(&mut session);
         }
+        if let Some(permission_state) = permission_state.as_ref() {
+            session.permission_context = PermissionContext::from_snapshot(permission_state);
+            session.last_permission_outcome = permission_state.last_decision.clone();
+            session.pending_permission_approval = permission_state.pending_approval.clone();
+        }
         Ok((session_id, session))
     }
 
@@ -666,6 +672,10 @@ impl SessionContext {
                 }
                 memory_state
             }),
+            permission_state: Some(self.permission_context.snapshot(
+                self.last_permission_outcome.clone(),
+                self.pending_permission_approval.clone(),
+            )),
         })
     }
 
@@ -2058,8 +2068,16 @@ async fn execute_tool_call(
         {
             let (pending, request) = build_permission_approval_request(&permission_outcome);
             if let Some(session) = sessions.get_mut(&session_id) {
+                session.state = SessionState::Paused;
                 session.pending_permission_approval = Some(pending);
             }
+            let _ = io
+                .output
+                .send(CoreOutput::SessionStateChanged {
+                    session_id,
+                    state: SessionState::Paused,
+                })
+                .await;
             let _ = io
                 .output
                 .send(CoreOutput::InteractionNeeded {
@@ -2076,8 +2094,16 @@ async fn execute_tool_call(
                     }) if resp_sid == session_id => {
                         let choice = parse_permission_approval_response(&response);
                         if let Some(session) = sessions.get_mut(&session_id) {
+                            session.state = SessionState::Streaming;
                             session.pending_permission_approval = None;
                         }
+                        let _ = io
+                            .output
+                            .send(CoreOutput::SessionStateChanged {
+                                session_id,
+                                state: SessionState::Streaming,
+                            })
+                            .await;
                         match choice {
                             Some(PermissionApprovalChoice::ApproveOnce) => break,
                             Some(PermissionApprovalChoice::DenyOnce) | None => {
@@ -2097,8 +2123,16 @@ async fn execute_tool_call(
                         session_id: cancel_sid,
                     }) if cancel_sid == session_id => {
                         if let Some(session) = sessions.get_mut(&session_id) {
+                            session.state = SessionState::Streaming;
                             session.pending_permission_approval = None;
                         }
+                        let _ = io
+                            .output
+                            .send(CoreOutput::SessionStateChanged {
+                                session_id,
+                                state: SessionState::Streaming,
+                            })
+                            .await;
                         interrupt_session(sessions, io.deferred_inputs, session_id);
                         return ToolOutcome::Cancelled;
                     }
@@ -2112,17 +2146,37 @@ async fn execute_tool_call(
                         ) =>
                     {
                         if let Some(session) = sessions.get_mut(&session_id) {
+                            session.state = SessionState::Streaming;
                             session.pending_permission_approval = None;
                         }
+                        let _ = io
+                            .output
+                            .send(CoreOutput::SessionStateChanged {
+                                session_id,
+                                state: SessionState::Streaming,
+                            })
+                            .await;
                         interrupt_session(sessions, io.deferred_inputs, session_id);
                         return ToolOutcome::Cancelled;
+                    }
+                    Some(CoreInput::RequestCheckpoint { reply }) => {
+                        emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
+                        let _ = reply.send(());
                     }
                     Some(other) => io.deferred_inputs.push_back(other),
                     None => {
                         if let Some(session) = sessions.get_mut(&session_id) {
+                            session.state = SessionState::Streaming;
                             session.pending_permission_approval = None;
                             session.cancel_tx = None;
                         }
+                        let _ = io
+                            .output
+                            .send(CoreOutput::SessionStateChanged {
+                                session_id,
+                                state: SessionState::Streaming,
+                            })
+                            .await;
                         return ToolOutcome::Error {
                             message: ToolError::PermissionDenied {
                                 reason: format!(
@@ -5995,20 +6049,24 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         let execute = execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine);
         let deny = async {
-            match output_rx.recv().await {
-                Some(CoreOutput::InteractionNeeded { .. }) => {
-                    input_tx
-                        .send(CoreInput::InteractionResponse {
-                            session_id,
-                            response: InteractionResponse {
-                                response: "deny once".into(),
-                                selected_indices: vec![1],
-                            },
-                        })
-                        .await
-                        .unwrap();
+            loop {
+                match output_rx.recv().await {
+                    Some(CoreOutput::InteractionNeeded { .. }) => {
+                        input_tx
+                            .send(CoreInput::InteractionResponse {
+                                session_id,
+                                response: InteractionResponse {
+                                    response: "deny once".into(),
+                                    selected_indices: vec![1],
+                                },
+                            })
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    Some(CoreOutput::SessionStateChanged { .. }) => {}
+                    other => panic!("expected permission interaction, got {other:?}"),
                 }
-                other => panic!("expected permission interaction, got {other:?}"),
             }
         };
         let (outcome, ()) = tokio::join!(execute, deny);
@@ -6088,24 +6146,28 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         let execute = execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine);
         let approve = async {
-            match output_rx.recv().await {
-                Some(CoreOutput::InteractionNeeded { request, .. }) => {
-                    assert!(request
-                        .source_label
-                        .as_deref()
-                        .is_some_and(|label| label.starts_with("permission:")));
-                    input_tx
-                        .send(CoreInput::InteractionResponse {
-                            session_id,
-                            response: InteractionResponse {
-                                response: "approve once".into(),
-                                selected_indices: vec![0],
-                            },
-                        })
-                        .await
-                        .unwrap();
+            loop {
+                match output_rx.recv().await {
+                    Some(CoreOutput::InteractionNeeded { request, .. }) => {
+                        assert!(request
+                            .source_label
+                            .as_deref()
+                            .is_some_and(|label| label.starts_with("permission:")));
+                        input_tx
+                            .send(CoreInput::InteractionResponse {
+                                session_id,
+                                response: InteractionResponse {
+                                    response: "approve once".into(),
+                                    selected_indices: vec![0],
+                                },
+                            })
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    Some(CoreOutput::SessionStateChanged { .. }) => {}
+                    other => panic!("expected permission interaction, got {other:?}"),
                 }
-                other => panic!("expected permission interaction, got {other:?}"),
             }
         };
 
@@ -6169,20 +6231,24 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         let execute = execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine);
         let deny = async {
-            match output_rx.recv().await {
-                Some(CoreOutput::InteractionNeeded { .. }) => {
-                    input_tx
-                        .send(CoreInput::InteractionResponse {
-                            session_id,
-                            response: InteractionResponse {
-                                response: "deny once".into(),
-                                selected_indices: vec![1],
-                            },
-                        })
-                        .await
-                        .unwrap();
+            loop {
+                match output_rx.recv().await {
+                    Some(CoreOutput::InteractionNeeded { .. }) => {
+                        input_tx
+                            .send(CoreInput::InteractionResponse {
+                                session_id,
+                                response: InteractionResponse {
+                                    response: "deny once".into(),
+                                    selected_indices: vec![1],
+                                },
+                            })
+                            .await
+                            .unwrap();
+                        break;
+                    }
+                    Some(CoreOutput::SessionStateChanged { .. }) => {}
+                    other => panic!("expected permission interaction, got {other:?}"),
                 }
-                other => panic!("expected permission interaction, got {other:?}"),
             }
         };
 
@@ -6865,6 +6931,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     prompt_memory: None,
                     memory_diagnostics: None,
                 }),
+                permission_state: None,
             }],
             crate::persistence::PersistedSessionTree {
                 parents: std::collections::HashMap::new(),

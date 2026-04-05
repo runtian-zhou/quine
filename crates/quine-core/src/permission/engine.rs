@@ -29,6 +29,7 @@ pub(crate) fn evaluate_permission(
                 .reason
                 .unwrap_or_else(|| "tool-local policy denied request".into()),
             context.prompt_behavior(),
+            None,
         );
     }
 
@@ -43,12 +44,12 @@ pub(crate) fn evaluate_permission(
                 },
                 reason,
                 context.prompt_behavior(),
+                None,
             );
         }
     }
 
-    if let Some((source, _rule)) =
-        first_matching_rule(context, &request, PermissionRuleEffect::Deny)
+    if let Some((source, rule)) = first_matching_rule(context, &request, PermissionRuleEffect::Deny)
     {
         return outcome_for(
             request,
@@ -59,6 +60,7 @@ pub(crate) fn evaluate_permission(
             },
             format!("permission denied by {source:?} rule"),
             context.prompt_behavior(),
+            Some(rule.clone()),
         );
     }
 
@@ -75,6 +77,7 @@ pub(crate) fn evaluate_permission(
             },
             format!("permission allowed by {source:?} rule"),
             context.prompt_behavior(),
+            Some(rule.clone()),
         );
     }
 
@@ -89,6 +92,7 @@ pub(crate) fn evaluate_permission(
         },
         mode_reason,
         context.prompt_behavior(),
+        None,
     )
 }
 
@@ -98,6 +102,7 @@ fn outcome_for(
     source: MatchedPermissionSource,
     reason: String,
     prompt_behavior: PermissionPromptBehavior,
+    matched_rule: Option<PermissionRule>,
 ) -> PermissionOutcome {
     if decision == PermissionDecision::Ask && !prompt_behavior.is_interactive() {
         return PermissionOutcome {
@@ -112,6 +117,7 @@ fn outcome_for(
                 prompt_behavior.denial_label()
             ),
             request,
+            matched_rule,
         };
     }
 
@@ -128,6 +134,7 @@ fn outcome_for(
         source,
         reason,
         request,
+        matched_rule,
     }
 }
 
@@ -214,6 +221,13 @@ fn first_matching_rule<'a>(
 }
 
 fn rule_matches(rule: &PermissionRule, request: &PermissionRequest) -> bool {
+    if rule
+        .request_scope
+        .is_some_and(|scope| scope != request.scope)
+    {
+        return false;
+    }
+
     match &rule.target {
         PermissionTarget::Any => true,
         PermissionTarget::Tool { name } => name == &request.tool_name,
@@ -262,9 +276,11 @@ mod tests {
             PermissionRule {
                 effect: PermissionRuleEffect::Allow,
                 scope: RuleScope::Session,
+                request_scope: None,
                 target: PermissionTarget::Tool {
                     name: "bash".into(),
                 },
+                source_path: None,
             },
         );
 
@@ -292,16 +308,20 @@ mod tests {
         let allow_rule = PermissionRule {
             effect: PermissionRuleEffect::Allow,
             scope: RuleScope::Session,
+            request_scope: None,
             target: PermissionTarget::Tool {
                 name: "bash".into(),
             },
+            source_path: None,
         };
         let deny_rule = PermissionRule {
             effect: PermissionRuleEffect::Deny,
             scope: RuleScope::Session,
+            request_scope: None,
             target: PermissionTarget::Tool {
                 name: "bash".into(),
             },
+            source_path: None,
         };
         context.add_rule(PermissionRuleSource::User, allow_rule);
         context.add_rule(PermissionRuleSource::Workspace, deny_rule);
@@ -327,9 +347,11 @@ mod tests {
             PermissionRule {
                 effect: PermissionRuleEffect::Allow,
                 scope: RuleScope::Session,
+                request_scope: None,
                 target: PermissionTarget::Tool {
                     name: "bash".into(),
                 },
+                source_path: None,
             },
         );
 
