@@ -80,6 +80,7 @@ async fn run_tool_turn(
             skills: Vec::new(),
             plan_mode: false,
             prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
+            permission_rules: quine_core::PermissionRuleSet::default(),
             initial_messages: Vec::new(),
             agent_key: None,
             team_key: None,

@@ -28,8 +28,8 @@ use crate::permission::{
     analyze_command, build_permission_approval_request, evaluate_permission,
     exit_plan_mode as exit_permission_plan_mode, parse_permission_approval_response,
     PendingPermissionApproval, PermissionApprovalChoice, PermissionContext, PermissionOutcome,
-    PermissionPromptBehavior, PermissionRequest, PermissionResource, PermissionScope,
-    ToolLocalDecision,
+    PermissionPromptBehavior, PermissionRequest, PermissionResource, PermissionRuleSet,
+    PermissionScope, ToolLocalDecision,
 };
 use crate::persistence::{
     CoreCheckpoint, PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
@@ -1941,6 +1941,7 @@ async fn start_child_session(
     task: String,
     system_prompt: Option<String>,
     prompt_behavior: PermissionPromptBehavior,
+    permission_rules: PermissionRuleSet,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
 ) -> Result<(), String> {
@@ -1971,6 +1972,8 @@ async fn start_child_session(
     )
     .await
     .map_err(|e| e.to_string())?;
+    let mut ctx = ctx;
+    ctx.permission_context.set_rules(permission_rules);
 
     debug_log_session(
         child_id,
@@ -2219,18 +2222,20 @@ async fn execute_tool_call(
             .get("system_prompt")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned);
-        let (archive_root, max_context_window, prompt_behavior) = match sessions.get(&session_id) {
-            Some(session) => (
-                session.archive_root.clone(),
-                session.max_context_window,
-                session.permission_context.prompt_behavior(),
-            ),
-            None => {
-                return ToolOutcome::Error {
-                    message: "session not found".into(),
-                };
-            }
-        };
+        let (archive_root, max_context_window, prompt_behavior, permission_rules) =
+            match sessions.get(&session_id) {
+                Some(session) => (
+                    session.archive_root.clone(),
+                    session.max_context_window,
+                    session.permission_context.prompt_behavior(),
+                    session.permission_context.rules().persisted_only(),
+                ),
+                None => {
+                    return ToolOutcome::Error {
+                        message: "session not found".into(),
+                    };
+                }
+            };
         let child_id = SessionId::new();
         match Box::pin(start_child_session(
             sessions,
@@ -2241,6 +2246,7 @@ async fn execute_tool_call(
             task,
             system_prompt,
             prompt_behavior,
+            permission_rules,
             archive_root,
             max_context_window,
         ))
@@ -3463,6 +3469,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 agent_key,
                 team_key,
                 memory_policy,
+                permission_rules,
                 reply,
             } => {
                 debug_log_session(
@@ -3502,7 +3509,8 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 )
                 .await
                 {
-                    Ok(ctx) => {
+                    Ok(mut ctx) => {
+                        ctx.permission_context.set_rules(permission_rules);
                         debug_log_session(
                             session_id,
                             format!(
@@ -3884,6 +3892,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 task,
                 system_prompt,
                 prompt_behavior,
+                permission_rules,
                 inheritance,
                 reply,
             } => {
@@ -3925,6 +3934,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     task,
                     system_prompt,
                     prompt_behavior,
+                    permission_rules,
                     archive_root.clone(),
                     max_context_window,
                 )
@@ -6584,6 +6594,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6605,6 +6616,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 task: "Reply with exactly one integer. No explanation.".into(),
                 system_prompt: None,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 inheritance: InheritanceFlags::default(),
                 reply: spawn_reply_tx,
             })
@@ -6662,6 +6674,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6701,6 +6714,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6784,6 +6798,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6857,6 +6872,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     initial_messages: Vec::new(),
                     agent_key: None,
                     team_key: None,
+                    permission_rules: PermissionRuleSet::default(),
                     memory_policy: MemoryPolicyConfig::default(),
                     reply: reply_tx,
                 })
@@ -7021,6 +7037,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7076,6 +7093,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7137,6 +7155,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7157,6 +7176,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7193,6 +7213,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
@@ -7305,6 +7326,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
@@ -7577,6 +7599,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
@@ -7695,6 +7718,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 reply: reply_tx,
             })
@@ -7804,6 +7828,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: true,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7918,6 +7943,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: true,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7997,6 +8023,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: vec![seeded_message.clone()],
                 agent_key: None,
                 team_key: None,
@@ -8032,6 +8059,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     skills: Vec::new(),
                     plan_mode: false,
                     prompt_behavior: PermissionPromptBehavior::Interactive,
+                    permission_rules: PermissionRuleSet::default(),
                     initial_messages: Vec::new(),
                     agent_key: None,
                     team_key: None,
@@ -8172,6 +8200,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 plan_mode: false,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,

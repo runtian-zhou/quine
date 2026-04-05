@@ -118,6 +118,7 @@ impl Tool for SpawnTool {
                 task: task.to_string(),
                 system_prompt,
                 prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: crate::permission::PermissionRuleSet::default(),
                 inheritance: InheritanceFlags {
                     history: inherit_history,
                     filesystem: inherit_filesystem,
@@ -245,6 +246,7 @@ mod tests {
                 prompt_behavior,
                 inheritance,
                 reply,
+                ..
             } => {
                 assert_eq!(parent_id, session_id);
                 assert_eq!(task, "delegate this");

@@ -143,6 +143,10 @@ impl PermissionContext {
             prompt_behavior: snapshot.prompt_behavior,
         }
     }
+
+    pub(crate) fn set_rules(&mut self, rules: PermissionRuleSet) {
+        self.rules = rules;
+    }
 }
 
 #[cfg(test)]

@@ -528,6 +528,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn get_session_context_distinguishes_persisted_and_session_rules() {
+        let mut checkpoint = sample_checkpoint();
+        checkpoint.sessions[0]
+            .permission_state
+            .as_mut()
+            .expect("permission state should be present")
+            .rules = quine_core::PermissionRuleSet {
+            built_in: Vec::new(),
+            session: vec![quine_core::PermissionRule {
+                effect: quine_core::PermissionRuleEffect::Allow,
+                scope: quine_core::RuleScope::Session,
+                request_scope: Some(quine_core::PermissionScope::Execute),
+                target: quine_core::PermissionTarget::Tool {
+                    name: "bash".into(),
+                },
+                source_path: None,
+            }],
+            user: Vec::new(),
+            workspace: vec![quine_core::PermissionRule {
+                effect: quine_core::PermissionRuleEffect::Deny,
+                scope: quine_core::RuleScope::Workspace,
+                request_scope: Some(quine_core::PermissionScope::Write),
+                target: quine_core::PermissionTarget::Path {
+                    path: PathBuf::from("src"),
+                },
+                source_path: Some(PathBuf::from("/tmp/project/.quine/permissions.yaml")),
+            }],
+        };
+
+        let session_id = checkpoint.sessions[0].session_id;
+        let snapshot = super::session_context_from_checkpoint(
+            &checkpoint,
+            session_id,
+            &HashMap::from([(session_id, "idle".to_string())]),
+        )
+        .expect("session context should project from checkpoint");
+        let diagnostics = snapshot
+            .permission_diagnostics
+            .expect("permission diagnostics should be present");
+
+        assert_eq!(diagnostics.rules.session.len(), 1);
+        assert_eq!(diagnostics.rules.workspace.len(), 1);
+        assert!(diagnostics.rules.session[0].source_path.is_none());
+        assert_eq!(
+            diagnostics.rules.workspace[0].source_path.as_deref(),
+            Some(Path::new("/tmp/project/.quine/permissions.yaml"))
+        );
+    }
+
     #[tokio::test]
     async fn commit_and_load_roundtrip() {
         let storage = make_temp_storage();
