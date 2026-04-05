@@ -1,7 +1,10 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use quine_core::{MemoryPolicyConfig, PermissionPromptBehavior};
+use quine_core::{
+    MemoryPolicyConfig, PermissionPromptBehavior, PermissionRule, PermissionRuleEffect,
+    PermissionRuleSet, PermissionRuleSource, PermissionTarget, RuleScope,
+};
 use quine_llm::anthropic::AnthropicConfig;
 use quine_llm::config::ProviderConfig;
 use quine_llm::openai_compat::OpenAiCompatConfig;
@@ -95,6 +98,76 @@ pub fn default_memory_dir() -> PathBuf {
 
 pub fn default_memory_dir_from_state_dir(state_dir: &std::path::Path) -> PathBuf {
     state_dir.join("memory")
+}
+
+#[derive(Debug, Deserialize)]
+struct PermissionRuleDocument {
+    #[serde(default)]
+    rules: Vec<ConfiguredPermissionRule>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConfiguredPermissionRule {
+    effect: PermissionRuleEffect,
+    scope: quine_core::PermissionScope,
+    target: PermissionTarget,
+}
+
+fn user_permission_rules_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".quine").join("permissions.yaml"))
+}
+
+pub fn project_permission_rules_path(working_directory: &std::path::Path) -> PathBuf {
+    working_directory.join(".quine").join("permissions.yaml")
+}
+
+fn parse_permission_rules_from_path(
+    path: &std::path::Path,
+    source: PermissionRuleSource,
+) -> anyhow::Result<Vec<PermissionRule>> {
+    let contents = std::fs::read_to_string(path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
+    let document: PermissionRuleDocument = serde_yaml::from_str(&contents)
+        .map_err(|error| anyhow::anyhow!("failed to parse {}: {error}", path.display()))?;
+
+    let scope = match source {
+        PermissionRuleSource::BuiltIn => RuleScope::Global,
+        PermissionRuleSource::Session => RuleScope::Session,
+        PermissionRuleSource::User => RuleScope::Global,
+        PermissionRuleSource::Workspace => RuleScope::Workspace,
+    };
+
+    Ok(document
+        .rules
+        .into_iter()
+        .map(|rule| PermissionRule {
+            effect: rule.effect,
+            scope,
+            request_scope: Some(rule.scope),
+            target: rule.target,
+            source_path: Some(path.to_path_buf()),
+        })
+        .collect())
+}
+
+pub fn load_persisted_permission_rules(
+    working_directory: &std::path::Path,
+) -> anyhow::Result<PermissionRuleSet> {
+    let mut rules = PermissionRuleSet::default();
+
+    if let Some(user_path) = user_permission_rules_path().filter(|path| path.exists()) {
+        rules.user = parse_permission_rules_from_path(&user_path, PermissionRuleSource::User)?;
+    }
+
+    let project_path = project_permission_rules_path(working_directory);
+    if project_path.exists() {
+        rules.workspace =
+            parse_permission_rules_from_path(&project_path, PermissionRuleSource::Workspace)?;
+    }
+
+    Ok(rules)
 }
 
 /// Build an LLM `ProviderConfig` from environment variables.
@@ -203,6 +276,15 @@ fn openai_compat_context_window(model: &str) -> Option<u64> {
 mod tests {
     use super::*;
     use std::path::Path;
+    use std::sync::{LazyLock, Mutex};
+    use tempfile::TempDir;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
+        let _guard = ENV_LOCK.lock().unwrap();
+        f()
+    }
 
     #[test]
     fn default_config_has_socket_path() {
@@ -244,20 +326,41 @@ mod tests {
 
     #[test]
     fn default_state_dir_prefers_quine_home_layout() {
-        std::env::remove_var("XDG_STATE_HOME");
-        std::env::set_var("HOME", "/tmp/quine-home");
-        assert_eq!(
-            default_state_dir(),
-            PathBuf::from("/tmp/quine-home/.quine/state")
-        );
-        std::env::remove_var("HOME");
+        with_env_lock(|| {
+            let previous_xdg_state_home = std::env::var_os("XDG_STATE_HOME");
+            let previous_home = std::env::var_os("HOME");
+            unsafe {
+                std::env::remove_var("XDG_STATE_HOME");
+                std::env::set_var("HOME", "/tmp/quine-home");
+            }
+            assert_eq!(
+                default_state_dir(),
+                PathBuf::from("/tmp/quine-home/.quine/state")
+            );
+            match previous_xdg_state_home {
+                Some(value) => unsafe { std::env::set_var("XDG_STATE_HOME", value) },
+                None => unsafe { std::env::remove_var("XDG_STATE_HOME") },
+            }
+            match previous_home {
+                Some(value) => unsafe { std::env::set_var("HOME", value) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        });
     }
 
     #[test]
     fn explicit_context_window_override_is_used() {
-        std::env::set_var("LLM_CONTEXT_WINDOW", "65536");
-        assert_eq!(max_context_window_from_env(), Some(65_536));
-        std::env::remove_var("LLM_CONTEXT_WINDOW");
+        with_env_lock(|| {
+            let previous_context_window = std::env::var_os("LLM_CONTEXT_WINDOW");
+            unsafe {
+                std::env::set_var("LLM_CONTEXT_WINDOW", "65536");
+            }
+            assert_eq!(max_context_window_from_env(), Some(65_536));
+            match previous_context_window {
+                Some(value) => unsafe { std::env::set_var("LLM_CONTEXT_WINDOW", value) },
+                None => unsafe { std::env::remove_var("LLM_CONTEXT_WINDOW") },
+            }
+        });
     }
 
     #[test]
@@ -272,5 +375,97 @@ mod tests {
             default_memory_dir_from_state_dir(state_dir),
             PathBuf::from("/tmp/quine-state/memory")
         );
+    }
+
+    #[test]
+    fn config_parses_user_and_project_permission_rules() {
+        with_env_lock(|| {
+            let home = TempDir::new().unwrap();
+            let project = TempDir::new().unwrap();
+            let user_config_dir = home.path().join(".quine");
+            let project_config_dir = project.path().join(".quine");
+            std::fs::create_dir_all(&user_config_dir).unwrap();
+            std::fs::create_dir_all(&project_config_dir).unwrap();
+            std::fs::write(
+                user_config_dir.join("permissions.yaml"),
+                r#"
+rules:
+  - effect: allow
+    scope: read
+    target:
+      kind: tool
+      name: read_file
+"#,
+            )
+            .unwrap();
+            std::fs::write(
+                project_config_dir.join("permissions.yaml"),
+                r#"
+rules:
+  - effect: deny
+    scope: execute
+    target:
+      kind: tool
+      name: bash
+  - effect: ask
+    scope: write
+    target:
+      kind: path
+      path: src
+"#,
+            )
+            .unwrap();
+
+            let previous_home = std::env::var_os("HOME");
+            unsafe {
+                std::env::set_var("HOME", home.path());
+            }
+            let rules = load_persisted_permission_rules(project.path()).unwrap();
+
+            assert_eq!(rules.user.len(), 1);
+            assert_eq!(rules.workspace.len(), 2);
+            assert_eq!(rules.user[0].effect, PermissionRuleEffect::Allow);
+            assert_eq!(
+                rules.user[0].request_scope,
+                Some(quine_core::PermissionScope::Read)
+            );
+            assert_eq!(
+                rules.workspace[0].request_scope,
+                Some(quine_core::PermissionScope::Execute)
+            );
+            assert_eq!(rules.workspace[1].effect, PermissionRuleEffect::Ask);
+            assert!(rules.workspace[1]
+                .source_path
+                .as_ref()
+                .is_some_and(|path| path.ends_with("permissions.yaml")));
+
+            match previous_home {
+                Some(value) => unsafe { std::env::set_var("HOME", value) },
+                None => unsafe { std::env::remove_var("HOME") },
+            }
+        });
+    }
+
+    #[test]
+    fn config_rejects_invalid_permission_rule_documents() {
+        let project = TempDir::new().unwrap();
+        let config_dir = project.path().join(".quine");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(
+            config_dir.join("permissions.yaml"),
+            r#"
+rules:
+  - effect: allow
+    scope: definitely_not_valid
+    target:
+      kind: tool
+      name: bash
+"#,
+        )
+        .unwrap();
+
+        let error = load_persisted_permission_rules(project.path()).unwrap_err();
+        assert!(error.to_string().contains("permissions.yaml"));
+        assert!(error.to_string().contains("definitely_not_valid"));
     }
 }

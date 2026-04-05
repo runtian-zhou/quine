@@ -362,6 +362,7 @@ async fn dispatch_scheduled_action(
                     task,
                     system_prompt,
                     prompt_behavior: PermissionPromptBehavior::Background,
+                    permission_rules: crate::permission::PermissionRuleSet::default(),
                     inheritance: InheritanceFlags::default(),
                     reply: reply_tx,
                 })

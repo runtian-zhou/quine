@@ -13,8 +13,8 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::Duration;
 
 use crate::config::{
-    default_memory_dir_from_state_dir, default_state_dir, max_context_window_from_env,
-    SessionConfig,
+    default_memory_dir_from_state_dir, default_state_dir, load_persisted_permission_rules,
+    max_context_window_from_env, SessionConfig,
 };
 
 use crate::error::HarnessError;
@@ -300,15 +300,26 @@ impl HarnessService for LocalHarness {
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
         let skills = load_skills_from_config(&config.skills).await;
+        let working_directory = config
+            .working_directory
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let permission_rules =
+            load_persisted_permission_rules(&working_directory).map_err(|error| {
+                HarnessError::SessionCreationFailed {
+                    reason: error.to_string(),
+                }
+            })?;
 
         self.core_input
             .send(CoreInput::CreateSession {
                 session_id,
                 system_prompt: config.system_prompt,
-                working_directory: config.working_directory,
+                working_directory: Some(working_directory),
                 skills,
                 plan_mode: config.plan_mode,
                 prompt_behavior: config.prompt_behavior,
+                permission_rules,
                 initial_messages: config.initial_messages,
                 agent_key: config.agent_key,
                 team_key: config.team_key,
@@ -532,6 +543,7 @@ impl HarnessService for LocalHarness {
                 task,
                 system_prompt,
                 prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
+                permission_rules: quine_core::PermissionRuleSet::default(),
                 inheritance: InheritanceFlags::default(),
                 reply: reply_tx,
             })

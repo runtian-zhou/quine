@@ -49,33 +49,21 @@ pub(crate) fn evaluate_permission(
         }
     }
 
-    if let Some((source, rule)) = first_matching_rule(context, &request, PermissionRuleEffect::Deny)
-    {
+    if let Some((source, rule, decision)) = first_matching_rule(context, &request) {
+        let reason = match decision {
+            PermissionDecision::Allow => format!("permission allowed by {source:?} rule"),
+            PermissionDecision::Deny => format!("permission denied by {source:?} rule"),
+            PermissionDecision::Ask => format!("permission requires approval by {source:?} rule"),
+            PermissionDecision::Defer => "permission deferred unexpectedly".into(),
+        };
         return outcome_for(
             request,
-            PermissionDecision::Deny,
+            decision,
             MatchedPermissionSource {
                 kind: PermissionMatchKind::Rule,
                 rule_source: Some(source),
             },
-            format!("permission denied by {source:?} rule"),
-            context.prompt_behavior(),
-            Some(rule.clone()),
-        );
-    }
-
-    if let Some((source, rule)) =
-        first_matching_rule(context, &request, PermissionRuleEffect::Allow)
-    {
-        let _ = rule;
-        return outcome_for(
-            request,
-            PermissionDecision::Allow,
-            MatchedPermissionSource {
-                kind: PermissionMatchKind::Rule,
-                rule_source: Some(source),
-            },
-            format!("permission allowed by {source:?} rule"),
+            reason,
             context.prompt_behavior(),
             Some(rule.clone()),
         );
@@ -197,23 +185,34 @@ fn mode_default_reason(mode: PermissionMode, request: &PermissionRequest) -> Str
 fn first_matching_rule<'a>(
     context: &'a PermissionContext,
     request: &PermissionRequest,
-    effect: PermissionRuleEffect,
-) -> Option<(PermissionRuleSource, &'a PermissionRule)> {
+) -> Option<(PermissionRuleSource, &'a PermissionRule, PermissionDecision)> {
     let sources = [
         PermissionRuleSource::Session,
         PermissionRuleSource::Workspace,
         PermissionRuleSource::User,
         PermissionRuleSource::BuiltIn,
     ];
+    let effects = [
+        PermissionRuleEffect::Deny,
+        PermissionRuleEffect::Allow,
+        PermissionRuleEffect::Ask,
+    ];
 
     for source in sources {
-        if let Some(rule) = context
-            .rules()
-            .rules_for_source(source)
-            .iter()
-            .find(|rule| rule.effect == effect && rule_matches(rule, request))
-        {
-            return Some((source, rule));
+        for effect in effects {
+            if let Some(rule) = context
+                .rules()
+                .rules_for_source(source)
+                .iter()
+                .find(|rule| rule.effect == effect && rule_matches(rule, request))
+            {
+                let decision = match effect {
+                    PermissionRuleEffect::Allow => PermissionDecision::Allow,
+                    PermissionRuleEffect::Deny => PermissionDecision::Deny,
+                    PermissionRuleEffect::Ask => PermissionDecision::Ask,
+                };
+                return Some((source, rule, decision));
+            }
         }
     }
 
@@ -323,7 +322,7 @@ mod tests {
             },
             source_path: None,
         };
-        context.add_rule(PermissionRuleSource::User, allow_rule);
+        context.add_rule(PermissionRuleSource::Workspace, allow_rule);
         context.add_rule(PermissionRuleSource::Workspace, deny_rule);
 
         let outcome = evaluate_permission(&context, request(PermissionScope::Execute), None);
@@ -359,6 +358,92 @@ mod tests {
 
         assert_eq!(outcome.kind, PermissionOutcomeKind::Allowed);
         assert_eq!(outcome.final_decision, PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn explicit_ask_beats_mode_default() {
+        let mut context = PermissionContext::new(
+            PathBuf::from("/workspace"),
+            false,
+            PermissionPromptBehavior::Interactive,
+        );
+        context.add_rule(
+            PermissionRuleSource::User,
+            PermissionRule {
+                effect: PermissionRuleEffect::Ask,
+                scope: RuleScope::Global,
+                request_scope: Some(PermissionScope::Read),
+                target: PermissionTarget::Tool {
+                    name: "read_file".into(),
+                },
+                source_path: Some(PathBuf::from("/home/test/.quine/permissions.yaml")),
+            },
+        );
+
+        let outcome = evaluate_permission(
+            &context,
+            PermissionRequest {
+                tool_name: "read_file".into(),
+                action: Some("open".into()),
+                scope: PermissionScope::Read,
+                resource: PermissionResource::Path {
+                    path: PathBuf::from("/workspace/notes.txt"),
+                },
+            },
+            None,
+        );
+
+        assert_eq!(outcome.kind, PermissionOutcomeKind::RequiresApproval);
+        assert_eq!(outcome.final_decision, PermissionDecision::Ask);
+        assert_eq!(outcome.source.rule_source, Some(PermissionRuleSource::User));
+    }
+
+    #[test]
+    fn session_rule_overrides_persisted_workspace_rule_with_source_provenance() {
+        let mut context = PermissionContext::new(
+            PathBuf::from("/workspace"),
+            false,
+            PermissionPromptBehavior::Interactive,
+        );
+        context.add_rule(
+            PermissionRuleSource::Workspace,
+            PermissionRule {
+                effect: PermissionRuleEffect::Deny,
+                scope: RuleScope::Workspace,
+                request_scope: Some(PermissionScope::Execute),
+                target: PermissionTarget::Tool {
+                    name: "bash".into(),
+                },
+                source_path: Some(PathBuf::from("/workspace/.quine/permissions.yaml")),
+            },
+        );
+        context.add_rule(
+            PermissionRuleSource::Session,
+            PermissionRule {
+                effect: PermissionRuleEffect::Allow,
+                scope: RuleScope::Session,
+                request_scope: Some(PermissionScope::Execute),
+                target: PermissionTarget::Tool {
+                    name: "bash".into(),
+                },
+                source_path: None,
+            },
+        );
+
+        let outcome = evaluate_permission(&context, request(PermissionScope::Execute), None);
+
+        assert_eq!(outcome.kind, PermissionOutcomeKind::Allowed);
+        assert_eq!(
+            outcome.source.rule_source,
+            Some(PermissionRuleSource::Session)
+        );
+        assert_eq!(
+            outcome
+                .matched_rule
+                .as_ref()
+                .and_then(|rule| rule.request_scope),
+            Some(PermissionScope::Execute)
+        );
     }
 
     #[test]

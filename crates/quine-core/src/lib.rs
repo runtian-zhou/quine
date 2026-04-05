@@ -36,7 +36,7 @@ pub use permission::{
     PendingPermissionApproval, PermissionDecision, PermissionMatchKind, PermissionMode,
     PermissionOutcome, PermissionOutcomeKind, PermissionRequest, PermissionResource,
     PermissionRule, PermissionRuleEffect, PermissionRuleSet, PermissionRuleSource,
-    PermissionRuntimeSnapshot, PermissionScope, RuleScope, ToolLocalDecision,
+    PermissionRuntimeSnapshot, PermissionScope, PermissionTarget, RuleScope, ToolLocalDecision,
 };
 pub use persistence::{
     CoreCheckpoint, PersistedMemoryState, PersistedPersistentMemoryState, PersistedPlanStore,

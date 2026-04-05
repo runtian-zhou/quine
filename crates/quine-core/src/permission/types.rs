@@ -104,6 +104,15 @@ impl PermissionRuleSet {
             PermissionRuleSource::Workspace => &self.workspace,
         }
     }
+
+    pub(crate) fn persisted_only(&self) -> Self {
+        Self {
+            built_in: self.built_in.clone(),
+            session: Vec::new(),
+            user: self.user.clone(),
+            workspace: self.workspace.clone(),
+        }
+    }
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
