@@ -29,7 +29,8 @@ impl std::str::FromStr for PlanId {
     type Err = uuid::Error;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(Self(Uuid::parse_str(s)?))
+        let normalized = s.strip_prefix("urn:uuid:").unwrap_or(s);
+        Ok(Self(Uuid::parse_str(normalized)?))
     }
 }
 
@@ -139,6 +140,14 @@ mod tests {
         let id = PlanId::new();
         let s = id.to_string();
         let parsed: PlanId = s.parse().unwrap();
+        assert_eq!(id, parsed);
+    }
+
+    #[test]
+    fn plan_id_parse_accepts_urn_uuid_prefix() {
+        let id = PlanId::new();
+        let prefixed = format!("urn:uuid:{id}");
+        let parsed: PlanId = prefixed.parse().unwrap();
         assert_eq!(id, parsed);
     }
 

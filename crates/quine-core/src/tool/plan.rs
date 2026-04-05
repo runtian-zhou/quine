@@ -225,12 +225,20 @@ impl PlanTool {
                 message: format!("invalid update_plan arguments: {e}"),
             })?;
 
-        let plan_id: PlanId = input
-            .plan_id
-            .parse()
-            .map_err(|e| ToolError::InvalidArguments {
-                message: format!("invalid plan_id: {e}"),
-            })?;
+        let raw_plan_id = input.plan_id.trim();
+        if raw_plan_id.starts_with("call_") {
+            return Err(ToolError::InvalidArguments {
+                message: format!(
+                    "invalid plan_id: got tool call id `{raw_plan_id}`; use the UUID returned by `create_plan` in the tool result, not the `call_...` invocation id"
+                ),
+            });
+        }
+
+        let plan_id: PlanId = raw_plan_id.parse().map_err(|e| ToolError::InvalidArguments {
+            message: format!(
+                "invalid plan_id: {e}. Use the UUID returned by `create_plan`, not the `call_...` tool invocation id"
+            ),
+        })?;
 
         let action_id = ActionId::new(&input.action_id);
 
@@ -326,6 +334,28 @@ mod tests {
 
         let store_locked = store.lock().await;
         assert_eq!(store_locked.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn update_plan_with_tool_call_id_gives_helpful_error() {
+        let tool = PlanTool::new(new_plan_store());
+        let ctx = make_context();
+
+        let args = serde_json::json!({
+            "operation": "update_plan",
+            "plan_id": "call_abc123",
+            "action_id": "a1",
+            "status": "completed"
+        });
+
+        let result = tool.execute(args, &ctx).await;
+        match result {
+            Err(ToolError::InvalidArguments { message }) => {
+                assert!(message.contains("got tool call id `call_abc123`"));
+                assert!(message.contains("UUID returned by `create_plan`"));
+            }
+            other => panic!("expected InvalidArguments error, got {other:?}"),
+        }
     }
 
     #[tokio::test]
