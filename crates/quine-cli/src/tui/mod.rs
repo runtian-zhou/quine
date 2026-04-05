@@ -16,6 +16,7 @@ use ratatui::Terminal;
 
 use crate::client::IpcClient;
 use crate::context_debug::fetch_session_context;
+use crate::interaction::{maybe_auto_approve, prompt as interaction_prompt};
 use crate::run::fetch_available_skills;
 use crate::session::{
     create_session, create_slash_skill_session, exit_plan_mode, resolve_resume_target,
@@ -44,12 +45,6 @@ pub async fn run_tui_chat(
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let available_skills = fetch_available_skills(&mut client).await?;
-
-    if auto_approve {
-        eprintln!(
-            "`--auto-approve` is retained for CLI compatibility and currently has no effect."
-        );
-    }
 
     let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
 
@@ -99,6 +94,7 @@ pub async fn run_tui_chat(
         &mut event_stream,
         &mut spinner_interval,
         socket_path,
+        auto_approve,
     )
     .await;
 
@@ -132,6 +128,7 @@ async fn run_event_loop(
     event_stream: &mut EventStream,
     spinner_interval: &mut tokio::time::Interval,
     socket_path: &Path,
+    auto_approve: bool,
 ) -> anyhow::Result<()> {
     loop {
         // Draw.
@@ -158,6 +155,16 @@ async fn run_event_loop(
             maybe_notif = client.recv_notification() => {
                 match maybe_notif {
                     Some(notif) => {
+                        if notif.method == notifications::INTERACTION_NEEDED
+                            && maybe_auto_approve(client, &app.session_id, &notif, auto_approve).await?
+                        {
+                            app.push_message(app::ConversationEntry::AssistantText(format!(
+                                "Auto-approved permission request: {}",
+                                interaction_prompt(&notif)
+                            )));
+                            app.auto_scroll();
+                            continue;
+                        }
                         let should_check_plan_exit =
                             app.plan_mode && notif.method == notifications::TURN_COMPLETE;
                         app.apply_notification(&notif);

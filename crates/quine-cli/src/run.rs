@@ -3,6 +3,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::client::IpcClient;
+use crate::interaction::{maybe_auto_approve, prompt as interaction_prompt, source_label};
 use crate::session::resolve_resume_target;
 use quine_harness::{
     protocol::{methods, notifications},
@@ -73,6 +74,7 @@ pub async fn run_oneshot(
     resume_checkpoint: Option<&str>,
     json_output: bool,
     skills: &[String],
+    auto_approve: bool,
 ) -> anyhow::Result<()> {
     let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
@@ -87,8 +89,11 @@ pub async fn run_oneshot(
             if !skills.is_empty() {
                 session_params["skills"] = serde_json::json!(skills);
             }
-            session_params["prompt_behavior"] =
-                serde_json::json!(PermissionPromptBehavior::Headless);
+            session_params["prompt_behavior"] = serde_json::json!(if auto_approve {
+                PermissionPromptBehavior::Interactive
+            } else {
+                PermissionPromptBehavior::Headless
+            });
             let params = if session_params.as_object().unwrap().is_empty() {
                 None
             } else {
@@ -180,20 +185,14 @@ pub async fn run_oneshot(
                     }
                 }
                 notifications::INTERACTION_NEEDED => {
+                    if maybe_auto_approve(&mut client, &session_id, &notif, auto_approve).await? {
+                        continue;
+                    }
+
                     // Output the interaction prompt so the caller can respond
                     // via `quine respond --session <id> "answer"`.
-                    let prompt = notif
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.get("prompt"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(interaction requested)");
-
-                    let source_label = notif
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.get("source_label"))
-                        .and_then(|v| v.as_str());
+                    let prompt = interaction_prompt(&notif);
+                    let source_label = source_label(&notif);
 
                     let partial = if !completed_text.is_empty() {
                         &completed_text
@@ -370,18 +369,8 @@ pub async fn run_respond(
                 }
                 notifications::INTERACTION_NEEDED => {
                     // Another interaction needed — output and exit for caller to respond again.
-                    let prompt = notif
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.get("prompt"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(interaction requested)");
-
-                    let source_label = notif
-                        .params
-                        .as_ref()
-                        .and_then(|p| p.get("source_label"))
-                        .and_then(|v| v.as_str());
+                    let prompt = interaction_prompt(&notif);
+                    let source_label = source_label(&notif);
 
                     let partial = if !completed_text.is_empty() {
                         &completed_text
