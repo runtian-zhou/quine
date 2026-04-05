@@ -740,6 +740,127 @@ mod tests {
         }
     }
 
+    struct ApprovalProvider {
+        call_count: std::sync::atomic::AtomicU32,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ApprovalProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events = if count == 0 {
+                vec![
+                    Ok(LlmEvent::ToolCall {
+                        tool_use_id: "toolu_apply_patch".into(),
+                        tool_name: "apply_patch".into(),
+                        arguments: serde_json::json!({
+                            "file_path": "approval-check.txt",
+                            "new_file_content": "approved-by-operator"
+                        }),
+                    }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ]
+            } else {
+                vec![
+                    Ok(LlmEvent::TextDelta {
+                        text: "approval complete".into(),
+                    }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    #[tokio::test]
+    async fn local_harness_routes_permission_approval_and_resumes_turn() {
+        let storage = temp_storage();
+        let workspace = storage.root().to_path_buf();
+        let harness = LocalHarness::new(
+            Arc::new(ApprovalProvider {
+                call_count: std::sync::atomic::AtomicU32::new(0),
+            }),
+            Some(storage),
+        )
+        .await
+        .unwrap();
+        let mut rx = harness.subscribe();
+
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(workspace.clone()),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        harness
+            .send_message(session_id, "create the approval test file".into())
+            .await
+            .unwrap();
+
+        let mut saw_interaction = false;
+        let mut saw_text_complete = false;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(CoreOutput::InteractionNeeded {
+                    session_id: event_session_id,
+                    request,
+                })) if event_session_id == session_id => {
+                    saw_interaction = true;
+                    assert!(request
+                        .source_label
+                        .as_deref()
+                        .is_some_and(|label| label.starts_with("permission:")));
+                    harness
+                        .submit_interaction_response(
+                            session_id,
+                            InteractionResponse {
+                                response: "approve once".into(),
+                                selected_indices: vec![0],
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+                Ok(Ok(CoreOutput::TextComplete {
+                    session_id: event_session_id,
+                    full_text,
+                })) if event_session_id == session_id => {
+                    assert_eq!(full_text, "approval complete");
+                    saw_text_complete = true;
+                }
+                Ok(Ok(CoreOutput::TurnComplete {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => {
+                    break;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("event stream closed unexpectedly: {error}"),
+                Err(_) => panic!("timeout waiting for approval flow"),
+            }
+        }
+
+        assert!(saw_interaction);
+        assert!(saw_text_complete);
+        assert_eq!(
+            async_fs::read_to_string(workspace.join("approval-check.txt"))
+                .await
+                .unwrap(),
+            "approved-by-operator"
+        );
+
+        harness.shutdown().await.unwrap();
+    }
+
     struct ObservedMemoryProvider;
 
     #[async_trait::async_trait]
