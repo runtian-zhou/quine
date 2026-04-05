@@ -103,11 +103,27 @@ impl PermissionRuleSet {
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PermissionPromptBehavior {
+pub enum PermissionPromptBehavior {
+    #[default]
     Interactive,
     Headless,
+    Background,
+}
+
+impl PermissionPromptBehavior {
+    pub fn is_interactive(self) -> bool {
+        matches!(self, Self::Interactive)
+    }
+
+    pub fn denial_label(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Headless => "headless",
+            Self::Background => "background",
+        }
+    }
 }
 
 #[allow(dead_code)]

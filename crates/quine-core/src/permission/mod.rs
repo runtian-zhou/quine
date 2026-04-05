@@ -20,4 +20,4 @@ pub(crate) use outcome::PermissionOutcome;
 pub(crate) use request::{
     PermissionRequest, PermissionResource, PermissionScope, ToolLocalDecision,
 };
-pub(crate) use types::PermissionPromptBehavior;
+pub use types::PermissionPromptBehavior;

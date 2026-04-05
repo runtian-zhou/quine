@@ -5,6 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 
 use crate::channel::CoreInput;
+use crate::permission::PermissionPromptBehavior;
 use crate::session::{InheritanceFlags, SessionId};
 
 #[derive(Debug)]
@@ -360,6 +361,7 @@ async fn dispatch_scheduled_action(
                     child_id: SessionId::new(),
                     task,
                     system_prompt,
+                    prompt_behavior: PermissionPromptBehavior::Background,
                     inheritance: InheritanceFlags::default(),
                     reply: reply_tx,
                 })
@@ -455,13 +457,19 @@ mod tests {
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(matches!(
             input_rx.recv().await.unwrap(),
-            CoreInput::SpawnSession { .. }
+            CoreInput::SpawnSession {
+                prompt_behavior: PermissionPromptBehavior::Background,
+                ..
+            }
         ));
 
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(matches!(
             input_rx.recv().await.unwrap(),
-            CoreInput::SpawnSession { .. }
+            CoreInput::SpawnSession {
+                prompt_behavior: PermissionPromptBehavior::Background,
+                ..
+            }
         ));
 
         handle.shutdown().await.unwrap();

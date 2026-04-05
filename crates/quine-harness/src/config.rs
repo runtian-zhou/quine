@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use quine_core::MemoryPolicyConfig;
+use quine_core::{MemoryPolicyConfig, PermissionPromptBehavior};
 use quine_llm::anthropic::AnthropicConfig;
 use quine_llm::config::ProviderConfig;
 use quine_llm::openai_compat::OpenAiCompatConfig;
@@ -21,6 +21,9 @@ pub struct SessionConfig {
     /// Whether this session operates in read-only plan mode.
     #[serde(default)]
     pub plan_mode: bool,
+    /// How permission prompts should behave for this session.
+    #[serde(default = "default_permission_prompt_behavior")]
+    pub prompt_behavior: PermissionPromptBehavior,
     /// Seed the session with these messages after the system prompt.
     #[serde(default)]
     pub initial_messages: Vec<Message>,
@@ -33,6 +36,10 @@ pub struct SessionConfig {
     /// Memory scope and policy configuration for this session.
     #[serde(default)]
     pub memory_policy: MemoryPolicyConfig,
+}
+
+fn default_permission_prompt_behavior() -> PermissionPromptBehavior {
+    PermissionPromptBehavior::Interactive
 }
 
 /// Configuration for the harness daemon.
@@ -217,6 +224,7 @@ mod tests {
             working_directory: None,
             skills: Vec::new(),
             plan_mode: false,
+            prompt_behavior: PermissionPromptBehavior::Headless,
             initial_messages: Vec::new(),
             agent_key: None,
             team_key: None,
@@ -227,6 +235,10 @@ mod tests {
         assert_eq!(
             deserialized.system_prompt.as_deref(),
             Some("You are helpful.")
+        );
+        assert_eq!(
+            deserialized.prompt_behavior,
+            PermissionPromptBehavior::Headless
         );
     }
 

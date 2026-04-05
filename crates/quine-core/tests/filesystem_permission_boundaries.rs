@@ -79,6 +79,7 @@ async fn run_tool_turn(
             working_directory: Some(workspace_root),
             skills: Vec::new(),
             plan_mode: false,
+            prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
             initial_messages: Vec::new(),
             agent_key: None,
             team_key: None,
