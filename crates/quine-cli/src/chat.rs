@@ -4,6 +4,9 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
 use crate::client::IpcClient;
 use crate::context_debug::render_session_context;
+use crate::interaction::{
+    maybe_auto_approve, options as interaction_options, prompt as interaction_prompt, source_label,
+};
 use crate::render::{Renderer, TerminalRenderer};
 use crate::run::fetch_available_skills;
 use crate::session::{
@@ -153,14 +156,6 @@ pub async fn run_chat(
     let mut renderer = TerminalRenderer::new();
     let available_skills = fetch_available_skills(&mut client).await?;
 
-    if auto_approve {
-        renderer
-            .render_info(
-                "`--auto-approve` is retained for CLI compatibility and currently has no effect.",
-            )
-            .await?;
-    }
-
     let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
 
     let session_plan_mode = resumed.as_ref().map(|target| target.plan_mode);
@@ -283,7 +278,13 @@ pub async fn run_chat(
                                     match notif {
                                         Some(notif) => {
                                             if notif.method == notifications::INTERACTION_NEEDED {
-                                                handle_interaction(&notif, &mut client, &session.session_id).await?;
+                                                handle_interaction(
+                                                    &notif,
+                                                    &mut client,
+                                                    &session.session_id,
+                                                    auto_approve,
+                                                )
+                                                .await?;
                                                 continue;
                                             }
                                             let handled = handle_notification(&notif, &mut renderer).await?;
@@ -360,35 +361,17 @@ async fn handle_interaction(
     notif: &quine_harness::protocol::JsonRpcNotification,
     client: &mut IpcClient,
     session_id: &str,
+    auto_approve: bool,
 ) -> anyhow::Result<()> {
-    let prompt = notif
-        .params
-        .as_ref()
-        .and_then(|p| p.get("prompt"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("(tool is asking for input)");
+    if maybe_auto_approve(client, session_id, notif, auto_approve).await? {
+        eprintln!("\n[permission] auto-approved");
+        return Ok(());
+    }
 
-    // Extract options if present.
-    let options: Vec<String> = notif
-        .params
-        .as_ref()
-        .and_then(|p| p.get("options"))
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|item| {
-                    item.get("label")
-                        .and_then(|l| l.as_str())
-                        .map(|s| s.to_string())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let source_label = notif
-        .params
-        .as_ref()
-        .and_then(|p| p.get("source_label"))
-        .and_then(|v| v.as_str());
+    let prompt = interaction_prompt(notif);
+
+    let options = interaction_options(notif);
+    let source_label = source_label(notif);
     let prompt_tag = if source_label.is_some_and(|label| label.starts_with("permission:")) {
         "permission"
     } else {

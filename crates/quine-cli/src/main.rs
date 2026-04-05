@@ -2,6 +2,7 @@ mod agent_ctl;
 mod chat;
 mod client;
 mod context_debug;
+mod interaction;
 mod log;
 mod render;
 mod run;
@@ -37,7 +38,7 @@ enum Commands {
         /// Start in read-only plan mode (restricted to exploration and planning).
         #[arg(long)]
         plan: bool,
-        /// Retained for CLI compatibility; currently has no effect.
+        /// Automatically approve permission-gated operations in this session.
         #[arg(long)]
         auto_approve: bool,
         /// Resume a restored checkpoint by session ID, or use `latest`.
@@ -63,6 +64,9 @@ enum Commands {
         /// Skills to load for this session (can be repeated).
         #[arg(long, short = 's')]
         skill: Vec<String>,
+        /// Automatically approve permission-gated operations for this run.
+        #[arg(long)]
+        auto_approve: bool,
     },
     /// Respond to an interaction request (e.g., ask_user prompt) on an existing session.
     Respond {
@@ -255,6 +259,7 @@ async fn main() -> anyhow::Result<()> {
             json,
             socket,
             skill,
+            auto_approve,
         } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
@@ -266,6 +271,7 @@ async fn main() -> anyhow::Result<()> {
                 resume.as_deref(),
                 json,
                 &skill,
+                auto_approve,
             )
             .await?;
         }
