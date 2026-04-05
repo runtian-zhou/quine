@@ -46,6 +46,36 @@ struct SessionListing {
     created_at: chrono::DateTime<Utc>,
     event_count: usize,
     plan_mode: bool,
+    parent_id: Option<SessionId>,
+}
+
+fn serialize_session_id(session_id: SessionId) -> String {
+    serde_json::to_value(session_id)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_default()
+}
+
+fn session_lineage(
+    sessions: &HashMap<SessionId, SessionListing>,
+) -> HashMap<String, (String, usize)> {
+    sessions
+        .keys()
+        .copied()
+        .map(|session_id| {
+            let mut depth = 0usize;
+            let mut root_id = session_id;
+            while let Some(parent_id) = sessions.get(&root_id).and_then(|session| session.parent_id)
+            {
+                root_id = parent_id;
+                depth += 1;
+            }
+            (
+                serialize_session_id(session_id),
+                (serialize_session_id(root_id), depth),
+            )
+        })
+        .collect()
 }
 
 impl LocalHarness {
@@ -116,6 +146,11 @@ impl LocalHarness {
                                 created_at: session.created_at,
                                 event_count: session.history.len(),
                                 plan_mode: session.config.plan_mode,
+                                parent_id: checkpoint
+                                    .session_tree
+                                    .parents
+                                    .get(&session.session_id)
+                                    .copied(),
                             },
                         )
                     })
@@ -258,6 +293,7 @@ impl LocalHarness {
                                 created_at: Utc::now(),
                                 event_count: 0,
                                 plan_mode: false,
+                                parent_id: None,
                             });
                     }
                 }
@@ -341,6 +377,7 @@ impl HarnessService for LocalHarness {
                 created_at: Utc::now(),
                 event_count: 0,
                 plan_mode: config.plan_mode,
+                parent_id: None,
             },
         );
 
@@ -446,6 +483,7 @@ impl HarnessService for LocalHarness {
 
     async fn list_sessions(&self) -> Result<Vec<serde_json::Value>, HarnessError> {
         let sessions = self.sessions.lock().await;
+        let lineage = session_lineage(&sessions);
         let mut items: Vec<serde_json::Value> = sessions
             .iter()
             .map(|(session_id, session)| {
@@ -453,12 +491,19 @@ impl HarnessService for LocalHarness {
                     .ok()
                     .and_then(|value| value.as_str().map(str::to_owned))
                     .unwrap_or_else(|| format!("{session_id:?}"));
+                let (root_id, depth) = lineage
+                    .get(session_id.as_str())
+                    .cloned()
+                    .unwrap_or_else(|| (session_id.clone(), 0));
                 serde_json::json!({
                     "session_id": session_id,
                     "status": format!("{:?}", session.state).to_lowercase(),
                     "first_event": session.created_at.to_rfc3339(),
                     "event_count": session.event_count,
                     "plan_mode": session.plan_mode,
+                    "parent_id": session.parent_id.map(serialize_session_id),
+                    "root_id": root_id,
+                    "depth": depth,
                 })
             })
             .collect();
@@ -515,7 +560,14 @@ impl HarnessService for LocalHarness {
             .map(|(id, session)| (*id, format!("{:?}", session.state).to_lowercase()))
             .collect();
 
-        if session_context_from_checkpoint(&checkpoint, session_id, &live_states).is_none() {
+        if session_context_from_checkpoint(
+            &checkpoint,
+            session_id,
+            &live_states,
+            Some(self._storage.root()),
+        )
+        .is_none()
+        {
             return Err(HarnessError::SessionNotFound {
                 session_id: serde_json::to_value(session_id)
                     .ok()
@@ -554,6 +606,17 @@ impl HarnessService for LocalHarness {
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)?
             .map_err(|reason| HarnessError::SessionCreationFailed { reason })?;
+
+        self.sessions.lock().await.insert(
+            child_id,
+            SessionListing {
+                state: quine_core::SessionState::Idle,
+                created_at: Utc::now(),
+                event_count: 0,
+                plan_mode: false,
+                parent_id,
+            },
+        );
 
         Ok(child_id)
     }
@@ -623,6 +686,10 @@ impl HarnessService for LocalHarness {
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)
     }
+
+    fn state_root(&self) -> Option<std::path::PathBuf> {
+        Some(self._storage.root().to_path_buf())
+    }
 }
 
 #[cfg(test)]
@@ -679,8 +746,9 @@ mod tests {
 
         let snapshot = wait_for_context_snapshot(&harness, session_id).await;
         let checkpoint = harness.latest_checkpoint_for_tests().await.unwrap();
-        let projected = session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new())
-            .expect("session snapshot should exist in checkpoint");
+        let projected =
+            session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new(), None)
+                .expect("session snapshot should exist in checkpoint");
 
         assert_eq!(snapshot.session_id, projected.session_id);
         assert_eq!(snapshot.working_directory, projected.working_directory);
@@ -954,9 +1022,12 @@ mod tests {
         let pending_snapshot = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(checkpoint) = harness.get_session_context(session_id).await {
-                    if let Some(snapshot) =
-                        session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new())
-                    {
+                    if let Some(snapshot) = session_context_from_checkpoint(
+                        &checkpoint,
+                        session_id,
+                        &HashMap::new(),
+                        None,
+                    ) {
                         if snapshot
                             .permission_diagnostics
                             .as_ref()
@@ -1008,9 +1079,12 @@ mod tests {
         let denied_snapshot = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(checkpoint) = harness.get_session_context(session_id).await {
-                    if let Some(snapshot) =
-                        session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new())
-                    {
+                    if let Some(snapshot) = session_context_from_checkpoint(
+                        &checkpoint,
+                        session_id,
+                        &HashMap::new(),
+                        None,
+                    ) {
                         if snapshot
                             .permission_diagnostics
                             .as_ref()
@@ -1256,9 +1330,12 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
                 if let Ok(checkpoint) = harness.get_session_context(session_id).await {
-                    if let Some(snapshot) =
-                        session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new())
-                    {
+                    if let Some(snapshot) = session_context_from_checkpoint(
+                        &checkpoint,
+                        session_id,
+                        &HashMap::new(),
+                        None,
+                    ) {
                         break snapshot;
                     }
                 }

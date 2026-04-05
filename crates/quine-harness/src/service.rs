@@ -1,5 +1,6 @@
 use async_trait::async_trait;
 use quine_core::{CoreCheckpoint, CoreOutput, InteractionResponse, SessionId, SessionSignal};
+use std::path::PathBuf;
 use tokio::sync::broadcast;
 use tokio::time::Duration;
 
@@ -134,6 +135,11 @@ pub trait HarnessService: Send + Sync {
         Err(HarnessError::Internal {
             message: "not implemented".into(),
         })
+    }
+
+    /// Return the harness state root when snapshots need access to persisted artifacts.
+    fn state_root(&self) -> Option<PathBuf> {
+        None
     }
 }
 

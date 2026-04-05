@@ -7,7 +7,7 @@ use quine_harness::protocol::methods;
 pub async fn handle_ps(
     socket_path: &Path,
     _all: bool,
-    _tree: bool,
+    tree: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let (mut client, _) = IpcClient::connect_or_launch(socket_path).await?;
@@ -19,7 +19,7 @@ pub async fn handle_ps(
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 let sessions: Vec<serde_json::Value> = serde_json::from_value(value)?;
-                print_sessions_table(&sessions);
+                print_sessions_table(&sessions, tree);
             }
         }
         Err(e) => {
@@ -193,9 +193,16 @@ fn parse_signal_string(signal: &str) -> anyhow::Result<String> {
 }
 
 /// Format sessions as a table for terminal output.
-fn print_sessions_table(sessions: &[serde_json::Value]) {
+fn print_sessions_table(sessions: &[serde_json::Value], tree: bool) {
     if sessions.is_empty() {
         println!("No active sessions.");
+        return;
+    }
+
+    if tree {
+        for line in format_tree_lines(sessions) {
+            println!("{line}");
+        }
         return;
     }
 
@@ -268,6 +275,92 @@ fn format_ps_table(sessions: &[serde_json::Value]) -> String {
 }
 
 #[cfg(test)]
+fn format_ps_tree(sessions: &[serde_json::Value]) -> String {
+    if sessions.is_empty() {
+        return "No active sessions.".to_string();
+    }
+
+    format_tree_lines(sessions).join("\n")
+}
+
+fn format_tree_lines(sessions: &[serde_json::Value]) -> Vec<String> {
+    use std::collections::BTreeMap;
+
+    if sessions.is_empty() {
+        return vec!["No active sessions.".to_string()];
+    }
+
+    let mut records = BTreeMap::new();
+    let mut children: BTreeMap<Option<String>, Vec<String>> = BTreeMap::new();
+
+    for session in sessions {
+        let id = session
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let parent_id = session
+            .get("parent_id")
+            .and_then(|v| v.as_str())
+            .map(ToString::to_string);
+        children
+            .entry(parent_id.clone())
+            .or_default()
+            .push(id.clone());
+        records.insert(id, session);
+    }
+
+    for ids in children.values_mut() {
+        ids.sort();
+    }
+
+    let mut roots = children.remove(&None).unwrap_or_default();
+    if roots.is_empty() {
+        roots = records.keys().cloned().collect();
+        roots.sort();
+    }
+
+    let mut lines = Vec::new();
+    for root_id in roots {
+        push_tree_lines(&mut lines, &records, &children, &root_id, 0);
+    }
+    lines
+}
+
+fn push_tree_lines(
+    lines: &mut Vec<String>,
+    records: &std::collections::BTreeMap<String, &serde_json::Value>,
+    children: &std::collections::BTreeMap<Option<String>, Vec<String>>,
+    session_id: &str,
+    depth: usize,
+) {
+    if let Some(session) = records.get(session_id) {
+        let status = session
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let event_count = session
+            .get("event_count")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let created = session
+            .get("first_event")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-");
+        let indent = "  ".repeat(depth);
+        lines.push(format!(
+            "{indent}{} [{}] events={} created={created}",
+            session_id, status, event_count
+        ));
+        if let Some(child_ids) = children.get(&Some(session_id.to_string())) {
+            for child_id in child_ids {
+                push_tree_lines(lines, records, children, child_id, depth + 1);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -335,5 +428,29 @@ mod tests {
         let sessions = vec![serde_json::json!({})];
         let output = format_ps_table(&sessions);
         assert!(output.contains("unknown"));
+    }
+
+    #[test]
+    fn format_ps_tree_groups_children_under_parent() {
+        let sessions = vec![
+            serde_json::json!({
+                "session_id": "parent",
+                "status": "idle",
+                "first_event": "2026-01-01T00:00:00Z",
+                "event_count": 2,
+                "parent_id": null
+            }),
+            serde_json::json!({
+                "session_id": "child",
+                "status": "waiting",
+                "first_event": "2026-01-01T00:01:00Z",
+                "event_count": 5,
+                "parent_id": "parent"
+            }),
+        ];
+
+        let output = format_ps_tree(&sessions);
+        assert!(output.contains("parent [idle]"));
+        assert!(output.contains("  child [waiting]"));
     }
 }

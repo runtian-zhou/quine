@@ -638,6 +638,7 @@ async fn handle_request(
                                 &checkpoint,
                                 session_id,
                                 &live_states,
+                                service.state_root().as_deref(),
                             ) {
                                 Some(snapshot) => {
                                     let resp = JsonRpcResponse::success(id, snapshot);
