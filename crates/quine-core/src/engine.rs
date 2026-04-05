@@ -5379,6 +5379,155 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         }
     }
 
+    struct MutatingProbeTool {
+        name: &'static str,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for MutatingProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Test mutating probe tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _context: &ExecutionContext,
+        ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+            Ok(crate::tool::ToolOutput::success("mutated"))
+        }
+    }
+
+    struct MarkerProbeTool {
+        name: &'static str,
+        ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for MarkerProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Test marker probe tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        fn is_read_only(&self) -> bool {
+            true
+        }
+
+        fn is_idempotent(&self) -> bool {
+            true
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _context: &ExecutionContext,
+        ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(crate::tool::ToolOutput::success("marker"))
+        }
+    }
+
+    #[tokio::test]
+    async fn build_permission_request_uses_apply_patch_path_resource() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        let tool = crate::tool::write::WriteTool;
+        let call = PendingToolCall {
+            tool_use_id: "toolu_apply_patch".into(),
+            tool_name: "apply_patch".into(),
+            arguments: serde_json::json!({"file_path": "src/lib.rs", "edits": []}),
+        };
+
+        let (request, local) = build_permission_request(&session, &call, &tool);
+
+        assert_eq!(request.tool_name, "apply_patch");
+        assert_eq!(
+            request.scope,
+            crate::permission::request::PermissionScope::Write
+        );
+        assert!(matches!(
+            request.resource,
+            PermissionResource::Path { ref path } if path.ends_with("src/lib.rs")
+        ));
+        assert_eq!(
+            local.expect("tool-local decision should exist").decision,
+            crate::permission::types::PermissionDecision::Defer
+        );
+    }
+
+    #[tokio::test]
+    async fn build_permission_request_treats_ask_user_as_internal_interaction() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        let tool = AskUserTool;
+        let call = PendingToolCall {
+            tool_use_id: "toolu_ask".into(),
+            tool_name: "ask_user".into(),
+            arguments: serde_json::json!({"question": "Proceed?"}),
+        };
+
+        let (request, _) = build_permission_request(&session, &call, &tool);
+
+        assert_eq!(request.tool_name, "ask_user");
+        assert_eq!(
+            request.scope,
+            crate::permission::request::PermissionScope::Read
+        );
+        assert_eq!(request.resource, PermissionResource::None);
+    }
+
     #[tokio::test]
     async fn execute_tool_call_records_permission_outcome_before_execution() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());

@@ -8,7 +8,7 @@ Short summary: Adopt the shared permission engine across Quine’s current tools
 
 ## Agreement Status
 
-pending — Reviewed the current QA draft and found blocking alignment gaps. The QA plan still needs concrete executable scenarios, including exact daemon/chat commands, round-by-round prompts, and expected permission/tool outputs before this implementation plan can mark agreement.
+agreed — Re-reviewed `features/plans/045-tool-permission-integration-qa.md`. The QA plan is now concrete enough to execute, with exact test commands and daemon-backed scenarios aligned to this implementation scope.
 
 ## Proposed Design
 
