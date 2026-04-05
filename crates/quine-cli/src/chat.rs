@@ -12,6 +12,9 @@ use crate::session::{
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{methods, notifications};
 
+const PLAN_EXIT_PROMPT: &str =
+    "Leave plan mode and start a normal session with this final plan? (y/n)";
+
 /// Shut down the daemon if we spawned it.
 async fn shutdown_if_spawned(client: &mut IpcClient, daemon_spawned: bool) {
     if daemon_spawned {
@@ -80,12 +83,7 @@ async fn maybe_exit_plan_mode(
         return Ok(false);
     }
 
-    if !confirm_plan_exit(
-        lines,
-        "Leave plan mode and start a normal session with this final plan? (y/n)",
-    )
-    .await?
-    {
+    if !confirm_plan_exit(lines, PLAN_EXIT_PROMPT).await? {
         eprintln!("Stayed in plan mode.");
         return Ok(false);
     }
@@ -584,5 +582,19 @@ mod tests {
         assert_eq!(is_confirmed_plan_exit("no"), Some(false));
         assert_eq!(is_confirmed_plan_exit("n"), Some(false));
         assert_eq!(is_confirmed_plan_exit("maybe"), None);
+    }
+
+    #[test]
+    fn exit_plan_mode_confirmation_prompt_matches_expected_copy() {
+        assert_eq!(
+            PLAN_EXIT_PROMPT,
+            "Leave plan mode and start a normal session with this final plan? (y/n)"
+        );
+    }
+
+    #[test]
+    fn exit_plan_mode_confirmation_accepts_yes_and_no() {
+        assert_eq!(is_confirmed_plan_exit("yes"), Some(true));
+        assert_eq!(is_confirmed_plan_exit("n"), Some(false));
     }
 }
