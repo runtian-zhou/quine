@@ -151,6 +151,7 @@ fn append_execution_time(text: &mut String, elapsed: Duration) {
 mod tests {
     use super::*;
     use crate::filesystem::OverlayFilesystem;
+    use crate::permission::{analyze_command, CommandRisk};
     use crate::session::SessionId;
     use std::path::Path;
     use std::sync::Arc;
@@ -355,5 +356,52 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(file_contents.trim(), "hello");
+    }
+
+    #[test]
+    fn bash_classifies_read_oriented_commands() {
+        let pwd = analyze_command("pwd");
+        let ls = analyze_command("ls -la");
+        let find = analyze_command("find . -maxdepth 1 -type f");
+
+        assert_eq!(pwd.risk, CommandRisk::ReadOnly);
+        assert_eq!(ls.risk, CommandRisk::ReadOnly);
+        assert_eq!(find.risk, CommandRisk::ReadOnly);
+    }
+
+    #[test]
+    fn bash_classifies_write_capable_commands() {
+        let redirected_echo = analyze_command("echo hello > test.txt");
+        let touch = analyze_command("touch test.txt");
+        let mkdir = analyze_command("mkdir scratch");
+        let remove = analyze_command("rm -f test.txt");
+
+        assert_eq!(redirected_echo.risk, CommandRisk::Mutating);
+        assert_eq!(touch.risk, CommandRisk::Mutating);
+        assert_eq!(mkdir.risk, CommandRisk::Mutating);
+        assert_eq!(remove.risk, CommandRisk::Mutating);
+    }
+
+    #[test]
+    fn bash_classifies_nested_shell_wrappers_conservatively() {
+        let sh_c = analyze_command("sh -c 'pwd'");
+        let bash_lc = analyze_command("bash -lc 'ls -la'");
+        let env_shell = analyze_command("env sh -c 'echo hello'");
+
+        assert_eq!(sh_c.risk, CommandRisk::NestedShell);
+        assert_eq!(bash_lc.risk, CommandRisk::NestedShell);
+        assert_eq!(env_shell.risk, CommandRisk::NestedShell);
+    }
+
+    #[test]
+    fn bash_classifies_inline_interpreters_conservatively() {
+        let python_read = analyze_command("python -c 'print(1)'");
+        let python_write =
+            analyze_command("python -c 'from pathlib import Path; Path(\"x\").write_text(\"y\")'");
+        let perl = analyze_command("perl -e 'print qq(hi)'");
+
+        assert_eq!(python_read.risk, CommandRisk::Interpreter);
+        assert_eq!(python_write.risk, CommandRisk::Interpreter);
+        assert_eq!(perl.risk, CommandRisk::Interpreter);
     }
 }

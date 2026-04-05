@@ -9,6 +9,7 @@ use super::types::{
     PermissionDecision, PermissionMode, PermissionPromptBehavior, PermissionRule,
     PermissionRuleEffect, PermissionRuleSource, PermissionTarget,
 };
+use crate::permission::CommandRisk;
 
 pub(crate) fn evaluate_permission(
     context: &PermissionContext,
@@ -78,6 +79,7 @@ pub(crate) fn evaluate_permission(
     }
 
     let mode_decision = mode_default_decision(context.mode(), &request);
+    let mode_reason = mode_default_reason(context.mode(), &request);
     outcome_for(
         request,
         mode_decision,
@@ -85,7 +87,7 @@ pub(crate) fn evaluate_permission(
             kind: PermissionMatchKind::ModeDefault,
             rule_source: None,
         },
-        format!("permission resolved by {:?} mode default", context.mode()),
+        mode_reason,
         context.prompt_behavior(),
     )
 }
@@ -128,6 +130,22 @@ fn outcome_for(
 }
 
 fn mode_default_decision(mode: PermissionMode, request: &PermissionRequest) -> PermissionDecision {
+    if let PermissionResource::Command { descriptor } = &request.resource {
+        if request.tool_name == "bash" && request.scope == PermissionScope::Execute {
+            return match mode {
+                PermissionMode::Bypass => PermissionDecision::Allow,
+                PermissionMode::Plan => PermissionDecision::Deny,
+                PermissionMode::Default | PermissionMode::AcceptEdits => match descriptor.risk {
+                    CommandRisk::ReadOnly => PermissionDecision::Allow,
+                    CommandRisk::Mutating
+                    | CommandRisk::NestedShell
+                    | CommandRisk::Interpreter
+                    | CommandRisk::Unknown => PermissionDecision::Ask,
+                },
+            };
+        }
+    }
+
     match mode {
         PermissionMode::Bypass => PermissionDecision::Allow,
         PermissionMode::Plan => match request.scope {
@@ -151,6 +169,20 @@ fn mode_default_decision(mode: PermissionMode, request: &PermissionRequest) -> P
             | PermissionScope::AgentControl => PermissionDecision::Ask,
         },
     }
+}
+
+fn mode_default_reason(mode: PermissionMode, request: &PermissionRequest) -> String {
+    if let PermissionResource::Command { descriptor } = &request.resource {
+        if request.tool_name == "bash" && request.scope == PermissionScope::Execute {
+            return format!(
+                "permission resolved by {:?} mode default for {} bash command",
+                mode,
+                descriptor.risk.reason_label()
+            );
+        }
+    }
+
+    format!("permission resolved by {:?} mode default", mode)
 }
 
 fn first_matching_rule<'a>(
@@ -197,6 +229,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+    use crate::permission::command::{analyze_command, CommandRisk};
     use crate::permission::context::PermissionContext;
     use crate::permission::types::{
         PermissionPromptBehavior, PermissionRule, PermissionRuleEffect, PermissionRuleSource,
@@ -210,7 +243,7 @@ mod tests {
             action: Some("run".into()),
             scope,
             resource: PermissionResource::Command {
-                command: "echo hi".into(),
+                descriptor: analyze_command("echo hi"),
             },
         }
     }
@@ -302,6 +335,123 @@ mod tests {
 
         assert_eq!(outcome.kind, PermissionOutcomeKind::Allowed);
         assert_eq!(outcome.final_decision, PermissionDecision::Allow);
+    }
+
+    #[test]
+    fn mode_default_allows_read_only_bash_commands() {
+        let context = PermissionContext::new(
+            PathBuf::from("/workspace"),
+            false,
+            PermissionPromptBehavior::Interactive,
+        );
+        let request = PermissionRequest {
+            tool_name: "bash".into(),
+            action: Some("run".into()),
+            scope: PermissionScope::Execute,
+            resource: PermissionResource::Command {
+                descriptor: analyze_command("pwd"),
+            },
+        };
+
+        let outcome = evaluate_permission(&context, request, None);
+
+        assert_eq!(outcome.kind, PermissionOutcomeKind::Allowed);
+        assert_eq!(outcome.final_decision, PermissionDecision::Allow);
+        assert!(outcome.reason.contains("read-oriented bash command"));
+    }
+
+    #[test]
+    fn mode_default_requires_approval_for_mutating_bash_commands() {
+        let context = PermissionContext::new(
+            PathBuf::from("/workspace"),
+            false,
+            PermissionPromptBehavior::Interactive,
+        );
+        let request = PermissionRequest {
+            tool_name: "bash".into(),
+            action: Some("run".into()),
+            scope: PermissionScope::Execute,
+            resource: PermissionResource::Command {
+                descriptor: analyze_command("touch test.txt"),
+            },
+        };
+
+        let outcome = evaluate_permission(&context, request, None);
+
+        assert_eq!(outcome.kind, PermissionOutcomeKind::RequiresApproval);
+        assert_eq!(outcome.final_decision, PermissionDecision::Ask);
+        assert!(outcome.reason.contains("mutating bash command"));
+    }
+
+    #[test]
+    fn mode_default_requires_approval_for_nested_shell_bash_commands() {
+        let context = PermissionContext::new(
+            PathBuf::from("/workspace"),
+            false,
+            PermissionPromptBehavior::Interactive,
+        );
+        let request = PermissionRequest {
+            tool_name: "bash".into(),
+            action: Some("run".into()),
+            scope: PermissionScope::Execute,
+            resource: PermissionResource::Command {
+                descriptor: analyze_command("sh -c 'pwd'"),
+            },
+        };
+
+        let outcome = evaluate_permission(&context, request, None);
+
+        assert_eq!(outcome.kind, PermissionOutcomeKind::RequiresApproval);
+        assert_eq!(outcome.final_decision, PermissionDecision::Ask);
+        assert!(outcome.reason.contains("nested-shell bash command"));
+    }
+
+    #[test]
+    fn analyzed_command_metadata_changes_mode_default_outcome() {
+        let context = PermissionContext::new(
+            PathBuf::from("/workspace"),
+            false,
+            PermissionPromptBehavior::Interactive,
+        );
+        let read_only = PermissionRequest {
+            tool_name: "bash".into(),
+            action: Some("run".into()),
+            scope: PermissionScope::Execute,
+            resource: PermissionResource::Command {
+                descriptor: analyze_command("pwd"),
+            },
+        };
+        let interpreter = PermissionRequest {
+            tool_name: "bash".into(),
+            action: Some("run".into()),
+            scope: PermissionScope::Execute,
+            resource: PermissionResource::Command {
+                descriptor: analyze_command("python -c 'print(1)'"),
+            },
+        };
+
+        let read_outcome = evaluate_permission(&context, read_only, None);
+        let interpreter_outcome = evaluate_permission(&context, interpreter, None);
+
+        assert_eq!(read_outcome.kind, PermissionOutcomeKind::Allowed);
+        assert_eq!(
+            interpreter_outcome.kind,
+            PermissionOutcomeKind::RequiresApproval
+        );
+        let PermissionResource::Command {
+            descriptor: read_descriptor,
+        } = &read_outcome.request.resource
+        else {
+            panic!("expected command resource");
+        };
+        let PermissionResource::Command {
+            descriptor: interpreter_descriptor,
+        } = &interpreter_outcome.request.resource
+        else {
+            panic!("expected command resource");
+        };
+        assert_eq!(read_descriptor.risk, CommandRisk::ReadOnly);
+        assert_eq!(interpreter_descriptor.risk, CommandRisk::Interpreter);
     }
 
     #[test]

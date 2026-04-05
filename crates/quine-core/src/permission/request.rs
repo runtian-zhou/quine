@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+use super::command::CommandDescriptor;
 use super::types::{PermissionDecision, PermissionRuleSource};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,7 +20,7 @@ pub(crate) enum PermissionScope {
 pub(crate) enum PermissionResource {
     None,
     Path { path: PathBuf },
-    Command { command: String },
+    Command { descriptor: CommandDescriptor },
     Process { target: String },
     Agent { target: String },
 }

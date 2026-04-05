@@ -1,4 +1,5 @@
 pub(crate) mod approval;
+pub(crate) mod command;
 pub(crate) mod context;
 pub(crate) mod engine;
 pub(crate) mod mode;
@@ -11,6 +12,7 @@ pub(crate) use approval::{
     build_permission_approval_request, parse_permission_approval_response,
     PendingPermissionApproval, PermissionApprovalChoice,
 };
+pub(crate) use command::{analyze_command, CommandRisk};
 pub(crate) use context::PermissionContext;
 pub(crate) use engine::evaluate_permission;
 pub(crate) use mode::exit_plan_mode;
