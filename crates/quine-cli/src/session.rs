@@ -1,5 +1,6 @@
 use crate::client::IpcClient;
 use quine_harness::protocol::methods;
+use quine_harness::PermissionPromptBehavior;
 use quine_llm::Message;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -17,6 +18,7 @@ pub(crate) struct CreatedSession {
 fn build_session_params(
     skills: &[String],
     plan_mode: bool,
+    prompt_behavior: PermissionPromptBehavior,
     initial_messages: &[Message],
     system_prompt: Option<String>,
 ) -> Option<serde_json::Value> {
@@ -30,6 +32,10 @@ fn build_session_params(
     if plan_mode {
         session_params["plan_mode"] = serde_json::json!(true);
     }
+    if prompt_behavior != PermissionPromptBehavior::Interactive {
+        session_params["prompt_behavior"] =
+            serde_json::to_value(prompt_behavior).expect("prompt behavior should serialize");
+    }
     if !initial_messages.is_empty() {
         session_params["initial_messages"] =
             serde_json::to_value(initial_messages).expect("initial messages should serialize");
@@ -41,9 +47,10 @@ fn build_session_params(
 pub(crate) fn build_create_session_params(
     skills: &[String],
     plan_mode: bool,
+    prompt_behavior: PermissionPromptBehavior,
     initial_messages: &[Message],
 ) -> Option<serde_json::Value> {
-    build_session_params(skills, plan_mode, initial_messages, None)
+    build_session_params(skills, plan_mode, prompt_behavior, initial_messages, None)
 }
 
 fn slash_skill_arguments_overlay(request: &str) -> Option<String> {
@@ -111,7 +118,14 @@ pub(crate) async fn create_session(
     skills: &[String],
     plan_mode: bool,
 ) -> anyhow::Result<CreatedSession> {
-    create_session_with_initial_messages(client, skills, plan_mode, &[]).await
+    create_session_with_initial_messages(
+        client,
+        skills,
+        plan_mode,
+        PermissionPromptBehavior::Interactive,
+        &[],
+    )
+    .await
 }
 
 pub(crate) async fn create_slash_skill_session(
@@ -123,7 +137,13 @@ pub(crate) async fn create_slash_skill_session(
     let result = client
         .call(
             methods::CREATE_SESSION,
-            build_session_params(&skills, false, &[], slash_skill_arguments_overlay(request)),
+            build_session_params(
+                &skills,
+                false,
+                PermissionPromptBehavior::Interactive,
+                &[],
+                slash_skill_arguments_overlay(request),
+            ),
         )
         .await?;
 
@@ -155,12 +175,13 @@ pub(crate) async fn create_session_with_initial_messages(
     client: &mut IpcClient,
     skills: &[String],
     plan_mode: bool,
+    prompt_behavior: PermissionPromptBehavior,
     initial_messages: &[Message],
 ) -> anyhow::Result<CreatedSession> {
     let result = client
         .call(
             methods::CREATE_SESSION,
-            build_create_session_params(skills, plan_mode, initial_messages),
+            build_create_session_params(skills, plan_mode, prompt_behavior, initial_messages),
         )
         .await?;
 
@@ -210,7 +231,13 @@ mod tests {
 
     #[test]
     fn build_create_session_params_includes_plan_mode() {
-        let params = build_create_session_params(&["feature-request".into()], true, &[]).unwrap();
+        let params = build_create_session_params(
+            &["feature-request".into()],
+            true,
+            PermissionPromptBehavior::Interactive,
+            &[],
+        )
+        .unwrap();
 
         assert_eq!(
             params,
@@ -223,7 +250,24 @@ mod tests {
 
     #[test]
     fn build_create_session_params_omits_empty_fields() {
-        assert_eq!(build_create_session_params(&[], false, &[]), None);
+        assert_eq!(
+            build_create_session_params(&[], false, PermissionPromptBehavior::Interactive, &[]),
+            None
+        );
+    }
+
+    #[test]
+    fn build_create_session_params_includes_noninteractive_prompt_behavior() {
+        let params =
+            build_create_session_params(&[], false, PermissionPromptBehavior::Headless, &[])
+                .unwrap();
+
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "prompt_behavior": "headless"
+            })
+        );
     }
 
     #[test]

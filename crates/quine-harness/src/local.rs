@@ -308,6 +308,7 @@ impl HarnessService for LocalHarness {
                 working_directory: config.working_directory,
                 skills,
                 plan_mode: config.plan_mode,
+                prompt_behavior: config.prompt_behavior,
                 initial_messages: config.initial_messages,
                 agent_key: config.agent_key,
                 team_key: config.team_key,
@@ -530,6 +531,7 @@ impl HarnessService for LocalHarness {
                 child_id,
                 task,
                 system_prompt,
+                prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
                 inheritance: InheritanceFlags::default(),
                 reply: reply_tx,
             })
@@ -615,7 +617,7 @@ impl HarnessService for LocalHarness {
 mod tests {
     use super::*;
     use crate::storage::session_context_from_checkpoint;
-    use quine_core::{CoreOutput, SessionState};
+    use quine_core::{CoreOutput, PermissionPromptBehavior, SessionState};
     use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, Role, ToolDefinition};
     use std::collections::HashMap;
     use std::fs;
@@ -859,6 +861,45 @@ mod tests {
         );
 
         harness.shutdown().await.unwrap();
+    }
+
+    struct BackgroundApprovalProvider {
+        call_count: std::sync::atomic::AtomicU32,
+        marker_name: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for BackgroundApprovalProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            let count = self
+                .call_count
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let events = if count == 0 {
+                vec![
+                    Ok(LlmEvent::ToolCall {
+                        tool_use_id: "toolu_background_bash".into(),
+                        tool_name: "bash".into(),
+                        arguments: serde_json::json!({
+                            "command": format!("touch {}", self.marker_name),
+                        }),
+                    }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ]
+            } else {
+                vec![
+                    Ok(LlmEvent::TextDelta {
+                        text: "background complete".into(),
+                    }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ]
+            };
+            Ok(Box::pin(futures::stream::iter(events)))
+        }
     }
 
     struct ObservedMemoryProvider;
@@ -1803,6 +1844,93 @@ mod tests {
             .await
             .unwrap();
         harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_harness_scheduler_background_style_session_denies_without_pending_approval() {
+        let marker_name = format!("qa-050-scheduled-background-{}.txt", uuid::Uuid::new_v4());
+        let storage = temp_storage();
+        let workspace = storage.root().to_path_buf();
+        let marker_path = workspace.join(&marker_name);
+        let _ = fs::remove_file(&marker_path);
+
+        let harness = LocalHarness::new(
+            Arc::new(BackgroundApprovalProvider {
+                call_count: std::sync::atomic::AtomicU32::new(0),
+                marker_name: marker_name.clone(),
+            }),
+            Some(storage),
+        )
+        .await
+        .unwrap();
+        let mut rx = harness.subscribe();
+
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(workspace.clone()),
+                prompt_behavior: PermissionPromptBehavior::Headless,
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        harness
+            .send_message(
+                session_id,
+                "attempt the scheduled background mutation".into(),
+            )
+            .await
+            .unwrap();
+
+        let mut saw_interaction = false;
+        let mut saw_denied_bash = false;
+        let saw_turn_complete = loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(CoreOutput::InteractionNeeded {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => {
+                    saw_interaction = true;
+                }
+                Ok(Ok(CoreOutput::ToolResult {
+                    session_id: event_session_id,
+                    tool_name,
+                    is_error,
+                    content,
+                    ..
+                })) if event_session_id == session_id && tool_name == "bash" => {
+                    assert!(is_error, "headless bash should fail safe");
+                    assert!(content.contains("permission denied"));
+                    saw_denied_bash = true;
+                }
+                Ok(Ok(CoreOutput::TurnComplete {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => {
+                    break true;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("event stream closed unexpectedly: {error}"),
+                Err(_) => panic!("timeout waiting for headless background-style session"),
+            }
+        };
+
+        assert!(!saw_interaction, "background session should not prompt");
+        assert!(
+            saw_denied_bash,
+            "headless session should emit a permission denial"
+        );
+        assert!(
+            saw_turn_complete,
+            "headless session should complete deterministically"
+        );
+        assert!(
+            !marker_path.exists(),
+            "headless denial must not run the bash command"
+        );
+
+        harness.shutdown().await.unwrap();
+        let _ = fs::remove_file(marker_path);
     }
 
     #[tokio::test]

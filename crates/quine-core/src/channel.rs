@@ -6,6 +6,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 
 use crate::error::CoreError;
+use crate::permission::PermissionPromptBehavior;
 use crate::persistence::CoreCheckpoint;
 use crate::session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 use crate::skill::Skill;
@@ -25,6 +26,8 @@ pub enum CoreInput {
         skills: Vec<Skill>,
         /// Whether this session operates in read-only plan mode.
         plan_mode: bool,
+        /// How permission prompts should behave for this session.
+        prompt_behavior: PermissionPromptBehavior,
         /// Seed the new session with these messages after the system prompt.
         initial_messages: Vec<Message>,
         /// Optional custom-agent durable memory key.
@@ -85,6 +88,7 @@ pub enum CoreInput {
         child_id: SessionId,
         task: String,
         system_prompt: Option<String>,
+        prompt_behavior: PermissionPromptBehavior,
         inheritance: InheritanceFlags,
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -393,6 +397,7 @@ mod tests {
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: crate::permission::PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,

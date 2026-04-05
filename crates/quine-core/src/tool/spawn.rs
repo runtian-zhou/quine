@@ -20,6 +20,7 @@ fn debug_log_spawn(session_id: SessionId, child_id: SessionId, message: impl AsR
 
 use super::{ExecutionContext, Tool, ToolError, ToolOutput};
 use crate::channel::CoreInput;
+use crate::permission::PermissionPromptBehavior;
 use crate::session::{InheritanceFlags, SessionId};
 
 /// Tool for spawning a child agent session.
@@ -116,6 +117,7 @@ impl Tool for SpawnTool {
                 child_id,
                 task: task.to_string(),
                 system_prompt,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 inheritance: InheritanceFlags {
                     history: inherit_history,
                     filesystem: inherit_filesystem,
@@ -240,12 +242,14 @@ mod tests {
                 child_id,
                 task,
                 system_prompt,
+                prompt_behavior,
                 inheritance,
                 reply,
             } => {
                 assert_eq!(parent_id, session_id);
                 assert_eq!(task, "delegate this");
                 assert!(system_prompt.is_none());
+                assert_eq!(prompt_behavior, PermissionPromptBehavior::Interactive);
                 assert!(!inheritance.history);
                 assert!(inheritance.filesystem);
                 (child_id, reply)

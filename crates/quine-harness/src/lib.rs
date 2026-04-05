@@ -18,6 +18,7 @@ pub(crate) use memory_store::MemoryStore;
 pub use protocol::{
     JsonRpcError, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
 };
+pub use quine_core::PermissionPromptBehavior;
 pub use service::HarnessService;
 pub use session_log::{
     default_log_dir, list_sessions, log_file_path, read_session_log, EventDirection,

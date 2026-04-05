@@ -413,6 +413,7 @@ mod tests {
                     skill_names: Vec::new(),
                     working_directory: PathBuf::from("/tmp/project"),
                     plan_mode: false,
+                    prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
                     prompt_memory_mode: quine_core::PromptMemoryMode::Disabled,
                     agent_key: None,
                     team_key: None,

@@ -359,6 +359,16 @@ async fn handle_request(
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            let prompt_behavior = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("prompt_behavior"))
+                .cloned()
+                .map(serde_json::from_value)
+                .transpose()
+                .unwrap_or_default()
+                .unwrap_or(quine_core::PermissionPromptBehavior::Interactive);
+
             let initial_messages = request
                 .params
                 .as_ref()
@@ -398,6 +408,7 @@ async fn handle_request(
                 working_directory: None,
                 skills,
                 plan_mode,
+                prompt_behavior,
                 initial_messages,
                 agent_key,
                 team_key,

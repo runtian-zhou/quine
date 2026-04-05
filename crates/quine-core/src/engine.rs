@@ -331,6 +331,7 @@ struct SessionInit {
     skills: Vec<Skill>,
     working_directory: PathBuf,
     plan_mode: bool,
+    prompt_behavior: PermissionPromptBehavior,
     initial_messages: Vec<Message>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
@@ -351,6 +352,7 @@ impl SessionInit {
                 .collect(),
             working_directory: self.working_directory.clone(),
             plan_mode: self.plan_mode,
+            prompt_behavior: self.prompt_behavior,
             prompt_memory_mode: self.prompt_memory_mode,
             agent_key: self.agent_key.clone(),
             team_key: self.team_key.clone(),
@@ -455,6 +457,7 @@ impl SessionContext {
             skills,
             working_directory,
             plan_mode: _,
+            prompt_behavior,
             initial_messages,
             archive_root,
             max_context_window,
@@ -495,7 +498,7 @@ impl SessionContext {
         let permission_context = PermissionContext::new(
             working_directory.clone(),
             persisted_config.plan_mode,
-            PermissionPromptBehavior::Interactive,
+            prompt_behavior,
         );
         let tools = tool_registry.tool_definitions();
 
@@ -575,6 +578,7 @@ impl SessionContext {
                 skills,
                 working_directory: config.working_directory.clone(),
                 plan_mode: config.plan_mode,
+                prompt_behavior: config.prompt_behavior,
                 initial_messages: Vec::new(),
                 archive_root,
                 max_context_window,
@@ -1926,6 +1930,7 @@ async fn start_child_session(
     child_id: SessionId,
     task: String,
     system_prompt: Option<String>,
+    prompt_behavior: PermissionPromptBehavior,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
 ) -> Result<(), String> {
@@ -1943,6 +1948,7 @@ async fn start_child_session(
             skills: Vec::new(),
             working_directory: work_dir,
             plan_mode: false,
+            prompt_behavior,
             initial_messages: Vec::new(),
             archive_root,
             max_context_window,
@@ -2159,8 +2165,12 @@ async fn execute_tool_call(
             .get("system_prompt")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned);
-        let (archive_root, max_context_window) = match sessions.get(&session_id) {
-            Some(session) => (session.archive_root.clone(), session.max_context_window),
+        let (archive_root, max_context_window, prompt_behavior) = match sessions.get(&session_id) {
+            Some(session) => (
+                session.archive_root.clone(),
+                session.max_context_window,
+                session.permission_context.prompt_behavior(),
+            ),
             None => {
                 return ToolOutcome::Error {
                     message: "session not found".into(),
@@ -2176,6 +2186,7 @@ async fn execute_tool_call(
             child_id,
             task,
             system_prompt,
+            prompt_behavior,
             archive_root,
             max_context_window,
         ))
@@ -2885,6 +2896,13 @@ async fn handle_llm_turn(
                         usage: accumulated_usage,
                     })
                     .await;
+                let _ = io
+                    .output
+                    .send(CoreOutput::SessionStateChanged {
+                        session_id,
+                        state: SessionState::Idle,
+                    })
+                    .await;
                 if let Some(session) = sessions.get_mut(&session_id) {
                     schedule_session_memory_refresh(session, session_id, io.input_tx.clone());
                 }
@@ -3095,6 +3113,13 @@ async fn handle_llm_turn(
                                 let duration_us = turn_start.elapsed().as_micros() as u64;
                                 let _ = io
                                     .output
+                                    .send(CoreOutput::SessionStateChanged {
+                                        session_id,
+                                        state: SessionState::Idle,
+                                    })
+                                    .await;
+                                let _ = io
+                                    .output
                                     .send(CoreOutput::SessionError {
                                         session_id,
                                         error: error.clone(),
@@ -3142,6 +3167,13 @@ async fn handle_llm_turn(
                             session.state = SessionState::Idle;
                         }
                         let duration_us = turn_start.elapsed().as_micros() as u64;
+                        let _ = io
+                            .output
+                            .send(CoreOutput::SessionStateChanged {
+                                session_id,
+                                state: SessionState::Idle,
+                            })
+                            .await;
                         let _ = io
                             .output
                             .send(CoreOutput::TurnComplete {
@@ -3200,6 +3232,13 @@ async fn handle_llm_turn(
                     let duration_us = turn_start.elapsed().as_micros() as u64;
                     let _ = io
                         .output
+                        .send(CoreOutput::SessionStateChanged {
+                            session_id,
+                            state: SessionState::Idle,
+                        })
+                        .await;
+                    let _ = io
+                        .output
                         .send(CoreOutput::TurnComplete {
                             session_id,
                             duration_us,
@@ -3222,6 +3261,13 @@ async fn handle_llm_turn(
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.state = SessionState::Idle;
                 }
+                let _ = io
+                    .output
+                    .send(CoreOutput::SessionStateChanged {
+                        session_id,
+                        state: SessionState::Idle,
+                    })
+                    .await;
                 let _ = io
                     .output
                     .send(CoreOutput::SessionError { session_id, error })
@@ -3358,6 +3404,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 working_directory,
                 skills,
                 plan_mode,
+                prompt_behavior,
                 initial_messages,
                 agent_key,
                 team_key,
@@ -3388,6 +3435,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         skills,
                         working_directory: work_dir,
                         plan_mode,
+                        prompt_behavior,
                         initial_messages,
                         archive_root: archive_root.clone(),
                         max_context_window,
@@ -3781,6 +3829,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 child_id,
                 task,
                 system_prompt,
+                prompt_behavior,
                 inheritance,
                 reply,
             } => {
@@ -3821,6 +3870,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     child_id,
                     task,
                     system_prompt,
+                    prompt_behavior,
                     archive_root.clone(),
                     max_context_window,
                 )
@@ -4101,6 +4151,7 @@ mod tests {
                 skills: Vec::new(),
                 working_directory: working_directory.clone(),
                 plan_mode: true,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: temp_dir.path().join("archive"),
                 max_context_window: None,
@@ -4140,6 +4191,7 @@ mod tests {
                 skills: Vec::new(),
                 working_directory: temp_dir.path().to_path_buf(),
                 plan_mode: true,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: temp_dir.path().join("archive"),
                 max_context_window: None,
@@ -4158,6 +4210,41 @@ mod tests {
         assert!(!session.persisted_config.plan_mode);
         assert_eq!(session.permission_context.mode(), PermissionMode::Default);
         assert_eq!(session.permission_context.pre_plan_mode(), None);
+    }
+
+    #[tokio::test]
+    async fn session_context_bootstraps_explicit_headless_prompt_behavior() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let temp_dir = TempDir::new().unwrap();
+        let session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: temp_dir.path().to_path_buf(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Headless,
+                initial_messages: Vec::new(),
+                archive_root: temp_dir.path().join("archive"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            session.permission_context.prompt_behavior(),
+            PermissionPromptBehavior::Headless
+        );
+        assert_eq!(
+            session.persisted_config.prompt_behavior,
+            PermissionPromptBehavior::Headless
+        );
     }
 
     fn compacted_summary_text(history: &[Message]) -> &str {
@@ -4180,6 +4267,7 @@ mod tests {
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root,
                 max_context_window: None,
@@ -4293,6 +4381,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: working_directory.clone(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: vec![Message::user("How do I run the Rust test suite?")],
                 archive_root,
                 max_context_window: None,
@@ -4804,6 +4893,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     skills: Vec::new(),
                     working_directory: std::env::current_dir().unwrap_or_default(),
                     plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-a"),
                     max_context_window: None,
@@ -4823,6 +4913,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     skills: Vec::new(),
                     working_directory: std::env::current_dir().unwrap_or_default(),
                     plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-b"),
                     max_context_window: None,
@@ -4842,6 +4933,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     skills: Vec::new(),
                     working_directory: std::env::current_dir().unwrap_or_default(),
                     plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-wait-cycles-c"),
                     max_context_window: None,
@@ -4897,6 +4989,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     skills: Vec::new(),
                     working_directory: std::env::current_dir().unwrap_or_default(),
                     plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-timeout-a"),
                     max_context_window: None,
@@ -4916,6 +5009,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     skills: Vec::new(),
                     working_directory: std::env::current_dir().unwrap_or_default(),
                     plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
                     initial_messages: Vec::new(),
                     archive_root: std::env::temp_dir().join("quine-core-timeout-b"),
                     max_context_window: None,
@@ -4956,6 +5050,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: vec![Message::assistant_tool_use(None, vec![])],
                 archive_root: std::env::temp_dir().join("quine-core-timeout-resume"),
                 max_context_window: None,
@@ -5029,6 +5124,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-mailbox-resume"),
                 max_context_window: None,
@@ -5100,6 +5196,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
@@ -5183,6 +5280,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: vec![Message::user("inspect")],
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
@@ -5287,6 +5385,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: vec![Message::user("inspect")],
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
@@ -5570,6 +5669,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
                 max_context_window: None,
@@ -5616,6 +5716,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
                 max_context_window: None,
@@ -5664,6 +5765,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
                 max_context_window: None,
@@ -5703,6 +5805,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
@@ -5770,6 +5873,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
@@ -5850,6 +5954,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
                 max_context_window: None,
@@ -5942,6 +6047,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
                 max_context_window: None,
@@ -6022,6 +6128,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
                 max_context_window: None,
@@ -6090,6 +6197,80 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[tokio::test]
+    async fn execute_tool_call_denies_headless_permission_request_without_interaction() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session_id = SessionId::new();
+        let mut session = SessionContext::new(
+            session_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Headless,
+                initial_messages: Vec::new(),
+                archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.tool_registry.register(Arc::new(MutatingProbeTool {
+            name: "write_probe",
+        }));
+
+        let call = PendingToolCall {
+            tool_use_id: "toolu_permission_headless".into(),
+            tool_name: "write_probe".into(),
+            arguments: serde_json::json!({}),
+        };
+
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(4);
+        let (input_tx, mut input_rx) = tokio::sync::mpsc::channel(4);
+        let mut deferred_inputs = VecDeque::new();
+        let mut io = CoreIo {
+            output: &output_tx,
+            input: &mut input_rx,
+            input_tx: &input_tx,
+            deferred_inputs: &mut deferred_inputs,
+        };
+        let mut sessions = HashMap::from([(session_id, session)]);
+        let mut session_tree = SessionTree::new();
+        let mut engine = EngineState {
+            provider: &provider,
+            session_tree: &mut session_tree,
+        };
+
+        let outcome =
+            execute_tool_call(&call, &mut sessions, session_id, &mut io, &mut engine).await;
+
+        assert!(
+            matches!(outcome, ToolOutcome::Error { ref message } if message.contains("permission denied"))
+        );
+        assert!(output_rx.try_recv().is_err());
+        let permission_outcome = sessions
+            .get(&session_id)
+            .and_then(|session| session.last_permission_outcome.clone())
+            .expect("permission outcome should be recorded");
+        assert_eq!(
+            permission_outcome.source.kind,
+            crate::permission::request::PermissionMatchKind::HeadlessFallback
+        );
+        assert_eq!(
+            permission_outcome.final_decision,
+            crate::permission::types::PermissionDecision::Deny
+        );
+        assert!(sessions
+            .get(&session_id)
+            .is_some_and(|session| session.pending_permission_approval.is_none()));
+    }
+
+    #[tokio::test]
     async fn execute_tool_call_denies_outside_workspace_write_boundary() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let workspace = tempfile::TempDir::new().unwrap();
@@ -6101,6 +6282,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: workspace.path().to_path_buf(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-permission-tests"),
                 max_context_window: None,
@@ -6160,6 +6342,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
@@ -6229,6 +6412,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: std::env::temp_dir().join("quine-core-compaction-tests"),
                 max_context_window: None,
@@ -6271,6 +6455,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 archive_root: archive_root.clone(),
                 max_context_window: None,
@@ -6332,6 +6517,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6352,6 +6538,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 child_id,
                 task: "Reply with exactly one integer. No explanation.".into(),
                 system_prompt: None,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 inheritance: InheritanceFlags::default(),
                 reply: spawn_reply_tx,
             })
@@ -6408,6 +6595,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6446,6 +6634,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6528,6 +6717,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6597,6 +6787,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     working_directory: None,
                     skills: Vec::new(),
                     plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
                     initial_messages: Vec::new(),
                     agent_key: None,
                     team_key: None,
@@ -6649,6 +6840,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     skill_names: Vec::new(),
                     working_directory: std::env::current_dir().unwrap_or_default(),
                     plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
                     prompt_memory_mode: PromptMemoryMode::Disabled,
                     agent_key: None,
                     team_key: None,
@@ -6761,6 +6953,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6815,6 +7008,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6875,6 +7069,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6894,6 +7089,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -6926,6 +7122,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7037,6 +7234,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7165,6 +7363,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 skills: Vec::new(),
                 working_directory: std::env::current_dir().unwrap_or_default(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: vec![Message::user("run tools")],
                 archive_root: std::env::temp_dir().join("quine-core-interrupt-tests"),
                 max_context_window: None,
@@ -7307,6 +7506,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7424,6 +7624,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7535,6 +7736,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: Some(workspace.path().to_path_buf()),
                 skills: Vec::new(),
                 plan_mode: true,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7648,6 +7850,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: Some(workspace.path().to_path_buf()),
                 skills: Vec::new(),
                 plan_mode: true,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
@@ -7726,6 +7929,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: vec![seeded_message.clone()],
                 agent_key: None,
                 team_key: None,
@@ -7760,6 +7964,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     working_directory: None,
                     skills: Vec::new(),
                     plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
                     initial_messages: Vec::new(),
                     agent_key: None,
                     team_key: None,
@@ -7899,6 +8104,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 working_directory: None,
                 skills: Vec::new(),
                 plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,

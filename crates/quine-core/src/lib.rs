@@ -30,6 +30,7 @@ pub use memory::{
     PromptMemoryDiagnostics, ScopeSelector, ScopedMemoryLookupOrder, ScopedMemoryPaths,
     ScopedPersistentMemoryState, SessionMemoryDiagnostics, SessionRefreshDiagnostics,
 };
+pub use permission::PermissionPromptBehavior;
 pub use persistence::{
     CoreCheckpoint, PersistedMemoryState, PersistedPersistentMemoryState, PersistedPlanStore,
     PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,

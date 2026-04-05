@@ -99,8 +99,7 @@ fn outcome_for(
     reason: String,
     prompt_behavior: PermissionPromptBehavior,
 ) -> PermissionOutcome {
-    if decision == PermissionDecision::Ask && prompt_behavior == PermissionPromptBehavior::Headless
-    {
+    if decision == PermissionDecision::Ask && !prompt_behavior.is_interactive() {
         return PermissionOutcome {
             kind: PermissionOutcomeKind::Denied,
             final_decision: PermissionDecision::Deny,
@@ -108,7 +107,10 @@ fn outcome_for(
                 kind: PermissionMatchKind::HeadlessFallback,
                 rule_source: source.rule_source,
             },
-            reason: format!("{reason}; headless sessions cannot satisfy approval prompts"),
+            reason: format!(
+                "{reason}; {} sessions cannot satisfy approval prompts",
+                prompt_behavior.denial_label()
+            ),
             request,
         };
     }
@@ -506,6 +508,24 @@ mod tests {
         assert!(outcome
             .reason
             .contains("headless sessions cannot satisfy approval prompts"));
+    }
+
+    #[test]
+    fn background_ask_fails_safe() {
+        let context = PermissionContext::new(
+            PathBuf::from("/workspace"),
+            false,
+            PermissionPromptBehavior::Background,
+        );
+
+        let outcome = evaluate_permission(&context, request(PermissionScope::Execute), None);
+
+        assert_eq!(outcome.kind, PermissionOutcomeKind::Denied);
+        assert_eq!(outcome.final_decision, PermissionDecision::Deny);
+        assert_eq!(outcome.source.kind, PermissionMatchKind::HeadlessFallback);
+        assert!(outcome
+            .reason
+            .contains("background sessions cannot satisfy approval prompts"));
     }
 
     #[test]

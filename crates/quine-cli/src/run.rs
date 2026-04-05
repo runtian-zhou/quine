@@ -4,7 +4,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::IpcClient;
 use crate::session::resolve_resume_target;
-use quine_harness::protocol::{methods, notifications};
+use quine_harness::{
+    protocol::{methods, notifications},
+    PermissionPromptBehavior,
+};
 
 fn print_resume_command(socket_path: &Path, session_id: &str) {
     eprintln!(
@@ -84,6 +87,8 @@ pub async fn run_oneshot(
             if !skills.is_empty() {
                 session_params["skills"] = serde_json::json!(skills);
             }
+            session_params["prompt_behavior"] =
+                serde_json::json!(PermissionPromptBehavior::Headless);
             let params = if session_params.as_object().unwrap().is_empty() {
                 None
             } else {

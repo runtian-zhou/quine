@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::{MemoryPolicyConfig, ScopedPersistentMemoryState};
+use crate::permission::PermissionPromptBehavior;
 use crate::planner::ActionPlan;
 use crate::session::{ExitStatus, SessionId, SessionState};
 
@@ -45,6 +46,8 @@ pub struct PersistedSessionConfig {
     pub skill_names: Vec<String>,
     pub working_directory: PathBuf,
     pub plan_mode: bool,
+    #[serde(default = "default_permission_prompt_behavior")]
+    pub prompt_behavior: PermissionPromptBehavior,
     #[serde(default)]
     pub prompt_memory_mode: PromptMemoryMode,
     #[serde(default)]
@@ -53,6 +56,10 @@ pub struct PersistedSessionConfig {
     pub team_key: Option<String>,
     #[serde(default)]
     pub memory_policy: MemoryPolicyConfig,
+}
+
+fn default_permission_prompt_behavior() -> PermissionPromptBehavior {
+    PermissionPromptBehavior::Interactive
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
