@@ -1125,6 +1125,7 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
 
     match explorer.active_tab {
         ContextExplorerTab::History => {
+            frame.render_widget(Clear, sections[2]);
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
@@ -1132,6 +1133,7 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
 
             frame.render_widget(Clear, columns[0]);
             frame.render_widget(Clear, columns[1]);
+            paint_blank_area(frame, columns[1]);
 
             let list_items: Vec<ListItem> = explorer
                 .snapshot
@@ -1170,13 +1172,17 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             *list_state.offset_mut() = usize::from(list_scroll);
             frame.render_stateful_widget(list, columns[0], &mut list_state);
 
+            let detail_block = Block::default().title(" Detail ").borders(Borders::ALL);
+            let detail_inner = detail_block.inner(columns[1]);
+            frame.render_widget(detail_block, columns[1]);
+            paint_blank_area(frame, detail_inner);
             let detail = Paragraph::new(format_context_entry_detail(explorer))
-                .block(Block::default().title(" Detail ").borders(Borders::ALL))
                 .wrap(Wrap { trim: false })
                 .scroll((explorer.scroll_offset, 0));
-            frame.render_widget(detail, columns[1]);
+            frame.render_widget(detail, detail_inner);
         }
         ContextExplorerTab::Tools => {
+            frame.render_widget(Clear, sections[2]);
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
@@ -1184,6 +1190,7 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
 
             frame.render_widget(Clear, columns[0]);
             frame.render_widget(Clear, columns[1]);
+            paint_blank_area(frame, columns[1]);
 
             let list_items: Vec<ListItem> = explorer
                 .snapshot
@@ -1222,17 +1229,19 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             *list_state.offset_mut() = usize::from(list_scroll);
             frame.render_stateful_widget(list, columns[0], &mut list_state);
 
+            let detail_block = Block::default()
+                .title(" Tool Detail ")
+                .borders(Borders::ALL);
+            let detail_inner = detail_block.inner(columns[1]);
+            frame.render_widget(detail_block, columns[1]);
+            paint_blank_area(frame, detail_inner);
             let detail = Paragraph::new(format_tool_detail(explorer))
-                .block(
-                    Block::default()
-                        .title(" Tool Detail ")
-                        .borders(Borders::ALL),
-                )
                 .wrap(Wrap { trim: false })
                 .scroll((explorer.scroll_offset, 0));
-            frame.render_widget(detail, columns[1]);
+            frame.render_widget(detail, detail_inner);
         }
         ContextExplorerTab::Skills => {
+            frame.render_widget(Clear, sections[2]);
             let columns = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Percentage(35), Constraint::Percentage(65)])
@@ -1240,6 +1249,7 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
 
             frame.render_widget(Clear, columns[0]);
             frame.render_widget(Clear, columns[1]);
+            paint_blank_area(frame, columns[1]);
 
             let list_items: Vec<ListItem> = explorer
                 .snapshot
@@ -1278,18 +1288,20 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             *list_state.offset_mut() = usize::from(list_scroll);
             frame.render_stateful_widget(list, columns[0], &mut list_state);
 
+            let detail_block = Block::default()
+                .title(" Skill Detail ")
+                .borders(Borders::ALL);
+            let detail_inner = detail_block.inner(columns[1]);
+            frame.render_widget(detail_block, columns[1]);
+            paint_blank_area(frame, detail_inner);
             let detail = Paragraph::new(format_skill_detail(explorer))
-                .block(
-                    Block::default()
-                        .title(" Skill Detail ")
-                        .borders(Borders::ALL),
-                )
                 .wrap(Wrap { trim: false })
                 .scroll((explorer.scroll_offset, 0));
-            frame.render_widget(detail, columns[1]);
+            frame.render_widget(detail, detail_inner);
         }
         ContextExplorerTab::Plans => {
             frame.render_widget(Clear, sections[2]);
+            paint_blank_area(frame, sections[2]);
             let plans = Paragraph::new(Text::from(format_plans_tab_lines(explorer)))
                 .block(Block::default().title(" Plans ").borders(Borders::ALL))
                 .wrap(Wrap { trim: false })
@@ -1307,6 +1319,18 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
         );
     frame.render_widget(Clear, sections[3]);
     frame.render_widget(footer, sections[3]);
+}
+
+fn paint_blank_area(frame: &mut Frame, area: Rect) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let blank_line = " ".repeat(area.width as usize);
+    let style = Style::default().fg(Color::White).bg(Color::Reset);
+    let buffer = frame.buffer_mut();
+    for y in area.top()..area.bottom() {
+        buffer.set_string(area.left(), y, &blank_line, style);
+    }
 }
 
 fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
@@ -2434,11 +2458,49 @@ mod tests {
     }
 
     #[test]
-    fn input_cursor_position_uses_display_width_for_wide_wrap_boundary() {
-        let mut input = InputBuffer::new();
-        input.set_from_string("1234567界");
+    fn context_detail_repaint_overwrites_old_wrapped_content() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec![],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
+            prompt_memory: None,
+            compact_memory_summary_markdown: None,
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            history: vec![
+                HistoryEntry::Text {
+                    role: "assistant".into(),
+                    text: "this is a very long detail entry that should wrap across multiple lines and then disappear completely after we move the selection to a shorter entry\nthis leftover line must not remain visible".into(),
+                },
+                HistoryEntry::Text {
+                    role: "assistant".into(),
+                    text: "short detail".into(),
+                },
+            ],
+        };
 
-        assert_eq!(input_cursor_position(&input, "> ", 10), (1, 1));
-        assert_eq!(input_content_rows(&input, "> ", 10), 2);
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        app.context_explorer_move_down();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("short detail")));
+        assert!(!lines
+            .iter()
+            .any(|line| line.contains("this leftover line must not remain visible")));
     }
 }

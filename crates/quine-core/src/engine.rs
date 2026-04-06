@@ -1679,17 +1679,43 @@ fn handle_session_control_input(
     }
 }
 
+fn tool_call_is_concurrency_eligible(session: &SessionContext, call: &PendingToolCall) -> bool {
+    CONCURRENT_TOOL_BATCH_ALLOWLIST.contains(&call.tool_name.as_str())
+        && session
+            .tool_registry
+            .get(&call.tool_name)
+            .is_some_and(|tool| {
+                !tool.is_interactive() && tool.is_read_only() && tool.is_idempotent()
+            })
+}
+
 fn tool_batch_is_concurrency_eligible(session: &SessionContext, calls: &[PendingToolCall]) -> bool {
     calls.len() > 1
-        && calls.iter().all(|call| {
-            CONCURRENT_TOOL_BATCH_ALLOWLIST.contains(&call.tool_name.as_str())
-                && session
-                    .tool_registry
-                    .get(&call.tool_name)
-                    .is_some_and(|tool| {
-                        !tool.is_interactive() && tool.is_read_only() && tool.is_idempotent()
-                    })
-        })
+        && calls
+            .iter()
+            .all(|call| tool_call_is_concurrency_eligible(session, call))
+}
+
+fn partition_tool_calls_by_concurrency<'a>(
+    session: &SessionContext,
+    calls: &'a [PendingToolCall],
+) -> Vec<(bool, &'a [PendingToolCall])> {
+    let mut partitions = Vec::new();
+    let mut start = 0;
+
+    while start < calls.len() {
+        let is_concurrent = tool_call_is_concurrency_eligible(session, &calls[start]);
+        let mut end = start + 1;
+        while end < calls.len()
+            && tool_call_is_concurrency_eligible(session, &calls[end]) == is_concurrent
+        {
+            end += 1;
+        }
+        partitions.push((is_concurrent, &calls[start..end]));
+        start = end;
+    }
+
+    partitions
 }
 
 fn prepare_concurrent_tool_calls(
@@ -3172,30 +3198,123 @@ async fn handle_llm_turn(
                     .and_then(|session| prepare_concurrent_tool_calls(session, &calls));
 
                 let concurrent_mode = concurrent_batch.is_some();
-                let completed_calls = if let Some(prepared_calls) = concurrent_batch {
-                    for call in &calls {
-                        if debug {
-                            debug_log_session(
-                                session_id,
-                                format!(
-                                    "calling tool `{}` concurrently (id={}) args={}",
-                                    call.tool_name,
-                                    call.tool_use_id,
-                                    serde_json::to_string(&call.arguments).unwrap_or_default()
-                                ),
+                let completed_calls = if concurrent_mode {
+                    let mut completed_calls = Vec::with_capacity(calls.len());
+                    let call_partitions = {
+                        let session = sessions
+                            .get(&session_id)
+                            .expect("session must exist while partitioning tool calls");
+                        partition_tool_calls_by_concurrency(session, &calls)
+                    };
+
+                    for (is_concurrent, partition) in call_partitions {
+                        if is_concurrent && partition.len() > 1 {
+                            for call in partition {
+                                if debug {
+                                    debug_log_session(
+                                        session_id,
+                                        format!(
+                                            "calling tool `{}` concurrently (id={}) args={}",
+                                            call.tool_name,
+                                            call.tool_use_id,
+                                            serde_json::to_string(&call.arguments)
+                                                .unwrap_or_default()
+                                        ),
+                                    );
+                                }
+                                let _ = io
+                                    .output
+                                    .send(CoreOutput::ToolRequest {
+                                        session_id,
+                                        tool_use_id: call.tool_use_id.clone(),
+                                        tool_name: call.tool_name.clone(),
+                                        arguments: call.arguments.clone(),
+                                    })
+                                    .await;
+                            }
+
+                            let prepared_calls = {
+                                let session = sessions
+                                    .get(&session_id)
+                                    .expect("session must exist while preparing tool calls");
+                                prepare_concurrent_tool_calls(session, partition)
+                                    .unwrap_or_default()
+                            };
+                            completed_calls.extend(
+                                execute_concurrent_tool_batch(
+                                    prepared_calls,
+                                    sessions,
+                                    session_id,
+                                    io,
+                                )
+                                .await,
                             );
+                            continue;
                         }
-                        let _ = io
-                            .output
-                            .send(CoreOutput::ToolRequest {
-                                session_id,
+
+                        for call in partition {
+                            if sessions
+                                .get(&session_id)
+                                .is_some_and(|session| session.interrupted)
+                            {
+                                debug_log_session(
+                                    session_id,
+                                    "skipping pending tool calls because session is interrupted",
+                                );
+                                let duration_us = turn_start.elapsed().as_micros() as u64;
+                                let _ = io
+                                    .output
+                                    .send(CoreOutput::SessionStateChanged {
+                                        session_id,
+                                        state: SessionState::Idle,
+                                    })
+                                    .await;
+                                let _ = io
+                                    .output
+                                    .send(CoreOutput::TurnComplete {
+                                        session_id,
+                                        duration_us,
+                                        usage: accumulated_usage.clone(),
+                                    })
+                                    .await;
+                                return TurnOutcome::Cancelled;
+                            }
+                            if debug {
+                                debug_log_session(
+                                    session_id,
+                                    format!(
+                                        "calling tool `{}` (id={}) args={}",
+                                        call.tool_name,
+                                        call.tool_use_id,
+                                        serde_json::to_string(&call.arguments).unwrap_or_default()
+                                    ),
+                                );
+                            }
+                            let _ = io
+                                .output
+                                .send(CoreOutput::ToolRequest {
+                                    session_id,
+                                    tool_use_id: call.tool_use_id.clone(),
+                                    tool_name: call.tool_name.clone(),
+                                    arguments: call.arguments.clone(),
+                                })
+                                .await;
+
+                            let tool_start = std::time::Instant::now();
+                            let result =
+                                execute_tool_call(call, sessions, session_id, io, engine).await;
+                            completed_calls.push(CompletedConcurrentToolCall {
+                                index: completed_calls.len(),
                                 tool_use_id: call.tool_use_id.clone(),
                                 tool_name: call.tool_name.clone(),
                                 arguments: call.arguments.clone(),
-                            })
-                            .await;
+                                result,
+                                duration_us: tool_start.elapsed().as_micros() as u64,
+                            });
+                        }
                     }
-                    execute_concurrent_tool_batch(prepared_calls, sessions, session_id, io).await
+
+                    completed_calls
                 } else {
                     let mut completed_calls = Vec::with_capacity(calls.len());
                     for call in &calls {
@@ -5516,6 +5635,85 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[tokio::test]
+    async fn partition_tool_calls_by_concurrency_preserves_order_and_batches() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: temp_dir.path().to_path_buf(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                initial_messages: Vec::new(),
+                archive_root: temp_dir.path().join("archive"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        session
+            .tool_registry
+            .register(Arc::new(ProbeTool::test_tool("read_file")));
+        session
+            .tool_registry
+            .register(Arc::new(ProbeTool::test_tool("find")));
+        session
+            .tool_registry
+            .register(Arc::new(NonConcurrentProbeTool::new("bash")));
+        session.tools = session.tool_registry.tool_definitions();
+
+        let calls = vec![
+            PendingToolCall {
+                tool_use_id: "toolu_1".into(),
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({}),
+            },
+            PendingToolCall {
+                tool_use_id: "toolu_2".into(),
+                tool_name: "find".into(),
+                arguments: serde_json::json!({}),
+            },
+            PendingToolCall {
+                tool_use_id: "toolu_3".into(),
+                tool_name: "bash".into(),
+                arguments: serde_json::json!({}),
+            },
+            PendingToolCall {
+                tool_use_id: "toolu_4".into(),
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({}),
+            },
+            PendingToolCall {
+                tool_use_id: "toolu_5".into(),
+                tool_name: "find".into(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+
+        let partitions = partition_tool_calls_by_concurrency(&session, &calls);
+        assert_eq!(partitions.len(), 3);
+        assert!(partitions[0].0);
+        assert_eq!(partitions[0].1.len(), 2);
+        assert!(!partitions[1].0);
+        assert_eq!(partitions[1].1.len(), 1);
+        assert!(partitions[2].0);
+        assert_eq!(partitions[2].1.len(), 2);
+        assert_eq!(partitions[0].1[0].tool_use_id, "toolu_1");
+        assert_eq!(partitions[0].1[1].tool_use_id, "toolu_2");
+        assert_eq!(partitions[1].1[0].tool_use_id, "toolu_3");
+        assert_eq!(partitions[2].1[0].tool_use_id, "toolu_4");
+        assert_eq!(partitions[2].1[1].tool_use_id, "toolu_5");
+    }
+
+    #[tokio::test]
     async fn concurrent_tool_batch_preserves_request_order_in_outputs() {
         let provider: Arc<dyn LlmProvider> = Arc::new(ToolCallThenTextProvider {
             call_count: AtomicU32::new(0),
@@ -5919,6 +6117,29 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         completion_order: Arc<Mutex<Vec<&'static str>>>,
     }
 
+    impl ProbeTool {
+        fn test_tool(name: &'static str) -> Self {
+            Self {
+                name,
+                delay: std::time::Duration::from_millis(0),
+                active: Arc::new(AtomicUsize::new(0)),
+                max_active: Arc::new(AtomicUsize::new(0)),
+                barrier: Arc::new(Barrier::new(1)),
+                completion_order: Arc::new(Mutex::new(Vec::new())),
+            }
+        }
+    }
+
+    struct NonConcurrentProbeTool {
+        name: &'static str,
+    }
+
+    impl NonConcurrentProbeTool {
+        fn new(name: &'static str) -> Self {
+            Self { name }
+        }
+    }
+
     #[async_trait::async_trait]
     impl crate::tool::Tool for ProbeTool {
         fn name(&self) -> &str {
@@ -5956,6 +6177,29 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             tokio::time::sleep(self.delay).await;
             self.completion_order.lock().unwrap().push(self.name);
             self.active.fetch_sub(1, Ordering::SeqCst);
+            Ok(crate::tool::ToolOutput::success(self.name))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for NonConcurrentProbeTool {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn description(&self) -> &str {
+            "Non-concurrent test probe tool"
+        }
+
+        fn parameters_schema(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn execute(
+            &self,
+            _arguments: serde_json::Value,
+            _context: &ExecutionContext,
+        ) -> Result<crate::tool::ToolOutput, crate::tool::ToolError> {
             Ok(crate::tool::ToolOutput::success(self.name))
         }
     }

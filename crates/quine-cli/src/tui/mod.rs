@@ -13,6 +13,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
 use ratatui::prelude::CrosstermBackend;
+use ratatui::widgets::Clear as TuiClear;
 use ratatui::Terminal;
 use serde::Deserialize;
 
@@ -363,9 +364,18 @@ async fn run_event_loop(
     socket_path: &Path,
     auto_approve: bool,
 ) -> anyhow::Result<()> {
+    let mut last_context_visible = app.context_explorer_active();
+    let mut force_terminal_clear = false;
     loop {
         // Draw.
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        terminal.draw(|frame| {
+            if force_terminal_clear || app.context_explorer_active() != last_context_visible {
+                frame.render_widget(TuiClear, frame.area());
+            }
+            ui::draw(frame, app)
+        })?;
+        force_terminal_clear = false;
+        last_context_visible = app.context_explorer_active();
 
         if app.should_quit {
             break;
@@ -377,7 +387,12 @@ async fn run_event_loop(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if let Some(action) = handle_terminal_event(app, event) {
-                            execute_action(app, client, skills, available_skills, socket_path, action).await?;
+                            if matches!(action, AppAction::ForceFullRedraw) {
+                                terminal.clear()?;
+                                force_terminal_clear = true;
+                            } else {
+                                execute_action(app, client, skills, available_skills, socket_path, action).await?;
+                            }
                         }
                     }
                     Some(Err(_)) | None => {
@@ -444,23 +459,23 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 return match code {
                     KeyCode::Esc => {
                         app.close_context_explorer();
-                        None
+                        Some(AppAction::ForceFullRedraw)
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
                         app.context_explorer_prev_tab();
-                        None
+                        Some(AppAction::ForceFullRedraw)
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
                         app.context_explorer_next_tab();
-                        None
+                        Some(AppAction::ForceFullRedraw)
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.context_explorer_move_up();
-                        None
+                        Some(AppAction::ForceFullRedraw)
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.context_explorer_move_down();
-                        None
+                        Some(AppAction::ForceFullRedraw)
                     }
                     KeyCode::PageUp => {
                         let step = if app.last_view_height > 2 {
@@ -469,7 +484,7 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                             10
                         };
                         app.context_explorer_scroll_up(step);
-                        None
+                        Some(AppAction::ForceFullRedraw)
                     }
                     KeyCode::PageDown => {
                         let step = if app.last_view_height > 2 {
@@ -478,15 +493,15 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                             10
                         };
                         app.context_explorer_scroll_down(step);
-                        None
+                        Some(AppAction::ForceFullRedraw)
                     }
                     KeyCode::Home => {
                         app.context_explorer_move_to_first();
-                        None
+                        Some(AppAction::ForceFullRedraw)
                     }
                     KeyCode::End => {
                         app.context_explorer_move_to_last();
-                        None
+                        Some(AppAction::ForceFullRedraw)
                     }
                     _ => None,
                 };
@@ -850,6 +865,7 @@ async fn execute_action(
             app.messages
                 .push(app::ConversationEntry::Error("(cancelled)".into()));
         }
+        AppAction::ForceFullRedraw => {}
         AppAction::Quit => {
             app.should_quit = true;
         }
