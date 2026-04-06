@@ -205,6 +205,7 @@ pub struct OptionSelectState {
 pub enum AppAction {
     SendMessage(String),
     ShowContext,
+    ListSessions { tree: bool },
     CompactSession,
     SendSlashSkillMessage {
         skill_name: String,
@@ -485,6 +486,8 @@ pub struct App {
     saved_input: String,
     /// Active option selector state (for SingleSelect/MultiSelect interactions).
     pub option_select: Option<OptionSelectState>,
+    pub loaded_skill_commands: Vec<String>,
+    pub slash_select_active: bool,
     /// Whether this session is in read-only plan mode.
     pub plan_mode: bool,
     /// Pending local confirmation required before leaving plan mode.
@@ -628,6 +631,8 @@ impl App {
             history_index: None,
             saved_input: String::new(),
             option_select: None,
+            loaded_skill_commands: Vec::new(),
+            slash_select_active: false,
             plan_mode,
             pending_plan_exit: None,
             last_view_height: 0,
@@ -696,6 +701,7 @@ impl App {
         self.last_turn_usage = None;
         self.max_context_window = max_context_window;
         self.option_select = None;
+        self.loaded_skill_commands.clear();
         self.plan_mode = plan_mode;
         self.pending_plan_exit = None;
         self.context_explorer = None;
@@ -813,6 +819,80 @@ impl App {
         }
     }
 
+    pub(crate) fn finalize_slash_command_selection(&mut self) -> bool {
+        if self.slash_select_active {
+            self.accept_slash_command_option()
+        } else {
+            self.autocomplete_slash_command()
+        }
+    }
+
+    pub(crate) fn autocomplete_slash_command(&mut self) -> bool {
+        let text = self.input.content();
+        let Some(stripped) = text.strip_prefix('/') else {
+            return false;
+        };
+        let prefix = stripped.trim_start();
+
+        let commands = ["ps", "ps tree", "plan", "loop", "compact", "context"];
+        let matches: Vec<&str> = commands
+            .into_iter()
+            .filter(|candidate| prefix.is_empty() || candidate.starts_with(prefix))
+            .collect();
+
+        if matches.len() != 1 {
+            return false;
+        }
+
+        let completed = format!("/{} ", matches[0]);
+        self.input.set_from_string(&completed);
+        self.refresh_slash_command_options();
+        true
+    }
+
+    pub(crate) fn slash_command_hint(&self) -> Option<Vec<(String, &'static str)>> {
+        let text = self.input.content();
+        let prefix = text.strip_prefix('/')?;
+        let prefix = prefix.trim_start();
+
+        let mut commands = vec![
+            ("ps".to_string(), "/ps".to_string(), "list sessions"),
+            (
+                "ps tree".to_string(),
+                "/ps tree".to_string(),
+                "show session tree",
+            ),
+            ("plan".to_string(), "/plan".to_string(), "toggle plan mode"),
+            ("loop".to_string(), "/loop".to_string(), "run autonomous loop"),
+            (
+                "compact".to_string(),
+                "/compact".to_string(),
+                "compact current session",
+            ),
+            (
+                "context".to_string(),
+                "/context".to_string(),
+                "show context details",
+            ),
+        ];
+        commands.extend(self.loaded_skill_commands.iter().cloned().map(|skill| {
+            let command = format!("/{skill}");
+            (skill, command, "run a skill command")
+        }));
+
+        let filtered: Vec<(String, &'static str)> = commands
+            .into_iter()
+            .filter(|(matcher, _, _)| prefix.is_empty() || matcher.starts_with(prefix))
+            .map(|(_, command, help)| (command, help))
+            .collect();
+
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered)
+        }
+    }
+
     /// Handle Enter/Ctrl+S: send message or submit interaction response.
     pub fn submit_input(&mut self) -> Option<AppAction> {
         if let Some(select) = self.option_select.take() {
@@ -904,6 +984,10 @@ impl App {
                         "quit" => {
                             self.should_quit = true;
                             Some(AppAction::Quit)
+                        }
+                        "ps" => {
+                            let tree = matches!(arguments.trim(), "tree");
+                            Some(AppAction::ListSessions { tree })
                         }
                         "compact" => {
                             if arguments.is_empty() {
@@ -1073,11 +1157,71 @@ impl App {
         self.option_select.is_some()
     }
 
+    pub(crate) fn refresh_slash_command_options(&mut self) {
+        let Some(hints) = self.slash_command_hint() else {
+            if self.slash_select_active {
+                self.option_select = None;
+                self.slash_select_active = false;
+            }
+            return;
+        };
+
+        let options: Vec<String> = hints
+            .into_iter()
+            .map(|(command, help)| format!("{command}\t{help}"))
+            .collect();
+        let previous_cursor = self.option_select.as_ref().map(|state| state.cursor).unwrap_or(0);
+        let cursor = previous_cursor.min(options.len().saturating_sub(1));
+        self.option_select = Some(OptionSelectState {
+            options,
+            cursor,
+            multi_select: false,
+            selected: HashSet::new(),
+            allow_freeform: true,
+        });
+        self.slash_select_active = true;
+    }
+
+    pub(crate) fn accept_slash_command_option(&mut self) -> bool {
+        let Some(select) = self.option_select.as_ref() else {
+            return false;
+        };
+        let Some(line) = select.options.get(select.cursor) else {
+            return false;
+        };
+        let Some(command) = line.split('\t').next() else {
+            return false;
+        };
+        self.input.set_from_string(&format!("{command} "));
+        self.slash_select_active = false;
+        self.option_select = None;
+        true
+    }
+
+    pub(crate) fn preview_slash_command_option(&mut self) -> bool {
+        let Some(select) = self.option_select.as_ref() else {
+            return false;
+        };
+        let Some(line) = select.options.get(select.cursor) else {
+            return false;
+        };
+        let Some(command) = line.split('\t').next() else {
+            return false;
+        };
+        self.input.set_from_string(command);
+        true
+    }
+
     pub fn context_explorer_active(&self) -> bool {
         self.context_explorer.is_some()
     }
 
     pub fn open_context_explorer(&mut self, snapshot: SessionContextSnapshot) {
+        self.loaded_skill_commands = snapshot
+            .loaded_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect();
         self.context_explorer = Some(ContextExplorerState::new(snapshot));
     }
 
@@ -2138,6 +2282,159 @@ mod tests {
             Some(ConversationEntry::AssistantText(text)) if text == "Compacting context..."
         ));
         assert!(matches!(app.phase, AgentPhase::Thinking));
+    }
+
+    #[test]
+    fn autocomplete_slash_command_completes_unique_match() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/comp");
+
+        assert!(app.autocomplete_slash_command());
+        assert_eq!(app.input.content(), "/compact ");
+    }
+
+    #[test]
+    fn autocomplete_slash_command_does_not_complete_ambiguous_match() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/p");
+
+        assert!(!app.autocomplete_slash_command());
+        assert_eq!(app.input.content(), "/p");
+    }
+
+    #[test]
+    fn autocomplete_slash_command_completes_subcommand() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/ps t");
+
+        assert!(app.autocomplete_slash_command());
+        assert_eq!(app.input.content(), "/ps tree ");
+    }
+
+    #[test]
+    fn finalize_slash_command_selection_uses_highlighted_option() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/");
+        app.refresh_slash_command_options();
+        app.option_cursor_down();
+        app.preview_slash_command_option();
+
+        assert!(app.finalize_slash_command_selection());
+        assert_eq!(app.input.content(), "/ps tree ");
+    }
+
+    #[test]
+    fn accept_slash_command_option_applies_selected_command() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/");
+        app.refresh_slash_command_options();
+        app.option_cursor_down();
+
+        assert!(app.accept_slash_command_option());
+        assert_eq!(app.input.content(), "/ps tree ");
+        assert!(!app.slash_select_active);
+    }
+
+    #[test]
+    fn preview_slash_command_option_shows_selected_command() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/");
+        app.refresh_slash_command_options();
+        app.option_cursor_down();
+
+        assert!(app.preview_slash_command_option());
+        assert_eq!(app.input.content(), "/ps tree");
+        assert!(app.slash_select_active);
+    }
+
+    #[test]
+    fn submit_input_ps_command_lists_sessions() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/ps");
+
+        let action = app.submit_input();
+
+        assert!(matches!(action, Some(AppAction::ListSessions { tree: false })));
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn submit_input_ps_tree_command_lists_tree_sessions() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/ps tree");
+
+        let action = app.submit_input();
+
+        assert!(matches!(action, Some(AppAction::ListSessions { tree: true })));
+        assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn input_label_shows_default_prompt() {
+        let app = App::new("test".into(), false, None);
+        assert_eq!(app.input_label(), "> ");
+    }
+
+    #[test]
+    fn input_label_shows_plan_prompt_in_plan_mode() {
+        let app = App::new("test".into(), true, None);
+        assert_eq!(app.input_label(), "[plan] > ");
+    }
+
+    #[test]
+    fn slash_command_hint_hidden_without_slash_prefix() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("hello");
+        assert_eq!(app.slash_command_hint(), None);
+    }
+
+    #[test]
+    fn slash_command_hint_shows_available_commands_for_slash_prefix() {
+        let mut app = App::new("test".into(), false, None);
+        app.loaded_skill_commands = vec!["review".to_string(), "ship-it".to_string()];
+        app.input.set_from_string("/");
+        assert_eq!(
+            app.slash_command_hint(),
+            Some(vec![
+                ("/ps".to_string(), "list sessions"),
+                ("/ps tree".to_string(), "show session tree"),
+                ("/plan".to_string(), "toggle plan mode"),
+                ("/loop".to_string(), "run autonomous loop"),
+                ("/compact".to_string(), "compact current session"),
+                ("/context".to_string(), "show context details"),
+                ("/review".to_string(), "run a skill command"),
+                ("/ship-it".to_string(), "run a skill command"),
+            ])
+        );
+    }
+
+    #[test]
+    fn slash_command_hint_does_not_include_placeholder_skill_entry() {
+        let mut app = App::new("test".into(), false, None);
+        app.loaded_skill_commands = vec!["review".to_string()];
+        app.input.set_from_string("/");
+
+        let hints = app.slash_command_hint().expect("slash hints");
+
+        assert!(hints.iter().any(|(command, _)| command == "/review"));
+        assert!(!hints.iter().any(|(command, _)| command == "/<skill>"));
+    }
+
+    #[test]
+    fn slash_command_hint_filters_by_prefix() {
+        let mut app = App::new("test".into(), false, None);
+        app.loaded_skill_commands = vec!["plan-review".to_string(), "ps-audit".to_string()];
+        app.input.set_from_string("/p");
+        assert_eq!(
+            app.slash_command_hint(),
+            Some(vec![
+                ("/ps".to_string(), "list sessions"),
+                ("/ps tree".to_string(), "show session tree"),
+                ("/plan".to_string(), "toggle plan mode"),
+                ("/plan-review".to_string(), "run a skill command"),
+                ("/ps-audit".to_string(), "run a skill command"),
+            ])
+        );
     }
 
     #[test]

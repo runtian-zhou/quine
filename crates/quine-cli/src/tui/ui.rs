@@ -85,8 +85,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         content_rows + 2
     } else {
         let label = app.input_label();
-        let content_rows =
+        let mut content_rows =
             input_content_rows(&app.input, &label, frame.area().width.saturating_sub(2));
+        if let Some(hints) = app.slash_command_hint() {
+            content_rows += hints.len() as u16;
+        }
         (content_rows + 2).max(3).min(max_height) // +2 for borders
     };
     let chunks = Layout::default()
@@ -1239,6 +1242,34 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     frame.render_widget(Clear, area);
 
     if let Some(ref select) = app.option_select {
+        if app.slash_select_active {
+            let label = app.input_label();
+            let mut lines = wrap_input_lines(&app.input, &label, area.width.saturating_sub(2));
+            for (index, option) in select.options.iter().enumerate() {
+                let is_cursor = index == select.cursor;
+                let style = if is_cursor {
+                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                };
+                let (command, help) = option.split_once('\t').unwrap_or((option.as_str(), ""));
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {:<10}", command), style),
+                    Span::styled(help.to_string(), Style::default().fg(Color::DarkGray)),
+                ]));
+            }
+            let widget =
+                Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL));
+            frame.render_widget(widget, area);
+
+            let (cursor_row, cursor_col) =
+                input_cursor_position(&app.input, &label, area.width.saturating_sub(2));
+            let cursor_y = (area.y + 1 + cursor_row).min(area.y + area.height.saturating_sub(2));
+            let cursor_x = (area.x + 1 + cursor_col).min(area.x + area.width.saturating_sub(2));
+            frame.set_cursor_position((cursor_x, cursor_y));
+            return;
+        }
+
         let mut lines: Vec<Line> = Vec::new();
         let label = app.input_label();
         lines.push(Line::from(Span::styled(
@@ -1278,12 +1309,19 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     }
 
     let label = app.input_label();
-    let input_widget = Paragraph::new(Text::from(wrap_input_lines(
-        &app.input,
-        &label,
-        area.width.saturating_sub(2),
-    )))
-    .block(Block::default().borders(Borders::ALL));
+    let mut lines = wrap_input_lines(&app.input, &label, area.width.saturating_sub(2));
+    if let Some(hints) = app.slash_command_hint() {
+        for (command, help) in hints {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("  {:<10}", command),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(help.to_string(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+    let input_widget = Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL));
 
     frame.render_widget(input_widget, area);
 

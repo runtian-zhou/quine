@@ -1,6 +1,7 @@
 mod app;
 mod ui;
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -11,8 +12,9 @@ use crossterm::terminal::{
 };
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
-use ratatui::backend::CrosstermBackend;
+use ratatui::prelude::CrosstermBackend;
 use ratatui::Terminal;
+use serde::Deserialize;
 
 use crate::client::IpcClient;
 use crate::context_debug::fetch_session_context;
@@ -23,6 +25,178 @@ use crate::session::{
 };
 use app::{AgentPhase, AppAction, PendingPlanExit};
 use quine_harness::protocol::{methods, notifications};
+
+#[derive(Debug, Deserialize)]
+struct TuiSessionSummary {
+    session_id: String,
+    #[serde(default)]
+    parent_id: Option<String>,
+    status: String,
+    #[serde(default)]
+    plan_mode: bool,
+    #[serde(default)]
+    _depth: usize,
+}
+
+fn format_tui_ps_table(mut sessions: Vec<TuiSessionSummary>) -> String {
+    if sessions.is_empty() {
+        return "No sessions found.".to_string();
+    }
+
+    sessions.sort_by(|left, right| {
+        left.parent_id
+            .cmp(&right.parent_id)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+
+    let session_width = sessions
+        .iter()
+        .map(|session| session.session_id.len())
+        .max()
+        .unwrap_or(7)
+        .max("SESSION".len());
+    let parent_width = sessions
+        .iter()
+        .map(|session| session.parent_id.as_deref().unwrap_or("-").len())
+        .max()
+        .unwrap_or(6)
+        .max("PARENT".len());
+    let state_width = sessions
+        .iter()
+        .map(|session| session.status.len())
+        .max()
+        .unwrap_or(5)
+        .max("STATUS".len());
+
+    let mut lines = Vec::with_capacity(sessions.len() + 1);
+    lines.push(format!(
+        "{:<session_width$}  {:<parent_width$}  {:<state_width$}  MODE",
+        "SESSION",
+        "PARENT",
+        "STATUS",
+        session_width = session_width,
+        parent_width = parent_width,
+        state_width = state_width,
+    ));
+
+    for session in sessions {
+        lines.push(format!(
+            "{:<session_width$}  {:<parent_width$}  {:<state_width$}  {}",
+            session.session_id,
+            session.parent_id.as_deref().unwrap_or("-"),
+            session.status,
+            if session.plan_mode { "plan" } else { "chat" },
+            session_width = session_width,
+            parent_width = parent_width,
+            state_width = state_width,
+        ));
+    }
+
+    lines.join("\n")
+}
+
+fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
+    if sessions.is_empty() {
+        return "No sessions found.".to_string();
+    }
+
+    let mut sessions_by_id: BTreeMap<String, TuiSessionSummary> = BTreeMap::new();
+    let mut children_by_parent: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    let mut roots = Vec::new();
+
+    for session in sessions {
+        let session_id = session.session_id.clone();
+        if let Some(parent_id) = session.parent_id.clone() {
+            children_by_parent
+                .entry(parent_id)
+                .or_default()
+                .push(session_id.clone());
+        } else {
+            roots.push(session_id.clone());
+        }
+        sessions_by_id.insert(session_id, session);
+    }
+
+    roots.sort();
+    for children in children_by_parent.values_mut() {
+        children.sort();
+    }
+
+    fn walk(
+        output: &mut Vec<String>,
+        sessions_by_id: &BTreeMap<String, TuiSessionSummary>,
+        children_by_parent: &BTreeMap<String, Vec<String>>,
+        session_id: &str,
+        prefix: &str,
+        is_last: bool,
+    ) {
+        let Some(session) = sessions_by_id.get(session_id) else {
+            return;
+        };
+
+        let branch = if prefix.is_empty() {
+            ""
+        } else if is_last {
+            "└─ "
+        } else {
+            "├─ "
+        };
+
+        output.push(format!(
+            "{}{}{} [{}]{}",
+            prefix,
+            branch,
+            session.session_id,
+            session.status,
+            if session.plan_mode { " [plan]" } else { "" },
+        ));
+
+        let next_prefix = if prefix.is_empty() {
+            String::new()
+        } else if is_last {
+            format!("{prefix}   ")
+        } else {
+            format!("{prefix}│  ")
+        };
+
+        if let Some(children) = children_by_parent.get(session_id) {
+            for (index, child_id) in children.iter().enumerate() {
+                walk(
+                    output,
+                    sessions_by_id,
+                    children_by_parent,
+                    child_id,
+                    &next_prefix,
+                    index + 1 == children.len(),
+                );
+            }
+        }
+    }
+
+    let mut output = Vec::new();
+    for (index, root_id) in roots.iter().enumerate() {
+        walk(
+            &mut output,
+            &sessions_by_id,
+            &children_by_parent,
+            root_id,
+            "",
+            index + 1 == roots.len(),
+        );
+    }
+    output.join("\n")
+}
+
+async fn fetch_tui_ps_output(client: &mut IpcClient, tree: bool) -> anyhow::Result<String> {
+    let response = client.call(methods::LIST_SESSIONS, Some(serde_json::json!({}))).await?;
+    let response = response.map_err(anyhow::Error::msg)?;
+    let sessions: Vec<TuiSessionSummary> = serde_json::from_value(response)?;
+    Ok(if tree {
+        format_tui_ps_tree(sessions)
+    } else {
+        format_tui_ps_table(sessions)
+    })
+}
 
 fn print_resume_command(socket_path: &Path, session_id: &str) {
     eprintln!(
@@ -82,6 +256,13 @@ pub async fn run_tui_chat(
         session_plan_mode.unwrap_or(plan_mode),
         session.max_context_window,
     );
+    if let Ok(snapshot) = fetch_session_context(&mut client, &app.session_id).await {
+        app.loaded_skill_commands = snapshot
+            .loaded_skills
+            .into_iter()
+            .map(|skill| skill.name)
+            .collect();
+    }
     let mut event_stream = EventStream::new();
     let mut spinner_interval = tokio::time::interval(Duration::from_millis(80));
 
@@ -270,7 +451,7 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
             }
 
             // In option-select mode, route keys differently.
-            if app.is_selecting_options() {
+            if app.is_selecting_options() && !app.slash_select_active {
                 return match code {
                     KeyCode::Enter => app.submit_input(),
                     KeyCode::Up => {
@@ -303,26 +484,37 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 return None;
             }
 
-            // Enter submits input.
+            // Enter submits input, unless a slash suggestion is active.
             if code == KeyCode::Enter {
+                if app.accept_slash_command_option() {
+                    return None;
+                }
                 return app.submit_input();
             }
 
             match code {
                 KeyCode::Backspace => {
                     app.input.delete_char_before();
+                    app.refresh_slash_command_options();
                     None
                 }
                 KeyCode::Left => {
                     app.input.cursor_left();
+                    app.refresh_slash_command_options();
                     None
                 }
                 KeyCode::Right => {
                     app.input.cursor_right();
+                    app.refresh_slash_command_options();
                     None
                 }
                 KeyCode::Up => {
-                    if app.input.is_multiline() && app.input.row() > 0 {
+                    if app.is_selecting_options() {
+                        app.option_cursor_up();
+                        if app.slash_select_active {
+                            app.preview_slash_command_option();
+                        }
+                    } else if app.input.is_multiline() && app.input.row() > 0 {
                         app.input.cursor_up();
                     } else {
                         app.history_prev();
@@ -330,7 +522,12 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                     None
                 }
                 KeyCode::Down => {
-                    if app.input.is_multiline() && app.input.row() < app.input.line_count() - 1 {
+                    if app.is_selecting_options() {
+                        app.option_cursor_down();
+                        if app.slash_select_active {
+                            app.preview_slash_command_option();
+                        }
+                    } else if app.input.is_multiline() && app.input.row() < app.input.line_count() - 1 {
                         app.input.cursor_down();
                     } else {
                         app.history_next();
@@ -370,11 +567,17 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                     } else {
                         // Agent is idle — clear input buffer.
                         app.input.clear();
+                        app.refresh_slash_command_options();
                         None
                     }
                 }
+                KeyCode::Tab => {
+                    app.finalize_slash_command_selection();
+                    None
+                }
                 KeyCode::Char(c) => {
                     app.input.insert_char(c);
+                    app.refresh_slash_command_options();
                     None
                 }
                 _ => None,
@@ -437,6 +640,16 @@ async fn execute_action(
             app.set_phase(AgentPhase::Idle);
             app.auto_scroll();
         }
+        AppAction::ListSessions { tree } => {
+            match fetch_tui_ps_output(client, tree).await {
+                Ok(output) => app.push_message(app::ConversationEntry::AssistantText(output)),
+                Err(error) => {
+                    app.push_message(app::ConversationEntry::Error(format!("/ps failed: {error}")));
+                }
+            }
+            app.set_phase(AgentPhase::Idle);
+            app.auto_scroll();
+        }
         AppAction::SendSlashSkillMessage {
             skill_name,
             request,
@@ -458,6 +671,13 @@ async fn execute_action(
                             false,
                             session.max_context_window,
                         );
+                        if let Ok(snapshot) = fetch_session_context(client, &app.session_id).await {
+                            app.loaded_skill_commands = snapshot
+                                .loaded_skills
+                                .into_iter()
+                                .map(|skill| skill.name)
+                                .collect();
+                        }
                         app.push_message(app::ConversationEntry::AssistantText(format!(
                             "Started skill session: /{skill_name}"
                         )));
@@ -507,6 +727,13 @@ async fn execute_action(
         } => match create_session(client, skills, true).await {
             Ok(session) => {
                 app.reset_for_new_session(session.session_id, true, session.max_context_window);
+                if let Ok(snapshot) = fetch_session_context(client, &app.session_id).await {
+                    app.loaded_skill_commands = snapshot
+                        .loaded_skills
+                        .into_iter()
+                        .map(|skill| skill.name)
+                        .collect();
+                }
                 app.push_message(app::ConversationEntry::User(request.clone()));
                 app.set_phase(AgentPhase::Thinking);
                 app.auto_scroll();
