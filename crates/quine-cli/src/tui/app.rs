@@ -143,7 +143,10 @@ pub enum ConversationEntry {
         prompt: String,
         options: Vec<String>,
     },
-    InteractionPrompt(String),
+    InteractionPrompt {
+        summary: Option<String>,
+        prompt: String,
+    },
     /// Turn summary with timing and token usage.
     TurnInfo {
         duration_us: u64,
@@ -212,6 +215,12 @@ pub struct OptionSelectState {
     pub allow_freeform: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SwitchSessionCandidate {
+    pub session_id: String,
+    pub summary: Option<String>,
+}
+
 /// Actions the event loop should perform after handling an event.
 pub enum AppAction {
     SendMessage(String),
@@ -220,6 +229,10 @@ pub enum AppAction {
         tree: bool,
     },
     CompactSession,
+    ClearSession,
+    SwitchSession {
+        session_id: String,
+    },
     SendSlashSkillMessage {
         skill_name: String,
         request: String,
@@ -501,6 +514,8 @@ pub struct App {
     pub option_select: Option<OptionSelectState>,
     pub loaded_skill_commands: Vec<String>,
     pub slash_select_active: bool,
+    pub switch_select_active: bool,
+    pub switch_session_candidates: Vec<SwitchSessionCandidate>,
     /// Whether this session is in read-only plan mode.
     pub plan_mode: bool,
     /// Pending local confirmation required before leaving plan mode.
@@ -646,6 +661,8 @@ impl App {
             option_select: None,
             loaded_skill_commands: Vec::new(),
             slash_select_active: false,
+            switch_select_active: false,
+            switch_session_candidates: Vec::new(),
             plan_mode,
             pending_plan_exit: None,
             last_view_height: 0,
@@ -727,6 +744,40 @@ impl App {
         self.pending_plan_exit = None;
         self.set_phase(AgentPhase::Idle);
         self.invalidate_conversation_cache();
+    }
+
+    pub fn load_session_context(&mut self, snapshot: SessionContextSnapshot) {
+        self.loaded_skill_commands = snapshot
+            .loaded_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect();
+        self.messages.clear();
+
+        for entry in snapshot.history {
+            match entry {
+                HistoryEntry::Text { role, text } => match role.as_str() {
+                    "user" => self.push_message(ConversationEntry::User(text)),
+                    "assistant" => {
+                        if !text.is_empty() {
+                            self.push_message(ConversationEntry::AssistantText(text));
+                        }
+                    }
+                    _ => {}
+                },
+                HistoryEntry::ToolUse { role, text, .. } => {
+                    if role == "assistant" {
+                        if let Some(text) = text.filter(|value| !value.is_empty()) {
+                            self.push_message(ConversationEntry::AssistantText(text));
+                        }
+                    }
+                }
+                HistoryEntry::ToolResult { .. } => {}
+            }
+        }
+
+        self.invalidate_conversation_cache();
+        self.auto_scroll();
     }
 
     /// Advance the spinner animation frame.
@@ -847,7 +898,9 @@ impl App {
         };
         let prefix = stripped.trim_start();
 
-        let commands = ["ps", "ps tree", "plan", "loop", "compact", "context"];
+        let commands = [
+            "ps", "ps tree", "plan", "loop", "compact", "context", "clear", "switch",
+        ];
         let matches: Vec<&str> = commands
             .into_iter()
             .filter(|candidate| prefix.is_empty() || candidate.starts_with(prefix))
@@ -891,6 +944,16 @@ impl App {
                 "/context".to_string(),
                 "show context details",
             ),
+            (
+                "clear".to_string(),
+                "/clear".to_string(),
+                "start a fresh session",
+            ),
+            (
+                "switch".to_string(),
+                "/switch".to_string(),
+                "switch to another session",
+            ),
         ];
         commands.extend(self.loaded_skill_commands.iter().cloned().map(|skill| {
             let command = format!("/{skill}");
@@ -912,7 +975,10 @@ impl App {
 
     /// Handle Enter/Ctrl+S: send message or submit interaction response.
     pub fn submit_input(&mut self) -> Option<AppAction> {
-        if let Some(select) = self.option_select.take() {
+        if self.interaction_queue.front().is_some() {
+            let Some(select) = self.option_select.take() else {
+                return None;
+            };
             if select.allow_freeform && select.cursor == select.options.len() - 1 {
                 return None;
             }
@@ -933,7 +999,10 @@ impl App {
                     .unwrap_or_default()
             };
             self.interaction_queue.pop_front();
-            self.push_message(ConversationEntry::InteractionPrompt(response.clone()));
+            self.push_message(ConversationEntry::InteractionPrompt {
+                summary: None,
+                prompt: response.clone(),
+            });
             self.auto_scroll();
             return Some(AppAction::SubmitInteraction(response));
         }
@@ -943,11 +1012,17 @@ impl App {
             return None;
         }
         self.input.clear();
+        self.option_select = None;
+        self.slash_select_active = false;
+        self.switch_select_active = false;
         self.history_index = None;
         self.saved_input.clear();
 
         if let Some(pending_exit) = self.pending_plan_exit.take() {
-            self.push_message(ConversationEntry::InteractionPrompt(text.clone()));
+            self.push_message(ConversationEntry::InteractionPrompt {
+                summary: None,
+                prompt: text.clone(),
+            });
             self.auto_scroll();
             return match text.to_ascii_lowercase().as_str() {
                 "y" | "yes" => match pending_exit {
@@ -988,8 +1063,10 @@ impl App {
             } else {
                 text.clone()
             };
-            self.messages
-                .push(ConversationEntry::InteractionPrompt(text));
+            self.messages.push(ConversationEntry::InteractionPrompt {
+                summary: None,
+                prompt: text,
+            });
             self.invalidate_conversation_cache();
             self.auto_scroll();
             Some(AppAction::SubmitInteraction(response))
@@ -1030,6 +1107,34 @@ impl App {
                                     .push(ConversationEntry::Error("Usage: /context".into()));
                                 self.auto_scroll();
                                 None
+                            }
+                        }
+                        "clear" => {
+                            if arguments.is_empty() {
+                                self.push_message(ConversationEntry::AssistantText(
+                                    "Starting a fresh session...".into(),
+                                ));
+                                self.set_phase(AgentPhase::Thinking);
+                                self.auto_scroll();
+                                Some(AppAction::ClearSession)
+                            } else {
+                                self.push_message(ConversationEntry::Error("Usage: /clear".into()));
+                                self.auto_scroll();
+                                None
+                            }
+                        }
+                        "switch" => {
+                            let target = arguments.trim();
+                            if target.is_empty() {
+                                self.push_message(ConversationEntry::Error(
+                                    "Usage: /switch <session-id>".into(),
+                                ));
+                                self.auto_scroll();
+                                None
+                            } else {
+                                Some(AppAction::SwitchSession {
+                                    session_id: target.to_string(),
+                                })
                             }
                         }
                         "plan" => {
@@ -1204,6 +1309,9 @@ impl App {
     }
 
     pub(crate) fn accept_slash_command_option(&mut self) -> bool {
+        if !self.slash_select_active {
+            return false;
+        }
         let Some(select) = self.option_select.as_ref() else {
             return false;
         };
@@ -1216,10 +1324,14 @@ impl App {
         self.input.set_from_string(&format!("{command} "));
         self.slash_select_active = false;
         self.option_select = None;
+        self.refresh_switch_session_options();
         true
     }
 
     pub(crate) fn preview_slash_command_option(&mut self) -> bool {
+        if !self.slash_select_active {
+            return false;
+        }
         let Some(select) = self.option_select.as_ref() else {
             return false;
         };
@@ -1230,6 +1342,79 @@ impl App {
             return false;
         };
         self.input.set_from_string(command);
+        self.refresh_switch_session_options();
+        true
+    }
+
+    fn switch_session_prefix(&self) -> Option<String> {
+        let content = self.input.content();
+        let remainder = content.strip_prefix("/switch")?;
+        if remainder.contains('\n') {
+            return None;
+        }
+        Some(remainder.trim_start().to_string())
+    }
+
+    pub(crate) fn set_switch_session_candidates(&mut self, sessions: Vec<SwitchSessionCandidate>) {
+        self.switch_session_candidates = sessions;
+        self.refresh_switch_session_options();
+    }
+
+    pub(crate) fn refresh_switch_session_options(&mut self) {
+        let Some(prefix) = self.switch_session_prefix() else {
+            if self.switch_select_active {
+                self.switch_select_active = false;
+                self.option_select = None;
+            }
+            return;
+        };
+
+        let options: Vec<String> = self
+            .switch_session_candidates
+            .iter()
+            .filter(|session| prefix.is_empty() || session.session_id.starts_with(prefix.as_str()))
+            .map(|session| match session.summary.as_deref().filter(|value| !value.is_empty()) {
+                Some(summary) => format!("{}\t{}", session.session_id, summary),
+                None => session.session_id.clone(),
+            })
+            .collect();
+
+        if options.is_empty() {
+            if self.switch_select_active {
+                self.switch_select_active = false;
+                self.option_select = None;
+            }
+            return;
+        }
+
+        let previous_cursor = self
+            .option_select
+            .as_ref()
+            .map(|state| state.cursor)
+            .unwrap_or(0);
+        let cursor = previous_cursor.min(options.len().saturating_sub(1));
+        self.option_select = Some(OptionSelectState {
+            options,
+            cursor,
+            multi_select: false,
+            selected: HashSet::new(),
+            allow_freeform: true,
+        });
+        self.switch_select_active = true;
+        self.slash_select_active = false;
+    }
+
+    pub(crate) fn accept_switch_session_option(&mut self) -> bool {
+        let Some(select) = self.option_select.as_ref() else {
+            return false;
+        };
+        let Some(option) = select.options.get(select.cursor) else {
+            return false;
+        };
+        let session_id = option.split('\t').next().unwrap_or(option);
+        self.input.set_from_string(&format!("/switch {session_id}"));
+        self.switch_select_active = false;
+        self.option_select = None;
         true
     }
 
@@ -2444,6 +2629,8 @@ mod tests {
                 ("/loop".to_string(), "run autonomous loop"),
                 ("/compact".to_string(), "compact current session"),
                 ("/context".to_string(), "show context details"),
+                ("/clear".to_string(), "start a fresh session"),
+                ("/switch".to_string(), "switch to another session"),
                 ("/review".to_string(), "run a skill command"),
                 ("/ship-it".to_string(), "run a skill command"),
             ])
@@ -2541,7 +2728,7 @@ mod tests {
         assert!(app.pending_plan_exit.is_none());
         assert!(matches!(
             app.messages.last(),
-            Some(ConversationEntry::InteractionPrompt(text)) if text == "yes"
+            Some(ConversationEntry::InteractionPrompt { summary: None, prompt }) if prompt == "yes"
         ));
     }
 
@@ -2645,5 +2832,99 @@ mod tests {
             Some(ConversationEntry::Error(text)) if text.contains("Invalid duration")
                 || text.contains("Unsupported duration")
         ));
+    }
+
+    #[test]
+    fn submit_input_switch_command_uses_typed_target_even_with_switch_options_active() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/switch alpha");
+        app.set_switch_session_candidates(vec![
+            SwitchSessionCandidate {
+                session_id: "alpha".into(),
+                summary: Some("Alpha summary".into()),
+            },
+            SwitchSessionCandidate {
+                session_id: "alpine".into(),
+                summary: Some("Alpine summary".into()),
+            },
+        ]);
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::SwitchSession { session_id }) if session_id == "alpha"
+        ));
+        assert!(app.option_select.is_none());
+        assert!(!app.switch_select_active);
+    }
+
+    #[test]
+    fn switch_session_active_char_input_updates_filter_and_options() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/switch a");
+        app.set_switch_session_candidates(vec![
+            SwitchSessionCandidate {
+                session_id: "alpha".into(),
+                summary: Some("Alpha summary".into()),
+            },
+            SwitchSessionCandidate {
+                session_id: "beta".into(),
+                summary: None,
+            },
+            SwitchSessionCandidate {
+                session_id: "alpine".into(),
+                summary: Some("Alpine summary".into()),
+            },
+        ]);
+
+        app.input.insert_char('l');
+        app.refresh_switch_session_options();
+
+        assert_eq!(app.input.content(), "/switch al");
+        let options = app
+            .option_select
+            .as_ref()
+            .map(|select| select.options.clone());
+        assert_eq!(
+            options,
+            Some(vec![
+                "alpha\tAlpha summary".into(),
+                "alpine\tAlpine summary".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn switch_session_active_backspace_updates_filter_and_options() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/switch alp");
+        app.set_switch_session_candidates(vec![
+            SwitchSessionCandidate {
+                session_id: "alpha".into(),
+                summary: None,
+            },
+            SwitchSessionCandidate {
+                session_id: "alpine".into(),
+                summary: Some("Alpine summary".into()),
+            },
+            SwitchSessionCandidate {
+                session_id: "beta".into(),
+                summary: None,
+            },
+        ]);
+
+        app.input.delete_char_before();
+        app.refresh_switch_session_options();
+
+        assert_eq!(app.input.content(), "/switch al");
+        let options = app
+            .option_select
+            .as_ref()
+            .map(|select| select.options.clone());
+        assert_eq!(
+            options,
+            Some(vec!["alpha".into(), "alpine\tAlpine summary".into()])
+        );
     }
 }

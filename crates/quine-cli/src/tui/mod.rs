@@ -25,7 +25,7 @@ use crate::run::fetch_available_skills;
 use crate::session::{
     create_session, create_slash_skill_session, exit_plan_mode, resolve_resume_target,
 };
-use app::{AgentPhase, AppAction, PendingPlanExit};
+use app::{AgentPhase, AppAction, PendingPlanExit, SwitchSessionCandidate};
 use quine_harness::protocol::{methods, notifications};
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +251,15 @@ async fn fetch_tui_ps_output(client: &mut IpcClient, tree: bool) -> anyhow::Resu
     })
 }
 
+async fn list_sessions(client: &mut IpcClient) -> anyhow::Result<Vec<TuiSessionSummary>> {
+    let response = client
+        .call(methods::LIST_SESSIONS, Some(serde_json::json!({})))
+        .await?;
+    let response = response.map_err(anyhow::Error::msg)?;
+    let sessions: Vec<TuiSessionSummary> = serde_json::from_value(response)?;
+    Ok(sessions)
+}
+
 fn print_resume_command(socket_path: &Path, session_id: &str) {
     eprintln!(
         "Resume from this checkpoint with: `quine run --session {} --socket {} \"<message>\"`",
@@ -315,6 +324,17 @@ pub async fn run_tui_chat(
             .into_iter()
             .map(|skill| skill.name)
             .collect();
+    }
+    if let Ok(sessions) = list_sessions(&mut client).await {
+        app.set_switch_session_candidates(
+            sessions
+                .into_iter()
+                .map(|session| SwitchSessionCandidate {
+                    session_id: session.session_id,
+                    summary: session.summary.or(session.title),
+                })
+                .collect(),
+        );
     }
     let mut event_stream = EventStream::new();
     let mut spinner_interval = tokio::time::interval(Duration::from_millis(80));
@@ -511,7 +531,8 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
             }
 
             // In option-select mode, route keys differently.
-            if app.is_selecting_options() && !app.slash_select_active {
+            if app.is_selecting_options() && !app.slash_select_active && !app.switch_select_active
+            {
                 return match code {
                     KeyCode::Enter => app.submit_input(),
                     KeyCode::Up => {
@@ -544,8 +565,12 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 return None;
             }
 
-            // Enter submits input, unless a slash suggestion is active.
+            // Enter accepts the active completion before submitting input.
             if code == KeyCode::Enter {
+                if app.switch_select_active {
+                    app.accept_switch_session_option();
+                    return None;
+                }
                 if app.accept_slash_command_option() {
                     return None;
                 }
@@ -553,9 +578,16 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
             }
 
             match code {
+                KeyCode::Backspace if app.switch_select_active => {
+                    app.input.delete_char_before();
+                    app.refresh_slash_command_options();
+                    app.refresh_switch_session_options();
+                    None
+                }
                 KeyCode::Backspace => {
                     app.input.delete_char_before();
                     app.refresh_slash_command_options();
+                    app.refresh_switch_session_options();
                     None
                 }
                 KeyCode::Left => {
@@ -630,16 +662,28 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                         // Agent is idle — clear input buffer.
                         app.input.clear();
                         app.refresh_slash_command_options();
+                        app.refresh_switch_session_options();
                         None
                     }
                 }
                 KeyCode::Tab => {
-                    app.finalize_slash_command_selection();
+                    if app.switch_select_active {
+                        app.accept_switch_session_option();
+                    } else {
+                        app.finalize_slash_command_selection();
+                    }
+                    None
+                }
+                KeyCode::Char(c) if app.switch_select_active => {
+                    app.input.insert_char(c);
+                    app.refresh_slash_command_options();
+                    app.refresh_switch_session_options();
                     None
                 }
                 KeyCode::Char(c) => {
                     app.input.insert_char(c);
                     app.refresh_slash_command_options();
+                    app.refresh_switch_session_options();
                     None
                 }
                 _ => None,
@@ -708,6 +752,52 @@ async fn execute_action(
                 Err(error) => {
                     app.push_message(app::ConversationEntry::Error(format!(
                         "/ps failed: {error}"
+                    )));
+                }
+            }
+            match list_sessions(client).await {
+                Ok(sessions) => {
+                    let session_ids = sessions
+                        .into_iter()
+                        .map(|session| SwitchSessionCandidate {
+                            session_id: session.session_id,
+                            summary: session.summary.or(session.title),
+                        })
+                        .collect();
+                    app.set_switch_session_candidates(session_ids);
+                }
+                Err(error) => {
+                    app.push_message(app::ConversationEntry::Error(format!(
+                        "failed to refresh session completions: {error}"
+                    )));
+                }
+            }
+            app.set_phase(AgentPhase::Idle);
+            app.auto_scroll();
+        }
+        AppAction::ClearSession => {
+            let created = create_session(client, available_skills, false).await?;
+            let new_session_id = created.session_id;
+            app.reset_for_new_session(new_session_id.clone(), false, None);
+            app.push_message(app::ConversationEntry::AssistantText(format!(
+                "Started new session {new_session_id}."
+            )));
+            app.set_phase(AgentPhase::Idle);
+            app.auto_scroll();
+        }
+        AppAction::SwitchSession { session_id } => {
+            match fetch_session_context(client, &session_id).await {
+                Ok(context) => {
+                    let plan_mode = context.plan_mode;
+                    app.reset_for_new_session(session_id.clone(), plan_mode, None);
+                    app.load_session_context(context);
+                    app.push_message(app::ConversationEntry::AssistantText(format!(
+                        "Switched to session {session_id}."
+                    )));
+                }
+                Err(error) => {
+                    app.push_message(app::ConversationEntry::Error(format!(
+                        "/switch failed: {error}"
                     )));
                 }
             }
@@ -960,5 +1050,65 @@ mod tests {
             app.messages.last(),
             Some(app::ConversationEntry::TurnInfo { .. })
         ));
+    }
+
+    #[test]
+    fn switch_selector_allows_typing_through_terminal_handler() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.input.set_from_string("/switch a");
+        app.set_switch_session_candidates(vec![
+            app::SwitchSessionCandidate {
+                session_id: "alpha".into(),
+                summary: Some("Alpha summary".into()),
+            },
+            app::SwitchSessionCandidate {
+                session_id: "alpine".into(),
+                summary: Some("Alpine summary".into()),
+            },
+        ]);
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('l'), KeyModifiers::NONE)),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(app.input.content(), "/switch al");
+        let options = app
+            .option_select
+            .as_ref()
+            .map(|select| select.options.clone());
+        assert_eq!(
+            options,
+            Some(vec![
+                "alpha\tAlpha summary".into(),
+                "alpine\tAlpine summary".into()
+            ])
+        );
+    }
+
+    #[test]
+    fn switch_selector_enter_submits_switch_action() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.input.set_from_string("/switch a");
+        app.set_switch_session_candidates(vec![
+            app::SwitchSessionCandidate {
+                session_id: "alpha".into(),
+                summary: Some("Alpha summary".into()),
+            },
+            app::SwitchSessionCandidate {
+                session_id: "alpine".into(),
+                summary: Some("Alpine summary".into()),
+            },
+        ]);
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(app.input.content(), "/switch alpha");
+        assert!(!app.switch_select_active);
     }
 }
