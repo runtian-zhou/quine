@@ -80,9 +80,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Dynamic input box height: expand for option selection or multi-line input.
     let max_height = (frame.area().height / 2).min(12);
     let input_height = if let Some(ref select) = app.option_select {
-        // 2 for borders + 1 for label + option count, capped at half terminal
-        let content_rows = (select.options.len() as u16 + 1).min(frame.area().height / 2);
-        content_rows + 2
+        let label = app.input_label();
+        let content_rows = input_content_rows(&app.input, &label, frame.area().width.saturating_sub(2))
+            .saturating_add(select.options.len() as u16);
+        (content_rows + 2).max(3).min(max_height)
     } else {
         let label = app.input_label();
         let mut content_rows =
@@ -115,6 +116,24 @@ fn wrapped_rows(width: usize, area_width: u16) -> u16 {
     }
     let area_width = usize::from(area_width);
     width.max(1).div_ceil(area_width) as u16
+}
+
+fn option_window_bounds(total: usize, cursor: usize, visible_rows: usize) -> (usize, usize) {
+    if total == 0 || visible_rows == 0 {
+        return (0, 0);
+    }
+
+    if total <= visible_rows {
+        return (0, total);
+    }
+
+    let mut start = cursor.saturating_sub(visible_rows.saturating_sub(1));
+    let max_start = total.saturating_sub(visible_rows);
+    if start > max_start {
+        start = max_start;
+    }
+    let end = (start + visible_rows).min(total);
+    (start, end)
 }
 
 fn display_width(text: &str) -> usize {
@@ -547,7 +566,18 @@ fn push_conversation_entry_lines(
                 )));
             }
         }
-        ConversationEntry::InteractionPrompt(text) => {
+        ConversationEntry::InteractionPrompt { summary, prompt } => {
+            if let Some(summary) = summary.as_deref().filter(|value| !value.trim().is_empty()) {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        "Summary: ",
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::raw(summary.to_string()),
+                ]));
+            }
             lines.push(Line::from(vec![
                 Span::styled(
                     "Response: ",
@@ -555,7 +585,7 @@ fn push_conversation_entry_lines(
                         .fg(Color::Yellow)
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::raw(text.clone()),
+                Span::raw(prompt.clone()),
             ]));
         }
         ConversationEntry::TurnInfo { duration_us, usage } => {
@@ -1451,8 +1481,13 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         if app.slash_select_active {
             let label = app.input_label();
             let mut lines = wrap_input_lines(&app.input, &label, area.width.saturating_sub(2));
-            for (index, option) in select.options.iter().enumerate() {
-                let is_cursor = index == select.cursor;
+            let input_rows = lines.len();
+            let visible_rows = area.height.saturating_sub(2 + input_rows as u16) as usize;
+            let (start, end) =
+                option_window_bounds(select.options.len(), select.cursor, visible_rows);
+            for (index, option) in select.options[start..end].iter().enumerate() {
+                let absolute_index = start + index;
+                let is_cursor = absolute_index == select.cursor;
                 let style = if is_cursor {
                     Style::default()
                         .fg(Color::Yellow)
@@ -1480,14 +1515,19 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
         let mut lines: Vec<Line> = Vec::new();
         let label = app.input_label();
-        lines.push(Line::from(Span::styled(
-            label,
-            Style::default().fg(Color::Cyan),
-        )));
-        for (i, opt) in select.options.iter().enumerate() {
-            let is_cursor = i == select.cursor;
+        lines.extend(wrap_input_lines(
+            &app.input,
+            &label,
+            area.width.saturating_sub(2),
+        ));
+        let input_rows = lines.len();
+        let visible_rows = area.height.saturating_sub(2 + input_rows as u16) as usize;
+        let (start, end) = option_window_bounds(select.options.len(), select.cursor, visible_rows);
+        for (index, opt) in select.options[start..end].iter().enumerate() {
+            let absolute_index = start + index;
+            let is_cursor = absolute_index == select.cursor;
             let prefix = if select.multi_select {
-                let check = if select.selected.contains(&i) {
+                let check = if select.selected.contains(&absolute_index) {
                     "x"
                 } else {
                     " "
@@ -1509,10 +1549,24 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             } else {
                 Style::default()
             };
-            lines.push(Line::from(Span::styled(format!("{prefix}{opt}"), style)));
+            let (primary, secondary) = opt.split_once('\t').unwrap_or((opt.as_str(), ""));
+            let mut spans = vec![Span::styled(format!("{prefix}{primary}"), style)];
+            if !secondary.is_empty() {
+                spans.push(Span::styled(
+                    format!("  {secondary}"),
+                    Style::default().fg(Color::DarkGray),
+                ));
+            }
+            lines.push(Line::from(spans));
         }
         let widget = Paragraph::new(lines).block(Block::default().borders(Borders::ALL));
         frame.render_widget(widget, area);
+
+        let (cursor_row, cursor_col) =
+            input_cursor_position(&app.input, &label, area.width.saturating_sub(2));
+        let cursor_y = (area.y + 1 + cursor_row).min(area.y + area.height.saturating_sub(2));
+        let cursor_x = (area.x + 1 + cursor_col).min(area.x + area.width.saturating_sub(2));
+        frame.set_cursor_position((cursor_x, cursor_y));
         return;
     }
 
@@ -2641,5 +2695,77 @@ mod tests {
         assert!(!lines
             .iter()
             .any(|line| line.contains("this leftover line must not remain visible")));
+    }
+
+    #[test]
+    fn draw_interaction_prompt_renders_summary_and_response() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::InteractionPrompt {
+            summary: Some("Need confirmation".into()),
+            prompt: "Please answer yes or no".into(),
+        });
+
+        let backend = ratatui::backend::TestBackend::new(100, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Summary: Need confirmation")));
+        assert!(lines
+            .iter()
+            .any(|line| line.contains("Response: Please answer yes or no")));
+    }
+
+    #[test]
+    fn draw_switch_selector_renders_input_and_session_summary() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/switch al");
+        app.set_switch_session_candidates(vec![
+            crate::tui::app::SwitchSessionCandidate {
+                session_id: "alpha".into(),
+                summary: Some("Alpha summary".into()),
+            },
+            crate::tui::app::SwitchSessionCandidate {
+                session_id: "alpine".into(),
+                summary: Some("Alpine summary".into()),
+            },
+        ]);
+
+        let backend = ratatui::backend::TestBackend::new(100, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("/switch al")));
+        assert!(lines.iter().any(|line| line.contains("alpha")));
+        assert!(lines.iter().any(|line| line.contains("Alpha summary")));
+    }
+
+    #[test]
+    fn draw_switch_selector_scrolls_to_keep_selected_option_visible() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/switch s");
+        app.set_switch_session_candidates(
+            (1..=8)
+                .map(|index| crate::tui::app::SwitchSessionCandidate {
+                    session_id: format!("session-{index}"),
+                    summary: Some(format!("Summary {index}")),
+                })
+                .collect(),
+        );
+        for _ in 0..6 {
+            app.option_cursor_down();
+        }
+
+        let backend = ratatui::backend::TestBackend::new(80, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("session-7")));
+        assert!(lines.iter().any(|line| line.contains("Summary 7")));
+        assert!(!lines.iter().any(|line| line.contains("session-1")));
     }
 }

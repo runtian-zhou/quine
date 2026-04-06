@@ -13,10 +13,12 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     };
 
     match name {
-        "quit" | "plan" | "loop" | "compact" | "context" | "ps" => Some(SlashCommand::BuiltIn {
-            name: name.to_string(),
-            arguments: arguments.to_string(),
-        }),
+        "quit" | "plan" | "loop" | "compact" | "context" | "ps" | "clear" | "switch" => {
+            Some(SlashCommand::BuiltIn {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            })
+        }
         _ if !name.is_empty() => Some(SlashCommand::Skill {
             name: name.to_string(),
             arguments: arguments.to_string(),
@@ -113,6 +115,28 @@ mod tests {
             Some(SlashCommand::BuiltIn {
                 name: "ps".into(),
                 arguments: "tree".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_clear_command() {
+        assert_eq!(
+            parse_slash_command("/clear"),
+            Some(SlashCommand::BuiltIn {
+                name: "clear".into(),
+                arguments: String::new(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_switch_command() {
+        assert_eq!(
+            parse_slash_command("/switch session-123"),
+            Some(SlashCommand::BuiltIn {
+                name: "switch".into(),
+                arguments: "session-123".into(),
             })
         );
     }
