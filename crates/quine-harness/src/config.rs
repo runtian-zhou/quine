@@ -3,14 +3,17 @@ use std::sync::Arc;
 
 use quine_core::{
     MemoryPolicyConfig, PermissionPromptBehavior, PermissionRule, PermissionRuleEffect,
-    PermissionRuleSet, PermissionRuleSource, PermissionTarget, RuleScope,
+    PermissionRuleSet, PermissionRuleSource, PermissionTarget, RuleScope, SessionLlmConfig,
 };
-use quine_llm::anthropic::AnthropicConfig;
-use quine_llm::config::{ProviderConfig, WebProviderConfig};
-use quine_llm::openai_compat::OpenAiCompatConfig;
+use quine_llm::config::WebProviderConfig;
 use quine_llm::openai_web::OpenAiWebConfig;
 use quine_llm::Message;
 use serde::{Deserialize, Serialize};
+
+use crate::model_profiles::{
+    max_context_window_for_provider_config, provider_config_from_env,
+    resolve_env_provider_selection, resolve_named_model_profile,
+};
 
 /// Configuration for a single agent session.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -40,6 +43,9 @@ pub struct SessionConfig {
     /// Memory scope and policy configuration for this session.
     #[serde(default)]
     pub memory_policy: MemoryPolicyConfig,
+    /// Optional named model profile for this session.
+    #[serde(default)]
+    pub model_profile: Option<String>,
 }
 
 fn default_permission_prompt_behavior() -> PermissionPromptBehavior {
@@ -171,67 +177,25 @@ pub fn load_persisted_permission_rules(
     Ok(rules)
 }
 
-fn parse_bool_env(value: &str) -> Option<bool> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
-}
-
-fn default_parallel_tool_calls(model: &str) -> bool {
-    model.trim().eq_ignore_ascii_case("gpt-5.4")
-}
-
 /// Build an LLM `ProviderConfig` from environment variables.
 ///
 /// Uses `LLM_PROVIDER` to select the backend (`"anthropic"` or `"openai"`,
 /// default `"openai"`), plus `LLM_BASE_URL`, `LLM_API_KEY`, and `LLM_MODEL`.
-fn config_from_env() -> ProviderConfig {
-    let provider = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "openai".into());
-    let config = if provider.eq_ignore_ascii_case("anthropic") {
-        let api_key = std::env::var("LLM_API_KEY")
-            .or_else(|_| std::env::var("ANTHROPIC_API_KEY"))
-            .expect("LLM_API_KEY or ANTHROPIC_API_KEY must be set for Anthropic provider");
-        ProviderConfig::Anthropic(AnthropicConfig {
-            api_key,
-            base_url: std::env::var("LLM_BASE_URL")
-                .unwrap_or_else(|_| "https://api.anthropic.com".into()),
-            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "claude-sonnet-4-20250514".into()),
-            max_tokens: 4096,
-        })
-    } else {
-        ProviderConfig::OpenAiCompat(OpenAiCompatConfig {
-            base_url: std::env::var("LLM_BASE_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".into()),
-            api_key: std::env::var("LLM_API_KEY").ok(),
-            model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5.4".into()),
-            max_tokens: Some(4096),
-            parallel_tool_calls: std::env::var("LLM_PARALLEL_TOOL_CALLS")
-                .ok()
-                .and_then(|value| parse_bool_env(&value))
-                .unwrap_or_else(|| {
-                    default_parallel_tool_calls(
-                        &std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5.4".into()),
-                    )
-                }),
-        })
-    };
+fn log_provider_config(config: &quine_llm::config::ProviderConfig) {
     match &config {
-        ProviderConfig::Anthropic(c) => {
+        quine_llm::config::ProviderConfig::Anthropic(c) => {
             eprintln!(
                 "[daemon] LLM provider: Anthropic, model={}, base_url={}",
                 c.model, c.base_url
             );
         }
-        ProviderConfig::OpenAiCompat(c) => {
+        quine_llm::config::ProviderConfig::OpenAiCompat(c) => {
             eprintln!(
                 "[daemon] LLM provider: OpenAI-compat, model={}, base_url={}",
                 c.model, c.base_url
             );
         }
     }
-    config
 }
 
 /// Create an LLM provider from environment variables.
@@ -239,7 +203,21 @@ fn config_from_env() -> ProviderConfig {
 /// Convenience function that combines `config_from_env` with
 /// `quine_llm::config::create_provider`.
 pub fn create_provider_from_env() -> Arc<dyn quine_llm::LlmProvider> {
-    Arc::from(quine_llm::config::create_provider(config_from_env()))
+    let selection = resolve_env_provider_selection();
+    log_provider_config(&provider_config_from_env());
+    selection.provider
+}
+
+pub fn resolve_session_llm_config(model_profile: Option<&str>) -> anyhow::Result<SessionLlmConfig> {
+    let selection = match model_profile {
+        Some(profile) => resolve_named_model_profile(profile)?,
+        None => resolve_env_provider_selection(),
+    };
+    Ok(SessionLlmConfig {
+        provider: selection.provider,
+        max_context_window: selection.max_context_window,
+        model_profile: selection.model_profile,
+    })
 }
 
 fn web_config_from_env() -> WebProviderConfig {
@@ -285,45 +263,7 @@ pub fn max_context_window_from_env() -> Option<u64> {
             return Some(parsed);
         }
     }
-
-    let provider = std::env::var("LLM_PROVIDER").unwrap_or_else(|_| "openai".into());
-    let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| {
-        if provider.eq_ignore_ascii_case("anthropic") {
-            "claude-sonnet-4-20250514".into()
-        } else {
-            "gpt-5.4".into()
-        }
-    });
-
-    if provider.eq_ignore_ascii_case("anthropic") {
-        return anthropic_context_window(&model);
-    }
-
-    openai_compat_context_window(&model)
-}
-
-fn anthropic_context_window(model: &str) -> Option<u64> {
-    let normalized = model.to_ascii_lowercase();
-    if normalized.starts_with("claude") {
-        Some(200_000)
-    } else {
-        None
-    }
-}
-
-fn openai_compat_context_window(model: &str) -> Option<u64> {
-    let normalized = model.to_ascii_lowercase();
-    if normalized.starts_with("gpt-4.1") || normalized.starts_with("gpt-4o") {
-        Some(128_000)
-    } else if normalized.starts_with("o1") || normalized.starts_with("o3") {
-        Some(200_000)
-    } else if normalized.starts_with("qwen") {
-        Some(131_072)
-    } else if normalized.starts_with("llama-3.1") || normalized.starts_with("llama3.1") {
-        Some(128_000)
-    } else {
-        Some(250_000)
-    }
+    max_context_window_for_provider_config(&provider_config_from_env())
 }
 
 #[cfg(test)]
@@ -365,6 +305,7 @@ mod tests {
             agent_key: None,
             team_key: None,
             memory_policy: MemoryPolicyConfig::default(),
+            model_profile: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: SessionConfig = serde_json::from_str(&json).unwrap();

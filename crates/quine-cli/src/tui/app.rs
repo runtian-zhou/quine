@@ -230,6 +230,9 @@ pub enum AppAction {
     },
     CompactSession,
     ClearSession,
+    SetModelProfile {
+        model_profile: String,
+    },
     SwitchSession {
         session_id: String,
     },
@@ -514,7 +517,9 @@ pub struct App {
     pub option_select: Option<OptionSelectState>,
     pub loaded_skill_commands: Vec<String>,
     pub slash_select_active: bool,
+    pub model_select_active: bool,
     pub switch_select_active: bool,
+    pub model_profile_candidates: Vec<String>,
     pub switch_session_candidates: Vec<SwitchSessionCandidate>,
     /// Whether this session is in read-only plan mode.
     pub plan_mode: bool,
@@ -661,7 +666,9 @@ impl App {
             option_select: None,
             loaded_skill_commands: Vec::new(),
             slash_select_active: false,
+            model_select_active: false,
             switch_select_active: false,
+            model_profile_candidates: Vec::new(),
             switch_session_candidates: Vec::new(),
             plan_mode,
             pending_plan_exit: None,
@@ -704,6 +711,9 @@ impl App {
         self.current_turn_assistant_text = None;
         self.interaction_queue.clear();
         self.option_select = None;
+        self.slash_select_active = false;
+        self.model_select_active = false;
+        self.switch_select_active = false;
         self.pending_plan_exit = None;
         self.context_explorer = None;
         self.auto_scroll();
@@ -732,6 +742,11 @@ impl App {
         self.max_context_window = max_context_window;
         self.option_select = None;
         self.loaded_skill_commands.clear();
+        self.slash_select_active = false;
+        self.model_select_active = false;
+        self.switch_select_active = false;
+        self.model_profile_candidates.clear();
+        self.switch_session_candidates.clear();
         self.plan_mode = plan_mode;
         self.pending_plan_exit = None;
         self.context_explorer = None;
@@ -899,7 +914,7 @@ impl App {
         let prefix = stripped.trim_start();
 
         let commands = [
-            "ps", "ps tree", "plan", "loop", "compact", "context", "clear", "switch",
+            "ps", "ps tree", "plan", "loop", "compact", "context", "clear", "switch", "model",
         ];
         let matches: Vec<&str> = commands
             .into_iter()
@@ -953,6 +968,11 @@ impl App {
                 "switch".to_string(),
                 "/switch".to_string(),
                 "switch to another session",
+            ),
+            (
+                "model".to_string(),
+                "/model".to_string(),
+                "switch model profile",
             ),
         ];
         commands.extend(self.loaded_skill_commands.iter().cloned().map(|skill| {
@@ -1012,6 +1032,7 @@ impl App {
         self.input.clear();
         self.option_select = None;
         self.slash_select_active = false;
+        self.model_select_active = false;
         self.switch_select_active = false;
         self.history_index = None;
         self.saved_input.clear();
@@ -1132,6 +1153,20 @@ impl App {
                             } else {
                                 Some(AppAction::SwitchSession {
                                     session_id: target.to_string(),
+                                })
+                            }
+                        }
+                        "model" => {
+                            let target = arguments.trim();
+                            if target.is_empty() {
+                                self.push_message(ConversationEntry::Error(
+                                    "Usage: /model <profile>".into(),
+                                ));
+                                self.auto_scroll();
+                                None
+                            } else {
+                                Some(AppAction::SetModelProfile {
+                                    model_profile: target.to_string(),
                                 })
                             }
                         }
@@ -1304,6 +1339,8 @@ impl App {
             allow_freeform: true,
         });
         self.slash_select_active = true;
+        self.model_select_active = false;
+        self.switch_select_active = false;
     }
 
     pub(crate) fn accept_slash_command_option(&mut self) -> bool {
@@ -1322,6 +1359,7 @@ impl App {
         self.input.set_from_string(&format!("{command} "));
         self.slash_select_active = false;
         self.option_select = None;
+        self.refresh_model_profile_options();
         self.refresh_switch_session_options();
         true
     }
@@ -1340,7 +1378,77 @@ impl App {
             return false;
         };
         self.input.set_from_string(command);
+        self.refresh_model_profile_options();
         self.refresh_switch_session_options();
+        true
+    }
+
+    fn model_profile_prefix(&self) -> Option<String> {
+        let content = self.input.content();
+        let remainder = content.strip_prefix("/model")?;
+        if remainder.contains('\n') {
+            return None;
+        }
+        Some(remainder.trim_start().to_string())
+    }
+
+    pub(crate) fn set_model_profile_candidates(&mut self, profiles: Vec<String>) {
+        self.model_profile_candidates = profiles;
+        self.refresh_model_profile_options();
+    }
+
+    pub(crate) fn refresh_model_profile_options(&mut self) {
+        let Some(prefix) = self.model_profile_prefix() else {
+            if self.model_select_active {
+                self.model_select_active = false;
+                self.option_select = None;
+            }
+            return;
+        };
+
+        let options: Vec<String> = self
+            .model_profile_candidates
+            .iter()
+            .filter(|profile| prefix.is_empty() || profile.starts_with(prefix.as_str()))
+            .cloned()
+            .collect();
+
+        if options.is_empty() {
+            if self.model_select_active {
+                self.model_select_active = false;
+                self.option_select = None;
+            }
+            return;
+        }
+
+        let previous_cursor = self
+            .option_select
+            .as_ref()
+            .map(|state| state.cursor)
+            .unwrap_or(0);
+        let cursor = previous_cursor.min(options.len().saturating_sub(1));
+        self.option_select = Some(OptionSelectState {
+            options,
+            cursor,
+            multi_select: false,
+            selected: HashSet::new(),
+            allow_freeform: true,
+        });
+        self.model_select_active = true;
+        self.slash_select_active = false;
+        self.switch_select_active = false;
+    }
+
+    pub(crate) fn accept_model_profile_option(&mut self) -> bool {
+        let Some(select) = self.option_select.as_ref() else {
+            return false;
+        };
+        let Some(profile) = select.options.get(select.cursor) else {
+            return false;
+        };
+        self.input.set_from_string(&format!("/model {profile}"));
+        self.model_select_active = false;
+        self.option_select = None;
         true
     }
 
@@ -2631,6 +2739,7 @@ mod tests {
                 ("/context".to_string(), "show context details"),
                 ("/clear".to_string(), "start a fresh session"),
                 ("/switch".to_string(), "switch to another session"),
+                ("/model".to_string(), "switch model profile"),
                 ("/review".to_string(), "run a skill command"),
                 ("/ship-it".to_string(), "run a skill command"),
             ])
@@ -2660,6 +2769,7 @@ mod tests {
                 ("/ps".to_string(), "list sessions"),
                 ("/ps tree".to_string(), "show session tree"),
                 ("/plan".to_string(), "toggle plan mode"),
+                ("/model".to_string(), "switch model profile"),
                 ("/plan-review".to_string(), "run a skill command"),
                 ("/ps-audit".to_string(), "run a skill command"),
             ])
@@ -2925,6 +3035,79 @@ mod tests {
         assert_eq!(
             options,
             Some(vec!["alpha".into(), "alpine\tAlpine summary".into()])
+        );
+    }
+
+    #[test]
+    fn autocomplete_slash_command_completes_model_command() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/mo");
+
+        assert!(app.autocomplete_slash_command());
+        assert_eq!(app.input.content(), "/model ");
+    }
+
+    #[test]
+    fn submit_input_model_command_uses_typed_target_even_with_model_options_active() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/model local-qwen-coder");
+        app.set_model_profile_candidates(vec!["local-qwen-coder".into(), "local-fast".into()]);
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::SetModelProfile { model_profile }) if model_profile == "local-qwen-coder"
+        ));
+        assert!(app.option_select.is_none());
+        assert!(!app.model_select_active);
+    }
+
+    #[test]
+    fn model_profile_active_char_input_updates_filter_and_options() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/model loc");
+        app.set_model_profile_candidates(vec![
+            "local-qwen-coder".into(),
+            "local-fast".into(),
+            "remote-prod".into(),
+        ]);
+
+        app.input.insert_char('a');
+        app.refresh_model_profile_options();
+
+        assert_eq!(app.input.content(), "/model loca");
+        let options = app
+            .option_select
+            .as_ref()
+            .map(|select| select.options.clone());
+        assert_eq!(
+            options,
+            Some(vec!["local-qwen-coder".into(), "local-fast".into()])
+        );
+    }
+
+    #[test]
+    fn model_profile_active_backspace_updates_filter_and_options() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/model local-");
+        app.set_model_profile_candidates(vec![
+            "local-qwen-coder".into(),
+            "local-fast".into(),
+            "remote-prod".into(),
+        ]);
+
+        app.input.delete_char_before();
+        app.refresh_model_profile_options();
+
+        assert_eq!(app.input.content(), "/model local");
+        let options = app
+            .option_select
+            .as_ref()
+            .map(|select| select.options.clone());
+        assert_eq!(
+            options,
+            Some(vec!["local-qwen-coder".into(), "local-fast".into()])
         );
     }
 }

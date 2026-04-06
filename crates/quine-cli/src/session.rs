@@ -21,6 +21,7 @@ fn build_session_params(
     prompt_behavior: PermissionPromptBehavior,
     initial_messages: &[Message],
     system_prompt: Option<String>,
+    model_profile: Option<&str>,
 ) -> Option<serde_json::Value> {
     let mut session_params = serde_json::json!({});
     if !skills.is_empty() {
@@ -40,6 +41,9 @@ fn build_session_params(
         session_params["initial_messages"] =
             serde_json::to_value(initial_messages).expect("initial messages should serialize");
     }
+    if let Some(model_profile) = model_profile {
+        session_params["model_profile"] = serde_json::json!(model_profile);
+    }
 
     (!session_params.as_object().unwrap().is_empty()).then_some(session_params)
 }
@@ -49,8 +53,16 @@ pub(crate) fn build_create_session_params(
     plan_mode: bool,
     prompt_behavior: PermissionPromptBehavior,
     initial_messages: &[Message],
+    model_profile: Option<&str>,
 ) -> Option<serde_json::Value> {
-    build_session_params(skills, plan_mode, prompt_behavior, initial_messages, None)
+    build_session_params(
+        skills,
+        plan_mode,
+        prompt_behavior,
+        initial_messages,
+        None,
+        model_profile,
+    )
 }
 
 fn slash_skill_arguments_overlay(request: &str) -> Option<String> {
@@ -117,6 +129,7 @@ pub(crate) async fn create_session(
     client: &mut IpcClient,
     skills: &[String],
     plan_mode: bool,
+    model_profile: Option<&str>,
 ) -> anyhow::Result<CreatedSession> {
     create_session_with_initial_messages(
         client,
@@ -124,6 +137,7 @@ pub(crate) async fn create_session(
         plan_mode,
         PermissionPromptBehavior::Interactive,
         &[],
+        model_profile,
     )
     .await
 }
@@ -143,6 +157,7 @@ pub(crate) async fn create_slash_skill_session(
                 PermissionPromptBehavior::Interactive,
                 &[],
                 slash_skill_arguments_overlay(request),
+                None,
             ),
         )
         .await?;
@@ -177,11 +192,18 @@ pub(crate) async fn create_session_with_initial_messages(
     plan_mode: bool,
     prompt_behavior: PermissionPromptBehavior,
     initial_messages: &[Message],
+    model_profile: Option<&str>,
 ) -> anyhow::Result<CreatedSession> {
     let result = client
         .call(
             methods::CREATE_SESSION,
-            build_create_session_params(skills, plan_mode, prompt_behavior, initial_messages),
+            build_create_session_params(
+                skills,
+                plan_mode,
+                prompt_behavior,
+                initial_messages,
+                model_profile,
+            ),
         )
         .await?;
 
@@ -225,6 +247,26 @@ pub(crate) async fn exit_plan_mode(client: &mut IpcClient, session_id: &str) -> 
     }
 }
 
+pub(crate) async fn set_session_model_profile(
+    client: &mut IpcClient,
+    session_id: &str,
+    model_profile: &str,
+) -> anyhow::Result<()> {
+    let result = client
+        .call(
+            methods::SET_SESSION_MODEL_PROFILE,
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "model_profile": model_profile,
+            })),
+        )
+        .await?;
+    match result {
+        Ok(_) => Ok(()),
+        Err(error) => anyhow::bail!("failed to update session model profile: {error}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,6 +278,7 @@ mod tests {
             true,
             PermissionPromptBehavior::Interactive,
             &[],
+            None,
         )
         .unwrap();
 
@@ -251,7 +294,13 @@ mod tests {
     #[test]
     fn build_create_session_params_omits_empty_fields() {
         assert_eq!(
-            build_create_session_params(&[], false, PermissionPromptBehavior::Interactive, &[]),
+            build_create_session_params(
+                &[],
+                false,
+                PermissionPromptBehavior::Interactive,
+                &[],
+                None,
+            ),
             None
         );
     }
@@ -259,13 +308,32 @@ mod tests {
     #[test]
     fn build_create_session_params_includes_noninteractive_prompt_behavior() {
         let params =
-            build_create_session_params(&[], false, PermissionPromptBehavior::Headless, &[])
+            build_create_session_params(&[], false, PermissionPromptBehavior::Headless, &[], None)
                 .unwrap();
 
         assert_eq!(
             params,
             serde_json::json!({
                 "prompt_behavior": "headless"
+            })
+        );
+    }
+
+    #[test]
+    fn build_create_session_params_includes_model_profile() {
+        let params = build_create_session_params(
+            &[],
+            false,
+            PermissionPromptBehavior::Interactive,
+            &[],
+            Some("claude-sonnet"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "model_profile": "claude-sonnet"
             })
         );
     }

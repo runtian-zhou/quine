@@ -24,9 +24,22 @@ use crate::ps::{format_session_summary, prepend_summary};
 use crate::run::fetch_available_skills;
 use crate::session::{
     create_session, create_slash_skill_session, exit_plan_mode, resolve_resume_target,
+    set_session_model_profile,
 };
 use app::{AgentPhase, AppAction, PendingPlanExit, SwitchSessionCandidate};
 use quine_harness::protocol::{methods, notifications};
+
+#[derive(Debug, Deserialize, Default)]
+struct TuiModelProfilesDocument {
+    #[serde(default)]
+    profiles: BTreeMap<String, TuiModelProfileDefinition>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TuiModelProfileDefinition {
+    #[allow(dead_code)]
+    provider: String,
+}
 
 #[derive(Debug, Deserialize)]
 struct TuiSessionSummary {
@@ -125,6 +138,27 @@ fn format_tui_ps_table(mut sessions: Vec<TuiSessionSummary>) -> String {
     }
 
     prepend_summary(&summary, &lines.join("\n"))
+}
+
+fn model_profiles_path() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".quine").join("model-profiles.yaml"))
+}
+
+fn load_model_profile_names() -> anyhow::Result<Vec<String>> {
+    let Some(path) = model_profiles_path() else {
+        return Ok(Vec::new());
+    };
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
+    let document: TuiModelProfilesDocument = serde_yaml::from_str(&contents)
+        .map_err(|error| anyhow::anyhow!("failed to parse {}: {error}", path.display()))?;
+    Ok(document.profiles.into_keys().collect())
 }
 
 fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
@@ -278,6 +312,7 @@ pub async fn run_tui_chat(
     plan_mode: bool,
     auto_approve: bool,
     resume_checkpoint: Option<&str>,
+    model_profile: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let available_skills = fetch_available_skills(&mut client).await?;
@@ -291,7 +326,7 @@ pub async fn run_tui_chat(
             session_id: target.session_id,
             max_context_window: None,
         },
-        None => create_session(&mut client, skills, plan_mode).await?,
+        None => create_session(&mut client, skills, plan_mode, model_profile).await?,
     };
 
     // Setup terminal.
@@ -324,6 +359,9 @@ pub async fn run_tui_chat(
             .into_iter()
             .map(|skill| skill.name)
             .collect();
+    }
+    if let Ok(profiles) = load_model_profile_names() {
+        app.set_model_profile_candidates(profiles);
     }
     if let Ok(sessions) = list_sessions(&mut client).await {
         app.set_switch_session_candidates(
@@ -531,7 +569,11 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
             }
 
             // In option-select mode, route keys differently.
-            if app.is_selecting_options() && !app.slash_select_active && !app.switch_select_active {
+            if app.is_selecting_options()
+                && !app.slash_select_active
+                && !app.model_select_active
+                && !app.switch_select_active
+            {
                 return match code {
                     KeyCode::Enter => app.submit_input(),
                     KeyCode::Up => {
@@ -570,6 +612,10 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                     app.accept_switch_session_option();
                     return None;
                 }
+                if app.model_select_active {
+                    app.accept_model_profile_option();
+                    return None;
+                }
                 if app.accept_slash_command_option() {
                     return None;
                 }
@@ -580,12 +626,21 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 KeyCode::Backspace if app.switch_select_active => {
                     app.input.delete_char_before();
                     app.refresh_slash_command_options();
+                    app.refresh_model_profile_options();
+                    app.refresh_switch_session_options();
+                    None
+                }
+                KeyCode::Backspace if app.model_select_active => {
+                    app.input.delete_char_before();
+                    app.refresh_slash_command_options();
+                    app.refresh_model_profile_options();
                     app.refresh_switch_session_options();
                     None
                 }
                 KeyCode::Backspace => {
                     app.input.delete_char_before();
                     app.refresh_slash_command_options();
+                    app.refresh_model_profile_options();
                     app.refresh_switch_session_options();
                     None
                 }
@@ -661,6 +716,7 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                         // Agent is idle — clear input buffer.
                         app.input.clear();
                         app.refresh_slash_command_options();
+                        app.refresh_model_profile_options();
                         app.refresh_switch_session_options();
                         None
                     }
@@ -668,20 +724,31 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 KeyCode::Tab => {
                     if app.switch_select_active {
                         app.accept_switch_session_option();
+                    } else if app.model_select_active {
+                        app.accept_model_profile_option();
                     } else {
                         app.finalize_slash_command_selection();
                     }
                     None
                 }
+                KeyCode::Char(c) if app.model_select_active => {
+                    app.input.insert_char(c);
+                    app.refresh_slash_command_options();
+                    app.refresh_model_profile_options();
+                    app.refresh_switch_session_options();
+                    None
+                }
                 KeyCode::Char(c) if app.switch_select_active => {
                     app.input.insert_char(c);
                     app.refresh_slash_command_options();
+                    app.refresh_model_profile_options();
                     app.refresh_switch_session_options();
                     None
                 }
                 KeyCode::Char(c) => {
                     app.input.insert_char(c);
                     app.refresh_slash_command_options();
+                    app.refresh_model_profile_options();
                     app.refresh_switch_session_options();
                     None
                 }
@@ -775,7 +842,7 @@ async fn execute_action(
             app.auto_scroll();
         }
         AppAction::ClearSession => {
-            let created = create_session(client, available_skills, false).await?;
+            let created = create_session(client, available_skills, false, None).await?;
             let new_session_id = created.session_id;
             app.reset_for_new_session(new_session_id.clone(), false, None);
             app.push_message(app::ConversationEntry::AssistantText(format!(
@@ -799,6 +866,16 @@ async fn execute_action(
                         "/switch failed: {error}"
                     )));
                 }
+            }
+            app.set_phase(AgentPhase::Idle);
+            app.auto_scroll();
+        }
+        AppAction::SetModelProfile { model_profile } => {
+            match set_session_model_profile(client, &app.session_id, &model_profile).await {
+                Ok(()) => app.push_message(app::ConversationEntry::AssistantText(format!(
+                    "Switched model profile to `{model_profile}`."
+                ))),
+                Err(error) => app.push_message(app::ConversationEntry::Error(error.to_string())),
             }
             app.set_phase(AgentPhase::Idle);
             app.auto_scroll();
@@ -877,7 +954,7 @@ async fn execute_action(
         AppAction::EnterPlanMode {
             request,
             was_plan_mode,
-        } => match create_session(client, skills, true).await {
+        } => match create_session(client, skills, true, None).await {
             Ok(session) => {
                 app.reset_for_new_session(session.session_id, true, session.max_context_window);
                 if let Ok(snapshot) = fetch_session_context(client, &app.session_id).await {
@@ -1109,5 +1186,72 @@ mod tests {
         assert!(action.is_none());
         assert_eq!(app.input.content(), "/switch alpha");
         assert!(!app.switch_select_active);
+    }
+
+    #[test]
+    fn model_selector_allows_typing_through_terminal_handler() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.input.set_from_string("/model loc");
+        app.set_model_profile_candidates(vec!["local-qwen-coder".into(), "local-fast".into()]);
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(app.input.content(), "/model loca");
+        let options = app
+            .option_select
+            .as_ref()
+            .map(|select| select.options.clone());
+        assert_eq!(
+            options,
+            Some(vec!["local-qwen-coder".into(), "local-fast".into()])
+        );
+    }
+
+    #[test]
+    fn model_selector_enter_applies_selected_profile() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.input.set_from_string("/model loc");
+        app.set_model_profile_candidates(vec!["local-qwen-coder".into(), "local-fast".into()]);
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(app.input.content(), "/model local-qwen-coder");
+        assert!(!app.model_select_active);
+    }
+
+    #[test]
+    fn load_model_profile_names_reads_yaml_keys() {
+        let temp_home = tempfile::TempDir::new().unwrap();
+        let quine_dir = temp_home.path().join(".quine");
+        std::fs::create_dir_all(&quine_dir).unwrap();
+        std::fs::write(
+            quine_dir.join("model-profiles.yaml"),
+            "profiles:\n  local-qwen-coder:\n    provider: openai\n  local-fast:\n    provider: openai\n",
+        )
+        .unwrap();
+        let previous_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", temp_home.path());
+        }
+
+        let names = load_model_profile_names().unwrap();
+
+        match previous_home {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+
+        assert_eq!(
+            names,
+            vec!["local-fast".to_string(), "local-qwen-coder".to_string()]
+        );
     }
 }

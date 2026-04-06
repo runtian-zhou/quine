@@ -151,6 +151,7 @@ mounts=(
   --mount "type=bind,src=${common_dir_abs},dst=${common_dir_abs}"
   --mount "type=volume,src=${gh_auth_volume},dst=/root/.config/gh"
   --mount "type=bind,src=${quine_state_dir},dst=/root/.quine"
+  --mount "type=bind,src=${workspace_root}/.quine/model-profiles.yaml,dst=/root/.quine/model-profiles.yaml,readonly"
   --mount "type=volume,src=${cargo_registry_volume},dst=/usr/local/cargo/registry"
   --mount "type=volume,src=${cargo_git_volume},dst=/usr/local/cargo/git"
 )

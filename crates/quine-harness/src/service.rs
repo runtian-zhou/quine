@@ -31,6 +31,17 @@ pub trait HarnessService: Send + Sync {
         })
     }
 
+    /// Update the active named model profile for an existing session.
+    async fn set_session_model_profile(
+        &self,
+        _session_id: SessionId,
+        _model_profile: String,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
     /// Compact an existing session's conversation history.
     async fn compact_session(&self, session_id: SessionId) -> Result<(), HarnessError>;
 

@@ -1,0 +1,13 @@
+profiles:
+  gpt-5.4:
+    provider: openai
+    model: gpt-5.4
+    base_url: http://host.docker.internal:8000/v1
+    max_tokens: 4096
+    parallel_tool_calls: true
+  local-qwen-coder:
+    provider: openai
+    model: mlx-community/Qwen3-Coder-Next-4bit
+    base_url: http://host.docker.internal:8080/v1
+    max_tokens: 4096
+    parallel_tool_calls: false

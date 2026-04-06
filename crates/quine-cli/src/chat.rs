@@ -11,6 +11,7 @@ use crate::render::{Renderer, TerminalRenderer};
 use crate::run::fetch_available_skills;
 use crate::session::{
     create_session, create_slash_skill_session, exit_plan_mode, resolve_resume_target,
+    set_session_model_profile,
 };
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{methods, notifications};
@@ -66,6 +67,7 @@ enum ChatCommandAction {
     ShowContext,
     SendMessage(String),
     CompactSession,
+    SetModelProfile(String),
     EnterPlanModeAndSend(String),
     StartSkillSession { skill_name: String, request: String },
 }
@@ -126,6 +128,13 @@ fn handle_chat_command(input: &str, plan_mode: bool) -> ChatCommandAction {
                         ChatCommandAction::EnterPlanModeAndSend(arguments)
                     }
                 }
+                "model" => {
+                    if arguments.is_empty() {
+                        ChatCommandAction::ShowError("Usage: /model <profile>".to_string())
+                    } else {
+                        ChatCommandAction::SetModelProfile(arguments)
+                    }
+                }
                 "loop" => ChatCommandAction::ShowError(
                     "`/loop` is only supported in the TUI right now".to_string(),
                 ),
@@ -151,6 +160,7 @@ pub async fn run_chat(
     plan_mode: bool,
     auto_approve: bool,
     resume_checkpoint: Option<&str>,
+    model_profile: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let mut renderer = TerminalRenderer::new();
@@ -166,7 +176,7 @@ pub async fn run_chat(
             session_id: target.session_id,
             max_context_window: None,
         },
-        None => create_session(&mut client, skills, plan_mode).await?,
+        None => create_session(&mut client, skills, plan_mode, model_profile).await?,
     };
     let mut session_in_plan_mode = session_plan_mode.unwrap_or(plan_mode);
 
@@ -213,9 +223,23 @@ pub async fn run_chat(
                                 }
                                 continue;
                             }
+                            ChatCommandAction::SetModelProfile(profile) => {
+                                set_session_model_profile(
+                                    &mut client,
+                                    &session.session_id,
+                                    &profile,
+                                )
+                                .await?;
+                                renderer
+                                    .render_info(&format!("Switched model profile to `{profile}`."))
+                                    .await?;
+                                continue;
+                            }
                             ChatCommandAction::SendMessage(content) => content,
                             ChatCommandAction::EnterPlanModeAndSend(content) => {
-                                session = create_session(&mut client, skills, true).await?;
+                                session =
+                                    create_session(&mut client, skills, true, model_profile)
+                                        .await?;
                                 session_in_plan_mode = true;
                                 eprintln!("Switched to plan mode: {}", session.session_id);
                                 content

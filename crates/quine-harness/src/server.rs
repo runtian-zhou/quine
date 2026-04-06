@@ -402,6 +402,12 @@ async fn handle_request(
                 .transpose()
                 .unwrap_or_default()
                 .unwrap_or_default();
+            let model_profile = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("model_profile"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
             let config = crate::config::SessionConfig {
                 system_prompt,
@@ -413,6 +419,7 @@ async fn handle_request(
                 agent_key,
                 team_key,
                 memory_policy,
+                model_profile: model_profile.clone(),
             };
 
             match service.create_session(config).await {
@@ -435,7 +442,10 @@ async fn handle_request(
                         id,
                         serde_json::json!({
                             "session_id": sid_str,
-                            "max_context_window": crate::config::max_context_window_from_env(),
+                            "max_context_window": crate::config::resolve_session_llm_config(model_profile.as_deref())
+                                .ok()
+                                .and_then(|config| config.max_context_window),
+                            "model_profile": model_profile,
                         }),
                     );
                     Some(serde_json::to_string(&resp).unwrap_or_default())
@@ -484,6 +494,65 @@ async fn handle_request(
                 Err(e) => {
                     let resp =
                         JsonRpcErrorResponse::new(id, error_codes::INTERNAL_ERROR, e.to_string());
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::SET_SESSION_MODEL_PROFILE => {
+            let params = request.params.as_ref();
+            let session_id_str = params
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str());
+            let model_profile = params
+                .and_then(|p| p.get("model_profile"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+
+            match (session_id_str, model_profile) {
+                (Some(sid), Some(model_profile)) => {
+                    let session_id: quine_core::SessionId =
+                        match serde_json::from_value(serde_json::Value::String(sid.to_string())) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                let resp = JsonRpcErrorResponse::new(
+                                    id,
+                                    error_codes::INVALID_PARAMS,
+                                    format!("invalid session_id: {e}"),
+                                );
+                                return Some(serde_json::to_string(&resp).unwrap_or_default());
+                            }
+                        };
+                    match service
+                        .set_session_model_profile(session_id, model_profile.clone())
+                        .await
+                    {
+                        Ok(()) => {
+                            let resp = JsonRpcResponse::success(
+                                id,
+                                serde_json::json!({
+                                    "session_id": sid,
+                                    "model_profile": model_profile,
+                                }),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(error) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                error.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                _ => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing session_id or model_profile",
+                    );
                     Some(serde_json::to_string(&resp).unwrap_or_default())
                 }
             }
