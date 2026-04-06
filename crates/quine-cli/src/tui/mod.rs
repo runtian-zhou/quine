@@ -19,6 +19,7 @@ use serde::Deserialize;
 use crate::client::IpcClient;
 use crate::context_debug::fetch_session_context;
 use crate::interaction::{maybe_auto_approve, prompt as interaction_prompt};
+use crate::ps::{format_session_summary, prepend_summary};
 use crate::run::fetch_available_skills;
 use crate::session::{
     create_session, create_slash_skill_session, exit_plan_mode, resolve_resume_target,
@@ -33,14 +34,19 @@ struct TuiSessionSummary {
     parent_id: Option<String>,
     status: String,
     #[serde(default)]
+    title: Option<String>,
+    #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
     plan_mode: bool,
     #[serde(default)]
     _depth: usize,
 }
 
 fn format_tui_ps_table(mut sessions: Vec<TuiSessionSummary>) -> String {
+    let summary = format_tui_status_summary(&sessions);
     if sessions.is_empty() {
-        return "No sessions found.".to_string();
+        return summary;
     }
 
     sessions.sort_by(|left, right| {
@@ -67,37 +73,57 @@ fn format_tui_ps_table(mut sessions: Vec<TuiSessionSummary>) -> String {
         .max()
         .unwrap_or(5)
         .max("STATUS".len());
+    let mode_width = sessions
+        .iter()
+        .map(|session| if session.plan_mode { "plan".len() } else { "chat".len() })
+        .max()
+        .unwrap_or(4)
+        .max("MODE".len());
+    let summary_width = sessions
+        .iter()
+        .map(|session| tui_session_summary_text(session).len())
+        .max()
+        .unwrap_or(7)
+        .max("SUMMARY".len());
 
     let mut lines = Vec::with_capacity(sessions.len() + 1);
     lines.push(format!(
-        "{:<session_width$}  {:<parent_width$}  {:<state_width$}  MODE",
+        "{:<session_width$}  {:<parent_width$}  {:<state_width$}  {:<mode_width$}  {:<summary_width$}",
         "SESSION",
         "PARENT",
         "STATUS",
+        "MODE",
+        "SUMMARY",
         session_width = session_width,
         parent_width = parent_width,
         state_width = state_width,
+        mode_width = mode_width,
+        summary_width = summary_width,
     ));
 
     for session in sessions {
         lines.push(format!(
-            "{:<session_width$}  {:<parent_width$}  {:<state_width$}  {}",
+            "{:<session_width$}  {:<parent_width$}  {:<state_width$}  {:<mode_width$}  {:<summary_width$}",
             session.session_id,
             session.parent_id.as_deref().unwrap_or("-"),
             session.status,
             if session.plan_mode { "plan" } else { "chat" },
+            tui_session_summary_text(&session),
             session_width = session_width,
             parent_width = parent_width,
             state_width = state_width,
+            mode_width = mode_width,
+            summary_width = summary_width,
         ));
     }
 
-    lines.join("\n")
+    prepend_summary(&summary, &lines.join("\n"))
 }
 
 fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
+    let summary = format_tui_status_summary(&sessions);
     if sessions.is_empty() {
-        return "No sessions found.".to_string();
+        return summary;
     }
 
     let mut sessions_by_id: BTreeMap<String, TuiSessionSummary> = BTreeMap::new();
@@ -142,12 +168,18 @@ fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
             "├─ "
         };
 
+        let summary = tui_session_summary_text(session);
         output.push(format!(
-            "{}{}{} [{}]{}",
+            "{}{}{} [{}]{}{}",
             prefix,
             branch,
             session.session_id,
             session.status,
+            if summary.is_empty() {
+                String::new()
+            } else {
+                format!(" — {summary}")
+            },
             if session.plan_mode { " [plan]" } else { "" },
         ));
 
@@ -184,11 +216,25 @@ fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
             index + 1 == roots.len(),
         );
     }
-    output.join("\n")
+    prepend_summary(&summary, &output.join("\n"))
+}
+
+fn format_tui_status_summary(sessions: &[TuiSessionSummary]) -> String {
+    format_session_summary(sessions.iter().map(|session| session.status.as_str()))
+}
+
+fn tui_session_summary_text(session: &TuiSessionSummary) -> &str {
+    session
+        .summary
+        .as_deref()
+        .or(session.title.as_deref())
+        .unwrap_or("")
 }
 
 async fn fetch_tui_ps_output(client: &mut IpcClient, tree: bool) -> anyhow::Result<String> {
-    let response = client.call(methods::LIST_SESSIONS, Some(serde_json::json!({}))).await?;
+    let response = client
+        .call(methods::LIST_SESSIONS, Some(serde_json::json!({})))
+        .await?;
     let response = response.map_err(anyhow::Error::msg)?;
     let sessions: Vec<TuiSessionSummary> = serde_json::from_value(response)?;
     Ok(if tree {
@@ -527,7 +573,9 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                         if app.slash_select_active {
                             app.preview_slash_command_option();
                         }
-                    } else if app.input.is_multiline() && app.input.row() < app.input.line_count() - 1 {
+                    } else if app.input.is_multiline()
+                        && app.input.row() < app.input.line_count() - 1
+                    {
                         app.input.cursor_down();
                     } else {
                         app.history_next();
@@ -644,7 +692,9 @@ async fn execute_action(
             match fetch_tui_ps_output(client, tree).await {
                 Ok(output) => app.push_message(app::ConversationEntry::AssistantText(output)),
                 Err(error) => {
-                    app.push_message(app::ConversationEntry::Error(format!("/ps failed: {error}")));
+                    app.push_message(app::ConversationEntry::Error(format!(
+                        "/ps failed: {error}"
+                    )));
                 }
             }
             app.set_phase(AgentPhase::Idle);
@@ -812,6 +862,38 @@ mod tests {
             method: method.to_string(),
             params: Some(params),
         }
+    }
+
+    fn sample_tui_session(
+        session_id: &str,
+        parent_id: Option<&str>,
+        status: &str,
+    ) -> TuiSessionSummary {
+        TuiSessionSummary {
+            session_id: session_id.to_string(),
+            parent_id: parent_id.map(str::to_string),
+            status: status.to_string(),
+            title: None,
+            summary: None,
+            plan_mode: false,
+            _depth: 0,
+        }
+    }
+
+    #[test]
+    fn format_tui_ps_table_includes_summary() {
+        let output = format_tui_ps_table(vec![sample_tui_session("s1", None, "running")]);
+        assert!(output.starts_with("1 sessions · 1 running\n\nSESSION"));
+    }
+
+    #[test]
+    fn format_tui_ps_tree_includes_summary() {
+        let output = format_tui_ps_tree(vec![
+            sample_tui_session("parent", None, "waiting"),
+            sample_tui_session("child", Some("parent"), "running"),
+        ]);
+        assert!(output.starts_with("2 sessions · 1 running · 1 waiting\n\n"));
+        assert!(output.contains("parent [waiting]"));
     }
 
     #[test]

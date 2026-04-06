@@ -76,6 +76,7 @@ fn debug_log_session(session_id: SessionId, message: impl AsRef<str>) {
 fn schedule_session_memory_refresh(
     session: &mut SessionContext,
     session_id: SessionId,
+    provider: Arc<dyn LlmProvider>,
     input_tx: mpsc::Sender<CoreInput>,
 ) {
     let refresh_outcome = if !session.session_memory.enabled {
@@ -130,12 +131,23 @@ fn schedule_session_memory_refresh(
         })
         .await;
 
-        let (last_summarized_message_index, refreshed_at) = match refresh_result {
-            Ok(Ok(Some(update))) => (
-                Some(update.metadata.last_summarized_message_index),
-                Some(update.metadata.updated_at),
-            ),
-            _ => (None, None),
+        let (last_summarized_message_index, refreshed_at, listing_summary) = match refresh_result {
+            Ok(Ok(Some(update))) => {
+                let listing_summary = generate_session_listing_summary(
+                    provider.as_ref(),
+                    session_id,
+                    &update.document.render_markdown(),
+                )
+                .await
+                .ok()
+                .flatten();
+                (
+                    Some(update.metadata.last_summarized_message_index),
+                    Some(update.metadata.updated_at),
+                    listing_summary,
+                )
+            }
+            _ => (None, None, None),
         };
 
         let _ = input_tx
@@ -143,6 +155,7 @@ fn schedule_session_memory_refresh(
                 session_id,
                 last_summarized_message_index,
                 refreshed_at,
+                listing_summary,
             })
             .await;
         debug_log_session(session_id, "session memory refresh finished");
@@ -1296,6 +1309,47 @@ async fn summarize_history(
             message: "summarizer unexpectedly requested tool calls".into(),
         }),
     }
+}
+
+async fn generate_session_listing_summary(
+    provider: &dyn LlmProvider,
+    session_id: SessionId,
+    session_summary_markdown: &str,
+) -> Result<Option<String>, CoreError> {
+    let messages = [
+        Message::system(
+            "You generate session list summaries for a coding-agent UI. Reply with exactly one concise sentence describing the current session. Do not use bullets, prefixes, or markdown.",
+        ),
+        Message::user(format!(
+            "Session memory summary:\n\n{session_summary_markdown}\n\nReturn one sentence, 6 to 18 words, focused on the current task and most relevant progress."
+        )),
+    ];
+    match call_llm_with_messages(provider, &messages, &[], session_id, None).await? {
+        LlmCallResult {
+            turn: LlmTurnResult::Text(summary),
+            ..
+        } => Ok(normalize_listing_summary(&summary)),
+        LlmCallResult {
+            turn: LlmTurnResult::ToolCalls { .. },
+            ..
+        } => Err(CoreError::LlmError {
+            message: "session listing summarizer unexpectedly requested tool calls".into(),
+        }),
+    }
+}
+
+fn normalize_listing_summary(summary: &str) -> Option<String> {
+    let trimmed = summary.trim().trim_matches(|c| matches!(c, '"' | '\''));
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let collapsed = trimmed.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() {
+        return None;
+    }
+
+    Some(collapsed.chars().take(200).collect())
 }
 
 #[derive(Clone)]
@@ -3038,7 +3092,12 @@ async fn handle_llm_turn(
                     })
                     .await;
                 if let Some(session) = sessions.get_mut(&session_id) {
-                    schedule_session_memory_refresh(session, session_id, io.input_tx.clone());
+                    schedule_session_memory_refresh(
+                        session,
+                        session_id,
+                        Arc::clone(engine.provider),
+                        io.input_tx.clone(),
+                    );
                 }
                 emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
                 return TurnOutcome::Completed(Some(full_text));
@@ -3391,7 +3450,12 @@ async fn handle_llm_turn(
                         })
                         .await;
                     if let Some(session) = sessions.get_mut(&session_id) {
-                        schedule_session_memory_refresh(session, session_id, io.input_tx.clone());
+                        schedule_session_memory_refresh(
+                            session,
+                            session_id,
+                            Arc::clone(engine.provider),
+                            io.input_tx.clone(),
+                        );
                     }
                     emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
                     return TurnOutcome::Cancelled;
@@ -3935,6 +3999,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 session_id,
                 last_summarized_message_index,
                 refreshed_at,
+                listing_summary,
             } => {
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.session_memory.refresh_in_flight = false;
@@ -3943,6 +4008,9 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     }
                     if let Some(timestamp) = refreshed_at {
                         session.session_memory.last_refresh_at = Some(timestamp);
+                    }
+                    if let Some(summary) = listing_summary {
+                        session.session_memory.listing_summary = Some(summary);
                     }
                     let diagnostics = ensure_turn_diagnostics(session);
                     diagnostics.session_memory.refresh.attempted = true;
@@ -4204,6 +4272,7 @@ mod tests {
     use crate::channel::{create_channels, ChannelConfig};
     use crate::permission::types::PermissionMode;
     use crate::session::{ExitStatus, InheritanceFlags};
+    use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -4281,6 +4350,44 @@ mod tests {
         {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let text = self.response_text.clone();
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LlmEvent::TextDelta { text }),
+                Ok(LlmEvent::Done { usage: None }),
+            ])))
+        }
+    }
+
+    struct SequenceProvider {
+        responses: Mutex<VecDeque<String>>,
+    }
+
+    impl SequenceProvider {
+        fn new(responses: impl IntoIterator<Item = impl Into<String>>) -> Self {
+            Self {
+                responses: Mutex::new(
+                    responses
+                        .into_iter()
+                        .map(Into::into)
+                        .collect::<VecDeque<_>>(),
+                ),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for SequenceProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            let text = self
+                .responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_default();
             Ok(Box::pin(futures::stream::iter([
                 Ok(LlmEvent::TextDelta { text }),
                 Ok(LlmEvent::Done { usage: None }),
@@ -7009,6 +7116,106 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[tokio::test]
+    async fn session_memory_refresh_persists_model_generated_listing_summary() {
+        let temp = TempDir::new().unwrap();
+        let (mut harness, core) = create_channels(ChannelConfig::default());
+        let provider = Arc::new(SequenceProvider::new([
+            "assistant reply",
+            "Implements session-memory listing summaries for active sessions.",
+        ]));
+        let loop_handle = tokio::spawn(run_core_loop_with_compaction(
+            core,
+            provider,
+            None,
+            temp.path().to_path_buf(),
+            None,
+        ));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+        let _ = harness.output.recv().await.unwrap();
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "add a listing summary to session memory".into(),
+            })
+            .await
+            .unwrap();
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), harness.output.recv())
+                .await
+            {
+                Ok(Some(CoreOutput::TurnComplete { .. })) => break,
+                Ok(Some(_)) => {}
+                other => panic!("unexpected event while waiting for TurnComplete: {other:?}"),
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let expected = "Implements session-memory listing summaries for active sessions.";
+        let persisted = loop {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            harness
+                .input
+                .send(CoreInput::RequestCheckpoint { reply: reply_tx })
+                .await
+                .unwrap();
+            reply_rx.await.unwrap();
+
+            let checkpoint = loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(1), harness.output.recv())
+                    .await
+                {
+                    Ok(Some(CoreOutput::CheckpointRequested { checkpoint })) => break checkpoint,
+                    Ok(Some(_)) => {}
+                    other => panic!("unexpected event while waiting for checkpoint: {other:?}"),
+                }
+            };
+
+            let persisted = checkpoint
+                .sessions
+                .iter()
+                .find(|session| session.session_id == session_id)
+                .and_then(|session| session.memory_state.as_ref())
+                .and_then(|state| state.session_memory.as_ref())
+                .and_then(|state| state.listing_summary.clone());
+            if persisted.as_deref() == Some(expected) {
+                break persisted;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for listing summary, last observed value: {persisted:?}"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        };
+        assert_eq!(persisted.as_deref(), Some(expected));
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn session_memory_refresh_clears_inflight_and_advances_multiple_turns() {
         let temp = TempDir::new().unwrap();
         let (mut harness, core) = create_channels(ChannelConfig::default());
@@ -7172,6 +7379,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                         enabled: true,
                         last_summarized_message_index: Some(1),
                         template_version: 1,
+                        listing_summary: Some("Seeded session memory for restore coverage.".into()),
                     }),
                     persistent_memory: Some(crate::persistence::PersistedPersistentMemoryState {
                         enabled: true,

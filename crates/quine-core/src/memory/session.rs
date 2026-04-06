@@ -46,6 +46,7 @@ pub(crate) struct SessionMemoryState {
     #[allow(dead_code)]
     pub(crate) last_refresh_at: Option<DateTime<Utc>>,
     pub(crate) template_version: u32,
+    pub(crate) listing_summary: Option<String>,
     pub(crate) refresh_handle: PersistedRefreshHandle,
     pub(crate) persistent_enabled: bool,
     pub(crate) last_persistent_extracted_message_index: Option<usize>,
@@ -87,6 +88,7 @@ pub(crate) fn restore_memory_state(
         template_version: persisted_session
             .map(|state| state.template_version)
             .unwrap_or(SESSION_MEMORY_TEMPLATE_VERSION),
+        listing_summary: persisted_session.and_then(|state| state.listing_summary.clone()),
         refresh_handle: PersistedRefreshHandle::default(),
         persistent_enabled: persisted_persistent
             .map(|state| state.enabled)
@@ -102,6 +104,7 @@ pub(crate) fn snapshot_memory_state(state: &SessionMemoryState) -> PersistedMemo
             enabled: state.enabled,
             last_summarized_message_index: state.last_summarized_message_index,
             template_version: state.template_version,
+            listing_summary: state.listing_summary.clone(),
         }),
         persistent_memory: Some(PersistedPersistentMemoryState {
             enabled: state.persistent_enabled,
@@ -203,6 +206,7 @@ mod tests {
                 enabled: false,
                 last_summarized_message_index: Some(9),
                 template_version: 3,
+                listing_summary: Some("Round-trip listing summary".into()),
             }),
             persistent_memory: Some(PersistedPersistentMemoryState {
                 enabled: true,
@@ -216,6 +220,10 @@ mod tests {
         assert!(!state.enabled);
         assert_eq!(state.last_summarized_message_index, Some(9));
         assert_eq!(state.template_version, 3);
+        assert_eq!(
+            state.listing_summary.as_deref(),
+            Some("Round-trip listing summary")
+        );
         assert!(state.persistent_enabled);
         assert_eq!(state.last_persistent_extracted_message_index, Some(11));
 
@@ -226,6 +234,13 @@ mod tests {
                 .as_ref()
                 .and_then(|item| item.last_summarized_message_index),
             Some(9)
+        );
+        assert_eq!(
+            snapshot
+                .session_memory
+                .as_ref()
+                .and_then(|item| item.listing_summary.as_deref()),
+            Some("Round-trip listing summary")
         );
         assert_eq!(
             snapshot
@@ -252,6 +267,7 @@ mod tests {
             last_summarized_message_index: None,
             last_refresh_at: None,
             template_version: SESSION_MEMORY_TEMPLATE_VERSION,
+            listing_summary: None,
             refresh_handle: Default::default(),
             persistent_enabled: true,
             last_persistent_extracted_message_index: None,
@@ -317,6 +333,7 @@ mod tests {
             last_summarized_message_index: Some(2),
             last_refresh_at: None,
             template_version: SESSION_MEMORY_TEMPLATE_VERSION,
+            listing_summary: None,
             refresh_handle: Default::default(),
             persistent_enabled: true,
             last_persistent_extracted_message_index: None,
@@ -340,6 +357,7 @@ mod tests {
             last_summarized_message_index: None,
             last_refresh_at: None,
             template_version: SESSION_MEMORY_TEMPLATE_VERSION,
+            listing_summary: None,
             refresh_handle: Default::default(),
             persistent_enabled: true,
             last_persistent_extracted_message_index: None,

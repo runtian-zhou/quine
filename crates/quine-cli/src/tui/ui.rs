@@ -605,7 +605,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mode = if app.plan_mode { "plan" } else { "chat" };
     let phase = app.phase_status_text().to_lowercase();
     let usage = format_context_status(app.last_turn_usage.as_ref(), app.max_context_window);
-    let left = format!(" session:{} | {} | {} ", app.session_id, mode, phase);
+    let left = format!(" session:{} | {} | {} ", app.session_id, phase, mode);
     let right = format!(" {} ", usage);
 
     let chunks = Layout::default()
@@ -1248,7 +1248,9 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             for (index, option) in select.options.iter().enumerate() {
                 let is_cursor = index == select.cursor;
                 let style = if is_cursor {
-                    Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(Color::DarkGray)
                 };
@@ -1321,7 +1323,8 @@ fn draw_input(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
             ]));
         }
     }
-    let input_widget = Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL));
+    let input_widget =
+        Paragraph::new(Text::from(lines)).block(Block::default().borders(Borders::ALL));
 
     frame.render_widget(input_widget, area);
 

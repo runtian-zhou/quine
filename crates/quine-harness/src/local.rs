@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use anyhow::Result;
 use async_trait::async_trait;
 use chrono::Utc;
 use std::collections::HashMap;
@@ -45,8 +46,37 @@ struct SessionListing {
     state: quine_core::SessionState,
     created_at: chrono::DateTime<Utc>,
     event_count: usize,
+    title: Option<String>,
+    summary: Option<String>,
     plan_mode: bool,
     parent_id: Option<SessionId>,
+}
+
+fn persisted_listing_summary(session: &quine_core::PersistedSession) -> Option<String> {
+    session
+        .memory_state
+        .as_ref()
+        .and_then(|state| state.session_memory.as_ref())
+        .and_then(|state| state.listing_summary.clone())
+}
+
+async fn refresh_checkpoint_session_summaries(
+    sessions: &Arc<Mutex<HashMap<SessionId, SessionListing>>>,
+    checkpoint: &quine_core::persistence::CoreCheckpoint,
+    state_root: &std::path::Path,
+) -> Result<()> {
+    let live_states = HashMap::new();
+    let mut guard = sessions.lock().await;
+    for persisted_session in &checkpoint.sessions {
+        let session_id = persisted_session.session_id;
+        let _ =
+            session_context_from_checkpoint(checkpoint, session_id, &live_states, Some(state_root));
+        if let Some(session) = guard.get_mut(&session_id) {
+            session.summary = persisted_listing_summary(persisted_session);
+        }
+    }
+
+    Ok(())
 }
 
 fn serialize_session_id(session_id: SessionId) -> String {
@@ -145,6 +175,8 @@ impl LocalHarness {
                                 state: session.state.into(),
                                 created_at: session.created_at,
                                 event_count: session.history.len(),
+                                title: None,
+                                summary: persisted_listing_summary(session),
                                 plan_mode: session.config.plan_mode,
                                 parent_id: checkpoint
                                     .session_tree
@@ -277,6 +309,11 @@ impl LocalHarness {
                                 message: format!("failed to persist checkpoint: {error}"),
                             },
                         });
+                    } else if let Err(error) =
+                        refresh_checkpoint_session_summaries(&sessions, &checkpoint, storage.root())
+                            .await
+                    {
+                        tracing::warn!(?error, "failed to refresh session summaries");
                     }
                     continue;
                 }
@@ -292,6 +329,8 @@ impl LocalHarness {
                                 state: *state,
                                 created_at: Utc::now(),
                                 event_count: 0,
+                                title: None,
+                                summary: None,
                                 plan_mode: false,
                                 parent_id: None,
                             });
@@ -376,6 +415,8 @@ impl HarnessService for LocalHarness {
                 state: quine_core::SessionState::Idle,
                 created_at: Utc::now(),
                 event_count: 0,
+                title: None,
+                summary: None,
                 plan_mode: config.plan_mode,
                 parent_id: None,
             },
@@ -500,6 +541,8 @@ impl HarnessService for LocalHarness {
                     "status": format!("{:?}", session.state).to_lowercase(),
                     "first_event": session.created_at.to_rfc3339(),
                     "event_count": session.event_count,
+                    "title": session.title,
+                    "summary": session.summary,
                     "plan_mode": session.plan_mode,
                     "parent_id": session.parent_id.map(serialize_session_id),
                     "root_id": root_id,
@@ -613,6 +656,8 @@ impl HarnessService for LocalHarness {
                 state: quine_core::SessionState::Idle,
                 created_at: Utc::now(),
                 event_count: 0,
+                title: None,
+                summary: None,
                 plan_mode: false,
                 parent_id,
             },
@@ -700,6 +745,7 @@ mod tests {
     use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, Role, ToolDefinition};
     use std::collections::HashMap;
     use std::fs;
+    use std::path::PathBuf;
     use std::pin::Pin;
     use std::sync::LazyLock;
     use tokio::fs as async_fs;
@@ -756,6 +802,47 @@ mod tests {
         assert!(!projected.plan_mode);
 
         harness.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn persisted_listing_summary_reads_session_memory_field() {
+        let session = quine_core::PersistedSession {
+            session_id: SessionId::new(),
+            created_at: Utc::now(),
+            state: quine_core::PersistedSessionState::Idle,
+            config: quine_core::PersistedSessionConfig {
+                system_prompt: None,
+                skill_names: Vec::new(),
+                working_directory: PathBuf::from("."),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                prompt_memory_mode: quine_core::PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: quine_core::MemoryPolicyConfig::default(),
+            },
+            history: Vec::new(),
+            plan_store: quine_core::PersistedPlanStore::default(),
+            memory_state: Some(quine_core::PersistedMemoryState {
+                session_memory: Some(quine_core::PersistedSessionMemoryState {
+                    enabled: true,
+                    last_summarized_message_index: Some(3),
+                    template_version: 1,
+                    listing_summary: Some(
+                        "Tracks a model-generated session summary for listings.".into(),
+                    ),
+                }),
+                persistent_memory: None,
+                prompt_memory: None,
+                memory_diagnostics: None,
+            }),
+            permission_state: None,
+        };
+
+        assert_eq!(
+            persisted_listing_summary(&session).as_deref(),
+            Some("Tracks a model-generated session summary for listings.")
+        );
     }
 
     #[tokio::test]

@@ -158,6 +158,7 @@ pub enum CoreInput {
         session_id: SessionId,
         last_summarized_message_index: Option<usize>,
         refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
+        listing_summary: Option<String>,
     },
 
     /// Graceful shutdown of the entire core event loop.

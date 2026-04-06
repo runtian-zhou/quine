@@ -100,19 +100,25 @@ fn print_log_entries(entries: &[SessionLogEntry]) {
 /// Print session list to stdout.
 fn print_session_list(summaries: &[SessionSummary]) {
     println!(
-        "{:<40} {:<24} {:<24} ENTRIES",
-        "SESSION_ID", "CREATED", "LAST_ACTIVE"
+        "{:<40} {:<24} {:<24} {:<7} SUMMARY",
+        "SESSION_ID", "CREATED", "LAST_ACTIVE", "ENTRIES"
     );
-    println!("{}", "-".repeat(96));
+    println!("{}", "-".repeat(128));
     for s in summaries {
+        let summary_text = summarize_session_log_entry(s);
         println!(
-            "{:<40} {:<24} {:<24} {}",
+            "{:<40} {:<24} {:<24} {:<7} {}",
             s.session_id,
             s.created_at.format("%Y-%m-%d %H:%M:%S"),
             s.last_active.format("%Y-%m-%d %H:%M:%S"),
             s.entry_count,
+            summary_text,
         );
     }
+}
+
+fn summarize_session_log_entry(_summary: &SessionSummary) -> &'static str {
+    ""
 }
 
 #[cfg(test)]

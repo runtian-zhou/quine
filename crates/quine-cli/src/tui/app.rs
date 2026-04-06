@@ -205,7 +205,9 @@ pub struct OptionSelectState {
 pub enum AppAction {
     SendMessage(String),
     ShowContext,
-    ListSessions { tree: bool },
+    ListSessions {
+        tree: bool,
+    },
     CompactSession,
     SendSlashSkillMessage {
         skill_name: String,
@@ -863,7 +865,11 @@ impl App {
                 "show session tree",
             ),
             ("plan".to_string(), "/plan".to_string(), "toggle plan mode"),
-            ("loop".to_string(), "/loop".to_string(), "run autonomous loop"),
+            (
+                "loop".to_string(),
+                "/loop".to_string(),
+                "run autonomous loop",
+            ),
             (
                 "compact".to_string(),
                 "/compact".to_string(),
@@ -1170,7 +1176,11 @@ impl App {
             .into_iter()
             .map(|(command, help)| format!("{command}\t{help}"))
             .collect();
-        let previous_cursor = self.option_select.as_ref().map(|state| state.cursor).unwrap_or(0);
+        let previous_cursor = self
+            .option_select
+            .as_ref()
+            .map(|state| state.cursor)
+            .unwrap_or(0);
         let cursor = previous_cursor.min(options.len().saturating_sub(1));
         self.option_select = Some(OptionSelectState {
             options,
@@ -2354,7 +2364,10 @@ mod tests {
 
         let action = app.submit_input();
 
-        assert!(matches!(action, Some(AppAction::ListSessions { tree: false })));
+        assert!(matches!(
+            action,
+            Some(AppAction::ListSessions { tree: false })
+        ));
         assert!(app.messages.is_empty());
     }
 
@@ -2365,7 +2378,10 @@ mod tests {
 
         let action = app.submit_input();
 
-        assert!(matches!(action, Some(AppAction::ListSessions { tree: true })));
+        assert!(matches!(
+            action,
+            Some(AppAction::ListSessions { tree: true })
+        ));
         assert!(app.messages.is_empty());
     }
 
