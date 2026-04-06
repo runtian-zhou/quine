@@ -45,6 +45,9 @@ enum Commands {
         /// Resume a restored checkpoint by session ID, or use `latest`.
         #[arg(long)]
         resume: Option<String>,
+        /// Named model profile for this session.
+        #[arg(long)]
+        model_profile: Option<String>,
     },
     /// Send a one-shot message to the agent and exit.
     Run {
@@ -68,6 +71,9 @@ enum Commands {
         /// Automatically approve permission-gated operations for this run.
         #[arg(long)]
         auto_approve: bool,
+        /// Named model profile for a newly created session.
+        #[arg(long)]
+        model_profile: Option<String>,
     },
     /// Respond to an interaction request (e.g., ask_user prompt) on an existing session.
     Respond {
@@ -242,15 +248,31 @@ async fn main() -> anyhow::Result<()> {
             plan,
             auto_approve,
             resume,
+            model_profile,
         } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(default_socket_path);
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-                tui::run_tui_chat(&socket_path, &skill, plan, auto_approve, resume.as_deref())
-                    .await?;
+                tui::run_tui_chat(
+                    &socket_path,
+                    &skill,
+                    plan,
+                    auto_approve,
+                    resume.as_deref(),
+                    model_profile.as_deref(),
+                )
+                .await?;
             } else {
-                chat::run_chat(&socket_path, &skill, plan, auto_approve, resume.as_deref()).await?;
+                chat::run_chat(
+                    &socket_path,
+                    &skill,
+                    plan,
+                    auto_approve,
+                    resume.as_deref(),
+                    model_profile.as_deref(),
+                )
+                .await?;
             }
         }
         Commands::Run {
@@ -261,6 +283,7 @@ async fn main() -> anyhow::Result<()> {
             socket,
             skill,
             auto_approve,
+            model_profile,
         } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
@@ -273,6 +296,7 @@ async fn main() -> anyhow::Result<()> {
                 json,
                 &skill,
                 auto_approve,
+                model_profile.as_deref(),
             )
             .await?;
         }

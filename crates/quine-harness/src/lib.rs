@@ -2,6 +2,7 @@ pub mod config;
 pub mod error;
 pub mod local;
 mod memory_store;
+pub mod model_profiles;
 pub mod protocol;
 pub mod server;
 pub mod service;
@@ -16,6 +17,10 @@ pub use config::{
 pub use error::HarnessError;
 pub use local::LocalHarness;
 pub(crate) use memory_store::MemoryStore;
+pub use model_profiles::{
+    create_provider_from_config, max_context_window_for_provider_config,
+    resolve_env_provider_selection, resolve_named_model_profile, ResolvedProviderSelection,
+};
 pub use protocol::{
     JsonRpcError, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
 };

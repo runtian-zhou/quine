@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use quine_core::{
     create_channels, run_core_loop, ChannelConfig, CoreInput, CoreOutput, MemoryPolicyConfig,
-    SessionId, ToolOutcome,
+    SessionId, SessionLlmConfig, ToolOutcome,
 };
 use quine_llm::{LlmEvent, LlmProvider, Message, ToolDefinition};
 use tokio::sync::oneshot;
@@ -52,6 +52,20 @@ struct TurnResult {
     tool_outcome: ToolOutcome,
 }
 
+fn test_session_llm_config() -> SessionLlmConfig {
+    SessionLlmConfig {
+        provider: Arc::new(ScriptedToolProvider {
+            call_count: AtomicU32::new(0),
+            tool_use_id: "unused".into(),
+            tool_name: "unused".into(),
+            arguments: serde_json::json!({}),
+            final_text: String::new(),
+        }),
+        max_context_window: None,
+        model_profile: None,
+    }
+}
+
 async fn run_tool_turn(
     workspace_root: PathBuf,
     tool_use_id: &str,
@@ -85,6 +99,7 @@ async fn run_tool_turn(
             agent_key: None,
             team_key: None,
             memory_policy: MemoryPolicyConfig::default(),
+            session_llm: test_session_llm_config(),
             reply: reply_tx,
         })
         .await

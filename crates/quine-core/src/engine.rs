@@ -236,6 +236,8 @@ fn find_claude_md(start: &std::path::Path) -> Option<PathBuf> {
 /// Per-session context held by the core event loop.
 struct SessionContext {
     state: SessionState,
+    /// Active LLM provider for this session.
+    provider: Arc<dyn LlmProvider>,
     #[allow(dead_code)]
     system_prompt: Option<String>,
     /// Conversation history for this session.
@@ -355,6 +357,7 @@ struct SessionInit {
     agent_key: Option<String>,
     team_key: Option<String>,
     memory_policy: MemoryPolicyConfig,
+    model_profile: Option<String>,
 }
 
 impl SessionInit {
@@ -373,6 +376,7 @@ impl SessionInit {
             agent_key: self.agent_key.clone(),
             team_key: self.team_key.clone(),
             memory_policy: self.memory_policy.clone(),
+            model_profile: self.model_profile.clone(),
         }
     }
 }
@@ -496,6 +500,7 @@ impl SessionContext {
             agent_key,
             team_key,
             memory_policy,
+            model_profile: _,
             ..
         } = init;
         let filesystem = Arc::new(
@@ -546,6 +551,7 @@ impl SessionContext {
 
         Ok(Self {
             state: SessionState::Idle,
+            provider: Arc::clone(provider),
             system_prompt: combined_prompt,
             history,
             tools,
@@ -621,6 +627,7 @@ impl SessionContext {
                 agent_key: config.agent_key.clone(),
                 team_key: config.team_key.clone(),
                 memory_policy: config.memory_policy.clone(),
+                model_profile: config.model_profile.clone(),
             },
             provider,
             web_provider,
@@ -721,7 +728,6 @@ impl SessionContext {
 
     async fn rebuild_session_config_with_web_provider(
         &mut self,
-        provider: &Arc<dyn LlmProvider>,
         web_provider: &Arc<dyn WebProvider>,
     ) -> Result<(), CoreError> {
         let skills = crate::skill::load_skills(
@@ -730,7 +736,7 @@ impl SessionContext {
         )
         .await;
         self.tool_registry = build_tool_registry_for_session(
-            provider,
+            &self.provider,
             web_provider,
             self.plan_store.clone(),
             &self.persisted_config,
@@ -777,14 +783,13 @@ impl SessionContext {
 
     #[cfg(test)]
     async fn exit_plan_mode(&mut self, provider: &Arc<dyn LlmProvider>) -> Result<(), CoreError> {
+        self.provider = Arc::clone(provider);
         let web_provider: Arc<dyn WebProvider> = Arc::new(NoopWebProvider);
-        self.exit_plan_mode_with_web_provider(provider, &web_provider)
-            .await
+        self.exit_plan_mode_with_web_provider(&web_provider).await
     }
 
     async fn exit_plan_mode_with_web_provider(
         &mut self,
-        provider: &Arc<dyn LlmProvider>,
         web_provider: &Arc<dyn WebProvider>,
     ) -> Result<(), CoreError> {
         if !self.persisted_config.plan_mode {
@@ -792,7 +797,21 @@ impl SessionContext {
         }
         self.persisted_config.plan_mode = false;
         let _ = exit_permission_plan_mode(&mut self.permission_context);
-        self.rebuild_session_config_with_web_provider(provider, web_provider)
+        self.rebuild_session_config_with_web_provider(web_provider)
+            .await
+    }
+
+    async fn update_llm_provider_with_web_provider(
+        &mut self,
+        provider: Arc<dyn LlmProvider>,
+        model_profile: Option<String>,
+        max_context_window: Option<u64>,
+        web_provider: &Arc<dyn WebProvider>,
+    ) -> Result<(), CoreError> {
+        self.provider = provider;
+        self.persisted_config.model_profile = model_profile;
+        self.max_context_window = max_context_window;
+        self.rebuild_session_config_with_web_provider(web_provider)
             .await
     }
 }
@@ -2145,6 +2164,17 @@ async fn start_child_session(
 
     let work_dir = std::env::current_dir().unwrap_or_default();
     let work_dir_display = work_dir.display().to_string();
+    let inherited_provider = sessions
+        .get(&parent_id)
+        .map(|parent| Arc::clone(&parent.provider))
+        .unwrap_or_else(|| Arc::clone(engine.provider));
+    let inherited_model_profile = sessions
+        .get(&parent_id)
+        .and_then(|parent| parent.persisted_config.model_profile.clone());
+    let inherited_max_context_window = sessions
+        .get(&parent_id)
+        .and_then(|parent| parent.max_context_window)
+        .or(max_context_window);
 
     let ctx = SessionContext::new(
         child_id,
@@ -2156,13 +2186,14 @@ async fn start_child_session(
             prompt_behavior,
             initial_messages: Vec::new(),
             archive_root,
-            max_context_window,
+            max_context_window: inherited_max_context_window,
             prompt_memory_mode: PromptMemoryMode::Disabled,
             agent_key: None,
             team_key: None,
             memory_policy: MemoryPolicyConfig::default(),
+            model_profile: inherited_model_profile,
         },
-        engine.provider,
+        &inherited_provider,
     )
     .await
     .map_err(|e| e.to_string())?;
@@ -3028,13 +3059,10 @@ async fn handle_llm_turn(
             let Some(session) = sessions.get_mut(&session_id) else {
                 return TurnOutcome::Failed("session not found".into());
             };
-            if let Err(error) = compact_session_history(
-                &**engine.provider,
-                session,
-                session_id,
-                CompactionTrigger::Auto,
-            )
-            .await
+            let provider = Arc::clone(&session.provider);
+            if let Err(error) =
+                compact_session_history(&*provider, session, session_id, CompactionTrigger::Auto)
+                    .await
             {
                 let _ = io
                     .output
@@ -3081,9 +3109,15 @@ async fn handle_llm_turn(
             Some(session) => session.tools.clone(),
             None => return TurnOutcome::Failed("session not found".into()),
         };
-        match call_llm_interruptible(&**engine.provider, history, tools, session_id, io, sessions)
-            .await
-        {
+        let provider = sessions
+            .get(&session_id)
+            .map(|session| Arc::clone(&session.provider))
+            .ok_or_else(|| TurnOutcome::Failed("session not found".into()));
+        let provider = match provider {
+            Ok(provider) => provider,
+            Err(outcome) => return outcome,
+        };
+        match call_llm_interruptible(&*provider, history, tools, session_id, io, sessions).await {
             Ok(None) => {
                 debug_log_session(session_id, "LLM turn interrupted");
                 let duration_us = turn_start.elapsed().as_micros() as u64;
@@ -3162,7 +3196,7 @@ async fn handle_llm_turn(
                     schedule_session_memory_refresh(
                         session,
                         session_id,
-                        Arc::clone(engine.provider),
+                        Arc::clone(&session.provider),
                         io.input_tx.clone(),
                     );
                 }
@@ -3613,7 +3647,7 @@ async fn handle_llm_turn(
                         schedule_session_memory_refresh(
                             session,
                             session_id,
-                            Arc::clone(engine.provider),
+                            Arc::clone(&session.provider),
                             io.input_tx.clone(),
                         );
                     }
@@ -3801,6 +3835,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 agent_key,
                 team_key,
                 memory_policy,
+                session_llm,
                 permission_rules,
                 reply,
             } => {
@@ -3831,13 +3866,14 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         prompt_behavior,
                         initial_messages,
                         archive_root: archive_root.clone(),
-                        max_context_window,
+                        max_context_window: session_llm.max_context_window,
                         prompt_memory_mode: prompt_memory_mode_from_env(),
                         agent_key,
                         team_key,
                         memory_policy,
+                        model_profile: session_llm.model_profile.clone(),
                     },
-                    &provider,
+                    &session_llm.provider,
                     &web_provider,
                 )
                 .await
@@ -3884,7 +3920,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 }
 
                 match session
-                    .exit_plan_mode_with_web_provider(&provider, &web_provider)
+                    .exit_plan_mode_with_web_provider(&web_provider)
                     .await
                 {
                     Ok(()) => {
@@ -3893,6 +3929,43 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     }
                     Err(error) => {
                         let _ = reply.send(Err(format!("failed to exit plan mode: {error}")));
+                    }
+                }
+            }
+
+            CoreInput::UpdateSessionLlm {
+                session_id,
+                session_llm,
+                reply,
+            } => {
+                let Some(session) = sessions.get_mut(&session_id) else {
+                    let _ = reply.send(Err("unknown session".into()));
+                    continue;
+                };
+
+                if !matches!(session.state, SessionState::Idle | SessionState::Paused) {
+                    let _ = reply.send(Err(format!(
+                        "cannot switch model while session is {:?}",
+                        session.state
+                    )));
+                    continue;
+                }
+
+                match session
+                    .update_llm_provider_with_web_provider(
+                        Arc::clone(&session_llm.provider),
+                        session_llm.model_profile.clone(),
+                        session_llm.max_context_window,
+                        &web_provider,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(error) => {
+                        let _ = reply.send(Err(format!("failed to update session model: {error}")));
                     }
                 }
             }
@@ -4459,6 +4532,7 @@ mod tests {
     use crate::channel::{create_channels, ChannelConfig};
     use crate::permission::types::PermissionMode;
     use crate::session::{ExitStatus, InheritanceFlags};
+    use crate::SessionLlmConfig;
     use std::collections::VecDeque;
     use std::path::PathBuf;
     use std::pin::Pin;
@@ -4582,6 +4656,14 @@ mod tests {
         }
     }
 
+    fn session_llm_config(provider: Arc<dyn LlmProvider>) -> SessionLlmConfig {
+        SessionLlmConfig {
+            provider,
+            max_context_window: None,
+            model_profile: None,
+        }
+    }
+
     #[tokio::test]
     async fn session_context_bootstraps_permission_foundation_from_plan_mode() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
@@ -4602,6 +4684,7 @@ mod tests {
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -4642,6 +4725,7 @@ mod tests {
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -4674,6 +4758,7 @@ mod tests {
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -4718,6 +4803,7 @@ mod tests {
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             provider,
         )
@@ -4832,6 +4918,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -5344,6 +5431,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     agent_key: None,
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
                 },
                 &provider,
             ))
@@ -5364,6 +5452,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     agent_key: None,
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
                 },
                 &provider,
             ))
@@ -5384,6 +5473,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     agent_key: None,
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
                 },
                 &provider,
             ))
@@ -5440,6 +5530,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     agent_key: None,
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
                 },
                 &provider,
             ))
@@ -5460,6 +5551,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     agent_key: None,
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
                 },
                 &provider,
             ))
@@ -5501,6 +5593,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -5575,6 +5668,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -5647,6 +5741,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -5721,6 +5816,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -5810,6 +5906,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -5915,6 +6012,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -6007,6 +6105,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -6105,6 +6204,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     agent_key: None,
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
                 },
                 &provider,
             ))
@@ -6394,6 +6494,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -6441,6 +6542,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -6490,6 +6592,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -6530,6 +6633,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -6598,6 +6702,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -6679,6 +6784,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -6776,6 +6882,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -6861,6 +6968,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -6944,6 +7052,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -7019,6 +7128,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -7079,6 +7189,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -7149,6 +7260,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -7192,6 +7304,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -7234,7 +7347,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new("73"));
-        let loop_handle = tokio::spawn(run_core_loop(core, provider, None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let parent_id = SessionId::new();
         let (create_reply_tx, create_reply_rx) = oneshot::channel();
@@ -7252,6 +7365,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: create_reply_tx,
             })
             .await
@@ -7313,8 +7427,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     #[tokio::test]
     async fn create_session_and_shutdown_baseline() {
         let (harness, core) = create_channels(ChannelConfig::default());
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -7332,6 +7447,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -7350,7 +7466,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let provider = Arc::new(MockProvider::new("assistant reply"));
         let loop_handle = tokio::spawn(run_core_loop_with_compaction(
             core,
-            provider,
+            provider.clone(),
             None,
             temp.path().to_path_buf(),
             None,
@@ -7372,6 +7488,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -7437,7 +7554,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         ]));
         let loop_handle = tokio::spawn(run_core_loop_with_compaction(
             core,
-            provider,
+            provider.clone(),
             None,
             temp.path().to_path_buf(),
             None,
@@ -7459,6 +7576,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -7534,7 +7652,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let provider = Arc::new(MockProvider::new("assistant reply"));
         let loop_handle = tokio::spawn(run_core_loop_with_compaction(
             core,
-            provider,
+            provider.clone(),
             None,
             temp.path().to_path_buf(),
             None,
@@ -7556,6 +7674,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -7627,6 +7746,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     permission_rules: PermissionRuleSet::default(),
                     memory_policy: MemoryPolicyConfig::default(),
+                    session_llm: session_llm_config(provider.clone()),
                     reply: reply_tx,
                 })
                 .await
@@ -7680,6 +7800,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     agent_key: None,
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
                 },
                 history: vec![
                     Message::user("seed session memory"),
@@ -7713,7 +7834,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let (mut harness, core) = create_channels(ChannelConfig::default());
         let loop_handle = tokio::spawn(run_core_loop_with_compaction(
             core,
-            provider,
+            provider.clone(),
             Some(checkpoint),
             temp.path().to_path_buf(),
             None,
@@ -7777,8 +7898,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     async fn stale_external_tool_result_is_ignored_when_session_is_idle() {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -7796,6 +7918,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -7833,8 +7956,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     async fn user_message_produces_turn_complete() {
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -7852,6 +7976,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -7894,8 +8019,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     #[tokio::test]
     async fn duplicate_session_id_returns_error() {
         let (harness, core) = create_channels(ChannelConfig::default());
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
 
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(MockProvider::empty()), None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
 
@@ -7914,6 +8040,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -7935,6 +8062,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -7950,8 +8078,8 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
 
-        let provider = MockProvider::new("Hello from the LLM!");
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+        let provider = Arc::new(MockProvider::new("Hello from the LLM!"));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -7969,6 +8097,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -8061,10 +8190,10 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
 
-        let provider = ToolThenTextProvider {
+        let provider = Arc::new(ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
-        };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+        });
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -8082,6 +8211,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -8214,6 +8344,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             &provider,
         )
@@ -8334,10 +8465,10 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
-        let provider = ToolThenTextProvider {
+        let provider = Arc::new(ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
-        };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+        });
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -8355,6 +8486,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -8453,10 +8585,10 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
-        let provider = ToolThenTextProvider {
+        let provider = Arc::new(ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
-        };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+        });
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -8474,6 +8606,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -8566,10 +8699,10 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         std::fs::write(workspace.path().join("notes.txt"), "plan-only-read").unwrap();
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
-        let provider = ToolThenTextProvider {
+        let provider = Arc::new(ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
-        };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+        });
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -8587,6 +8720,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -8681,10 +8815,10 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let workspace = TempDir::new().unwrap();
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
-        let provider = ToolThenTextProvider {
+        let provider = Arc::new(ToolThenTextProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
-        };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+        });
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -8702,6 +8836,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -8782,6 +8917,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await
@@ -8797,7 +8933,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     async fn send_and_receive_mailbox_messages() {
         let (mut harness, core) = create_channels(ChannelConfig::default());
         let provider = Arc::new(MockProvider::empty());
-        let loop_handle = tokio::spawn(run_core_loop(core, provider, None));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let sender_id = SessionId::new();
         let receiver_id = SessionId::new();
@@ -8818,6 +8954,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     agent_key: None,
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
+                    session_llm: session_llm_config(provider.clone()),
                     reply: reply_tx,
                 })
                 .await
@@ -8937,10 +9074,10 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         let (harness, core) = create_channels(ChannelConfig::default());
         let mut output = harness.output;
-        let provider = RecvMessageProvider {
+        let provider = Arc::new(RecvMessageProvider {
             call_count: std::sync::atomic::AtomicU32::new(0),
-        };
-        let loop_handle = tokio::spawn(run_core_loop(core, Arc::new(provider), None));
+        });
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
 
         let receiver_id = SessionId::new();
         let sender_id = SessionId::new();
@@ -8959,6 +9096,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 agent_key: None,
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
                 reply: reply_tx,
             })
             .await

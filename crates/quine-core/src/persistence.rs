@@ -58,6 +58,8 @@ pub struct PersistedSessionConfig {
     pub team_key: Option<String>,
     #[serde(default)]
     pub memory_policy: MemoryPolicyConfig,
+    #[serde(default)]
+    pub model_profile: Option<String>,
 }
 
 fn default_permission_prompt_behavior() -> PermissionPromptBehavior {

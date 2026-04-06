@@ -107,6 +107,7 @@ pub mod error_codes {
 pub mod methods {
     pub const CREATE_SESSION: &str = "create_session";
     pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
+    pub const SET_SESSION_MODEL_PROFILE: &str = "set_session_model_profile";
     pub const SEND_MESSAGE: &str = "send_message";
     pub const COMPACT_SESSION: &str = "compact_session";
     pub const SUBMIT_TOOL_RESULT: &str = "submit_tool_result";

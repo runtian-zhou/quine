@@ -1,6 +1,7 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use quine_llm::Message;
+use quine_llm::{LlmProvider, Message};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
@@ -11,6 +12,22 @@ use crate::persistence::CoreCheckpoint;
 use crate::session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 use crate::skill::Skill;
 use crate::tool;
+
+#[derive(Clone)]
+pub struct SessionLlmConfig {
+    pub provider: Arc<dyn LlmProvider>,
+    pub max_context_window: Option<u64>,
+    pub model_profile: Option<String>,
+}
+
+impl std::fmt::Debug for SessionLlmConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionLlmConfig")
+            .field("max_context_window", &self.max_context_window)
+            .field("model_profile", &self.model_profile)
+            .finish()
+    }
+}
 
 /// Operations the harness sends into the core event loop.
 #[derive(Debug)]
@@ -38,6 +55,8 @@ pub enum CoreInput {
         team_key: Option<String>,
         /// Session memory scope and policy configuration.
         memory_policy: crate::memory::MemoryPolicyConfig,
+        /// Selected LLM provider/runtime config for this session.
+        session_llm: SessionLlmConfig,
         /// Acknowledges session creation.
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -51,6 +70,13 @@ pub enum CoreInput {
     /// Leave read-only plan mode for an existing session.
     ExitPlanMode {
         session_id: SessionId,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+
+    /// Update the active LLM provider for an existing session.
+    UpdateSessionLlm {
+        session_id: SessionId,
+        session_llm: SessionLlmConfig,
         reply: oneshot::Sender<Result<(), String>>,
     },
 
@@ -345,6 +371,31 @@ pub fn create_channels(config: ChannelConfig) -> (HarnessHandle, CoreHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quine_llm::{LlmEvent, ToolDefinition};
+    use std::pin::Pin;
+    use std::sync::Arc;
+
+    struct TestProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for TestProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            Ok(Box::pin(futures::stream::empty()))
+        }
+    }
+
+    fn test_session_llm_config() -> SessionLlmConfig {
+        SessionLlmConfig {
+            provider: Arc::new(TestProvider),
+            max_context_window: None,
+            model_profile: None,
+        }
+    }
 
     #[tokio::test]
     async fn channels_send_and_receive() {
@@ -407,6 +458,7 @@ mod tests {
                 agent_key: None,
                 team_key: None,
                 memory_policy: crate::memory::MemoryPolicyConfig::default(),
+                session_llm: test_session_llm_config(),
                 reply: reply_tx,
             })
             .await

@@ -75,6 +75,7 @@ pub async fn run_oneshot(
     json_output: bool,
     skills: &[String],
     auto_approve: bool,
+    model_profile: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
@@ -88,6 +89,9 @@ pub async fn run_oneshot(
             let mut session_params = serde_json::json!({});
             if !skills.is_empty() {
                 session_params["skills"] = serde_json::json!(skills);
+            }
+            if let Some(model_profile) = model_profile {
+                session_params["model_profile"] = serde_json::json!(model_profile);
             }
             session_params["prompt_behavior"] = serde_json::json!(if auto_approve {
                 PermissionPromptBehavior::Interactive

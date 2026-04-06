@@ -2,5 +2,8 @@
 .env
 .claude/settings.local.json
 target/
-.quine/
+.quine/*
+!.quine/skills/
+!.quine/skills/**
+!.quine/model-profiles.yaml
 .env_DONT_USE

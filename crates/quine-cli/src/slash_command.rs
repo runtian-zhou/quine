@@ -13,7 +13,7 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     };
 
     match name {
-        "quit" | "plan" | "loop" | "compact" | "context" | "ps" | "clear" | "switch" => {
+        "quit" | "plan" | "loop" | "compact" | "context" | "ps" | "clear" | "switch" | "model" => {
             Some(SlashCommand::BuiltIn {
                 name: name.to_string(),
                 arguments: arguments.to_string(),
@@ -137,6 +137,17 @@ mod tests {
             Some(SlashCommand::BuiltIn {
                 name: "switch".into(),
                 arguments: "session-123".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_model_command() {
+        assert_eq!(
+            parse_slash_command("/model claude-sonnet"),
+            Some(SlashCommand::BuiltIn {
+                name: "model".into(),
+                arguments: "claude-sonnet".into(),
             })
         );
     }

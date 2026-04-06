@@ -15,7 +15,8 @@ pub mod skill;
 pub mod tool;
 
 pub use channel::{
-    create_channels, ChannelConfig, CoreHandle, CoreInput, CoreOutput, HarnessHandle, ToolOutcome,
+    create_channels, ChannelConfig, CoreHandle, CoreInput, CoreOutput, HarnessHandle,
+    SessionLlmConfig, ToolOutcome,
 };
 pub use engine::{
     run_core_loop, run_core_loop_with_compaction, run_core_loop_with_compaction_and_web_provider,

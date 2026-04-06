@@ -15,13 +15,14 @@ services:
       LLM_PROVIDER: ${LLM_PROVIDER:-openai}
       LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:8000/v1}
       LLM_API_KEY: ${LLM_API_KEY:-}
-      LLM_MODEL: ${LLM_MODEL:-qwen-3.5}
+      LLM_MODEL: ${LLM_MODEL:-gpt-5.4}
       LLM_CONTEXT_WINDOW: ${LLM_CONTEXT_WINDOW:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       ANTHROPIC_BASE_URL: ${ANTHROPIC_BASE_URL:-}
       PERMISSION_LLM_ENABLED: ${PERMISSION_LLM_ENABLED:-false}
     volumes:
       - .:/workspace
+      - ./.quine/model-profiles.yaml:/root/.quine/model-profiles.yaml:ro
       - cargo-registry:/usr/local/cargo/registry
       - cargo-git:/usr/local/cargo/git
       - quine-target:/workspace/target

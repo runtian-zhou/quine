@@ -15,7 +15,7 @@ use tokio::time::Duration;
 
 use crate::config::{
     default_memory_dir_from_state_dir, default_state_dir, load_persisted_permission_rules,
-    max_context_window_from_env, SessionConfig,
+    max_context_window_from_env, resolve_session_llm_config, SessionConfig,
 };
 
 use crate::error::HarnessError;
@@ -39,6 +39,7 @@ pub struct LocalHarness {
     _storage: Arc<StorageManager>,
     /// Mirrored live/restored session states.
     sessions: Arc<Mutex<HashMap<SessionId, SessionListing>>>,
+    provider_manager: ProviderManager,
 }
 
 #[derive(Debug, Clone)]
@@ -50,6 +51,66 @@ struct SessionListing {
     summary: Option<String>,
     plan_mode: bool,
     parent_id: Option<SessionId>,
+    model_profile: Option<String>,
+}
+
+#[derive(Clone)]
+struct ProviderManager {
+    default_provider: Arc<dyn LlmProvider>,
+    default_max_context_window: Option<u64>,
+}
+
+impl ProviderManager {
+    fn new(
+        default_provider: Arc<dyn LlmProvider>,
+        default_max_context_window: Option<u64>,
+    ) -> Self {
+        Self {
+            default_provider,
+            default_max_context_window,
+        }
+    }
+
+    fn resolve(
+        &self,
+        model_profile: Option<&str>,
+    ) -> Result<quine_core::SessionLlmConfig, HarnessError> {
+        match model_profile {
+            Some(profile) => resolve_session_llm_config(Some(profile)).map_err(|error| {
+                HarnessError::SessionCreationFailed {
+                    reason: error.to_string(),
+                }
+            }),
+            None => Ok(quine_core::SessionLlmConfig {
+                provider: Arc::clone(&self.default_provider),
+                max_context_window: self.default_max_context_window,
+                model_profile: None,
+            }),
+        }
+    }
+
+    fn resolve_for_restore(&self, model_profile: Option<&str>) -> quine_core::SessionLlmConfig {
+        match model_profile {
+            Some(profile) => match self.resolve(Some(profile)) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!(
+                        "[daemon] restored session model profile `{profile}` is unavailable; falling back to default provider: {error}"
+                    );
+                    quine_core::SessionLlmConfig {
+                        provider: Arc::clone(&self.default_provider),
+                        max_context_window: self.default_max_context_window,
+                        model_profile: None,
+                    }
+                }
+            },
+            None => quine_core::SessionLlmConfig {
+                provider: Arc::clone(&self.default_provider),
+                max_context_window: self.default_max_context_window,
+                model_profile: None,
+            },
+        }
+    }
 }
 
 fn persisted_listing_summary(session: &quine_core::PersistedSession) -> Option<String> {
@@ -201,6 +262,7 @@ impl LocalHarness {
                                     .parents
                                     .get(&session.session_id)
                                     .copied(),
+                                model_profile: session.config.model_profile.clone(),
                             },
                         )
                     })
@@ -210,11 +272,28 @@ impl LocalHarness {
         let sessions = Arc::new(Mutex::new(initial_sessions));
 
         let max_context_window = max_context_window_from_env();
+        let provider_manager = ProviderManager::new(Arc::clone(&provider), max_context_window);
+        let restored_profile_updates = restored_checkpoint
+            .as_ref()
+            .map(|checkpoint| {
+                checkpoint
+                    .sessions
+                    .iter()
+                    .filter_map(|session| {
+                        session
+                            .config
+                            .model_profile
+                            .as_ref()
+                            .map(|profile| (session.session_id, profile.clone()))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         // Spawn the core event loop.
         let core_task = tokio::spawn(quine_core::run_core_loop_with_compaction_and_web_provider(
             core_handle,
-            provider,
+            Arc::clone(&provider),
             web_provider,
             restored_checkpoint,
             archive_root,
@@ -232,14 +311,40 @@ impl LocalHarness {
             memory_store,
         ));
 
-        Ok(Self {
+        let harness = Self {
             core_input: input,
             event_tx,
             _core_task: core_task,
             _fanout_task: fanout_task,
             _storage: storage,
             sessions,
-        })
+            provider_manager,
+        };
+
+        for (session_id, profile) in restored_profile_updates {
+            let session_llm = harness.provider_manager.resolve_for_restore(Some(&profile));
+            let restored_model_profile = session_llm.model_profile.clone();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            harness
+                .core_input
+                .send(CoreInput::UpdateSessionLlm {
+                    session_id,
+                    session_llm,
+                    reply: reply_tx,
+                })
+                .await
+                .map_err(|_| HarnessError::CoreChannelClosed)?;
+            reply_rx
+                .await
+                .map_err(|_| HarnessError::CoreChannelClosed)?
+                .map_err(|reason| HarnessError::SessionCreationFailed { reason })?;
+            let mut sessions = harness.sessions.lock().await;
+            if let Some(session) = sessions.get_mut(&session_id) {
+                session.model_profile = restored_model_profile;
+            }
+        }
+
+        Ok(harness)
     }
 
     /// Queue a user message to be delivered after `delay`.
@@ -352,6 +457,7 @@ impl LocalHarness {
                                 summary: None,
                                 plan_mode: false,
                                 parent_id: None,
+                                model_profile: None,
                             });
                     }
                 }
@@ -404,6 +510,9 @@ impl HarnessService for LocalHarness {
                     reason: error.to_string(),
                 }
             })?;
+        let session_llm = self
+            .provider_manager
+            .resolve(config.model_profile.as_deref())?;
 
         self.core_input
             .send(CoreInput::CreateSession {
@@ -418,6 +527,7 @@ impl HarnessService for LocalHarness {
                 agent_key: config.agent_key,
                 team_key: config.team_key,
                 memory_policy: config.memory_policy,
+                session_llm: session_llm.clone(),
                 reply: reply_tx,
             })
             .await
@@ -438,6 +548,7 @@ impl HarnessService for LocalHarness {
                 summary: None,
                 plan_mode: config.plan_mode,
                 parent_id: None,
+                model_profile: session_llm.model_profile,
             },
         );
 
@@ -471,6 +582,32 @@ impl HarnessService for LocalHarness {
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)?
             .map_err(|message| HarnessError::Internal { message })
+    }
+
+    async fn set_session_model_profile(
+        &self,
+        session_id: SessionId,
+        model_profile: String,
+    ) -> Result<(), HarnessError> {
+        let session_llm = self.provider_manager.resolve(Some(&model_profile))?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.core_input
+            .send(CoreInput::UpdateSessionLlm {
+                session_id,
+                session_llm,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+        reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|message| HarnessError::Internal { message })?;
+
+        if let Some(session) = self.sessions.lock().await.get_mut(&session_id) {
+            session.model_profile = Some(model_profile);
+        }
+        Ok(())
     }
 
     async fn compact_session(&self, session_id: SessionId) -> Result<(), HarnessError> {
@@ -564,6 +701,7 @@ impl HarnessService for LocalHarness {
                     "summary": session.summary,
                     "plan_mode": session.plan_mode,
                     "parent_id": session.parent_id.map(serialize_session_id),
+                    "model_profile": session.model_profile,
                     "root_id": root_id,
                     "depth": depth,
                 })
@@ -669,6 +807,16 @@ impl HarnessService for LocalHarness {
             .map_err(|_| HarnessError::CoreChannelClosed)?
             .map_err(|reason| HarnessError::SessionCreationFailed { reason })?;
 
+        let inherited_model_profile = if let Some(id) = parent_id {
+            self.sessions
+                .lock()
+                .await
+                .get(&id)
+                .and_then(|session| session.model_profile.clone())
+        } else {
+            None
+        };
+
         self.sessions.lock().await.insert(
             child_id,
             SessionListing {
@@ -679,6 +827,7 @@ impl HarnessService for LocalHarness {
                 summary: None,
                 plan_mode: false,
                 parent_id,
+                model_profile: inherited_model_profile,
             },
         );
 
@@ -839,6 +988,7 @@ mod tests {
                 agent_key: None,
                 team_key: None,
                 memory_policy: quine_core::MemoryPolicyConfig::default(),
+                model_profile: None,
             },
             history: Vec::new(),
             plan_store: quine_core::PersistedPlanStore::default(),
@@ -1591,6 +1741,59 @@ mod tests {
         .unwrap();
 
         restored.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
+    async fn local_harness_restore_falls_back_for_unknown_model_profile() {
+        let storage = temp_storage();
+        storage
+            .commit_checkpoint(&CoreCheckpoint::new(
+                vec![quine_core::PersistedSession {
+                    session_id: SessionId::new(),
+                    created_at: Utc::now(),
+                    state: quine_core::PersistedSessionState::Idle,
+                    config: quine_core::PersistedSessionConfig {
+                        system_prompt: None,
+                        skill_names: Vec::new(),
+                        working_directory: std::env::current_dir().unwrap_or_default(),
+                        plan_mode: false,
+                        prompt_behavior: PermissionPromptBehavior::Interactive,
+                        prompt_memory_mode: quine_core::PromptMemoryMode::Disabled,
+                        agent_key: None,
+                        team_key: None,
+                        memory_policy: quine_core::MemoryPolicyConfig::default(),
+                        model_profile: Some("missing-profile".into()),
+                    },
+                    history: Vec::new(),
+                    plan_store: quine_core::PersistedPlanStore::default(),
+                    memory_state: None,
+                    permission_state: None,
+                }],
+                quine_core::PersistedSessionTree {
+                    parents: HashMap::new(),
+                    children: HashMap::new(),
+                    exit_statuses: HashMap::new(),
+                },
+            ))
+            .await
+            .unwrap();
+
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .expect("unknown restored model profiles should fall back during startup");
+
+        let sessions = harness.list_sessions().await.unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0]
+                .get("model_profile")
+                .and_then(|value| value.as_str()),
+            None
+        );
+
+        harness.shutdown().await.unwrap();
+
         let _ = fs::remove_dir_all(storage.root());
     }
 
