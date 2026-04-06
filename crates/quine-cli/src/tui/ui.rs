@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
     AgentPhase, App, ContextExplorerState, ContextExplorerTab, ConversationEntry,
-    ConversationRenderCache, InputBuffer, ToolStatus,
+    ConversationRenderCache, InputBuffer, ToolBatchCall, ToolStatus,
 };
 
 /// Format a duration in microseconds to a human-readable string.
@@ -325,6 +325,52 @@ fn render_bash_preview_box(lines: &mut Vec<Line<'static>>, preview: &str, width:
     )));
 }
 
+fn push_tool_batch_entry_lines(
+    lines: &mut Vec<Line<'static>>,
+    calls: &[ToolBatchCall],
+    area_width: u16,
+) {
+    lines.push(Line::from(vec![
+        Span::raw("    "),
+        Span::styled(
+            format!("▌ Tools ({})", calls.len()),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+
+    for (index, call) in calls.iter().enumerate() {
+        let branch = if index + 1 == calls.len() {
+            "└"
+        } else {
+            "├"
+        };
+        let (marker, marker_style) = match &call.status {
+            ToolStatus::Running { .. } => ("⟳", Style::default().fg(Color::Yellow)),
+            ToolStatus::Success { .. } => ("✓", Style::default().fg(Color::Green)),
+            ToolStatus::Error { .. } => ("✗", Style::default().fg(Color::Red)),
+        };
+        let label = if call.summary.is_empty() {
+            call.tool_name.clone()
+        } else {
+            format!("{}: {}", call.tool_name, call.summary)
+        };
+        lines.push(Line::from(vec![
+            Span::raw("    "),
+            Span::styled(format!("{branch} {marker}"), marker_style),
+            Span::raw(format!(" {label}")),
+        ]));
+
+        if let Some(preview) = call.result_preview.as_deref() {
+            let preview = preview.trim();
+            if !preview.is_empty() {
+                render_bash_preview_box(lines, preview, area_width);
+            }
+        }
+    }
+}
+
 fn push_conversation_entry_lines(
     lines: &mut Vec<Line<'static>>,
     entry: &ConversationEntry,
@@ -347,6 +393,9 @@ fn push_conversation_entry_lines(
             for line in text.lines() {
                 lines.push(Line::from(Span::raw(format!("  {line}"))));
             }
+        }
+        ConversationEntry::ToolBatch { calls } => {
+            push_tool_batch_entry_lines(lines, calls, area_width);
         }
         ConversationEntry::ToolCall {
             tool_name,
@@ -554,14 +603,49 @@ fn should_insert_separator(previous: &ConversationEntry, current: &ConversationE
 
 fn build_conversation_lines(app: &App, area_width: u16) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut previous_entry: Option<&ConversationEntry> = None;
-    for entry in &app.messages {
-        if let Some(previous) = previous_entry {
-            if should_insert_separator(previous, entry) {
+    let mut previous_entry: Option<ConversationEntry> = None;
+    let mut index = 0usize;
+    while index < app.messages.len() {
+        let entry = if matches!(
+            app.messages.get(index),
+            Some(ConversationEntry::ToolCall { .. })
+        ) {
+            let mut calls = Vec::new();
+            let mut cursor = index;
+            while let Some(ConversationEntry::ToolCall {
+                tool_name,
+                summary,
+                status,
+                result_preview,
+                ..
+            }) = app.messages.get(cursor)
+            {
+                calls.push(ToolBatchCall {
+                    tool_name: tool_name.clone(),
+                    summary: summary.clone(),
+                    status: status.clone(),
+                    result_preview: result_preview.clone(),
+                });
+                cursor += 1;
+            }
+            index = cursor;
+            if calls.len() > 1 {
+                ConversationEntry::ToolBatch { calls }
+            } else {
+                app.messages[index - 1].clone()
+            }
+        } else {
+            let entry = app.messages[index].clone();
+            index += 1;
+            entry
+        };
+
+        if let Some(previous) = previous_entry.as_ref() {
+            if should_insert_separator(previous, &entry) {
                 lines.push(Line::from(""));
             }
         }
-        push_conversation_entry_lines(&mut lines, entry, area_width, app.max_context_window);
+        push_conversation_entry_lines(&mut lines, &entry, area_width, app.max_context_window);
         previous_entry = Some(entry);
     }
     append_live_lines(&mut lines, app);
@@ -668,20 +752,39 @@ fn format_context_entry_label(index: usize, explorer: &ContextExplorerState) -> 
             text,
             tool_calls,
         }) => {
-            let tool_summary = tool_calls
-                .first()
-                .map(|call| call.tool_name.as_str())
-                .unwrap_or("tool");
             let suffix = text
                 .as_deref()
                 .and_then(|value| value.lines().next())
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("");
-            if suffix.is_empty() {
-                format!("{entry_number:>3}. {role}: tool {tool_summary}")
+            if tool_calls.len() > 1 {
+                let names = tool_calls
+                    .iter()
+                    .map(|call| call.tool_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if suffix.is_empty() {
+                    format!(
+                        "{entry_number:>3}. {role}: tool batch ({}) [{names}]",
+                        tool_calls.len()
+                    )
+                } else {
+                    format!(
+                        "{entry_number:>3}. {role}: batch ({}) {suffix}",
+                        tool_calls.len()
+                    )
+                }
             } else {
-                format!("{entry_number:>3}. {role}: {suffix}")
+                let tool_summary = tool_calls
+                    .first()
+                    .map(|call| call.tool_name.as_str())
+                    .unwrap_or("tool");
+                if suffix.is_empty() {
+                    format!("{entry_number:>3}. {role}: tool {tool_summary}")
+                } else {
+                    format!("{entry_number:>3}. {role}: {suffix}")
+                }
             }
         }
         Some(crate::context_debug::HistoryEntry::ToolResult {
@@ -801,6 +904,15 @@ fn format_context_entry_detail(explorer: &ContextExplorerState) -> String {
             tool_calls,
         }) => {
             let mut detail = format!("kind: tool_use\nrole: {role}\n");
+            if tool_calls.len() > 1 {
+                detail.push_str(&format!("tool_batch_size: {}\n", tool_calls.len()));
+                let tool_names = tool_calls
+                    .iter()
+                    .map(|call| call.tool_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                detail.push_str(&format!("tool_batch: [{tool_names}]\n"));
+            }
             if let Some(text) = text {
                 detail.push_str("\ntext:\n");
                 detail.push_str(text);

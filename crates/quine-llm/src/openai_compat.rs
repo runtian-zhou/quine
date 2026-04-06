@@ -21,6 +21,8 @@ pub struct OpenAiCompatConfig {
     pub model: String,
     /// Maximum tokens to generate.
     pub max_tokens: Option<u32>,
+    /// Whether to ask the provider to emit parallelizable tool call batches.
+    pub parallel_tool_calls: bool,
 }
 
 /// An LLM provider adapter for OpenAI-compatible APIs.
@@ -56,6 +58,8 @@ struct ChatRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<OpenAiTool>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    parallel_tool_calls: bool,
 }
 
 #[derive(Serialize)]
@@ -313,6 +317,7 @@ impl LlmProvider for OpenAiCompatProvider {
             }),
             max_tokens: self.config.max_tokens,
             tools: convert_tools(tools),
+            parallel_tool_calls: self.config.parallel_tool_calls,
         };
 
         let mut req = self.client.post(&url).json(&request_body);

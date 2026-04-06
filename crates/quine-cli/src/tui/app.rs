@@ -125,6 +125,9 @@ pub enum ConversationEntry {
         status: ToolStatus,
         result_preview: Option<String>,
     },
+    ToolBatch {
+        calls: Vec<ToolBatchCall>,
+    },
     PatchPreview(String),
     PlanBox(String),
     PlanProgress {
@@ -146,6 +149,14 @@ pub enum ConversationEntry {
         duration_us: u64,
         usage: Option<quine_llm::TokenUsage>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct ToolBatchCall {
+    pub tool_name: String,
+    pub summary: String,
+    pub status: ToolStatus,
+    pub result_preview: Option<String>,
 }
 
 /// Current phase of the agent turn.

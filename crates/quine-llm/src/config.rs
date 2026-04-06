@@ -30,6 +30,7 @@ mod tests {
             api_key: None,
             model: "gpt-5.4".into(),
             max_tokens: Some(2048),
+            parallel_tool_calls: false,
         });
         let _provider = create_provider(config);
     }
