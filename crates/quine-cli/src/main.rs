@@ -4,6 +4,7 @@ mod client;
 mod context_debug;
 mod interaction;
 mod log;
+mod ps;
 mod render;
 mod run;
 mod session;

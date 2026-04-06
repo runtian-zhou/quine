@@ -1,6 +1,9 @@
 use std::path::Path;
 
+use chrono::{DateTime, Local};
+
 use crate::client::IpcClient;
+use crate::ps::{format_session_summary, prepend_summary};
 use quine_harness::protocol::methods;
 
 /// Handle the `ps` command: list active agent sessions.
@@ -194,58 +197,117 @@ fn parse_signal_string(signal: &str) -> anyhow::Result<String> {
 
 /// Format sessions as a table for terminal output.
 fn print_sessions_table(sessions: &[serde_json::Value], tree: bool) {
+    let summary = format_status_summary(sessions);
+
     if sessions.is_empty() {
-        println!("No active sessions.");
+        println!("{summary}");
         return;
     }
 
     if tree {
-        for line in format_tree_lines(sessions) {
-            println!("{line}");
-        }
+        let body = format_tree_lines(sessions).join("\n");
+        println!("{}", prepend_summary(&summary, &body));
         return;
     }
 
-    println!(
-        "{:<38} {:<12} {:<24} EVENTS",
-        "SESSION ID", "STATUS", "CREATED"
-    );
-    println!("{}", "-".repeat(80));
+    let summary_width = sessions
+        .iter()
+        .map(|session| session_summary_label(session).len())
+        .max()
+        .unwrap_or(7)
+        .max("SUMMARY".len());
+    let created_width = 16usize;
+
+    let mut lines = Vec::with_capacity(sessions.len() + 2);
+    lines.push(format!(
+        "{:<38} {:<12} {:<created_width$} {:<6} {:<summary_width$}",
+        "SESSION ID",
+        "STATUS",
+        "CREATED",
+        "EVENTS",
+        "SUMMARY",
+        created_width = created_width,
+        summary_width = summary_width,
+    ));
+    lines.push("-".repeat(79 + created_width + summary_width));
 
     for session in sessions {
         let id = session
             .get("session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let status = session
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let created = session
-            .get("first_event")
-            .and_then(|v| v.as_str())
-            .unwrap_or("-");
+        let status = session_status_label(session);
+        let created = compact_timestamp(session);
         let event_count = session
             .get("event_count")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        let session_summary = session_summary_label(session);
 
-        println!("{id:<38} {status:<12} {created:<24} {event_count}");
+        lines.push(format!(
+            "{id:<38} {status:<12} {created:<created_width$} {event_count:<6} {session_summary:<summary_width$}",
+            created_width = created_width,
+            summary_width = summary_width,
+        ));
     }
+
+    println!("{}", prepend_summary(&summary, &lines.join("\n")));
+}
+
+fn format_status_summary(sessions: &[serde_json::Value]) -> String {
+    format_session_summary(sessions.iter().map(session_status_label))
+}
+
+fn session_status_label(session: &serde_json::Value) -> &str {
+    session
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn session_summary_label(session: &serde_json::Value) -> &str {
+    session
+        .get("summary")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| session.get("title").and_then(serde_json::Value::as_str))
+        .unwrap_or("")
+}
+
+fn compact_timestamp(session: &serde_json::Value) -> String {
+    session
+        .get("first_event")
+        .and_then(|v| v.as_str())
+        .and_then(parse_timestamp)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn parse_timestamp(raw: &str) -> Option<String> {
+    DateTime::parse_from_rfc3339(raw).ok().map(|timestamp| {
+        timestamp
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    })
 }
 
 /// Format sessions as a table and return as a string.
 #[cfg(test)]
 fn format_ps_table(sessions: &[serde_json::Value]) -> String {
+    let summary = format_status_summary(sessions);
     if sessions.is_empty() {
-        return "No active sessions.".to_string();
+        return summary;
     }
 
+    let created_width = 16usize;
     let mut output = format!(
-        "{:<38} {:<12} {:<24} EVENTS\n",
-        "SESSION ID", "STATUS", "CREATED"
+        "{:<38} {:<12} {:<created_width$} {:<6} SUMMARY\n",
+        "SESSION ID",
+        "STATUS",
+        "CREATED",
+        "EVENTS",
+        created_width = created_width,
     );
-    output.push_str(&"-".repeat(80));
+    output.push_str(&"-".repeat(79 + created_width + "SUMMARY".len()));
     output.push('\n');
 
     for session in sessions {
@@ -253,41 +315,38 @@ fn format_ps_table(sessions: &[serde_json::Value]) -> String {
             .get("session_id")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let status = session
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let created = session
-            .get("first_event")
-            .and_then(|v| v.as_str())
-            .unwrap_or("-");
+        let status = session_status_label(session);
+        let created = compact_timestamp(session);
         let event_count = session
             .get("event_count")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
+        let session_summary = session_summary_label(session);
 
         output.push_str(&format!(
-            "{id:<38} {status:<12} {created:<24} {event_count}\n"
+            "{id:<38} {status:<12} {created:<created_width$} {event_count:<6} {session_summary}\n",
+            created_width = created_width,
         ));
     }
 
-    output
+    prepend_summary(&summary, &output)
 }
 
 #[cfg(test)]
 fn format_ps_tree(sessions: &[serde_json::Value]) -> String {
+    let summary = format_status_summary(sessions);
     if sessions.is_empty() {
-        return "No active sessions.".to_string();
+        return summary;
     }
 
-    format_tree_lines(sessions).join("\n")
+    prepend_summary(&summary, &format_tree_lines(sessions).join("\n"))
 }
 
 fn format_tree_lines(sessions: &[serde_json::Value]) -> Vec<String> {
     use std::collections::BTreeMap;
 
     if sessions.is_empty() {
-        return vec!["No active sessions.".to_string()];
+        return vec!["0 sessions".to_string()];
     }
 
     let mut records = BTreeMap::new();
@@ -343,14 +402,20 @@ fn push_tree_lines(
             .get("event_count")
             .and_then(|v| v.as_u64())
             .unwrap_or(0);
-        let created = session
-            .get("first_event")
-            .and_then(|v| v.as_str())
-            .unwrap_or("-");
+        let created = compact_timestamp(session);
+        let session_summary = session_summary_label(session);
         let indent = "  ".repeat(depth);
         lines.push(format!(
-            "{indent}{} [{}] events={} created={created}",
-            session_id, status, event_count
+            "{indent}{} [{}] {} ev {}{}",
+            session_id,
+            status,
+            event_count,
+            created,
+            if session_summary.is_empty() {
+                String::new()
+            } else {
+                format!(" — {session_summary}")
+            }
         ));
         if let Some(child_ids) = children.get(&Some(session_id.to_string())) {
             for child_id in child_ids {
@@ -405,7 +470,7 @@ mod tests {
     fn format_ps_table_empty() {
         let sessions: Vec<serde_json::Value> = vec![];
         let output = format_ps_table(&sessions);
-        assert_eq!(output, "No active sessions.");
+        assert_eq!(output, "0 sessions");
     }
 
     #[test]
@@ -414,20 +479,22 @@ mod tests {
             "session_id": "abc-123",
             "status": "active",
             "first_event": "2026-01-01T00:00:00Z",
-            "event_count": 42
+            "event_count": 42,
+            "summary": "Working on ps output"
         })];
         let output = format_ps_table(&sessions);
-        assert!(output.contains("SESSION ID"));
+        assert!(output.starts_with("1 sessions · 1 active\n\nSESSION ID"));
         assert!(output.contains("abc-123"));
         assert!(output.contains("active"));
         assert!(output.contains("42"));
+        assert!(output.contains("Working on ps output"));
     }
 
     #[test]
     fn format_ps_table_missing_fields() {
         let sessions = vec![serde_json::json!({})];
         let output = format_ps_table(&sessions);
-        assert!(output.contains("unknown"));
+        assert!(output.starts_with("1 sessions · 1 unknown"));
     }
 
     #[test]
@@ -450,7 +517,23 @@ mod tests {
         ];
 
         let output = format_ps_tree(&sessions);
+        assert!(output.starts_with("2 sessions · 1 idle · 1 waiting"));
         assert!(output.contains("parent [idle]"));
         assert!(output.contains("  child [waiting]"));
+    }
+
+    #[test]
+    fn format_ps_tree_shows_summary() {
+        let sessions = vec![serde_json::json!({
+            "session_id": "parent",
+            "status": "idle",
+            "first_event": "2026-01-01T00:00:00Z",
+            "event_count": 2,
+            "parent_id": null,
+            "summary": "Top level summary"
+        })];
+
+        let output = format_ps_tree(&sessions);
+        assert!(output.contains("— Top level summary"));
     }
 }

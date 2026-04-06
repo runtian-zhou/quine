@@ -90,6 +90,8 @@ pub struct PersistedSessionMemoryState {
     pub enabled: bool,
     pub last_summarized_message_index: Option<usize>,
     pub template_version: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listing_summary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -245,6 +247,7 @@ mod tests {
                 enabled: true,
                 last_summarized_message_index: Some(4),
                 template_version: 1,
+                listing_summary: Some("Summarizes the current session for listing.".into()),
             }),
             persistent_memory: Some(PersistedPersistentMemoryState {
                 enabled: true,
