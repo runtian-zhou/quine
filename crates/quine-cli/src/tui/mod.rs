@@ -365,16 +365,19 @@ async fn run_event_loop(
     auto_approve: bool,
 ) -> anyhow::Result<()> {
     let mut last_context_visible = app.context_explorer_active();
-    let mut force_terminal_clear = false;
     loop {
         // Draw.
         terminal.draw(|frame| {
-            if force_terminal_clear || app.context_explorer_active() != last_context_visible {
+            if app.context_explorer_active() != last_context_visible {
                 frame.render_widget(TuiClear, frame.area());
             }
             ui::draw(frame, app)
         })?;
-        force_terminal_clear = false;
+        if let Some(explorer) = app.context_explorer.as_mut() {
+            if explorer.detail_flush_pending {
+                explorer.detail_flush_pending = false;
+            }
+        }
         last_context_visible = app.context_explorer_active();
 
         if app.should_quit {
@@ -387,12 +390,7 @@ async fn run_event_loop(
                 match maybe_event {
                     Some(Ok(event)) => {
                         if let Some(action) = handle_terminal_event(app, event) {
-                            if matches!(action, AppAction::ForceFullRedraw) {
-                                terminal.clear()?;
-                                force_terminal_clear = true;
-                            } else {
-                                execute_action(app, client, skills, available_skills, socket_path, action).await?;
-                            }
+                            execute_action(app, client, skills, available_skills, socket_path, action).await?;
                         }
                     }
                     Some(Err(_)) | None => {
@@ -459,23 +457,23 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 return match code {
                     KeyCode::Esc => {
                         app.close_context_explorer();
-                        Some(AppAction::ForceFullRedraw)
+                        None
                     }
                     KeyCode::Left | KeyCode::Char('h') => {
                         app.context_explorer_prev_tab();
-                        Some(AppAction::ForceFullRedraw)
+                        None
                     }
                     KeyCode::Right | KeyCode::Char('l') => {
                         app.context_explorer_next_tab();
-                        Some(AppAction::ForceFullRedraw)
+                        None
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
                         app.context_explorer_move_up();
-                        Some(AppAction::ForceFullRedraw)
+                        None
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
                         app.context_explorer_move_down();
-                        Some(AppAction::ForceFullRedraw)
+                        None
                     }
                     KeyCode::PageUp => {
                         let step = if app.last_view_height > 2 {
@@ -484,7 +482,7 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                             10
                         };
                         app.context_explorer_scroll_up(step);
-                        Some(AppAction::ForceFullRedraw)
+                        None
                     }
                     KeyCode::PageDown => {
                         let step = if app.last_view_height > 2 {
@@ -493,15 +491,15 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                             10
                         };
                         app.context_explorer_scroll_down(step);
-                        Some(AppAction::ForceFullRedraw)
+                        None
                     }
                     KeyCode::Home => {
                         app.context_explorer_move_to_first();
-                        Some(AppAction::ForceFullRedraw)
+                        None
                     }
                     KeyCode::End => {
                         app.context_explorer_move_to_last();
-                        Some(AppAction::ForceFullRedraw)
+                        None
                     }
                     _ => None,
                 };
@@ -865,7 +863,6 @@ async fn execute_action(
             app.messages
                 .push(app::ConversationEntry::Error("(cancelled)".into()));
         }
-        AppAction::ForceFullRedraw => {}
         AppAction::Quit => {
             app.should_quit = true;
         }

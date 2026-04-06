@@ -325,6 +325,10 @@ fn render_bash_preview_box(lines: &mut Vec<Line<'static>>, preview: &str, width:
     )));
 }
 
+fn render_grouped_plan_preview(lines: &mut Vec<Line<'static>>, preview: &str, width: u16) {
+    render_plan_box(lines, preview, width);
+}
+
 fn push_tool_batch_entry_lines(
     lines: &mut Vec<Line<'static>>,
     calls: &[ToolBatchCall],
@@ -365,7 +369,11 @@ fn push_tool_batch_entry_lines(
         if let Some(preview) = call.result_preview.as_deref() {
             let preview = preview.trim();
             if !preview.is_empty() {
-                render_bash_preview_box(lines, preview, area_width);
+                if call.tool_name == "plan" {
+                    render_grouped_plan_preview(lines, preview, area_width);
+                } else if call.tool_name == "bash" {
+                    render_bash_preview_box(lines, preview, area_width);
+                }
             }
         }
     }
@@ -1176,7 +1184,12 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             let detail_inner = detail_block.inner(columns[1]);
             frame.render_widget(detail_block, columns[1]);
             paint_blank_area(frame, detail_inner);
-            let detail = Paragraph::new(format_context_entry_detail(explorer))
+            let detail_text = if explorer.detail_flush_pending {
+                "\n".repeat(detail_inner.height.saturating_sub(1) as usize)
+            } else {
+                format_context_entry_detail(explorer)
+            };
+            let detail = Paragraph::new(detail_text)
                 .wrap(Wrap { trim: false })
                 .scroll((explorer.scroll_offset, 0));
             frame.render_widget(detail, detail_inner);
@@ -1235,7 +1248,12 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             let detail_inner = detail_block.inner(columns[1]);
             frame.render_widget(detail_block, columns[1]);
             paint_blank_area(frame, detail_inner);
-            let detail = Paragraph::new(format_tool_detail(explorer))
+            let detail_text = if explorer.detail_flush_pending {
+                "\n".repeat(detail_inner.height.saturating_sub(1) as usize)
+            } else {
+                format_tool_detail(explorer)
+            };
+            let detail = Paragraph::new(detail_text)
                 .wrap(Wrap { trim: false })
                 .scroll((explorer.scroll_offset, 0));
             frame.render_widget(detail, detail_inner);
@@ -1294,7 +1312,12 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             let detail_inner = detail_block.inner(columns[1]);
             frame.render_widget(detail_block, columns[1]);
             paint_blank_area(frame, detail_inner);
-            let detail = Paragraph::new(format_skill_detail(explorer))
+            let detail_text = if explorer.detail_flush_pending {
+                "\n".repeat(detail_inner.height.saturating_sub(1) as usize)
+            } else {
+                format_skill_detail(explorer)
+            };
+            let detail = Paragraph::new(detail_text)
                 .wrap(Wrap { trim: false })
                 .scroll((explorer.scroll_offset, 0));
             frame.render_widget(detail, detail_inner);
@@ -1302,10 +1325,14 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
         ContextExplorerTab::Plans => {
             frame.render_widget(Clear, sections[2]);
             paint_blank_area(frame, sections[2]);
-            let plans = Paragraph::new(Text::from(format_plans_tab_lines(explorer)))
-                .block(Block::default().title(" Plans ").borders(Borders::ALL))
-                .wrap(Wrap { trim: false })
-                .scroll((explorer.scroll_offset, 0));
+            let plans = if explorer.detail_flush_pending {
+                Paragraph::new("\n".repeat(sections[2].height.saturating_sub(1) as usize))
+            } else {
+                Paragraph::new(Text::from(format_plans_tab_lines(explorer)))
+            }
+            .block(Block::default().title(" Plans ").borders(Borders::ALL))
+            .wrap(Wrap { trim: false })
+            .scroll((explorer.scroll_offset, 0));
             frame.render_widget(plans, sections[2]);
         }
     }
@@ -1783,6 +1810,9 @@ mod tests {
         let mut app = App::new("test".into(), false, None);
         app.open_context_explorer(snapshot);
         app.context_explorer_move_down();
+        if let Some(explorer) = app.context_explorer.as_mut() {
+            explorer.detail_flush_pending = false;
+        }
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1822,6 +1852,9 @@ mod tests {
         let mut app = App::new("test".into(), false, None);
         app.open_context_explorer(snapshot);
         app.context_explorer_next_tab();
+        if let Some(explorer) = app.context_explorer.as_mut() {
+            explorer.detail_flush_pending = false;
+        }
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1864,6 +1897,9 @@ mod tests {
         app.open_context_explorer(snapshot);
         app.context_explorer_next_tab();
         app.context_explorer_next_tab();
+        if let Some(explorer) = app.context_explorer.as_mut() {
+            explorer.detail_flush_pending = false;
+        }
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -2252,6 +2288,39 @@ mod tests {
     }
 
     #[test]
+    fn draw_grouped_plan_tool_preview_renders_plan_box() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "plan".into(),
+            tool_use_id: "tc1".into(),
+            summary: "create_plan: Demo".into(),
+            status: ToolStatus::Success { duration_us: 42 },
+            result_preview: Some("Plan: Demo\n🟢 [a1] First task\n✅ [a2] Done task".into()),
+        });
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "read_file".into(),
+            tool_use_id: "tc2".into(),
+            summary: "src/main.rs".into(),
+            status: ToolStatus::Success { duration_us: 24 },
+            result_preview: None,
+        });
+
+        let lines = build_conversation_lines(&app, 60);
+        let rendered: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+
+        let header_index = rendered
+            .iter()
+            .position(|line| line.contains("▌ Tools (2)"))
+            .unwrap();
+        let plan_box_top_index = rendered.iter().position(|line| line.contains("┌")).unwrap();
+
+        assert!(rendered.iter().any(|line| line.contains("Plan: Demo")));
+        assert!(rendered.iter().any(|line| line.contains("[a1] First task")));
+        assert!(rendered.iter().any(|line| line.contains("└")));
+        assert_eq!(plan_box_top_index, header_index + 2);
+    }
+
+    #[test]
     fn draw_renders_bash_running_timer_with_elapsed_and_timeout() {
         let mut app = App::new("test".into(), false, None);
         app.messages.push(ConversationEntry::ToolCall {
@@ -2495,6 +2564,10 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         app.context_explorer_move_down();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        if let Some(explorer) = app.context_explorer.as_mut() {
+            explorer.detail_flush_pending = false;
+        }
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let lines = buffer_lines(terminal.backend());

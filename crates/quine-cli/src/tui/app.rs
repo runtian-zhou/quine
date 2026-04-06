@@ -238,7 +238,6 @@ pub enum AppAction {
     },
     SubmitInteraction(String),
     Cancel,
-    ForceFullRedraw,
     Quit,
 }
 
@@ -430,6 +429,7 @@ pub struct ContextExplorerState {
     pub active_tab: ContextExplorerTab,
     pub selected_index: usize,
     pub scroll_offset: u16,
+    pub detail_flush_pending: bool,
 }
 
 impl ContextExplorerState {
@@ -439,6 +439,7 @@ impl ContextExplorerState {
             active_tab: ContextExplorerTab::History,
             selected_index: 0,
             scroll_offset: 0,
+            detail_flush_pending: false,
         }
     }
 
@@ -457,6 +458,7 @@ impl ContextExplorerState {
     fn reset_detail_state(&mut self) {
         self.selected_index = 0;
         self.scroll_offset = 0;
+        self.detail_flush_pending = false;
     }
 
     pub fn selected_entry(&self) -> Option<&HistoryEntry> {
@@ -1245,6 +1247,7 @@ impl App {
             .map(|skill| skill.name.clone())
             .collect();
         self.context_explorer = Some(ContextExplorerState::new(snapshot));
+        self.conversation_cache = None;
     }
 
     pub fn close_context_explorer(&mut self) {
@@ -1295,6 +1298,7 @@ impl App {
                             explorer.selected_index - 1
                         };
                         explorer.scroll_offset = 0;
+                        explorer.detail_flush_pending = true;
                     }
                 }
                 ContextExplorerTab::Plans => {
@@ -1312,6 +1316,7 @@ impl App {
                     if count > 0 {
                         explorer.selected_index = (explorer.selected_index + 1) % count;
                         explorer.scroll_offset = 0;
+                        explorer.detail_flush_pending = true;
                     }
                 }
                 ContextExplorerTab::Tools => {
@@ -1319,6 +1324,7 @@ impl App {
                     if count > 0 {
                         explorer.selected_index = (explorer.selected_index + 1) % count;
                         explorer.scroll_offset = 0;
+                        explorer.detail_flush_pending = true;
                     }
                 }
                 ContextExplorerTab::Skills => {
@@ -1326,6 +1332,7 @@ impl App {
                     if count > 0 {
                         explorer.selected_index = (explorer.selected_index + 1) % count;
                         explorer.scroll_offset = 0;
+                        explorer.detail_flush_pending = true;
                     }
                 }
                 ContextExplorerTab::Plans => {
@@ -1338,6 +1345,7 @@ impl App {
     pub fn context_explorer_move_to_first(&mut self) {
         if let Some(explorer) = self.context_explorer.as_mut() {
             explorer.scroll_offset = 0;
+            explorer.detail_flush_pending = true;
             if matches!(
                 explorer.active_tab,
                 ContextExplorerTab::History
@@ -1370,18 +1378,21 @@ impl App {
                 ContextExplorerTab::Plans => {}
             }
             explorer.scroll_offset = 0;
+            explorer.detail_flush_pending = true;
         }
     }
 
     pub fn context_explorer_scroll_up(&mut self, rows: u16) {
         if let Some(explorer) = self.context_explorer.as_mut() {
             explorer.scroll_offset = explorer.scroll_offset.saturating_sub(rows);
+            explorer.detail_flush_pending = true;
         }
     }
 
     pub fn context_explorer_scroll_down(&mut self, rows: u16) {
         if let Some(explorer) = self.context_explorer.as_mut() {
             explorer.scroll_offset = explorer.scroll_offset.saturating_add(rows);
+            explorer.detail_flush_pending = true;
         }
     }
 
