@@ -13,6 +13,7 @@ use crossterm::terminal::{
 use crossterm::ExecutableCommand;
 use futures::StreamExt;
 use ratatui::prelude::CrosstermBackend;
+use ratatui::widgets::Clear as TuiClear;
 use ratatui::Terminal;
 use serde::Deserialize;
 
@@ -363,9 +364,16 @@ async fn run_event_loop(
     socket_path: &Path,
     auto_approve: bool,
 ) -> anyhow::Result<()> {
+    let mut last_context_visible = app.context_explorer_active();
     loop {
         // Draw.
-        terminal.draw(|frame| ui::draw(frame, app))?;
+        terminal.draw(|frame| {
+            if app.context_explorer_active() != last_context_visible {
+                frame.render_widget(TuiClear, frame.area());
+            }
+            ui::draw(frame, app)
+        })?;
+        last_context_visible = app.context_explorer_active();
 
         if app.should_quit {
             break;

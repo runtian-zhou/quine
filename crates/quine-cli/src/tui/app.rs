@@ -1244,10 +1244,12 @@ impl App {
             .map(|skill| skill.name.clone())
             .collect();
         self.context_explorer = Some(ContextExplorerState::new(snapshot));
+        self.conversation_cache = None;
     }
 
     pub fn close_context_explorer(&mut self) {
         self.context_explorer = None;
+        self.conversation_cache = None;
     }
 
     pub fn context_explorer_prev_tab(&mut self) {
@@ -1280,8 +1282,18 @@ impl App {
                 ContextExplorerTab::History
                 | ContextExplorerTab::Tools
                 | ContextExplorerTab::Skills => {
-                    if explorer.selected_index > 0 {
-                        explorer.selected_index -= 1;
+                    let count = match explorer.active_tab {
+                        ContextExplorerTab::History => explorer.entry_count(),
+                        ContextExplorerTab::Tools => explorer.tool_count(),
+                        ContextExplorerTab::Skills => explorer.skill_count(),
+                        ContextExplorerTab::Plans => 0,
+                    };
+                    if count > 0 {
+                        explorer.selected_index = if explorer.selected_index == 0 {
+                            count - 1
+                        } else {
+                            explorer.selected_index - 1
+                        };
                         explorer.scroll_offset = 0;
                     }
                 }
@@ -1296,20 +1308,23 @@ impl App {
         if let Some(explorer) = self.context_explorer.as_mut() {
             match explorer.active_tab {
                 ContextExplorerTab::History => {
-                    if explorer.selected_index + 1 < explorer.entry_count() {
-                        explorer.selected_index += 1;
+                    let count = explorer.entry_count();
+                    if count > 0 {
+                        explorer.selected_index = (explorer.selected_index + 1) % count;
                         explorer.scroll_offset = 0;
                     }
                 }
                 ContextExplorerTab::Tools => {
-                    if explorer.selected_index + 1 < explorer.tool_count() {
-                        explorer.selected_index += 1;
+                    let count = explorer.tool_count();
+                    if count > 0 {
+                        explorer.selected_index = (explorer.selected_index + 1) % count;
                         explorer.scroll_offset = 0;
                     }
                 }
                 ContextExplorerTab::Skills => {
-                    if explorer.selected_index + 1 < explorer.skill_count() {
-                        explorer.selected_index += 1;
+                    let count = explorer.skill_count();
+                    if count > 0 {
+                        explorer.selected_index = (explorer.selected_index + 1) % count;
                         explorer.scroll_offset = 0;
                     }
                 }
