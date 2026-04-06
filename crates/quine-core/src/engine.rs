@@ -1298,6 +1298,7 @@ async fn summarize_history(
     }
 }
 
+#[derive(Clone)]
 struct PendingToolCall {
     tool_use_id: String,
     tool_name: String,
@@ -1360,6 +1361,78 @@ struct CompletedConcurrentToolCall {
     arguments: serde_json::Value,
     result: ToolOutcome,
     duration_us: u64,
+}
+
+fn extract_plan_id_from_tool_output(output: &str) -> Option<String> {
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if let Some(plan_id) = trimmed.strip_prefix("plan_id:") {
+            let plan_id = plan_id.trim();
+            if !plan_id.is_empty() {
+                return Some(plan_id.to_string());
+            }
+        }
+        if let Some(rest) = trimmed.strip_prefix("Plan created (ID:") {
+            let plan_id = rest.trim().strip_suffix(')')?.trim();
+            if !plan_id.is_empty() {
+                return Some(plan_id.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn resolve_plan_tool_call_id(session: &SessionContext, tool_use_id: &str) -> Option<String> {
+    session.history.iter().rev().find_map(|message| {
+        let quine_llm::MessageContent::ToolResult {
+            tool_use_id: result_tool_use_id,
+            output,
+            is_error,
+        } = &message.content
+        else {
+            return None;
+        };
+
+        if *is_error || result_tool_use_id != tool_use_id {
+            return None;
+        }
+
+        extract_plan_id_from_tool_output(output)
+    })
+}
+
+fn normalize_plan_tool_arguments(
+    session: &SessionContext,
+    call: &PendingToolCall,
+) -> PendingToolCall {
+    if call.tool_name != "plan" {
+        return call.clone();
+    }
+    if call
+        .arguments
+        .get("operation")
+        .and_then(|value| value.as_str())
+        != Some("update_plan")
+    {
+        return call.clone();
+    }
+    let Some(raw_plan_id) = call
+        .arguments
+        .get("plan_id")
+        .and_then(|value| value.as_str())
+    else {
+        return call.clone();
+    };
+    if !raw_plan_id.starts_with("call_") {
+        return call.clone();
+    }
+    let Some(resolved_plan_id) = resolve_plan_tool_call_id(session, raw_plan_id) else {
+        return call.clone();
+    };
+
+    let mut normalized = call.clone();
+    normalized.arguments["plan_id"] = serde_json::Value::String(resolved_plan_id);
+    normalized
 }
 
 fn resolved_permission_path(
@@ -2971,7 +3044,11 @@ async fn handle_llm_turn(
                 return TurnOutcome::Completed(Some(full_text));
             }
             Ok(Some(LlmCallResult {
-                turn: LlmTurnResult::ToolCalls { text_before, calls },
+                turn:
+                    LlmTurnResult::ToolCalls {
+                        text_before,
+                        mut calls,
+                    },
                 usage,
             })) => {
                 // Accumulate usage from this LLM call.
@@ -3015,6 +3092,13 @@ async fn handle_llm_turn(
                         text_before.clone(),
                         tool_use_requests,
                     ));
+                }
+
+                if let Some(session) = sessions.get(&session_id) {
+                    calls = calls
+                        .iter()
+                        .map(|call| normalize_plan_tool_arguments(session, call))
+                        .collect();
                 }
 
                 let debug = debug_enabled();
@@ -5607,6 +5691,78 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .expect("ready-action prompt should be appended");
         assert!(prompt.contains("update_plan"));
         assert!(prompt.contains(&format!("Reuse this exact plan_id: {plan_id}")));
+    }
+
+    #[test]
+    fn extract_plan_id_from_tool_output_supports_both_formats() {
+        assert_eq!(
+            extract_plan_id_from_tool_output(
+                "Plan created (ID: 11111111-1111-1111-1111-111111111111)\n\nPlan: Demo"
+            ),
+            Some("11111111-1111-1111-1111-111111111111".into())
+        );
+        assert_eq!(
+            extract_plan_id_from_tool_output(
+                "Plan created (ID: 22222222-2222-2222-2222-222222222222)\nplan_id: 22222222-2222-2222-2222-222222222222\n\nPlan: Demo"
+            ),
+            Some("22222222-2222-2222-2222-222222222222".into())
+        );
+    }
+
+    #[test]
+    fn normalize_plan_tool_arguments_recovers_plan_id_from_prior_tool_result() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let mut session = runtime
+            .block_on(SessionContext::new(
+                SessionId::new(),
+                SessionInit {
+                    system_prompt: None,
+                    skills: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap_or_default(),
+                    plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
+                    initial_messages: Vec::new(),
+                    archive_root: std::env::temp_dir().join("quine-core-plan-id-resolution-tests"),
+                    max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
+                },
+                &provider,
+            ))
+            .unwrap();
+        session.history.push(Message::tool_result(
+            "call_create_plan",
+            "Plan created (ID: 33333333-3333-3333-3333-333333333333)\nplan_id: 33333333-3333-3333-3333-333333333333\n\nPlan: Demo",
+            false,
+        ));
+
+        let normalized = normalize_plan_tool_arguments(
+            &session,
+            &PendingToolCall {
+                tool_use_id: "call_update_plan".into(),
+                tool_name: "plan".into(),
+                arguments: serde_json::json!({
+                    "operation": "update_plan",
+                    "plan_id": "call_create_plan",
+                    "action_id": "a1",
+                    "status": "completed"
+                }),
+            },
+        );
+
+        assert_eq!(
+            normalized
+                .arguments
+                .get("plan_id")
+                .and_then(|value| value.as_str()),
+            Some("33333333-3333-3333-3333-333333333333")
+        );
     }
 
     struct ToolCallThenTextProvider {
