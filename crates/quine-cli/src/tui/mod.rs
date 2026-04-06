@@ -75,7 +75,13 @@ fn format_tui_ps_table(mut sessions: Vec<TuiSessionSummary>) -> String {
         .max("STATUS".len());
     let mode_width = sessions
         .iter()
-        .map(|session| if session.plan_mode { "plan".len() } else { "chat".len() })
+        .map(|session| {
+            if session.plan_mode {
+                "plan".len()
+            } else {
+                "chat".len()
+            }
+        })
         .max()
         .unwrap_or(4)
         .max("MODE".len());
