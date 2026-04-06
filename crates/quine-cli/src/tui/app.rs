@@ -463,6 +463,8 @@ pub struct App {
     pub reasoning_buffer: String,
     pub streaming_buffer: String,
     pub current_turn_assistant_text: Option<String>,
+    last_backend_event_at: Option<Instant>,
+    last_backend_event_label: Option<&'static str>,
     pub scroll_offset: u32,
     pub user_scrolled: bool,
     pub input: InputBuffer,
@@ -610,6 +612,8 @@ impl App {
             reasoning_buffer: String::new(),
             streaming_buffer: String::new(),
             current_turn_assistant_text: None,
+            last_backend_event_at: None,
+            last_backend_event_label: None,
             scroll_offset: 0,
             user_scrolled: false,
             input: InputBuffer::new(),
@@ -681,6 +685,8 @@ impl App {
         self.reasoning_buffer.clear();
         self.streaming_buffer.clear();
         self.current_turn_assistant_text = None;
+        self.last_backend_event_at = None;
+        self.last_backend_event_label = None;
         self.scroll_offset = 0;
         self.user_scrolled = false;
         self.interaction_queue.clear();
@@ -730,6 +736,45 @@ impl App {
     /// Get the current spinner character.
     pub fn spinner_char(&self) -> char {
         SPINNER_FRAMES[self.spinner_frame]
+    }
+
+    pub fn phase_status_text(&self) -> String {
+        let base = match &self.phase {
+            AgentPhase::Idle => "Idle".to_string(),
+            AgentPhase::Thinking => format!("{} Thinking", self.spinner_char()),
+            AgentPhase::Streaming => format!("{} Responding", self.spinner_char()),
+            AgentPhase::RunningTool(name) => {
+                format!("{} Running {name}", self.spinner_char())
+            }
+        };
+
+        match self.backend_activity_text() {
+            Some(activity) => format!("{base} · {activity}"),
+            None => base,
+        }
+    }
+
+    fn note_backend_event(&mut self, label: &'static str) {
+        self.last_backend_event_at = Some(Instant::now());
+        self.last_backend_event_label = Some(label);
+    }
+
+    fn backend_activity_text(&self) -> Option<String> {
+        const STALE_AFTER_SECS: u64 = 15;
+
+        let last_at = self.last_backend_event_at?;
+        let label = self.last_backend_event_label.unwrap_or("event");
+        let age_secs = Instant::now().saturating_duration_since(last_at).as_secs();
+
+        let prefix = if matches!(self.phase, AgentPhase::Idle) {
+            "last backend"
+        } else if age_secs >= STALE_AFTER_SECS {
+            "backend quiet"
+        } else {
+            "backend active"
+        };
+
+        Some(format!("{prefix}: {label} {age_secs}s ago"))
     }
 
     /// Get the label for the input box.
@@ -1229,6 +1274,7 @@ impl App {
 
         match notif.method.as_str() {
             notifications::REASONING_DELTA => {
+                self.note_backend_event("reasoning");
                 if notif
                     .params
                     .as_ref()
@@ -1240,6 +1286,7 @@ impl App {
                 }
             }
             notifications::STREAM_DELTA => {
+                self.note_backend_event("stream");
                 if let Some(delta) = notif
                     .params
                     .as_ref()
@@ -1253,6 +1300,7 @@ impl App {
                 }
             }
             notifications::TEXT_COMPLETE => {
+                self.note_backend_event("text complete");
                 self.reasoning_buffer.clear();
                 let text = if let Some(full_text) = notif
                     .params
@@ -1276,6 +1324,7 @@ impl App {
                 self.auto_scroll();
             }
             notifications::TOOL_REQUEST => {
+                self.note_backend_event("tool call");
                 self.reasoning_buffer.clear();
                 if !self.streaming_buffer.trim().is_empty() {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
@@ -1336,6 +1385,7 @@ impl App {
                 }
             }
             notifications::TOOL_RESULT => {
+                self.note_backend_event("tool result");
                 if let Some(params) = &notif.params {
                     let tool_use_id = params
                         .get("tool_use_id")
@@ -1382,6 +1432,7 @@ impl App {
                 }
             }
             notifications::TURN_COMPLETE => {
+                self.note_backend_event("turn complete");
                 self.reasoning_buffer.clear();
                 if !self.streaming_buffer.trim().is_empty() {
                     let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
@@ -1414,6 +1465,7 @@ impl App {
                 self.auto_scroll();
             }
             notifications::SESSION_STATE_CHANGED => {
+                self.note_backend_event("state");
                 if let Some(state) = notif
                     .params
                     .as_ref()
@@ -1442,6 +1494,7 @@ impl App {
                 }
             }
             notifications::PLAN_PROGRESS => {
+                self.note_backend_event("plan");
                 if let Some(params) = &notif.params {
                     let action_id = params
                         .get("action_id")
@@ -1468,6 +1521,7 @@ impl App {
                 }
             }
             notifications::SESSION_ERROR => {
+                self.note_backend_event("error");
                 if let Some(err) = notif
                     .params
                     .as_ref()
@@ -1478,6 +1532,7 @@ impl App {
                 }
             }
             notifications::INTERACTION_NEEDED => {
+                self.note_backend_event("interaction");
                 let prompt = notif
                     .params
                     .as_ref()

@@ -600,12 +600,7 @@ fn ensure_conversation_cache(app: &mut App, area_width: u16) -> &ConversationRen
 
 fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     let mode = if app.plan_mode { "plan" } else { "chat" };
-    let phase = match &app.phase {
-        AgentPhase::Idle => "idle".to_string(),
-        AgentPhase::Thinking => format!("{} thinking", app.spinner_char()),
-        AgentPhase::Streaming => format!("{} streaming", app.spinner_char()),
-        AgentPhase::RunningTool(name) => format!("{} tool:{name}", app.spinner_char()),
-    };
+    let phase = app.phase_status_text().to_lowercase();
     let usage = format_context_status(app.last_turn_usage.as_ref(), app.max_context_window);
     let left = format!(" session:{} | {} | {} ", app.session_id, mode, phase);
     let right = format!(" {} ", usage);
