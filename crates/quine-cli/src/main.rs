@@ -308,8 +308,15 @@ async fn main() -> anyhow::Result<()> {
 
                 // Start the daemon in-process.
                 let provider = quine_harness::create_provider_from_env();
-                let harness =
-                    std::sync::Arc::new(quine_harness::LocalHarness::new(provider, None).await?);
+                let web_provider = quine_harness::create_web_provider_from_env();
+                let harness = std::sync::Arc::new(
+                    quine_harness::LocalHarness::new_with_web_provider(
+                        provider,
+                        web_provider,
+                        None,
+                    )
+                    .await?,
+                );
                 quine_harness::server::run_ipc_server(&socket_path, harness).await?;
             }
             DaemonCommands::Stop { socket } => {

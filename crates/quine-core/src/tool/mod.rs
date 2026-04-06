@@ -10,6 +10,8 @@ pub mod skill_template;
 pub mod spawn;
 pub mod subagent;
 pub mod wait_child;
+pub mod web_open;
+pub mod web_search;
 pub mod write;
 
 use std::collections::HashMap;
@@ -19,7 +21,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::stream;
-use quine_llm::{LlmEvent, LlmProvider};
+use quine_llm::{LlmEvent, LlmProvider, NoopWebProvider};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -341,11 +343,18 @@ pub fn built_in_tool_definitions(plan_mode: bool) -> Vec<quine_llm::ToolDefiniti
     registry.register(Arc::new(find::FindTool));
     registry.register(Arc::new(plan::PlanTool::new(plan::new_plan_store())));
     registry.register(Arc::new(read::ReadTool));
+    registry.register(Arc::new(web_open::WebOpenTool::new(Arc::new(
+        NoopWebProvider,
+    ))));
+    registry.register(Arc::new(web_search::WebSearchTool::new(Arc::new(
+        NoopWebProvider,
+    ))));
     if !plan_mode {
         registry.register(Arc::new(write::WriteTool));
-        registry.register(Arc::new(subagent::SubagentTool::new(Arc::new(
-            NoopProvider,
-        ))));
+        registry.register(Arc::new(subagent::SubagentTool::new(
+            Arc::new(NoopProvider),
+            Arc::new(NoopWebProvider),
+        )));
         registry.register(Arc::new(spawn::SpawnTool));
         registry.register(Arc::new(wait_child::WaitChildTool));
         registry.register(Arc::new(signal::SignalTool));
@@ -454,6 +463,8 @@ mod tests {
         assert!(defs.iter().any(|tool| tool.name == "apply_patch"));
         assert!(!defs.iter().any(|tool| tool.name == "write_file"));
         assert!(defs.iter().any(|tool| tool.name == "recv_message"));
+        assert!(defs.iter().any(|tool| tool.name == "web_open"));
+        assert!(defs.iter().any(|tool| tool.name == "web_search"));
     }
 
     #[test]

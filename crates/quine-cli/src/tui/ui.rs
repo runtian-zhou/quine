@@ -81,8 +81,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let max_height = (frame.area().height / 2).min(12);
     let input_height = if let Some(ref select) = app.option_select {
         let label = app.input_label();
-        let content_rows = input_content_rows(&app.input, &label, frame.area().width.saturating_sub(2))
-            .saturating_add(select.options.len() as u16);
+        let content_rows =
+            input_content_rows(&app.input, &label, frame.area().width.saturating_sub(2))
+                .saturating_add(select.options.len() as u16);
         (content_rows + 2).max(3).min(max_height)
     } else {
         let label = app.input_label();

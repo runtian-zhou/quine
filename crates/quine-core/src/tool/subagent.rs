@@ -4,13 +4,14 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use quine_llm::{LlmEvent, LlmProvider, Message};
+use quine_llm::{LlmEvent, LlmProvider, Message, WebProvider};
 
 use super::{ExecutionContext, InteractionChannel, Tool, ToolError, ToolOutput, ToolRegistry};
 use crate::filesystem::SessionFilesystem;
 use crate::session::SessionId;
 use crate::tool::{
-    ask_user::AskUserTool, bash::BashTool, plan::PlanTool, read::ReadTool, write::WriteTool,
+    ask_user::AskUserTool, bash::BashTool, plan::PlanTool, read::ReadTool, web_open::WebOpenTool,
+    web_search::WebSearchTool, write::WriteTool,
 };
 
 /// Default timeout for subagent execution (5 minutes).
@@ -20,11 +21,15 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// the result. This is the primary mechanism for delegating subtasks.
 pub(crate) struct SubagentTool {
     provider: Arc<dyn LlmProvider>,
+    web_provider: Arc<dyn WebProvider>,
 }
 
 impl SubagentTool {
-    pub(crate) fn new(provider: Arc<dyn LlmProvider>) -> Self {
-        Self { provider }
+    pub(crate) fn new(provider: Arc<dyn LlmProvider>, web_provider: Arc<dyn WebProvider>) -> Self {
+        Self {
+            provider,
+            web_provider,
+        }
     }
 }
 
@@ -90,6 +95,7 @@ impl Tool for SubagentTool {
 
         match run_subagent(
             &*self.provider,
+            Arc::clone(&self.web_provider),
             task,
             system_prompt,
             Arc::clone(&context.filesystem),
@@ -145,6 +151,7 @@ fn wrap_channel_with_label(parent: &InteractionChannel, label: String) -> Intera
 #[allow(clippy::too_many_arguments)]
 async fn run_subagent(
     provider: &dyn LlmProvider,
+    web_provider: Arc<dyn WebProvider>,
     task: &str,
     system_prompt: Option<&str>,
     filesystem: Arc<dyn SessionFilesystem>,
@@ -156,6 +163,7 @@ async fn run_subagent(
         timeout,
         run_subagent_inner(
             provider,
+            web_provider,
             task,
             system_prompt,
             filesystem,
@@ -173,6 +181,7 @@ async fn run_subagent(
 
 async fn run_subagent_inner(
     provider: &dyn LlmProvider,
+    web_provider: Arc<dyn WebProvider>,
     task: &str,
     system_prompt: Option<&str>,
     filesystem: Arc<dyn SessionFilesystem>,
@@ -188,6 +197,8 @@ async fn run_subagent_inner(
     tool_registry.register(Arc::new(WriteTool));
     tool_registry.register(Arc::new(BashTool));
     tool_registry.register(Arc::new(PlanTool::new(plan_store.clone())));
+    tool_registry.register(Arc::new(WebSearchTool::new(Arc::clone(&web_provider))));
+    tool_registry.register(Arc::new(WebOpenTool::new(Arc::clone(&web_provider))));
     // Register AskUserTool so subagent can ask the user questions.
     tool_registry.register(Arc::new(AskUserTool));
     // Note: no SubagentTool registered here to avoid unbounded recursion.
@@ -310,7 +321,7 @@ async fn run_subagent_inner(
 mod tests {
     use super::*;
     use crate::filesystem::OverlayFilesystem;
-    use quine_llm::ToolDefinition;
+    use quine_llm::{NoopWebProvider, ToolDefinition};
     use std::pin::Pin;
     use std::sync::{
         atomic::{AtomicU32, Ordering},
@@ -406,7 +417,7 @@ mod tests {
     #[tokio::test]
     async fn subagent_simple_task() {
         let provider: Arc<dyn LlmProvider> = Arc::new(TextProvider::new("SUBAGENT_RESULT_777"));
-        let tool = SubagentTool::new(provider);
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
         let (_base, _session, ctx) = make_context().await;
 
         let result = tool
@@ -423,7 +434,7 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(ToolThenTextProvider {
             call_count: AtomicU32::new(0),
         });
-        let tool = SubagentTool::new(provider);
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
         let (_base, _session, ctx) = make_context().await;
 
         let result = tool
@@ -464,7 +475,7 @@ mod tests {
         }
 
         let provider: Arc<dyn LlmProvider> = Arc::new(InfiniteToolProvider);
-        let tool = SubagentTool::new(provider);
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
         let (_base, _session, ctx) = make_context().await;
 
         let result = tool
@@ -497,7 +508,7 @@ mod tests {
         }
 
         let provider: Arc<dyn LlmProvider> = Arc::new(ErrorProvider);
-        let tool = SubagentTool::new(provider);
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
         let (_base, _session, ctx) = make_context().await;
 
         let result = tool
@@ -582,7 +593,7 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(AskUserProvider {
             call_count: AtomicU32::new(0),
         });
-        let tool = SubagentTool::new(provider);
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
 
         let handle = tokio::spawn(async move {
             tool.execute(
@@ -623,7 +634,7 @@ mod tests {
     #[tokio::test]
     async fn subagent_without_interaction_channel_still_works() {
         let provider: Arc<dyn LlmProvider> = Arc::new(TextProvider::new("NO_CHANNEL_RESULT"));
-        let tool = SubagentTool::new(provider);
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
         let (_base, _session, ctx) = make_context().await;
         // ctx.interaction_channel is None (from make_context)
 
@@ -697,7 +708,7 @@ mod tests {
         let provider: Arc<dyn LlmProvider> = Arc::new(ProtocolCheckingProvider {
             call_count: AtomicU32::new(0),
         });
-        let tool = SubagentTool::new(provider);
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
         let (_base, _session, ctx) = make_context().await;
 
         let result = tool

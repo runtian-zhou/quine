@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use futures::StreamExt;
-use quine_llm::{LlmEvent, LlmProvider, Message, MessageContent, ToolDefinition};
+use quine_llm::{
+    LlmEvent, LlmProvider, Message, MessageContent, NoopWebProvider, ToolDefinition, WebProvider,
+};
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use tokio::task::JoinSet;
@@ -44,8 +46,9 @@ use crate::tool::{
     ask_user::AskUserTool, bash::BashTool, find::FindTool, plan::PlanTool, read::ReadTool,
     recv_message::RecvMessageTool, send_message::SendMessageTool, signal::SignalTool,
     skill_template::SkillTemplateTool, spawn::SpawnTool, subagent::SubagentTool,
-    wait_child::WaitChildTool, write::WriteTool, CancellationChannel, ExecutionContext,
-    InteractionChannel, InteractionRequest, InteractionResponse, ToolError, ToolRegistry,
+    wait_child::WaitChildTool, web_open::WebOpenTool, web_search::WebSearchTool, write::WriteTool,
+    CancellationChannel, ExecutionContext, InteractionChannel, InteractionRequest,
+    InteractionResponse, ToolError, ToolRegistry,
 };
 
 /// Default system prompt used when no CLAUDE.md and no explicit prompt is provided.
@@ -376,6 +379,7 @@ impl SessionInit {
 
 fn build_tool_registry_for_session(
     provider: &Arc<dyn LlmProvider>,
+    web_provider: &Arc<dyn WebProvider>,
     plan_store: crate::tool::plan::PlanStore,
     persisted_config: &PersistedSessionConfig,
     skills: &[Skill],
@@ -386,10 +390,15 @@ fn build_tool_registry_for_session(
     tool_registry.register(Arc::new(FindTool));
     tool_registry.register(Arc::new(AskUserTool));
     tool_registry.register(Arc::new(PlanTool::new(plan_store)));
+    tool_registry.register(Arc::new(WebSearchTool::new(Arc::clone(web_provider))));
+    tool_registry.register(Arc::new(WebOpenTool::new(Arc::clone(web_provider))));
 
     if !persisted_config.plan_mode {
         tool_registry.register(Arc::new(WriteTool));
-        tool_registry.register(Arc::new(SubagentTool::new(Arc::clone(provider))));
+        tool_registry.register(Arc::new(SubagentTool::new(
+            Arc::clone(provider),
+            Arc::clone(web_provider),
+        )));
         tool_registry.register(Arc::new(SpawnTool));
         tool_registry.register(Arc::new(WaitChildTool));
         tool_registry.register(Arc::new(SignalTool));
@@ -464,6 +473,16 @@ impl SessionContext {
         init: SessionInit,
         provider: &Arc<dyn LlmProvider>,
     ) -> Result<Self, CoreError> {
+        let web_provider: Arc<dyn WebProvider> = Arc::new(NoopWebProvider);
+        Self::new_with_web_provider(session_id, init, provider, &web_provider).await
+    }
+
+    async fn new_with_web_provider(
+        session_id: SessionId,
+        init: SessionInit,
+        provider: &Arc<dyn LlmProvider>,
+        web_provider: &Arc<dyn WebProvider>,
+    ) -> Result<Self, CoreError> {
         let persisted_config = init.to_persisted_config();
         let SessionInit {
             system_prompt: _,
@@ -504,6 +523,7 @@ impl SessionContext {
 
         let tool_registry = build_tool_registry_for_session(
             provider,
+            web_provider,
             plan_store.clone(),
             &persisted_config,
             &skills,
@@ -567,9 +587,10 @@ impl SessionContext {
         })
     }
 
-    async fn from_persisted(
+    async fn from_persisted_with_web_provider(
         persisted: PersistedSession,
         provider: &Arc<dyn LlmProvider>,
+        web_provider: &Arc<dyn WebProvider>,
         archive_root: PathBuf,
         max_context_window: Option<u64>,
     ) -> Result<(SessionId, Self), CoreError> {
@@ -585,7 +606,7 @@ impl SessionContext {
         } = persisted;
         let skills =
             crate::skill::load_skills(&config.working_directory, &config.skill_names).await;
-        let mut session = Self::new(
+        let mut session = Self::new_with_web_provider(
             session_id,
             SessionInit {
                 system_prompt: config.system_prompt.clone(),
@@ -602,6 +623,7 @@ impl SessionContext {
                 memory_policy: config.memory_policy.clone(),
             },
             provider,
+            web_provider,
         )
         .await?;
         session.state = state.into();
@@ -614,9 +636,14 @@ impl SessionContext {
             registry.register(Arc::new(FindTool));
             registry.register(Arc::new(AskUserTool));
             registry.register(Arc::new(PlanTool::new(session.plan_store.clone())));
+            registry.register(Arc::new(WebSearchTool::new(Arc::clone(web_provider))));
+            registry.register(Arc::new(WebOpenTool::new(Arc::clone(web_provider))));
             if !session.persisted_config.plan_mode {
                 registry.register(Arc::new(WriteTool));
-                registry.register(Arc::new(SubagentTool::new(Arc::clone(provider))));
+                registry.register(Arc::new(SubagentTool::new(
+                    Arc::clone(provider),
+                    Arc::clone(web_provider),
+                )));
                 registry.register(Arc::new(SpawnTool));
                 registry.register(Arc::new(WaitChildTool));
                 registry.register(Arc::new(SignalTool));
@@ -692,9 +719,10 @@ impl SessionContext {
         })
     }
 
-    async fn rebuild_session_config(
+    async fn rebuild_session_config_with_web_provider(
         &mut self,
         provider: &Arc<dyn LlmProvider>,
+        web_provider: &Arc<dyn WebProvider>,
     ) -> Result<(), CoreError> {
         let skills = crate::skill::load_skills(
             &self.persisted_config.working_directory,
@@ -703,6 +731,7 @@ impl SessionContext {
         .await;
         self.tool_registry = build_tool_registry_for_session(
             provider,
+            web_provider,
             self.plan_store.clone(),
             &self.persisted_config,
             &skills,
@@ -746,13 +775,25 @@ impl SessionContext {
         Ok(())
     }
 
+    #[cfg(test)]
     async fn exit_plan_mode(&mut self, provider: &Arc<dyn LlmProvider>) -> Result<(), CoreError> {
+        let web_provider: Arc<dyn WebProvider> = Arc::new(NoopWebProvider);
+        self.exit_plan_mode_with_web_provider(provider, &web_provider)
+            .await
+    }
+
+    async fn exit_plan_mode_with_web_provider(
+        &mut self,
+        provider: &Arc<dyn LlmProvider>,
+        web_provider: &Arc<dyn WebProvider>,
+    ) -> Result<(), CoreError> {
         if !self.persisted_config.plan_mode {
             return Ok(());
         }
         self.persisted_config.plan_mode = false;
         let _ = exit_permission_plan_mode(&mut self.permission_context);
-        self.rebuild_session_config(provider).await
+        self.rebuild_session_config_with_web_provider(provider, web_provider)
+            .await
     }
 }
 
@@ -3615,9 +3656,10 @@ pub async fn run_core_loop(
     provider: Arc<dyn LlmProvider>,
     restored_checkpoint: Option<CoreCheckpoint>,
 ) {
-    run_core_loop_with_compaction(
+    run_core_loop_with_compaction_and_web_provider(
         handle,
         provider,
+        Arc::new(NoopWebProvider),
         restored_checkpoint,
         std::env::temp_dir().join("quine-core-compactions"),
         None,
@@ -3626,8 +3668,27 @@ pub async fn run_core_loop(
 }
 
 pub async fn run_core_loop_with_compaction(
+    handle: CoreHandle,
+    provider: Arc<dyn LlmProvider>,
+    restored_checkpoint: Option<CoreCheckpoint>,
+    archive_root: PathBuf,
+    max_context_window: Option<u64>,
+) {
+    run_core_loop_with_compaction_and_web_provider(
+        handle,
+        provider,
+        Arc::new(NoopWebProvider),
+        restored_checkpoint,
+        archive_root,
+        max_context_window,
+    )
+    .await;
+}
+
+pub async fn run_core_loop_with_compaction_and_web_provider(
     mut handle: CoreHandle,
     provider: Arc<dyn LlmProvider>,
+    web_provider: Arc<dyn WebProvider>,
     restored_checkpoint: Option<CoreCheckpoint>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
@@ -3636,6 +3697,7 @@ pub async fn run_core_loop_with_compaction(
     run_core_loop_with_compaction_and_wait_notifier(
         &mut handle,
         provider,
+        web_provider,
         restored_checkpoint,
         archive_root,
         max_context_window,
@@ -3647,6 +3709,7 @@ pub async fn run_core_loop_with_compaction(
 async fn run_core_loop_with_compaction_and_wait_notifier(
     handle: &mut CoreHandle,
     provider: Arc<dyn LlmProvider>,
+    web_provider: Arc<dyn WebProvider>,
     restored_checkpoint: Option<CoreCheckpoint>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
@@ -3661,9 +3724,10 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
     if let Some(checkpoint) = restored_checkpoint {
         session_tree = SessionTree::restore(checkpoint.session_tree);
         for persisted_session in checkpoint.sessions {
-            match SessionContext::from_persisted(
+            match SessionContext::from_persisted_with_web_provider(
                 persisted_session,
                 &provider,
+                &web_provider,
                 archive_root.clone(),
                 max_context_window,
             )
@@ -3757,7 +3821,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
                 let work_dir_display = work_dir.display().to_string();
 
-                match SessionContext::new(
+                match SessionContext::new_with_web_provider(
                     session_id,
                     SessionInit {
                         system_prompt,
@@ -3774,6 +3838,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         memory_policy,
                     },
                     &provider,
+                    &web_provider,
                 )
                 .await
                 {
@@ -3818,7 +3883,10 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     continue;
                 }
 
-                match session.exit_plan_mode(&provider).await {
+                match session
+                    .exit_plan_mode_with_web_provider(&provider, &web_provider)
+                    .await
+                {
                     Ok(()) => {
                         emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
                         let _ = reply.send(Ok(()));
