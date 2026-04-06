@@ -668,20 +668,39 @@ fn format_context_entry_label(index: usize, explorer: &ContextExplorerState) -> 
             text,
             tool_calls,
         }) => {
-            let tool_summary = tool_calls
-                .first()
-                .map(|call| call.tool_name.as_str())
-                .unwrap_or("tool");
             let suffix = text
                 .as_deref()
                 .and_then(|value| value.lines().next())
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
                 .unwrap_or("");
-            if suffix.is_empty() {
-                format!("{entry_number:>3}. {role}: tool {tool_summary}")
+            if tool_calls.len() > 1 {
+                let names = tool_calls
+                    .iter()
+                    .map(|call| call.tool_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                if suffix.is_empty() {
+                    format!(
+                        "{entry_number:>3}. {role}: tool batch ({}) [{names}]",
+                        tool_calls.len()
+                    )
+                } else {
+                    format!(
+                        "{entry_number:>3}. {role}: batch ({}) {suffix}",
+                        tool_calls.len()
+                    )
+                }
             } else {
-                format!("{entry_number:>3}. {role}: {suffix}")
+                let tool_summary = tool_calls
+                    .first()
+                    .map(|call| call.tool_name.as_str())
+                    .unwrap_or("tool");
+                if suffix.is_empty() {
+                    format!("{entry_number:>3}. {role}: tool {tool_summary}")
+                } else {
+                    format!("{entry_number:>3}. {role}: {suffix}")
+                }
             }
         }
         Some(crate::context_debug::HistoryEntry::ToolResult {
@@ -801,6 +820,15 @@ fn format_context_entry_detail(explorer: &ContextExplorerState) -> String {
             tool_calls,
         }) => {
             let mut detail = format!("kind: tool_use\nrole: {role}\n");
+            if tool_calls.len() > 1 {
+                detail.push_str(&format!("tool_batch_size: {}\n", tool_calls.len()));
+                let tool_names = tool_calls
+                    .iter()
+                    .map(|call| call.tool_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                detail.push_str(&format!("tool_batch: [{tool_names}]\n"));
+            }
             if let Some(text) = text {
                 detail.push_str("\ntext:\n");
                 detail.push_str(text);

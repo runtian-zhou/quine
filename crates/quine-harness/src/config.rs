@@ -170,6 +170,18 @@ pub fn load_persisted_permission_rules(
     Ok(rules)
 }
 
+fn parse_bool_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn default_parallel_tool_calls(model: &str) -> bool {
+    model.trim().eq_ignore_ascii_case("gpt-5.4")
+}
+
 /// Build an LLM `ProviderConfig` from environment variables.
 ///
 /// Uses `LLM_PROVIDER` to select the backend (`"anthropic"` or `"openai"`,
@@ -194,6 +206,14 @@ fn config_from_env() -> ProviderConfig {
             api_key: std::env::var("LLM_API_KEY").ok(),
             model: std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5.4".into()),
             max_tokens: Some(4096),
+            parallel_tool_calls: std::env::var("LLM_PARALLEL_TOOL_CALLS")
+                .ok()
+                .and_then(|value| parse_bool_env(&value))
+                .unwrap_or_else(|| {
+                    default_parallel_tool_calls(
+                        &std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-5.4".into()),
+                    )
+                }),
         })
     };
     match &config {
