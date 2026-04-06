@@ -124,7 +124,7 @@ struct ChunkDelta {
     tool_calls: Option<Vec<OpenAiToolCallDelta>>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Clone)]
 struct OpenAiToolCall {
     id: String,
     r#type: String,
@@ -141,10 +141,17 @@ struct OpenAiToolCallDelta {
     function: Option<OpenAiToolCallFunctionDelta>,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Clone)]
 struct OpenAiToolCallFunction {
     name: String,
-    arguments: String,
+    arguments: OpenAiToolCallArguments,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(untagged)]
+enum OpenAiToolCallArguments {
+    JsonString(String),
+    JsonValue(serde_json::Value),
 }
 
 #[derive(Deserialize, Clone)]
@@ -155,7 +162,16 @@ struct OpenAiToolCallFunctionDelta {
     arguments: Option<String>,
 }
 
-fn convert_message(msg: &Message) -> ChatMessage {
+fn use_structured_tool_call_arguments(model: &str) -> bool {
+    let normalized = model.to_ascii_lowercase();
+    normalized.contains("qwen3-coder")
+}
+
+fn use_qwen_tool_call_parser(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("qwen")
+}
+
+fn convert_message(msg: &Message, structured_tool_call_arguments: bool) -> ChatMessage {
     let role = match msg.role {
         Role::System => "system",
         Role::User => "user",
@@ -182,7 +198,7 @@ fn convert_message(msg: &Message) -> ChatMessage {
         },
         MessageContent::ToolUse { text, tool_calls } => ChatMessage {
             role: "assistant".into(),
-            content: text.clone(),
+            content: Some(text.clone().unwrap_or_default()),
             tool_call_id: None,
             tool_calls: Some(
                 tool_calls
@@ -192,7 +208,13 @@ fn convert_message(msg: &Message) -> ChatMessage {
                         r#type: "function".into(),
                         function: OpenAiToolCallFunction {
                             name: tc.tool_name.clone(),
-                            arguments: serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                            arguments: if structured_tool_call_arguments {
+                                OpenAiToolCallArguments::JsonValue(tc.arguments.clone())
+                            } else {
+                                OpenAiToolCallArguments::JsonString(
+                                    serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                                )
+                            },
                         },
                     })
                     .collect(),
@@ -219,12 +241,19 @@ fn convert_tools(tools: &[ToolDefinition]) -> Vec<OpenAiTool> {
 #[derive(Default)]
 struct ToolCallAccumulator {
     calls: Vec<AccumulatedToolCall>,
+    next_tool_call_index: u64,
 }
 
 struct AccumulatedToolCall {
     id: String,
     name: String,
     arguments: String,
+}
+
+#[derive(Default)]
+struct QwenToolCallParser {
+    pending: String,
+    next_tool_call_index: u64,
 }
 
 fn split_reasoning_tags(text: &str, in_think_block: &mut bool) -> (String, String) {
@@ -255,7 +284,120 @@ fn split_reasoning_tags(text: &str, in_think_block: &mut bool) -> (String, Strin
     (visible, reasoning)
 }
 
+fn parse_qwen_parameter_value(text: &str) -> serde_json::Value {
+    let trimmed = text.trim();
+    serde_json::from_str(trimmed).unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()))
+}
+
+fn parse_qwen_tool_call_block(block: &str, tool_use_id: String) -> Option<LlmEvent> {
+    let body = block
+        .strip_prefix("<tool_call>")
+        .and_then(|text| text.strip_suffix("</tool_call>"))?
+        .trim();
+    let function_body = body.strip_prefix("<function=")?;
+    let function_name_end = function_body.find('>')?;
+    let tool_name = function_body[..function_name_end].trim();
+    let function_rest = &function_body[function_name_end + 1..];
+    let function_end = function_rest.find("</function>")?;
+    let parameter_body = &function_rest[..function_end];
+
+    let mut arguments = serde_json::Map::new();
+    let mut remaining = parameter_body;
+    loop {
+        let trimmed = remaining.trim_start();
+        if trimmed.is_empty() {
+            break;
+        }
+        let parameter_body = trimmed.strip_prefix("<parameter=")?;
+        let parameter_name_end = parameter_body.find('>')?;
+        let parameter_name = parameter_body[..parameter_name_end].trim();
+        let parameter_rest = &parameter_body[parameter_name_end + 1..];
+        let parameter_end = parameter_rest.find("</parameter>")?;
+        let parameter_value = &parameter_rest[..parameter_end];
+        arguments.insert(
+            parameter_name.to_string(),
+            parse_qwen_parameter_value(parameter_value),
+        );
+        remaining = &parameter_rest[parameter_end + "</parameter>".len()..];
+    }
+
+    Some(LlmEvent::ToolCall {
+        tool_use_id,
+        tool_name: tool_name.to_string(),
+        arguments: serde_json::Value::Object(arguments),
+    })
+}
+
+fn qwen_text_safe_prefix_len(text: &str) -> usize {
+    match text.rfind('<') {
+        Some(index) if !text[index..].contains('>') => index,
+        _ => text.len(),
+    }
+}
+
+impl QwenToolCallParser {
+    fn next_tool_use_id(&mut self) -> String {
+        self.next_tool_call_index += 1;
+        format!("qwen-tool-call-{}", self.next_tool_call_index)
+    }
+
+    fn push_text(&mut self, text: &str) -> Vec<LlmEvent> {
+        self.pending.push_str(text);
+        let mut events = Vec::new();
+
+        loop {
+            if let Some(start) = self.pending.find("<tool_call>") {
+                if start > 0 {
+                    events.push(LlmEvent::TextDelta {
+                        text: self.pending[..start].to_string(),
+                    });
+                    self.pending.drain(..start);
+                }
+
+                if let Some(end_start) = self.pending.find("</tool_call>") {
+                    let end = end_start + "</tool_call>".len();
+                    let block = self.pending[..end].to_string();
+                    self.pending.drain(..end);
+                    let tool_use_id = self.next_tool_use_id();
+                    match parse_qwen_tool_call_block(&block, tool_use_id) {
+                        Some(event) => events.push(event),
+                        None => events.push(LlmEvent::TextDelta { text: block }),
+                    }
+                    continue;
+                }
+                break;
+            }
+
+            let safe_prefix_len = qwen_text_safe_prefix_len(&self.pending);
+            if safe_prefix_len > 0 {
+                events.push(LlmEvent::TextDelta {
+                    text: self.pending[..safe_prefix_len].to_string(),
+                });
+                self.pending.drain(..safe_prefix_len);
+            }
+            break;
+        }
+
+        events
+    }
+
+    fn finish(&mut self) -> Vec<LlmEvent> {
+        if self.pending.is_empty() {
+            Vec::new()
+        } else {
+            vec![LlmEvent::TextDelta {
+                text: std::mem::take(&mut self.pending),
+            }]
+        }
+    }
+}
+
 impl ToolCallAccumulator {
+    fn next_tool_use_id(&mut self) -> String {
+        self.next_tool_call_index += 1;
+        format!("openai-tool-call-{}", self.next_tool_call_index)
+    }
+
     fn process_delta(&mut self, delta: &OpenAiToolCallDelta) {
         let index = delta.index;
         // Grow the accumulator if needed
@@ -276,6 +418,11 @@ impl ToolCallAccumulator {
             if let Some(args) = &func.arguments {
                 self.calls[index].arguments.push_str(args);
             }
+        }
+        if self.calls[index].id.is_empty()
+            && (!self.calls[index].name.is_empty() || !self.calls[index].arguments.is_empty())
+        {
+            self.calls[index].id = self.next_tool_use_id();
         }
     }
 
@@ -303,6 +450,8 @@ impl LlmProvider for OpenAiCompatProvider {
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<LlmEvent>> + Send>>> {
+        let structured_tool_call_arguments = use_structured_tool_call_arguments(&self.config.model);
+        let qwen_tool_call_parser_enabled = use_qwen_tool_call_parser(&self.config.model);
         let url = format!(
             "{}/chat/completions",
             self.config.base_url.trim_end_matches('/')
@@ -310,7 +459,10 @@ impl LlmProvider for OpenAiCompatProvider {
 
         let request_body = ChatRequest {
             model: self.config.model.clone(),
-            messages: messages.iter().map(convert_message).collect(),
+            messages: messages
+                .iter()
+                .map(|message| convert_message(message, structured_tool_call_arguments))
+                .collect(),
             stream: true,
             stream_options: Some(StreamOptions {
                 include_usage: true,
@@ -343,14 +495,16 @@ impl LlmProvider for OpenAiCompatProvider {
                 byte_stream,
                 String::new(),
                 ToolCallAccumulator::default(),
+                QwenToolCallParser::default(),
                 None::<TokenUsage>,
                 false,
                 false,
             ),
-            |(
+            move |(
                 mut byte_stream,
                 mut buffer,
                 mut tool_acc,
+                mut qwen_tool_parser,
                 mut usage,
                 mut in_think_block,
                 mut done,
@@ -375,6 +529,9 @@ impl LlmProvider for OpenAiCompatProvider {
                                 // Emit any accumulated tool calls, then Done
                                 let mut events: Vec<anyhow::Result<LlmEvent>> =
                                     tool_acc.take_completed().into_iter().map(Ok).collect();
+                                if qwen_tool_call_parser_enabled {
+                                    events.extend(qwen_tool_parser.finish().into_iter().map(Ok));
+                                }
                                 events.push(Ok(LlmEvent::Done {
                                     usage: usage.take(),
                                 }));
@@ -385,6 +542,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                         byte_stream,
                                         buffer,
                                         ToolCallAccumulator::default(),
+                                        QwenToolCallParser::default(),
                                         usage,
                                         in_think_block,
                                         done,
@@ -422,9 +580,18 @@ impl LlmProvider for OpenAiCompatProvider {
                                                 }));
                                             }
                                             if !visible_text.is_empty() {
-                                                events.push(Ok(LlmEvent::TextDelta {
-                                                    text: visible_text,
-                                                }));
+                                                if qwen_tool_call_parser_enabled {
+                                                    events.extend(
+                                                        qwen_tool_parser
+                                                            .push_text(&visible_text)
+                                                            .into_iter()
+                                                            .map(Ok),
+                                                    );
+                                                } else {
+                                                    events.push(Ok(LlmEvent::TextDelta {
+                                                        text: visible_text,
+                                                    }));
+                                                }
                                             }
                                         }
                                         if let Some(tool_calls) = &choice.delta.tool_calls {
@@ -446,6 +613,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                                 byte_stream,
                                                 buffer,
                                                 tool_acc,
+                                                qwen_tool_parser,
                                                 usage,
                                                 in_think_block,
                                                 done,
@@ -464,6 +632,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                             byte_stream,
                                             buffer,
                                             tool_acc,
+                                            qwen_tool_parser,
                                             usage,
                                             in_think_block,
                                             done,
@@ -485,13 +654,24 @@ impl LlmProvider for OpenAiCompatProvider {
                         Some(Err(e)) => {
                             return Some((
                                 stream::iter(vec![Err(e.into())]),
-                                (byte_stream, buffer, tool_acc, usage, in_think_block, done),
+                                (
+                                    byte_stream,
+                                    buffer,
+                                    tool_acc,
+                                    qwen_tool_parser,
+                                    usage,
+                                    in_think_block,
+                                    done,
+                                ),
                             ));
                         }
                         None => {
                             // Stream ended without [DONE] — emit accumulated tools + Done
                             let mut events: Vec<anyhow::Result<LlmEvent>> =
                                 tool_acc.take_completed().into_iter().map(Ok).collect();
+                            if qwen_tool_call_parser_enabled {
+                                events.extend(qwen_tool_parser.finish().into_iter().map(Ok));
+                            }
                             events.push(Ok(LlmEvent::Done {
                                 usage: usage.take(),
                             }));
@@ -502,6 +682,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     byte_stream,
                                     buffer,
                                     ToolCallAccumulator::default(),
+                                    QwenToolCallParser::default(),
                                     usage,
                                     in_think_block,
                                     done,
@@ -525,7 +706,7 @@ mod tests {
     #[test]
     fn convert_message_user() {
         let msg = Message::user("hello");
-        let chat = convert_message(&msg);
+        let chat = convert_message(&msg, false);
         assert_eq!(chat.role, "user");
         assert_eq!(chat.content.unwrap(), "hello");
     }
@@ -533,9 +714,49 @@ mod tests {
     #[test]
     fn convert_message_tool_result() {
         let msg = Message::tool_result("id-1", "output", false);
-        let chat = convert_message(&msg);
+        let chat = convert_message(&msg, false);
         assert_eq!(chat.role, "tool");
         assert_eq!(chat.tool_call_id.unwrap(), "id-1");
+    }
+
+    #[test]
+    fn convert_message_tool_use_sets_empty_content_when_missing() {
+        let msg = Message::assistant_tool_use(
+            None,
+            vec![crate::types::ToolUseRequest {
+                tool_use_id: "id-1".into(),
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({"file_path": "/tmp/test.txt"}),
+            }],
+        );
+        let chat = convert_message(&msg, false);
+        assert_eq!(chat.role, "assistant");
+        assert_eq!(chat.content.as_deref(), Some(""));
+        assert!(chat.tool_calls.is_some());
+    }
+
+    #[test]
+    fn convert_message_tool_use_can_emit_structured_arguments() {
+        let msg = Message::assistant_tool_use(
+            None,
+            vec![crate::types::ToolUseRequest {
+                tool_use_id: "id-1".into(),
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({"file_path": "/tmp/test.txt"}),
+            }],
+        );
+        let chat = convert_message(&msg, true);
+        let tool_calls = chat.tool_calls.expect("tool calls");
+        let json = serde_json::to_value(&tool_calls[0]).unwrap();
+        assert_eq!(json["function"]["arguments"]["file_path"], "/tmp/test.txt");
+    }
+
+    #[test]
+    fn qwen_tool_call_parser_is_only_enabled_for_qwen_models() {
+        assert!(use_qwen_tool_call_parser("Qwen3-Coder-Next"));
+        assert!(use_qwen_tool_call_parser("qwen2.5"));
+        assert!(!use_qwen_tool_call_parser("gpt-4.1"));
+        assert!(!use_qwen_tool_call_parser("claude-sonnet-4"));
     }
 
     #[test]
@@ -558,6 +779,99 @@ mod tests {
         assert_eq!(visible2, "b");
         assert_eq!(reasoning2, " more");
         assert!(!in_think_block);
+    }
+
+    #[test]
+    fn qwen_tool_call_parser_converts_complete_block_to_tool_event() {
+        let mut parser = QwenToolCallParser::default();
+        let events = parser.push_text(
+            "<tool_call><function=read_file><parameter=file_path>/tmp/test.txt</parameter></function></tool_call>",
+        );
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            LlmEvent::ToolCall {
+                tool_use_id,
+                tool_name,
+                arguments,
+            } => {
+                assert_eq!(tool_use_id, "qwen-tool-call-1");
+                assert_eq!(tool_name, "read_file");
+                assert_eq!(arguments["file_path"], "/tmp/test.txt");
+            }
+            _ => panic!("expected ToolCall event"),
+        }
+    }
+
+    #[test]
+    fn qwen_tool_call_parser_handles_split_blocks() {
+        let mut parser = QwenToolCallParser::default();
+        let events1 = parser.push_text("<tool_call><function=read_");
+        assert!(events1.is_empty());
+
+        let events2 = parser.push_text(
+            "file><parameter=file_path>/tmp/test.txt</parameter></function></tool_call>",
+        );
+        assert_eq!(events2.len(), 1);
+        match &events2[0] {
+            LlmEvent::ToolCall {
+                tool_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(tool_name, "read_file");
+                assert_eq!(arguments["file_path"], "/tmp/test.txt");
+            }
+            _ => panic!("expected ToolCall event"),
+        }
+    }
+
+    #[test]
+    fn qwen_tool_call_parser_preserves_visible_text_outside_blocks() {
+        let mut parser = QwenToolCallParser::default();
+        let events = parser.push_text(
+            "before<tool_call><function=read_file><parameter=file_path>/tmp/test.txt</parameter></function></tool_call>after",
+        );
+        assert_eq!(events.len(), 3);
+        match &events[0] {
+            LlmEvent::TextDelta { text } => assert_eq!(text, "before"),
+            _ => panic!("expected leading TextDelta"),
+        }
+        match &events[1] {
+            LlmEvent::ToolCall { tool_name, .. } => assert_eq!(tool_name, "read_file"),
+            _ => panic!("expected ToolCall"),
+        }
+        match &events[2] {
+            LlmEvent::TextDelta { text } => assert_eq!(text, "after"),
+            _ => panic!("expected trailing TextDelta"),
+        }
+    }
+
+    #[test]
+    fn tool_call_accumulator_generates_id_when_provider_omits_one() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.process_delta(&OpenAiToolCallDelta {
+            index: 0,
+            id: None,
+            function: Some(OpenAiToolCallFunctionDelta {
+                name: Some("read_file".into()),
+                arguments: Some("{\"file_path\":\"/tmp/test.txt\"}".into()),
+            }),
+        });
+
+        let events = acc.take_completed();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            LlmEvent::ToolCall {
+                tool_use_id,
+                tool_name,
+                arguments,
+            } => {
+                assert_eq!(tool_use_id, "openai-tool-call-1");
+                assert_eq!(tool_name, "read_file");
+                assert_eq!(arguments["file_path"], "/tmp/test.txt");
+            }
+            _ => panic!("expected ToolCall event"),
+        }
     }
 
     #[test]
