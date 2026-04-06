@@ -6,8 +6,9 @@ use quine_core::{
     PermissionRuleSet, PermissionRuleSource, PermissionTarget, RuleScope,
 };
 use quine_llm::anthropic::AnthropicConfig;
-use quine_llm::config::ProviderConfig;
+use quine_llm::config::{ProviderConfig, WebProviderConfig};
 use quine_llm::openai_compat::OpenAiCompatConfig;
+use quine_llm::openai_web::OpenAiWebConfig;
 use quine_llm::Message;
 use serde::{Deserialize, Serialize};
 
@@ -239,6 +240,39 @@ fn config_from_env() -> ProviderConfig {
 /// `quine_llm::config::create_provider`.
 pub fn create_provider_from_env() -> Arc<dyn quine_llm::LlmProvider> {
     Arc::from(quine_llm::config::create_provider(config_from_env()))
+}
+
+fn web_config_from_env() -> WebProviderConfig {
+    let provider = std::env::var("WEB_PROVIDER")
+        .or_else(|_| std::env::var("LLM_PROVIDER"))
+        .unwrap_or_else(|_| "openai".into());
+    if provider.eq_ignore_ascii_case("none") || provider.eq_ignore_ascii_case("disabled") {
+        return WebProviderConfig::None;
+    }
+
+    if provider.eq_ignore_ascii_case("anthropic") {
+        return WebProviderConfig::None;
+    }
+
+    let api_key = std::env::var("WEB_API_KEY")
+        .or_else(|_| std::env::var("LLM_API_KEY"))
+        .or_else(|_| std::env::var("OPENAI_API_KEY"))
+        .expect("WEB_API_KEY, OPENAI_API_KEY, or LLM_API_KEY must be set for web provider");
+
+    WebProviderConfig::OpenAi(OpenAiWebConfig {
+        base_url: std::env::var("WEB_BASE_URL")
+            .or_else(|_| std::env::var("LLM_BASE_URL"))
+            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
+            .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".into()),
+        api_key,
+        model: std::env::var("WEB_MODEL")
+            .or_else(|_| std::env::var("LLM_MODEL"))
+            .unwrap_or_else(|_| "gpt-5.4".into()),
+    })
+}
+
+pub fn create_web_provider_from_env() -> Arc<dyn quine_llm::WebProvider> {
+    Arc::from(quine_llm::config::create_web_provider(web_config_from_env()))
 }
 
 /// Resolve the configured model's max context window.

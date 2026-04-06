@@ -976,9 +976,7 @@ impl App {
     /// Handle Enter/Ctrl+S: send message or submit interaction response.
     pub fn submit_input(&mut self) -> Option<AppAction> {
         if self.interaction_queue.front().is_some() {
-            let Some(select) = self.option_select.take() else {
-                return None;
-            };
+            let select = self.option_select.take()?;
             if select.allow_freeform && select.cursor == select.options.len() - 1 {
                 return None;
             }
@@ -1373,10 +1371,12 @@ impl App {
             .switch_session_candidates
             .iter()
             .filter(|session| prefix.is_empty() || session.session_id.starts_with(prefix.as_str()))
-            .map(|session| match session.summary.as_deref().filter(|value| !value.is_empty()) {
-                Some(summary) => format!("{}\t{}", session.session_id, summary),
-                None => session.session_id.clone(),
-            })
+            .map(
+                |session| match session.summary.as_deref().filter(|value| !value.is_empty()) {
+                    Some(summary) => format!("{}\t{}", session.session_id, summary),
+                    None => session.session_id.clone(),
+                },
+            )
             .collect();
 
         if options.is_empty() {

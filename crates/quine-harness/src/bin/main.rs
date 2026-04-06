@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use quine_harness::{
-    create_provider_from_env, default_memory_dir_from_state_dir, HarnessConfig, LocalHarness,
+    create_provider_from_env, create_web_provider_from_env, default_memory_dir_from_state_dir,
+    HarnessConfig, LocalHarness,
 };
 
 #[derive(Parser)]
@@ -43,8 +44,14 @@ async fn main() -> anyhow::Result<()> {
             };
 
             let provider = create_provider_from_env();
+            let web_provider = create_web_provider_from_env();
             let harness = Arc::new(
-                LocalHarness::with_archive_root(provider, Some(config.state_dir.clone())).await?,
+                LocalHarness::with_archive_root_and_web_provider(
+                    provider,
+                    web_provider,
+                    Some(config.state_dir.clone()),
+                )
+                .await?,
             );
 
             quine_harness::server::run_ipc_server(&config.socket_path, harness).await?;

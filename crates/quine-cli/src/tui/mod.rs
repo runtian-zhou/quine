@@ -531,8 +531,7 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
             }
 
             // In option-select mode, route keys differently.
-            if app.is_selecting_options() && !app.slash_select_active && !app.switch_select_active
-            {
+            if app.is_selecting_options() && !app.slash_select_active && !app.switch_select_active {
                 return match code {
                     KeyCode::Enter => app.submit_input(),
                     KeyCode::Up => {

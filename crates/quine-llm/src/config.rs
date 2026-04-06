@@ -1,6 +1,8 @@
 use crate::anthropic::{AnthropicConfig, AnthropicProvider};
 use crate::openai_compat::{OpenAiCompatConfig, OpenAiCompatProvider};
+use crate::openai_web::{OpenAiWebConfig, OpenAiWebProvider};
 use crate::provider::LlmProvider;
+use crate::web::{NoopWebProvider, WebProvider};
 
 /// Configuration for selecting and configuring an LLM provider.
 #[derive(Debug, Clone)]
@@ -16,6 +18,23 @@ pub fn create_provider(config: ProviderConfig) -> Box<dyn LlmProvider> {
     match config {
         ProviderConfig::OpenAiCompat(c) => Box::new(OpenAiCompatProvider::new(c)),
         ProviderConfig::Anthropic(c) => Box::new(AnthropicProvider::new(c)),
+    }
+}
+
+/// Configuration for selecting and configuring a web provider.
+#[derive(Debug, Clone)]
+pub enum WebProviderConfig {
+    /// OpenAI Responses API `web_search` tool.
+    OpenAi(OpenAiWebConfig),
+    /// A disabled placeholder provider.
+    None,
+}
+
+/// Create a web provider instance from configuration.
+pub fn create_web_provider(config: WebProviderConfig) -> Box<dyn WebProvider> {
+    match config {
+        WebProviderConfig::OpenAi(c) => Box::new(OpenAiWebProvider::new(c)),
+        WebProviderConfig::None => Box::new(NoopWebProvider),
     }
 }
 

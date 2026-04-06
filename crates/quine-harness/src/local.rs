@@ -9,7 +9,7 @@ use quine_core::{
     create_channels, load_skills, ChannelConfig, CoreCheckpoint, CoreInput, CoreOutput,
     HarnessHandle, InheritanceFlags, InteractionResponse, SessionId, SessionSignal, Skill,
 };
-use quine_llm::LlmProvider;
+use quine_llm::{LlmProvider, NoopWebProvider, WebProvider};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::Duration;
 
@@ -115,18 +115,36 @@ impl LocalHarness {
         provider: Arc<dyn LlmProvider>,
         storage: Option<StorageManager>,
     ) -> Result<Self, HarnessError> {
-        Self::with_storage(provider, storage, None).await
+        Self::new_with_web_provider(provider, Arc::new(NoopWebProvider), storage).await
+    }
+
+    pub async fn new_with_web_provider(
+        provider: Arc<dyn LlmProvider>,
+        web_provider: Arc<dyn WebProvider>,
+        storage: Option<StorageManager>,
+    ) -> Result<Self, HarnessError> {
+        Self::with_storage(provider, web_provider, storage, None).await
     }
 
     pub async fn with_archive_root(
         provider: Arc<dyn LlmProvider>,
         archive_root: Option<std::path::PathBuf>,
     ) -> Result<Self, HarnessError> {
-        Self::with_storage(provider, None, archive_root).await
+        Self::with_archive_root_and_web_provider(provider, Arc::new(NoopWebProvider), archive_root)
+            .await
+    }
+
+    pub async fn with_archive_root_and_web_provider(
+        provider: Arc<dyn LlmProvider>,
+        web_provider: Arc<dyn WebProvider>,
+        archive_root: Option<std::path::PathBuf>,
+    ) -> Result<Self, HarnessError> {
+        Self::with_storage(provider, web_provider, None, archive_root).await
     }
 
     async fn with_storage(
         provider: Arc<dyn LlmProvider>,
+        web_provider: Arc<dyn WebProvider>,
         storage: Option<StorageManager>,
         archive_root: Option<std::path::PathBuf>,
     ) -> Result<Self, HarnessError> {
@@ -194,9 +212,10 @@ impl LocalHarness {
         let max_context_window = max_context_window_from_env();
 
         // Spawn the core event loop.
-        let core_task = tokio::spawn(quine_core::run_core_loop_with_compaction(
+        let core_task = tokio::spawn(quine_core::run_core_loop_with_compaction_and_web_provider(
             core_handle,
             provider,
+            web_provider,
             restored_checkpoint,
             archive_root,
             max_context_window,
