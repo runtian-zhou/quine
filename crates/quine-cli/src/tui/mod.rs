@@ -373,11 +373,6 @@ async fn run_event_loop(
             }
             ui::draw(frame, app)
         })?;
-        if let Some(explorer) = app.context_explorer.as_mut() {
-            if explorer.detail_flush_pending {
-                explorer.detail_flush_pending = false;
-            }
-        }
         last_context_visible = app.context_explorer_active();
 
         if app.should_quit {

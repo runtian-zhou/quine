@@ -211,65 +211,14 @@ fn plan_status_style(status_line: &str) -> Style {
     }
 }
 
-fn render_plan_box(lines: &mut Vec<Line<'_>>, plan: &str, width: u16) {
-    let inner_width = usize::from(width.saturating_sub(8)).max(1);
-    let top = format!("    ┌{}┐", "─".repeat(inner_width + 2));
-    let bottom = format!("    └{}┘", "─".repeat(inner_width + 2));
-    lines.push(Line::from(Span::styled(
-        top,
-        Style::default().fg(Color::Cyan),
-    )));
-
-    for raw_line in plan.lines() {
-        let line = if raw_line.is_empty() { " " } else { raw_line };
-        let mut current = String::new();
-        let mut current_width = 0usize;
-
-        for ch in line.chars() {
-            if current_width >= inner_width {
-                let padded = format!("    │ {:<width$} │", current, width = inner_width);
-                let style = if current.trim_start().starts_with("Plan:") {
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    plan_status_style(current.trim_start())
-                };
-                lines.push(Line::from(Span::styled(padded, style)));
-                current.clear();
-                current_width = 0;
-            }
-            current.push(ch);
-            current_width += 1;
-        }
-
-        let padded = format!("    │ {:<width$} │", current, width = inner_width);
-        let style = if current.trim_start().starts_with("Plan:") {
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            plan_status_style(current.trim_start())
-        };
-        lines.push(Line::from(Span::styled(padded, style)));
-    }
-
-    lines.push(Line::from(Span::styled(
-        bottom,
-        Style::default().fg(Color::Cyan),
-    )));
-}
-
-fn render_bash_preview_box(lines: &mut Vec<Line<'static>>, preview: &str, width: u16) {
-    let inner_width = usize::from(width.saturating_sub(10)).max(1);
-    let top = format!("      ┌{}┐", "─".repeat(inner_width + 2));
-    let bottom = format!("      └{}┘", "─".repeat(inner_width + 2));
+fn wrap_box_lines(text: &str, inner_width: usize) -> Vec<String> {
     let mut wrapped = Vec::new();
 
-    for raw_line in preview.lines() {
+    for raw_line in text.lines() {
         let line = if raw_line.is_empty() { " " } else { raw_line };
         let mut current = String::new();
         let mut current_width = 0usize;
+
         for ch in line.chars() {
             let ch_width = ch.width().unwrap_or(0).max(1);
             if current_width + ch_width > inner_width && !current.is_empty() {
@@ -280,12 +229,72 @@ fn render_bash_preview_box(lines: &mut Vec<Line<'static>>, preview: &str, width:
             current.push(ch);
             current_width += ch_width;
         }
+
         if current.is_empty() {
             wrapped.push(" ".to_string());
         } else {
             wrapped.push(current);
         }
     }
+
+    wrapped
+}
+
+fn render_plan_box_with_indent(
+    lines: &mut Vec<Line<'static>>,
+    plan: &str,
+    width: u16,
+    indent: usize,
+) {
+    let reserved = indent + 4;
+    let inner_width = usize::from(width).saturating_sub(reserved).max(1);
+    let indent_text = " ".repeat(indent);
+
+    lines.push(Line::from(Span::styled(
+        format!("{indent_text}┌{}┐", "─".repeat(inner_width + 2)),
+        Style::default().fg(Color::Cyan),
+    )));
+
+    for line in wrap_box_lines(plan, inner_width) {
+        let content_width = line.width();
+        let padding = " ".repeat(inner_width.saturating_sub(content_width));
+        let style = if line.trim_start().starts_with("Plan:") {
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            plan_status_style(line.trim_start())
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled(format!("{indent_text}│ "), Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{line}{padding}"), style),
+            Span::styled(" │", Style::default().fg(Color::Cyan)),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!("{indent_text}└{}┘", "─".repeat(inner_width + 2)),
+        Style::default().fg(Color::Cyan),
+    )));
+}
+
+fn render_plan_box(lines: &mut Vec<Line<'static>>, plan: &str, width: u16) {
+    render_plan_box_with_indent(lines, plan, width, 4);
+}
+
+fn render_bash_preview_box_with_indent(
+    lines: &mut Vec<Line<'static>>,
+    preview: &str,
+    width: u16,
+    indent: usize,
+) {
+    let reserved = indent + 4;
+    let inner_width = usize::from(width).saturating_sub(reserved).max(1);
+    let indent_text = " ".repeat(indent);
+    let top = format!("{indent_text}┌{}┐", "─".repeat(inner_width + 2));
+    let bottom = format!("{indent_text}└{}┘", "─".repeat(inner_width + 2));
+    let wrapped = wrap_box_lines(preview, inner_width);
 
     let clipped = wrapped.len() > 6;
     let visible = if clipped {
@@ -298,20 +307,24 @@ fn render_bash_preview_box(lines: &mut Vec<Line<'static>>, preview: &str, width:
         Style::default().fg(Color::Cyan),
     )));
     for line in visible {
+        let content_width = line.width();
+        let padding = " ".repeat(inner_width.saturating_sub(content_width));
         lines.push(Line::from(vec![
-            Span::styled("      │ ", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{indent_text}│ "), Style::default().fg(Color::Cyan)),
             Span::styled(
-                format!("{line:<width$}", width = inner_width),
+                format!("{line}{padding}"),
                 Style::default().fg(Color::White),
             ),
             Span::styled(" │", Style::default().fg(Color::Cyan)),
         ]));
     }
     if clipped {
+        let truncation = "… output truncated …";
+        let padding = " ".repeat(inner_width.saturating_sub(truncation.width()));
         lines.push(Line::from(vec![
-            Span::styled("      │ ", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{indent_text}│ "), Style::default().fg(Color::Cyan)),
             Span::styled(
-                format!("{:<width$}", "… output truncated …", width = inner_width),
+                format!("{truncation}{padding}"),
                 Style::default()
                     .fg(Color::DarkGray)
                     .add_modifier(Modifier::DIM),
@@ -325,8 +338,12 @@ fn render_bash_preview_box(lines: &mut Vec<Line<'static>>, preview: &str, width:
     )));
 }
 
+fn render_bash_preview_box(lines: &mut Vec<Line<'static>>, preview: &str, width: u16) {
+    render_bash_preview_box_with_indent(lines, preview, width, 6);
+}
+
 fn render_grouped_plan_preview(lines: &mut Vec<Line<'static>>, preview: &str, width: u16) {
-    render_plan_box(lines, preview, width);
+    render_plan_box_with_indent(lines, preview, width, 6);
 }
 
 fn push_tool_batch_entry_lines(
@@ -1183,16 +1200,12 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             let detail_block = Block::default().title(" Detail ").borders(Borders::ALL);
             let detail_inner = detail_block.inner(columns[1]);
             frame.render_widget(detail_block, columns[1]);
-            paint_blank_area(frame, detail_inner);
-            let detail_text = if explorer.detail_flush_pending {
-                "\n".repeat(detail_inner.height.saturating_sub(1) as usize)
-            } else {
-                format_context_entry_detail(explorer)
-            };
-            let detail = Paragraph::new(detail_text)
-                .wrap(Wrap { trim: false })
-                .scroll((explorer.scroll_offset, 0));
-            frame.render_widget(detail, detail_inner);
+            render_text_area(
+                frame,
+                detail_inner,
+                &format_context_entry_detail(explorer),
+                explorer.scroll_offset,
+            );
         }
         ContextExplorerTab::Tools => {
             frame.render_widget(Clear, sections[2]);
@@ -1247,16 +1260,12 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
                 .borders(Borders::ALL);
             let detail_inner = detail_block.inner(columns[1]);
             frame.render_widget(detail_block, columns[1]);
-            paint_blank_area(frame, detail_inner);
-            let detail_text = if explorer.detail_flush_pending {
-                "\n".repeat(detail_inner.height.saturating_sub(1) as usize)
-            } else {
-                format_tool_detail(explorer)
-            };
-            let detail = Paragraph::new(detail_text)
-                .wrap(Wrap { trim: false })
-                .scroll((explorer.scroll_offset, 0));
-            frame.render_widget(detail, detail_inner);
+            render_text_area(
+                frame,
+                detail_inner,
+                &format_tool_detail(explorer),
+                explorer.scroll_offset,
+            );
         }
         ContextExplorerTab::Skills => {
             frame.render_widget(Clear, sections[2]);
@@ -1311,29 +1320,24 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
                 .borders(Borders::ALL);
             let detail_inner = detail_block.inner(columns[1]);
             frame.render_widget(detail_block, columns[1]);
-            paint_blank_area(frame, detail_inner);
-            let detail_text = if explorer.detail_flush_pending {
-                "\n".repeat(detail_inner.height.saturating_sub(1) as usize)
-            } else {
-                format_skill_detail(explorer)
-            };
-            let detail = Paragraph::new(detail_text)
-                .wrap(Wrap { trim: false })
-                .scroll((explorer.scroll_offset, 0));
-            frame.render_widget(detail, detail_inner);
+            render_text_area(
+                frame,
+                detail_inner,
+                &format_skill_detail(explorer),
+                explorer.scroll_offset,
+            );
         }
         ContextExplorerTab::Plans => {
             frame.render_widget(Clear, sections[2]);
-            paint_blank_area(frame, sections[2]);
-            let plans = if explorer.detail_flush_pending {
-                Paragraph::new("\n".repeat(sections[2].height.saturating_sub(1) as usize))
-            } else {
-                Paragraph::new(Text::from(format_plans_tab_lines(explorer)))
-            }
-            .block(Block::default().title(" Plans ").borders(Borders::ALL))
-            .wrap(Wrap { trim: false })
-            .scroll((explorer.scroll_offset, 0));
-            frame.render_widget(plans, sections[2]);
+            let plans_block = Block::default().title(" Plans ").borders(Borders::ALL);
+            let plans_inner = plans_block.inner(sections[2]);
+            frame.render_widget(plans_block, sections[2]);
+            render_lines_area(
+                frame,
+                plans_inner,
+                &format_plans_tab_lines(explorer),
+                explorer.scroll_offset,
+            );
         }
     }
 
@@ -1357,6 +1361,45 @@ fn paint_blank_area(frame: &mut Frame, area: Rect) {
     let buffer = frame.buffer_mut();
     for y in area.top()..area.bottom() {
         buffer.set_string(area.left(), y, &blank_line, style);
+    }
+}
+
+fn render_text_area(frame: &mut Frame, area: Rect, text: &str, scroll_offset: u16) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    paint_blank_area(frame, area);
+    let wrapped = wrap_box_lines(text, area.width as usize);
+    render_wrapped_lines(frame, area, &wrapped, scroll_offset);
+}
+
+fn render_lines_area(frame: &mut Frame, area: Rect, lines: &[Line<'static>], scroll_offset: u16) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    paint_blank_area(frame, area);
+    let text = lines
+        .iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let wrapped = wrap_box_lines(&text, area.width as usize);
+    render_wrapped_lines(frame, area, &wrapped, scroll_offset);
+}
+
+fn render_wrapped_lines(frame: &mut Frame, area: Rect, wrapped: &[String], scroll_offset: u16) {
+    let style = Style::default().fg(Color::White).bg(Color::Reset);
+    let buffer = frame.buffer_mut();
+    let start = scroll_offset as usize;
+    let visible_rows = area.height as usize;
+
+    for row in 0..visible_rows {
+        let y = area.top() + row as u16;
+        let line = wrapped.get(start + row).map_or("", String::as_str);
+        let visible: String = line.chars().take(area.width as usize).collect();
+        buffer.set_stringn(area.left(), y, &visible, area.width as usize, style);
     }
 }
 
@@ -1810,9 +1853,6 @@ mod tests {
         let mut app = App::new("test".into(), false, None);
         app.open_context_explorer(snapshot);
         app.context_explorer_move_down();
-        if let Some(explorer) = app.context_explorer.as_mut() {
-            explorer.detail_flush_pending = false;
-        }
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1852,9 +1892,6 @@ mod tests {
         let mut app = App::new("test".into(), false, None);
         app.open_context_explorer(snapshot);
         app.context_explorer_next_tab();
-        if let Some(explorer) = app.context_explorer.as_mut() {
-            explorer.detail_flush_pending = false;
-        }
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1897,9 +1934,6 @@ mod tests {
         app.open_context_explorer(snapshot);
         app.context_explorer_next_tab();
         app.context_explorer_next_tab();
-        if let Some(explorer) = app.context_explorer.as_mut() {
-            explorer.detail_flush_pending = false;
-        }
 
         let backend = ratatui::backend::TestBackend::new(100, 30);
         let mut terminal = ratatui::Terminal::new(backend).unwrap();
@@ -1986,6 +2020,36 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.contains("… output truncated …")));
+    }
+
+    #[test]
+    fn draw_grouped_bash_preview_box_stays_aligned_with_wide_glyphs() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "bash".into(),
+            tool_use_id: "tc1".into(),
+            summary: "printf demo".into(),
+            status: ToolStatus::Success { duration_us: 42 },
+            result_preview: Some("wide ✅ output\nsecond line".into()),
+        });
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "read_file".into(),
+            tool_use_id: "tc2".into(),
+            summary: "src/main.rs".into(),
+            status: ToolStatus::Success { duration_us: 24 },
+            result_preview: None,
+        });
+
+        let lines = build_conversation_lines(&app, 60);
+        let rendered: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        let top_index = rendered.iter().position(|line| line.contains("┌")).unwrap();
+        let bottom_index = rendered.iter().position(|line| line.contains("└")).unwrap();
+
+        assert!(rendered[top_index].starts_with("      ┌"));
+        assert!(rendered[bottom_index].starts_with("      └"));
+        for line in &rendered[top_index..=bottom_index] {
+            assert_eq!(line.width(), rendered[top_index].width());
+        }
     }
 
     #[test]
@@ -2313,11 +2377,16 @@ mod tests {
             .position(|line| line.contains("▌ Tools (2)"))
             .unwrap();
         let plan_box_top_index = rendered.iter().position(|line| line.contains("┌")).unwrap();
+        let plan_box_bottom_index = rendered.iter().position(|line| line.contains("└")).unwrap();
 
         assert!(rendered.iter().any(|line| line.contains("Plan: Demo")));
         assert!(rendered.iter().any(|line| line.contains("[a1] First task")));
-        assert!(rendered.iter().any(|line| line.contains("└")));
         assert_eq!(plan_box_top_index, header_index + 2);
+        assert!(rendered[plan_box_top_index].starts_with("      ┌"));
+        assert!(rendered[plan_box_bottom_index].starts_with("      └"));
+        for line in &rendered[plan_box_top_index..=plan_box_bottom_index] {
+            assert_eq!(line.width(), rendered[plan_box_top_index].width());
+        }
     }
 
     #[test]
@@ -2565,9 +2634,6 @@ mod tests {
 
         app.context_explorer_move_down();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        if let Some(explorer) = app.context_explorer.as_mut() {
-            explorer.detail_flush_pending = false;
-        }
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let lines = buffer_lines(terminal.backend());
