@@ -2028,7 +2028,7 @@ async fn prepare_tool_result_for_history(
             tool_output.chars().count()
         ),
     );
-    Ok(compaction::render_archived_tool_result(
+    Ok(compaction::render_initial_archived_tool_result(
         tool_name,
         tool_use_id,
         is_error,
@@ -7311,7 +7311,12 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         .await
         .unwrap();
         let session_id = SessionId::new();
-        let oversized = "x".repeat(compaction::MAX_TOOL_RESULT_CHARS_IN_HISTORY + 128);
+        let oversized = (1..=13)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + &"\n"
+            + &"x".repeat(compaction::MAX_TOOL_RESULT_CHARS_IN_HISTORY + 128);
 
         let output = prepare_tool_result_for_history(
             &session,
@@ -7326,7 +7331,10 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         assert!(output.contains("[tool result archived: bash, ok"));
         assert!(output.contains("archive="));
-        assert!(output.contains("[... elided ...]"));
+        assert!(output.contains("line 1"));
+        assert!(output.contains("line 12"));
+        assert!(!output.contains("line 13"));
+        assert!(output.contains("[... omitted 2 more line(s); full tool result archived at "));
 
         let archived_dir = archive_root
             .join("tool-results")
