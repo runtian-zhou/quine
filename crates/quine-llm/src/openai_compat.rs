@@ -71,7 +71,7 @@ struct StreamOptions {
 struct ChatMessage {
     role: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_call_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -151,7 +151,6 @@ struct OpenAiToolCallFunction {
 #[serde(untagged)]
 enum OpenAiToolCallArguments {
     JsonString(String),
-    JsonValue(serde_json::Value),
 }
 
 #[derive(Deserialize, Clone)]
@@ -160,11 +159,6 @@ struct OpenAiToolCallFunctionDelta {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
-}
-
-fn use_structured_tool_call_arguments(model: &str) -> bool {
-    let normalized = model.to_ascii_lowercase();
-    normalized.contains("qwen3-coder")
 }
 
 fn use_qwen_tool_call_parser(model: &str) -> bool {
@@ -252,11 +246,7 @@ fn format_tool_result_content(
     serde_json::to_string(&content).unwrap_or_else(|_| output.to_string())
 }
 
-fn convert_message(
-    msg: &Message,
-    structured_tool_call_arguments: bool,
-    structured_tool_result_content: bool,
-) -> ChatMessage {
+fn convert_message(msg: &Message, structured_tool_result_content: bool) -> ChatMessage {
     let role = match msg.role {
         Role::System => "system",
         Role::User => "user",
@@ -267,7 +257,7 @@ fn convert_message(
     match &msg.content {
         MessageContent::Text(text) => ChatMessage {
             role: role.into(),
-            content: Some(text.clone()),
+            content: Some(serde_json::Value::String(text.clone())),
             tool_call_id: None,
             tool_calls: None,
         },
@@ -277,17 +267,17 @@ fn convert_message(
             is_error,
         } => ChatMessage {
             role: "tool".into(),
-            content: Some(format_tool_result_content(
+            content: Some(serde_json::Value::String(format_tool_result_content(
                 output,
                 *is_error,
                 structured_tool_result_content,
-            )),
+            ))),
             tool_call_id: Some(tool_use_id.clone()),
             tool_calls: None,
         },
         MessageContent::ToolUse { text, tool_calls } => ChatMessage {
             role: "assistant".into(),
-            content: Some(text.clone().unwrap_or_default()),
+            content: Some(serde_json::Value::String(text.clone().unwrap_or_default())),
             tool_call_id: None,
             tool_calls: Some(
                 tool_calls
@@ -297,13 +287,9 @@ fn convert_message(
                         r#type: "function".into(),
                         function: OpenAiToolCallFunction {
                             name: tc.tool_name.clone(),
-                            arguments: if structured_tool_call_arguments {
-                                OpenAiToolCallArguments::JsonValue(tc.arguments.clone())
-                            } else {
-                                OpenAiToolCallArguments::JsonString(
-                                    serde_json::to_string(&tc.arguments).unwrap_or_default(),
-                                )
-                            },
+                            arguments: OpenAiToolCallArguments::JsonString(
+                                serde_json::to_string(&tc.arguments).unwrap_or_default(),
+                            ),
                         },
                     })
                     .collect(),
@@ -564,7 +550,6 @@ impl LlmProvider for OpenAiCompatProvider {
         messages: &[Message],
         tools: &[ToolDefinition],
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<LlmEvent>> + Send>>> {
-        let structured_tool_call_arguments = use_structured_tool_call_arguments(&self.config.model);
         let structured_tool_result_content = use_structured_tool_result_content(&self.config.model);
         let qwen_tool_call_parser_enabled = use_qwen_tool_call_parser(&self.config.model);
         let url = format!(
@@ -576,13 +561,7 @@ impl LlmProvider for OpenAiCompatProvider {
             model: self.config.model.clone(),
             messages: messages
                 .iter()
-                .map(|message| {
-                    convert_message(
-                        message,
-                        structured_tool_call_arguments,
-                        structured_tool_result_content,
-                    )
-                })
+                .map(|message| convert_message(message, structured_tool_result_content))
                 .collect(),
             stream: true,
             stream_options: Some(StreamOptions {
@@ -830,15 +809,15 @@ mod tests {
     #[test]
     fn convert_message_user() {
         let msg = Message::user("hello");
-        let chat = convert_message(&msg, false, false);
+        let chat = convert_message(&msg, false);
         assert_eq!(chat.role, "user");
-        assert_eq!(chat.content.unwrap(), "hello");
+        assert_eq!(chat.content, Some(serde_json::json!("hello")));
     }
 
     #[test]
     fn convert_message_tool_result() {
         let msg = Message::tool_result("id-1", "output", false);
-        let chat = convert_message(&msg, false, false);
+        let chat = convert_message(&msg, false);
         assert_eq!(chat.role, "tool");
         assert_eq!(chat.tool_call_id.unwrap(), "id-1");
     }
@@ -853,14 +832,30 @@ mod tests {
                 arguments: serde_json::json!({"file_path": "/tmp/test.txt"}),
             }],
         );
-        let chat = convert_message(&msg, false, false);
+        let chat = convert_message(&msg, false);
         assert_eq!(chat.role, "assistant");
-        assert_eq!(chat.content.as_deref(), Some(""));
+        assert_eq!(chat.content, Some(serde_json::json!("")));
         assert!(chat.tool_calls.is_some());
     }
 
     #[test]
-    fn convert_message_tool_use_can_emit_structured_arguments() {
+    fn convert_message_tool_use_omits_whitespace_only_content() {
+        let msg = Message::assistant_tool_use(
+            Some("\n\t ".into()),
+            vec![crate::types::ToolUseRequest {
+                tool_use_id: "id-1".into(),
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({"file_path": "/tmp/test.txt"}),
+            }],
+        );
+        let chat = convert_message(&msg, false);
+        assert_eq!(chat.role, "assistant");
+        assert_eq!(chat.content, Some(serde_json::json!("\n\t ")));
+        assert!(chat.tool_calls.is_some());
+    }
+
+    #[test]
+    fn convert_message_tool_use_serializes_without_content_field_when_empty() {
         let msg = Message::assistant_tool_use(
             None,
             vec![crate::types::ToolUseRequest {
@@ -869,10 +864,58 @@ mod tests {
                 arguments: serde_json::json!({"file_path": "/tmp/test.txt"}),
             }],
         );
-        let chat = convert_message(&msg, true, false);
+        let chat = convert_message(&msg, false);
+        let json = serde_json::to_value(&chat).unwrap();
+        assert_eq!(json["role"], "assistant");
+        assert_eq!(json["content"], "");
+        assert!(json.get("tool_calls").is_some());
+    }
+
+    #[test]
+    fn convert_message_tool_use_stringifies_tool_arguments() {
+        let msg = Message::assistant_tool_use(
+            None,
+            vec![crate::types::ToolUseRequest {
+                tool_use_id: "id-1".into(),
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({"file_path": "/tmp/test.txt"}),
+            }],
+        );
+        let chat = convert_message(&msg, true);
         let tool_calls = chat.tool_calls.expect("tool calls");
         let json = serde_json::to_value(&tool_calls[0]).unwrap();
-        assert_eq!(json["function"]["arguments"]["file_path"], "/tmp/test.txt");
+        assert_eq!(
+            json["function"]["arguments"],
+            "{\"file_path\":\"/tmp/test.txt\"}"
+        );
+    }
+
+    #[test]
+    fn chat_request_serializes_tool_use_arguments_as_string() {
+        let msg = Message::assistant_tool_use(
+            None,
+            vec![crate::types::ToolUseRequest {
+                tool_use_id: "id-1".into(),
+                tool_name: "read_file".into(),
+                arguments: serde_json::json!({"file_path": "/tmp/test.txt"}),
+            }],
+        );
+        let request = ChatRequest {
+            model: "qwen/qwen3-coder-next".into(),
+            messages: vec![convert_message(&msg, false)],
+            stream: true,
+            stream_options: None,
+            max_tokens: Some(128),
+            tools: vec![],
+            parallel_tool_calls: false,
+        };
+        let json = serde_json::to_value(&request).unwrap();
+        assert_eq!(json["messages"][0]["role"], "assistant");
+        assert_eq!(json["messages"][0]["content"], "");
+        assert_eq!(
+            json["messages"][0]["tool_calls"][0]["function"]["arguments"],
+            "{\"file_path\":\"/tmp/test.txt\"}"
+        );
     }
 
     #[test]
@@ -886,9 +929,14 @@ mod tests {
     #[test]
     fn convert_message_tool_result_can_emit_structured_qwen_error() {
         let msg = Message::tool_result("id-1", "not found: missing.txt", true);
-        let chat = convert_message(&msg, false, true);
+        let chat = convert_message(&msg, true);
         let content = chat.content.expect("tool content");
-        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            content
+                .as_str()
+                .expect("structured tool result should serialize as a string"),
+        )
+        .unwrap();
         assert_eq!(json["ok"], false);
         assert_eq!(json["error"]["type"], "not_found");
         assert_eq!(json["error"]["message"], "not found: missing.txt");
@@ -897,9 +945,14 @@ mod tests {
     #[test]
     fn convert_message_tool_result_can_emit_structured_qwen_success() {
         let msg = Message::tool_result("id-1", "file contents", false);
-        let chat = convert_message(&msg, false, true);
+        let chat = convert_message(&msg, true);
         let content = chat.content.expect("tool content");
-        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        let json: serde_json::Value = serde_json::from_str(
+            content
+                .as_str()
+                .expect("structured tool result should serialize as a string"),
+        )
+        .unwrap();
         assert_eq!(json["ok"], true);
         assert_eq!(json["content"], "file contents");
     }
