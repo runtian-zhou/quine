@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
+use std::time::{Duration, Instant};
 
 use reqwest::Client;
 use serde::Deserialize;
@@ -9,7 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::client::IpcClient;
 use crate::context_debug::{fetch_session_context, SessionContextSnapshot};
-use crate::run::{self, InteractionNeededOutput, OneshotOutput, RunOneshotOptions};
+use crate::run::{self, OneshotOutput, OneshotProgressEvent, RunOneshotOptions};
 use crate::session::{create_session, create_slash_skill_session};
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::methods;
@@ -21,6 +21,41 @@ struct TelegramChatState {
     model_profile: Option<String>,
     state_tab: SessionStateTab,
     session_picker_page: usize,
+    pending_interaction: Option<TelegramPendingInteraction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TelegramInteractionKind {
+    Question,
+    Confirmation,
+    SingleSelect,
+    MultiSelect,
+}
+
+#[derive(Debug, Clone)]
+struct TelegramPendingInteraction {
+    session_id: String,
+    prompt: String,
+    source_label: Option<String>,
+    kind: TelegramInteractionKind,
+    options: Vec<String>,
+    allow_freeform: bool,
+    selected_indices: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+enum TelegramProgressPhase {
+    Thinking,
+    Responding,
+    RunningTool(String),
+    WaitingForInput,
+    Finalizing,
+}
+
+#[derive(Debug, Clone)]
+struct TelegramProgressState {
+    phase: TelegramProgressPhase,
+    started_at: Instant,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -41,11 +76,10 @@ enum TelegramSlashAction {
     ShowSessions {
         tree: bool,
     },
-    ShowState {
+    Compact,
+    Context {
         tab: Option<SessionStateTab>,
     },
-    Compact,
-    Context,
     Clear,
     SetModelProfile {
         model_profile: String,
@@ -130,6 +164,52 @@ impl SessionSummary {
             .as_deref()
             .or(self.title.as_deref())
             .filter(|value| !value.trim().is_empty())
+    }
+}
+
+impl TelegramProgressState {
+    fn new(phase: TelegramProgressPhase) -> Self {
+        Self {
+            phase,
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl TelegramInteractionKind {
+    fn from_output_kind(kind: &str) -> Self {
+        match kind {
+            "Confirmation" => Self::Confirmation,
+            "SingleSelect" => Self::SingleSelect,
+            "MultiSelect" => Self::MultiSelect,
+            _ => Self::Question,
+        }
+    }
+}
+
+impl TelegramPendingInteraction {
+    fn response_text_for(&self, selected_indices: &[usize], fallback: &str) -> String {
+        if !fallback.trim().is_empty() {
+            return fallback.to_string();
+        }
+
+        match self.kind {
+            TelegramInteractionKind::MultiSelect
+            | TelegramInteractionKind::SingleSelect
+            | TelegramInteractionKind::Confirmation => {
+                let selected_labels = selected_indices
+                    .iter()
+                    .filter_map(|index| self.options.get(*index))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                if selected_labels.is_empty() {
+                    String::new()
+                } else {
+                    selected_labels.join(", ")
+                }
+            }
+            TelegramInteractionKind::Question => String::new(),
+        }
     }
 }
 
@@ -243,10 +323,37 @@ impl TelegramBot {
         let response = self.client.get(url).send().await?;
         let envelope: TelegramApiEnvelope<serde_json::Value> = response.json().await?;
         if envelope.ok {
+            self.configure_commands_menu().await?;
             Ok(())
         } else {
             anyhow::bail!(
                 "Telegram bot token validation failed: {}",
+                envelope
+                    .description
+                    .unwrap_or_else(|| "unknown error".to_string())
+            );
+        }
+    }
+
+    async fn configure_commands_menu(&self) -> anyhow::Result<()> {
+        let url = format!("{}/setMyCommands", self.api_base);
+        let payload = serde_json::json!({
+            "commands": [
+                {"command": "ps", "description": "List sessions"},
+                {"command": "context", "description": "Show session context"},
+                {"command": "compact", "description": "Compact session context"},
+                {"command": "clear", "description": "Start a new session"},
+                {"command": "plan", "description": "Send a planning request"},
+                {"command": "quit", "description": "Clear the active session"},
+            ]
+        });
+        let response = self.client.post(url).json(&payload).send().await?;
+        let envelope: TelegramApiEnvelope<serde_json::Value> = response.json().await?;
+        if envelope.ok {
+            Ok(())
+        } else {
+            anyhow::bail!(
+                "Telegram setMyCommands failed: {}",
                 envelope
                     .description
                     .unwrap_or_else(|| "unknown error".to_string())
@@ -291,31 +398,46 @@ impl TelegramBot {
         }
     }
 
-    async fn resolve_status_session_id(&self, chat_id: i64) -> anyhow::Result<Option<String>> {
-        if let Some(session_id) = self.current_session_id(chat_id).await? {
-            return Ok(Some(session_id));
-        }
+    async fn pending_interaction(
+        &self,
+        chat_id: i64,
+    ) -> anyhow::Result<Option<TelegramPendingInteraction>> {
+        Ok(self
+            .chat_state
+            .lock()
+            .await
+            .get(&chat_id)
+            .and_then(|state| state.pending_interaction.clone()))
+    }
 
-        let mut client = self.connect_client().await?;
-        let sessions = self.fetch_sessions(&mut client).await?;
-        let Some(session) = sessions.first() else {
-            return Ok(None);
-        };
-        let session_id = session.session_id.clone();
-        eprintln!(
-            "[telegram] resolve_status_session_id chat_id={chat_id} falling back to latest session_id={session_id}"
-        );
+    async fn set_pending_interaction(
+        &self,
+        chat_id: i64,
+        pending_interaction: Option<TelegramPendingInteraction>,
+    ) {
+        if let Some(state) = self.chat_state.lock().await.get_mut(&chat_id) {
+            state.pending_interaction = pending_interaction;
+        }
+    }
+
+    async fn set_active_session_state(
+        &self,
+        chat_id: i64,
+        session_id: String,
+        plan_mode: bool,
+        state_tab: SessionStateTab,
+    ) {
         self.chat_state.lock().await.insert(
             chat_id,
             TelegramChatState {
-                session_id: Some(session_id.clone()),
-                plan_mode: session.plan_mode,
+                session_id: Some(session_id),
+                plan_mode,
                 model_profile: self.default_model_profile.clone(),
-                state_tab: SessionStateTab::Overview,
+                state_tab,
                 session_picker_page: 0,
+                pending_interaction: None,
             },
         );
-        Ok(Some(session_id))
     }
 
     async fn send_reply(
@@ -352,6 +474,188 @@ impl TelegramBot {
         Ok(())
     }
 
+    async fn render_oneshot_output(
+        &self,
+        chat_id: i64,
+        reply_to_message_id: i64,
+        status_message_id: i64,
+        output: &OneshotOutput,
+    ) -> anyhow::Result<()> {
+        let (reply, interaction_markup) = self.prepare_oneshot_output(chat_id, output).await;
+
+        match self
+            .edit_message(
+                chat_id,
+                status_message_id,
+                &reply,
+                if output.interaction_needed.is_some() {
+                    interaction_markup.clone()
+                } else {
+                    None
+                },
+            )
+            .await
+        {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                self.send_reply(
+                    chat_id,
+                    reply_to_message_id,
+                    &reply,
+                    if output.interaction_needed.is_some() {
+                        interaction_markup
+                    } else {
+                        None
+                    },
+                )
+                .await
+            }
+        }
+    }
+
+    async fn send_oneshot_output(
+        &self,
+        chat_id: i64,
+        reply_to_message_id: i64,
+        output: &OneshotOutput,
+    ) -> anyhow::Result<()> {
+        let (reply, interaction_markup) = self.prepare_oneshot_output(chat_id, output).await;
+        self.send_reply(
+            chat_id,
+            reply_to_message_id,
+            &reply,
+            if output.interaction_needed.is_some() {
+                interaction_markup
+            } else {
+                None
+            },
+        )
+        .await
+    }
+
+    async fn prepare_oneshot_output(
+        &self,
+        chat_id: i64,
+        output: &OneshotOutput,
+    ) -> (String, Option<serde_json::Value>) {
+        let pending_interaction = output
+            .interaction_needed
+            .as_ref()
+            .map(|interaction| TelegramPendingInteraction {
+                session_id: output.session_id.clone(),
+                prompt: interaction.prompt.clone(),
+                source_label: interaction.source_label.clone(),
+                kind: TelegramInteractionKind::from_output_kind(&interaction.kind),
+                options: interaction.options.clone(),
+                allow_freeform: interaction.allow_freeform,
+                selected_indices: Vec::new(),
+            });
+        let reply = if let Some(pending) = &pending_interaction {
+            format_pending_interaction(pending, &output.response)
+        } else {
+            format_reply(output)
+        };
+        let interaction_markup = pending_interaction
+            .as_ref()
+            .and_then(interaction_reply_markup_for_pending);
+
+        if let Some(pending) = pending_interaction {
+            self.set_pending_interaction(chat_id, Some(pending)).await;
+        } else {
+            self.set_pending_interaction(chat_id, None).await;
+        }
+
+        (reply, interaction_markup)
+    }
+
+    async fn submit_pending_interaction(
+        &self,
+        chat_id: i64,
+        reply_to_message_id: i64,
+        pending: TelegramPendingInteraction,
+        response: String,
+        selected_indices: Vec<usize>,
+        show_progress_message: bool,
+    ) -> anyhow::Result<()> {
+        if !show_progress_message {
+            let output = match run::execute_interaction_response(
+                &self.socket_path,
+                &pending.session_id,
+                &response,
+                selected_indices,
+                false,
+            )
+            .await
+            {
+                Ok(output) => output,
+                Err(error) => {
+                    let message = format!("Quine error: {error}");
+                    self.set_pending_interaction(chat_id, Some(pending)).await;
+                    return self
+                        .send_reply(chat_id, reply_to_message_id, &message, None)
+                        .await;
+                }
+            };
+            return self
+                .send_oneshot_output(chat_id, reply_to_message_id, &output)
+                .await;
+        }
+
+        let progress = Arc::new(StdMutex::new(TelegramProgressState::new(
+            TelegramProgressPhase::WaitingForInput,
+        )));
+        let progress_text = {
+            let state = progress.lock().expect("progress lock poisoned");
+            Self::render_progress_message(&state)
+        };
+        let status_message_id = self
+            .send_message(
+                chat_id,
+                &progress_text,
+                Some(reply_to_message_id),
+                None,
+            )
+            .await?;
+        let updater = self.spawn_progress_updater(chat_id, status_message_id, progress.clone());
+        let output = match run::execute_interaction_response(
+            &self.socket_path,
+            &pending.session_id,
+            &response,
+            selected_indices,
+            false,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                updater.abort();
+                let _ = updater.await;
+                let message = format!("Quine error: {error}");
+                self.set_pending_interaction(chat_id, Some(pending)).await;
+                let _ = self
+                    .edit_message(
+                        chat_id,
+                        status_message_id,
+                        &message,
+                        None,
+                    )
+                    .await;
+                return self
+                    .send_reply(
+                        chat_id,
+                        reply_to_message_id,
+                        &message,
+                        None,
+                    )
+                    .await;
+            }
+        };
+        updater.abort();
+        let _ = updater.await;
+        self.render_oneshot_output(chat_id, reply_to_message_id, status_message_id, &output)
+            .await
+    }
+
     async fn load_or_create_session(
         &self,
         chat_id: i64,
@@ -376,6 +680,7 @@ impl TelegramBot {
                     model_profile: self.default_model_profile.clone(),
                     state_tab: SessionStateTab::Overview,
                     session_picker_page: 0,
+                    pending_interaction: None,
                 },
             );
             return Ok(session_id);
@@ -396,6 +701,7 @@ impl TelegramBot {
                 model_profile: self.default_model_profile.clone(),
                 state_tab: SessionStateTab::Overview,
                 session_picker_page: 0,
+                pending_interaction: None,
             },
         );
         Ok(created.session_id)
@@ -412,15 +718,23 @@ impl TelegramBot {
             content.chars().count()
         );
         let session_id = self.load_or_create_session(chat_id, false).await?;
+        let progress = Arc::new(StdMutex::new(TelegramProgressState::new(
+            TelegramProgressPhase::Thinking,
+        )));
+        let progress_text = {
+            let state = progress.lock().expect("progress lock poisoned");
+            Self::render_progress_message(&state)
+        };
         let status_message_id = self
             .send_message(
                 chat_id,
-                "Quine is thinking...",
+                &progress_text,
                 Some(reply_to_message_id),
                 None,
             )
             .await?;
-        let output = match run::execute_oneshot(
+        let updater = self.spawn_progress_updater(chat_id, status_message_id, progress.clone());
+        let output = match run::execute_oneshot_with_progress(
             &self.socket_path,
             &content,
             RunOneshotOptions {
@@ -432,29 +746,41 @@ impl TelegramBot {
                 model_profile: self.default_model_profile.as_deref(),
             },
             false,
+            |event| Self::apply_progress_event(&progress, event),
         )
         .await
         {
             Ok(output) => output,
             Err(error) => {
+                updater.abort();
+                let _ = updater.await;
                 let message = format!("Quine error: {error}");
                 if self
-                    .edit_message(chat_id, status_message_id, &message, None)
+                    .edit_message(
+                        chat_id,
+                        status_message_id,
+                        &message,
+                        None,
+                    )
                     .await
                     .is_err()
                 {
                     let _ = self
-                        .send_reply(chat_id, reply_to_message_id, &message, None)
+                        .send_reply(
+                            chat_id,
+                            reply_to_message_id,
+                            &message,
+                            None,
+                        )
                         .await;
                 }
                 return Ok(());
             }
         };
-        let reply = format_reply(&output);
-        match self.edit_message(chat_id, status_message_id, &reply, None).await {
-            Ok(()) => Ok(()),
-            Err(_) => self.send_reply(chat_id, reply_to_message_id, &reply, None).await,
-        }
+        updater.abort();
+        let _ = updater.await;
+        self.render_oneshot_output(chat_id, reply_to_message_id, status_message_id, &output)
+            .await
     }
 
     async fn send_plan_request(
@@ -489,6 +815,7 @@ impl TelegramBot {
                     model_profile: self.default_model_profile.clone(),
                     state_tab: SessionStateTab::Overview,
                     session_picker_page: 0,
+                    pending_interaction: None,
                 },
             );
             created.session_id
@@ -496,7 +823,24 @@ impl TelegramBot {
             session_id
         };
 
-        let output = run::execute_oneshot(
+        let progress = Arc::new(StdMutex::new(TelegramProgressState::new(
+            TelegramProgressPhase::Thinking,
+        )));
+        let progress_text = {
+            let state = progress.lock().expect("progress lock poisoned");
+            Self::render_progress_message(&state)
+        };
+        let status_message_id = self
+            .send_message(
+                chat_id,
+                &progress_text,
+                Some(reply_to_message_id),
+                None,
+            )
+            .await?;
+        let updater = self.spawn_progress_updater(chat_id, status_message_id, progress.clone());
+
+        let output = match run::execute_oneshot_with_progress(
             &self.socket_path,
             &request,
             RunOneshotOptions {
@@ -508,16 +852,37 @@ impl TelegramBot {
                 model_profile: self.default_model_profile.as_deref(),
             },
             false,
-        )
-        .await?;
-        let reply = format_reply(&output);
-        self.send_reply(
-            chat_id,
-            reply_to_message_id,
-            &reply,
-            Some(default_slash_reply_markup()),
+            |event| Self::apply_progress_event(&progress, event),
         )
         .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                updater.abort();
+                let _ = updater.await;
+                let message = format!("Quine error: {error}");
+                let _ = self
+                    .edit_message(
+                        chat_id,
+                        status_message_id,
+                        &message,
+                        None,
+                    )
+                    .await;
+                return self
+                    .send_reply(
+                        chat_id,
+                        reply_to_message_id,
+                        &message,
+                        None,
+                    )
+                    .await;
+            }
+        };
+        updater.abort();
+        let _ = updater.await;
+        self.render_oneshot_output(chat_id, reply_to_message_id, status_message_id, &output)
+            .await
     }
 
     async fn send_skill_request(
@@ -546,7 +911,23 @@ impl TelegramBot {
         }
 
         let created = create_slash_skill_session(&mut client, &skill_name, &request).await?;
-        let output = run::execute_oneshot(
+        let progress = Arc::new(StdMutex::new(TelegramProgressState::new(
+            TelegramProgressPhase::Thinking,
+        )));
+        let progress_text = {
+            let state = progress.lock().expect("progress lock poisoned");
+            Self::render_progress_message(&state)
+        };
+        let status_message_id = self
+            .send_message(
+                chat_id,
+                &progress_text,
+                Some(reply_to_message_id),
+                None,
+            )
+            .await?;
+        let updater = self.spawn_progress_updater(chat_id, status_message_id, progress.clone());
+        let output = match run::execute_oneshot_with_progress(
             &self.socket_path,
             &request,
             RunOneshotOptions {
@@ -558,8 +939,34 @@ impl TelegramBot {
                 model_profile: self.default_model_profile.as_deref(),
             },
             false,
+            |event| Self::apply_progress_event(&progress, event),
         )
-        .await?;
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                updater.abort();
+                let message = format!("Quine error: {error}");
+                let _ = self
+                    .edit_message(
+                        chat_id,
+                        status_message_id,
+                        &message,
+                        None,
+                    )
+                    .await;
+                return self
+                    .send_reply(
+                        chat_id,
+                        reply_to_message_id,
+                        &message,
+                        None,
+                    )
+                    .await;
+            }
+        };
+        updater.abort();
+        let _ = updater.await;
         self.chat_state.lock().await.insert(
             chat_id,
             TelegramChatState {
@@ -568,16 +975,11 @@ impl TelegramBot {
                 model_profile: self.default_model_profile.clone(),
                 state_tab: SessionStateTab::Overview,
                 session_picker_page: 0,
+                pending_interaction: None,
             },
         );
-        let reply = format_reply(&output);
-        self.send_reply(
-            chat_id,
-            reply_to_message_id,
-            &reply,
-            Some(default_slash_reply_markup()),
-        )
-        .await
+        self.render_oneshot_output(chat_id, reply_to_message_id, status_message_id, &output)
+            .await
     }
 
     async fn fetch_sessions(&self, client: &mut IpcClient) -> anyhow::Result<Vec<SessionSummary>> {
@@ -596,11 +998,13 @@ impl TelegramBot {
                     "ps" => TelegramSlashAction::ShowSessions {
                         tree: matches!(arguments.trim(), "tree"),
                     },
-                    "state" => TelegramSlashAction::ShowState {
+                    "state" => TelegramSlashAction::Context {
                         tab: parse_state_tab(arguments.as_str()),
                     },
                     "compact" => TelegramSlashAction::Compact,
-                    "context" => TelegramSlashAction::Context,
+                    "context" => TelegramSlashAction::Context {
+                        tab: parse_state_tab(arguments.as_str()),
+                    },
                     "clear" => TelegramSlashAction::Clear,
                     "switch" => {
                         let target = arguments.trim();
@@ -797,6 +1201,84 @@ impl TelegramBot {
         }
     }
 
+    fn render_progress_bar(elapsed: Duration, width: usize) -> String {
+        let width = width.max(5);
+        let cycle = width.saturating_mul(2).saturating_sub(2).max(1);
+        let step = ((elapsed.as_millis() / 120) as usize) % cycle;
+        let head = if step < width { step } else { cycle - step };
+        let mut cells = vec!['░'; width];
+        cells[head] = '█';
+        if head > 0 {
+            cells[head - 1] = '▓';
+        }
+        if head + 1 < width {
+            cells[head + 1] = '▓';
+        }
+        format!("[{}]", cells.into_iter().collect::<String>())
+    }
+
+    fn render_progress_message(state: &TelegramProgressState) -> String {
+        let elapsed = state.started_at.elapsed();
+        let elapsed_secs = elapsed.as_secs_f32();
+        let bar = Self::render_progress_bar(elapsed, 14);
+        let phase = match &state.phase {
+            TelegramProgressPhase::Thinking => "Quine is thinking".to_string(),
+            TelegramProgressPhase::Responding => "Quine is responding".to_string(),
+            TelegramProgressPhase::RunningTool(tool_name) => {
+                format!("Quine is running {tool_name}")
+            }
+            TelegramProgressPhase::WaitingForInput => "Quine is waiting for input".to_string(),
+            TelegramProgressPhase::Finalizing => "Quine is finishing".to_string(),
+        };
+        format!("{phase} {bar}\n{elapsed_secs:.1}s")
+    }
+
+    fn apply_progress_event(
+        progress: &Arc<StdMutex<TelegramProgressState>>,
+        event: OneshotProgressEvent,
+    ) {
+        let mut state = progress.lock().expect("progress lock poisoned");
+        state.phase = match event {
+            OneshotProgressEvent::Streaming => TelegramProgressPhase::Responding,
+            OneshotProgressEvent::ToolRequested { tool_name } => {
+                TelegramProgressPhase::RunningTool(tool_name)
+            }
+            OneshotProgressEvent::InteractionNeeded => TelegramProgressPhase::WaitingForInput,
+            OneshotProgressEvent::TurnComplete => TelegramProgressPhase::Finalizing,
+        };
+    }
+
+    fn spawn_progress_updater(
+        &self,
+        chat_id: i64,
+        message_id: i64,
+        progress: Arc<StdMutex<TelegramProgressState>>,
+    ) -> tokio::task::JoinHandle<()> {
+        let bot = self.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(500));
+            let mut last_rendered = String::new();
+            loop {
+                interval.tick().await;
+                let text = {
+                    let state = progress.lock().expect("progress lock poisoned");
+                    TelegramBot::render_progress_message(&state)
+                };
+                if text == last_rendered {
+                    continue;
+                }
+                last_rendered = text.clone();
+                if bot
+                    .edit_message(chat_id, message_id, &text, None)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+    }
+
     async fn handle_command(
         &self,
         chat_id: i64,
@@ -836,7 +1318,9 @@ impl TelegramBot {
                 } else {
                     let (reply, page, total_pages) = render_session_picker_page(
                         &sessions,
-                        self.current_session_picker_page(chat_id).await?.unwrap_or(0),
+                        self.current_session_picker_page(chat_id)
+                            .await?
+                            .unwrap_or(0),
                     );
                     self.set_session_picker_page(chat_id, page).await;
                     (
@@ -850,70 +1334,10 @@ impl TelegramBot {
                         .await
                     {
                         Ok(()) => Ok(()),
-                        Err(_) => self
-                            .send_reply(chat_id, reply_to_message_id, &reply, Some(markup))
-                            .await,
-                    }
-                } else {
-                    self.send_reply(chat_id, reply_to_message_id, &reply, Some(markup))
-                        .await
-                }
-            }
-            TelegramSlashAction::ShowState { tab } => {
-                let tab = tab
-                    .or(self.current_state_tab(chat_id).await?)
-                    .unwrap_or_default();
-                let mut client = self.connect_client().await?;
-                let Some(session_id) = self.resolve_status_session_id(chat_id).await? else {
-                    eprintln!("[telegram] /state chat_id={chat_id} no session available");
-                    self.send_reply(
-                        chat_id,
-                        reply_to_message_id,
-                        "No session found. Send a message first.",
-                        Some(default_slash_reply_markup()),
-                    )
-                    .await?;
-                    return Ok(());
-                };
-                eprintln!(
-                    "[telegram] /state chat_id={chat_id} session_id={session_id} tab={tab:?}"
-                );
-                eprintln!(
-                    "[telegram] /state fetching context chat_id={chat_id} session_id={session_id}"
-                );
-                {
-                    let mut state = self.chat_state.lock().await;
-                    let entry = state.entry(chat_id).or_default();
-                    entry.session_id = Some(session_id.clone());
-                    entry.session_picker_page = 0;
-                }
-                let snapshot = fetch_session_context(&mut client, &session_id).await?;
-                eprintln!(
-                    "[telegram] /state fetched context chat_id={chat_id} session_id={session_id} plan_mode={}",
-                    snapshot.plan_mode
-                );
-                let session_picker_page = 0;
-                self.chat_state.lock().await.insert(
-                    chat_id,
-                    TelegramChatState {
-                        session_id: Some(session_id),
-                        plan_mode: snapshot.plan_mode,
-                        model_profile: self.default_model_profile.clone(),
-                        state_tab: tab,
-                        session_picker_page,
-                    },
-                );
-                let reply = render_state_view(&snapshot, tab);
-                let markup = state_view_reply_markup(tab);
-                if edit_in_place {
-                    match self
-                        .edit_message(chat_id, reply_to_message_id, &reply, Some(markup.clone()))
-                        .await
-                    {
-                        Ok(()) => Ok(()),
-                        Err(_) => self
-                            .send_reply(chat_id, reply_to_message_id, &reply, Some(markup))
-                            .await,
+                        Err(_) => {
+                            self.send_reply(chat_id, reply_to_message_id, &reply, Some(markup))
+                                .await
+                        }
                     }
                 } else {
                     self.send_reply(chat_id, reply_to_message_id, &reply, Some(markup))
@@ -959,19 +1383,12 @@ impl TelegramBot {
                     }
                 }
             }
-            TelegramSlashAction::Context => {
+            TelegramSlashAction::Context { tab } => {
+                let tab = tab
+                    .or(self.current_state_tab(chat_id).await?)
+                    .unwrap_or(SessionStateTab::Overview);
                 let mut client = self.connect_client().await?;
-                let Some(session_id) = self.resolve_status_session_id(chat_id).await? else {
-                    eprintln!("[telegram] /context chat_id={chat_id} no session available");
-                    self.send_reply(
-                        chat_id,
-                        reply_to_message_id,
-                        "No session found. Send a message first.",
-                        Some(default_slash_reply_markup()),
-                    )
-                    .await?;
-                    return Ok(());
-                };
+                let session_id = self.load_or_create_session(chat_id, false).await?;
                 eprintln!("[telegram] /context chat_id={chat_id} session_id={session_id}");
                 let params = serde_json::json!({ "session_id": session_id });
                 eprintln!("[telegram] /context fetching context chat_id={chat_id}");
@@ -984,22 +1401,39 @@ impl TelegramBot {
                         eprintln!(
                             "[telegram] /context fetched context chat_id={chat_id} session_id={session_id}"
                         );
-                        let reply = render_context_view(&snapshot);
-                        let markup = context_reply_markup(SessionStateTab::Overview);
+                        self.set_active_session_state(
+                            chat_id,
+                            session_id,
+                            snapshot.plan_mode,
+                            tab,
+                        )
+                        .await;
+                        let reply = if tab == SessionStateTab::Overview {
+                            render_context_view(&snapshot)
+                        } else {
+                            render_state_view(&snapshot, tab)
+                        };
+                        let markup = context_reply_markup(tab);
                         if edit_in_place {
                             match self
-                                .edit_message(chat_id, reply_to_message_id, &reply, Some(markup.clone()))
+                                .edit_message(
+                                    chat_id,
+                                    reply_to_message_id,
+                                    &reply,
+                                    Some(markup.clone()),
+                                )
                                 .await
                             {
                                 Ok(()) => Ok(()),
-                                Err(_) => self
-                                    .send_reply(
+                                Err(_) => {
+                                    self.send_reply(
                                         chat_id,
                                         reply_to_message_id,
                                         &reply,
                                         Some(markup),
                                     )
-                                    .await,
+                                    .await
+                                }
                             }
                         } else {
                             self.send_reply(chat_id, reply_to_message_id, &reply, Some(markup))
@@ -1031,11 +1465,12 @@ impl TelegramBot {
                     TelegramChatState {
                         session_id: Some(created.session_id.clone()),
                         plan_mode: false,
-                        model_profile: self.default_model_profile.clone(),
-                        state_tab: SessionStateTab::Overview,
-                        session_picker_page: 0,
-                    },
-                );
+                    model_profile: self.default_model_profile.clone(),
+                    state_tab: SessionStateTab::Overview,
+                    session_picker_page: 0,
+                    pending_interaction: None,
+                },
+            );
                 self.send_reply(
                     chat_id,
                     reply_to_message_id,
@@ -1099,24 +1534,31 @@ impl TelegramBot {
                                 model_profile: None,
                                 state_tab: SessionStateTab::Overview,
                                 session_picker_page: 0,
+                                pending_interaction: None,
                             },
                         );
                         let reply = format!("Switched to session {session_id}.");
                         let markup = context_reply_markup(SessionStateTab::Overview);
                         if edit_in_place {
                             match self
-                                .edit_message(chat_id, reply_to_message_id, &reply, Some(markup.clone()))
+                                .edit_message(
+                                    chat_id,
+                                    reply_to_message_id,
+                                    &reply,
+                                    Some(markup.clone()),
+                                )
                                 .await
                             {
                                 Ok(()) => Ok(()),
-                                Err(_) => self
-                                    .send_reply(
+                                Err(_) => {
+                                    self.send_reply(
                                         chat_id,
                                         reply_to_message_id,
                                         &reply,
                                         Some(markup),
                                     )
-                                    .await,
+                                    .await
+                                }
                             }
                         } else {
                             self.send_reply(chat_id, reply_to_message_id, &reply, Some(markup))
@@ -1204,14 +1646,15 @@ impl TelegramBot {
                         .await
                     {
                         Ok(()) => Ok(()),
-                        Err(error) => self
-                            .send_reply(
+                        Err(error) => {
+                            self.send_reply(
                                 chat_id,
                                 reply_to_message_id,
                                 &format!("Quine error: {error}"),
                                 Some(default_slash_reply_markup()),
                             )
-                            .await,
+                            .await
+                        }
                     }
                 }
             }
@@ -1234,6 +1677,22 @@ impl TelegramBot {
             return Ok(());
         }
 
+        if !trimmed.starts_with('/') {
+            if let Some(pending) = self.pending_interaction(message.chat.id).await? {
+                let response = pending.response_text_for(&pending.selected_indices, trimmed);
+                return self
+                    .submit_pending_interaction(
+                        message.chat.id,
+                        message.message_id,
+                        pending.clone(),
+                        response,
+                        pending.selected_indices.clone(),
+                        false,
+                    )
+                    .await;
+            }
+        }
+
         self.handle_command(message.chat.id, message.message_id, trimmed, true, false)
             .await
     }
@@ -1250,6 +1709,105 @@ impl TelegramBot {
             return Ok(());
         };
 
+        if let Some(index_text) = data.strip_prefix("ia:toggle:") {
+            let Some(mut pending) = self.pending_interaction(message.chat.id).await? else {
+                self.answer_callback_query(&query.id, Some("No pending interaction."))
+                    .await?;
+                return Ok(());
+            };
+            let index = index_text.parse::<usize>().unwrap_or(usize::MAX);
+            if index >= pending.options.len() {
+                self.answer_callback_query(&query.id, Some("Unknown option."))
+                    .await?;
+                return Ok(());
+            }
+            if let Some(position) = pending
+                .selected_indices
+                .iter()
+                .position(|selected| *selected == index)
+            {
+                pending.selected_indices.remove(position);
+            } else {
+                pending.selected_indices.push(index);
+                pending.selected_indices.sort_unstable();
+            }
+            let reply = format_pending_interaction(&pending, "");
+            let markup = interaction_reply_markup_for_pending(&pending)
+                .or_else(|| Some(default_slash_reply_markup()));
+            self.set_pending_interaction(message.chat.id, Some(pending)).await;
+            self.edit_message(message.chat.id, message.message_id, &reply, markup)
+                .await?;
+            self.answer_callback_query(&query.id, Some("Selection updated."))
+                .await?;
+            return Ok(());
+        }
+
+        if data == "ia:clear" {
+            let Some(mut pending) = self.pending_interaction(message.chat.id).await? else {
+                self.answer_callback_query(&query.id, Some("No pending interaction."))
+                    .await?;
+                return Ok(());
+            };
+            pending.selected_indices.clear();
+            let reply = format_pending_interaction(&pending, "");
+            let markup = interaction_reply_markup_for_pending(&pending)
+                .or_else(|| Some(default_slash_reply_markup()));
+            self.set_pending_interaction(message.chat.id, Some(pending)).await;
+            self.edit_message(message.chat.id, message.message_id, &reply, markup)
+                .await?;
+            self.answer_callback_query(&query.id, Some("Selection cleared."))
+                .await?;
+            return Ok(());
+        }
+
+        if let Some(index_text) = data.strip_prefix("ia:select:") {
+            let Some(pending) = self.pending_interaction(message.chat.id).await? else {
+                self.answer_callback_query(&query.id, Some("No pending interaction."))
+                    .await?;
+                return Ok(());
+            };
+            let index = index_text.parse::<usize>().unwrap_or(usize::MAX);
+            let Some(option) = pending.options.get(index).cloned() else {
+                self.answer_callback_query(&query.id, Some("Unknown option."))
+                    .await?;
+                return Ok(());
+            };
+            self.answer_callback_query(&query.id, Some("Submitting response."))
+                .await?;
+            let response = pending.response_text_for(&[index], &option);
+            return self
+                .submit_pending_interaction(
+                    message.chat.id,
+                    message.message_id,
+                    pending,
+                    response,
+                    vec![index],
+                    true,
+                )
+                .await;
+        }
+
+        if data == "ia:submit" {
+            let Some(pending) = self.pending_interaction(message.chat.id).await? else {
+                self.answer_callback_query(&query.id, Some("No pending interaction."))
+                    .await?;
+                return Ok(());
+            };
+            self.answer_callback_query(&query.id, Some("Submitting response."))
+                .await?;
+            let response = pending.response_text_for(&pending.selected_indices, "");
+            return self
+                .submit_pending_interaction(
+                    message.chat.id,
+                    message.message_id,
+                    pending.clone(),
+                    response,
+                    pending.selected_indices.clone(),
+                    true,
+                )
+                .await;
+        }
+
         let data = data.strip_prefix("cmd:").unwrap_or(data);
 
         if let Some(page_text) = data.strip_prefix("ps:page:") {
@@ -1260,7 +1818,12 @@ impl TelegramBot {
             self.set_session_picker_page(message.chat.id, page).await;
             let markup = session_picker_reply_markup(&sessions, page, total_pages);
             if self
-                .edit_message(message.chat.id, message.message_id, &reply, Some(markup.clone()))
+                .edit_message(
+                    message.chat.id,
+                    message.message_id,
+                    &reply,
+                    Some(markup.clone()),
+                )
                 .await
                 .is_err()
             {
@@ -1454,7 +2017,11 @@ fn summarize_session(session: &SessionSummary) -> Option<String> {
         format!(
             "{} {} - {}",
             short_session_id(&session.session_id),
-            if session.plan_mode { "[plan]" } else { "[chat]" },
+            if session.plan_mode {
+                "[plan]"
+            } else {
+                "[chat]"
+            },
             truncate_text(summary, 32)
         )
     })
@@ -1477,8 +2044,10 @@ fn truncate_text(text: &str, max_chars: usize) -> String {
 }
 
 fn render_session_picker_page(sessions: &[SessionSummary], page: usize) -> (String, usize, usize) {
-    let summarized: Vec<&SessionSummary> =
-        sessions.iter().filter(|session| session.summary_text().is_some()).collect();
+    let summarized: Vec<&SessionSummary> = sessions
+        .iter()
+        .filter(|session| session.summary_text().is_some())
+        .collect();
     if summarized.is_empty() {
         return ("No sessions with summaries found.".to_string(), 0, 0);
     }
@@ -1606,20 +2175,111 @@ fn render_session_tree(sessions: &[SessionSummary]) -> String {
 
 fn format_reply(output: &OneshotOutput) -> String {
     if let Some(interaction) = &output.interaction_needed {
-        let mut lines = vec![format!("Interaction needed: {}", interaction.prompt)];
-        if let Some(label) = &interaction.source_label {
-            lines.push(format!("Source: {label}"));
-        }
-        if !interaction.response.trim().is_empty() {
-            lines.push(String::new());
-            lines.push(interaction.response.clone());
-        }
-        lines.join("\n")
+        let pending = TelegramPendingInteraction {
+            session_id: output.session_id.clone(),
+            prompt: interaction.prompt.clone(),
+            source_label: interaction.source_label.clone(),
+            kind: TelegramInteractionKind::from_output_kind(&interaction.kind),
+            options: interaction.options.clone(),
+            allow_freeform: interaction.allow_freeform,
+            selected_indices: Vec::new(),
+        };
+        format_pending_interaction(&pending, &interaction.response)
     } else if output.response.trim().is_empty() {
         "No response.".to_string()
     } else {
         output.response.clone()
     }
+}
+
+fn format_pending_interaction(
+    interaction: &TelegramPendingInteraction,
+    partial_response: &str,
+) -> String {
+    let heading = match interaction.kind {
+        TelegramInteractionKind::MultiSelect => "Selection required.",
+        _ => "Approval required.",
+    };
+    let mut lines = vec![heading.to_string(), interaction.prompt.clone()];
+    if let Some(label) = &interaction.source_label {
+        lines.push(format!("Source: {label}"));
+    }
+
+    if !interaction.options.is_empty() {
+        lines.push(String::new());
+        lines.push("Options:".to_string());
+        for (index, option) in interaction.options.iter().enumerate() {
+            let prefix = if interaction.selected_indices.contains(&index) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            lines.push(format!("{prefix} {option}"));
+        }
+    }
+
+    if interaction.kind == TelegramInteractionKind::MultiSelect {
+        lines.push(String::new());
+        lines.push("Use the buttons below to select options, then submit.".to_string());
+    } else if interaction.allow_freeform {
+        lines.push(String::new());
+        lines.push("Reply with text or use a button below.".to_string());
+    }
+
+    if !partial_response.trim().is_empty() {
+        lines.push(String::new());
+        lines.push(partial_response.to_string());
+    }
+
+    lines.join("\n")
+}
+
+fn interaction_reply_markup_for_pending(
+    interaction: &TelegramPendingInteraction,
+) -> Option<serde_json::Value> {
+    if interaction.options.is_empty() {
+        return None;
+    }
+
+    let mut rows = Vec::new();
+    match interaction.kind {
+        TelegramInteractionKind::MultiSelect => {
+            for (index, option) in interaction.options.iter().enumerate() {
+                let is_selected = interaction.selected_indices.contains(&index);
+                let label = if is_selected {
+                    format!("☑ {option}")
+                } else {
+                    format!("☐ {option}")
+                };
+                rows.push(vec![serde_json::json!({
+                    "text": label,
+                    "callback_data": format!("ia:toggle:{index}"),
+                })]);
+            }
+            rows.push(vec![
+                serde_json::json!({
+                    "text": "Submit",
+                    "callback_data": "ia:submit",
+                }),
+                serde_json::json!({
+                    "text": "Clear",
+                    "callback_data": "ia:clear",
+                }),
+            ]);
+        }
+        TelegramInteractionKind::Confirmation
+        | TelegramInteractionKind::SingleSelect
+        | TelegramInteractionKind::Question => {
+            for (index, option) in interaction.options.iter().enumerate() {
+                rows.push(vec![serde_json::json!({
+                    "text": option,
+                    "callback_data": format!("ia:select:{index}"),
+                })]);
+            }
+        }
+    }
+
+    Some(serde_json::json!({ "inline_keyboard": rows }))
 }
 
 fn chunk_message(message: &str, max_chars: usize) -> Vec<String> {
@@ -1675,10 +2335,10 @@ impl SessionStateTab {
         }
     }
 
-    fn command(self) -> String {
+    fn context_command(self) -> String {
         match self {
-            Self::Overview => "/state overview".to_string(),
-            _ => format!("/state {}", self.label()),
+            Self::Overview => "/context".to_string(),
+            _ => format!("/context {}", self.label()),
         }
     }
 }
@@ -1706,12 +2366,11 @@ fn command_keyboard(rows: Vec<Vec<(String, String)>>) -> serde_json::Value {
 fn default_slash_reply_markup() -> serde_json::Value {
     command_keyboard(vec![
         vec![
-            ("State".to_string(), "/state".to_string()),
             ("Sessions".to_string(), "/ps".to_string()),
             ("Tree".to_string(), "/ps tree".to_string()),
+            ("Context".to_string(), "/context".to_string()),
         ],
         vec![
-            ("Context".to_string(), "/context".to_string()),
             ("Compact".to_string(), "/compact".to_string()),
             ("Clear".to_string(), "/clear".to_string()),
         ],
@@ -1729,10 +2388,7 @@ fn session_picker_reply_markup(
         .filter(|session| session.summary_text().is_some())
         .collect();
     if summarized.is_empty() {
-        return command_keyboard(vec![vec![(
-            "Refresh".to_string(),
-            "/ps".to_string(),
-        )]]);
+        return command_keyboard(vec![vec![("Refresh".to_string(), "/ps".to_string())]]);
     }
 
     let page = page.min(total_pages.saturating_sub(1));
@@ -1742,12 +2398,10 @@ fn session_picker_reply_markup(
     let mut rows: Vec<Vec<(String, String)>> = summarized[start..end]
         .iter()
         .map(|session| {
-            vec![
-                (
-                    session_picker_button_label(session),
-                    format!("/switch {}", session.session_id),
-                ),
-            ]
+            vec![(
+                session_picker_button_label(session),
+                format!("/switch {}", session.session_id),
+            )]
         })
         .collect();
 
@@ -1763,8 +2417,8 @@ fn session_picker_reply_markup(
     nav_row.push(("Refresh".to_string(), format!("ps:page:{page}")));
     rows.push(nav_row);
     rows.push(vec![
-        ("State".to_string(), "/state".to_string()),
         ("Context".to_string(), "/context".to_string()),
+        ("Sessions".to_string(), "/ps".to_string()),
     ]);
 
     command_keyboard(rows)
@@ -1778,7 +2432,6 @@ fn session_list_reply_markup(tree: bool, sessions: &[SessionSummary]) -> serde_j
     };
     let mut rows = vec![
         vec![
-            ("State".to_string(), "/state".to_string()),
             if tree {
                 ("List".to_string(), toggle)
             } else {
@@ -1798,39 +2451,35 @@ fn session_list_reply_markup(tree: bool, sessions: &[SessionSummary]) -> serde_j
 fn context_reply_markup(active_tab: SessionStateTab) -> serde_json::Value {
     command_keyboard(vec![
         vec![
-            ("Overview".to_string(), SessionStateTab::Overview.command()),
-            ("History".to_string(), SessionStateTab::History.command()),
-            ("Tools".to_string(), SessionStateTab::Tools.command()),
+            (
+                "Overview".to_string(),
+                SessionStateTab::Overview.context_command(),
+            ),
+            (
+                "History".to_string(),
+                SessionStateTab::History.context_command(),
+            ),
+            ("Tools".to_string(), SessionStateTab::Tools.context_command()),
         ],
         vec![
-            ("Skills".to_string(), SessionStateTab::Skills.command()),
-            ("Plans".to_string(), SessionStateTab::Plans.command()),
-            ("Memory".to_string(), SessionStateTab::Memory.command()),
+            (
+                "Skills".to_string(),
+                SessionStateTab::Skills.context_command(),
+            ),
+            ("Plans".to_string(), SessionStateTab::Plans.context_command()),
+            ("Memory".to_string(), SessionStateTab::Memory.context_command()),
         ],
         vec![
-            ("Permissions".to_string(), SessionStateTab::Permissions.command()),
-            ("Refresh".to_string(), active_tab.command()),
+            (
+                "Permissions".to_string(),
+                SessionStateTab::Permissions.context_command(),
+            ),
+            ("Refresh".to_string(), active_tab.context_command()),
             ("Sessions".to_string(), "/ps".to_string()),
         ],
-    ])
-}
-
-fn state_view_reply_markup(tab: SessionStateTab) -> serde_json::Value {
-    command_keyboard(vec![
         vec![
-            ("Overview".to_string(), SessionStateTab::Overview.command()),
-            ("History".to_string(), SessionStateTab::History.command()),
-            ("Tools".to_string(), SessionStateTab::Tools.command()),
-        ],
-        vec![
-            ("Skills".to_string(), SessionStateTab::Skills.command()),
-            ("Plans".to_string(), SessionStateTab::Plans.command()),
-            ("Memory".to_string(), SessionStateTab::Memory.command()),
-        ],
-        vec![
-            ("Permissions".to_string(), SessionStateTab::Permissions.command()),
-            ("Refresh".to_string(), tab.command()),
-            ("Context".to_string(), "/context".to_string()),
+            ("Compact".to_string(), "/compact".to_string()),
+            ("Clear".to_string(), "/clear".to_string()),
         ],
     ])
 }
@@ -1839,11 +2488,22 @@ fn session_button_label(session: &SessionSummary) -> String {
     let short_id = short_session_id(&session.session_id);
     let summary = session.summary_text().unwrap_or("");
     if summary.is_empty() {
-        format!("{short_id} {}", if session.plan_mode { "[plan]" } else { "[chat]" })
+        format!(
+            "{short_id} {}",
+            if session.plan_mode {
+                "[plan]"
+            } else {
+                "[chat]"
+            }
+        )
     } else {
         format!(
             "{short_id} {} - {summary}",
-            if session.plan_mode { "[plan]" } else { "[chat]" }
+            if session.plan_mode {
+                "[plan]"
+            } else {
+                "[chat]"
+            }
         )
     }
 }
@@ -1866,7 +2526,11 @@ fn session_picker_button_label(session: &SessionSummary) -> String {
     format!(
         "{} {} - {}",
         short_session_id(&session.session_id),
-        if session.plan_mode { "[plan]" } else { "[chat]" },
+        if session.plan_mode {
+            "[plan]"
+        } else {
+            "[chat]"
+        },
         truncate_text(summary, 24)
     )
 }
@@ -1960,7 +2624,8 @@ fn render_state_view(snapshot: &SessionContextSnapshot, tab: SessionStateTab) ->
             .system_prompt
             .as_deref()
             .filter(|value| !value.trim().is_empty())
-            .unwrap_or("<none>")
+            .map(|value| format!("configured ({} chars)", value.chars().count()))
+            .unwrap_or_else(|| "<none>".to_string())
     ));
     lines.push(format!(
         "Tools: {} | Loaded skills: {} | Plans: {}",
@@ -2264,6 +2929,7 @@ pub async fn run_autostart(socket_path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::InteractionNeededOutput;
 
     #[test]
     fn chunk_message_splits_on_character_boundaries() {
@@ -2282,6 +2948,9 @@ mod tests {
             interaction_needed: Some(InteractionNeededOutput {
                 prompt: "Need approval".into(),
                 source_label: Some("permission:1".into()),
+                kind: "SingleSelect".into(),
+                options: vec!["approve once".into(), "deny once".into()],
+                allow_freeform: false,
                 response: "partial".into(),
                 tool_calls: Vec::new(),
             }),
@@ -2291,4 +2960,87 @@ mod tests {
         assert!(reply.contains("Need approval"));
         assert!(reply.contains("partial"));
     }
+
+    #[test]
+    fn render_progress_message_shows_state_and_bar() {
+        let state = TelegramProgressState::new(TelegramProgressPhase::Thinking);
+        let rendered = TelegramBot::render_progress_message(&state);
+        assert!(rendered.contains("Quine is thinking"));
+        assert!(rendered.contains('['));
+        assert!(rendered.contains(']'));
+    }
+
+    #[test]
+    fn multi_select_interaction_renders_toggle_and_submit_buttons() {
+        let interaction = TelegramPendingInteraction {
+            session_id: "s".into(),
+            prompt: "Choose repositories".into(),
+            source_label: None,
+            kind: TelegramInteractionKind::MultiSelect,
+            options: vec!["core".into(), "cli".into()],
+            allow_freeform: false,
+            selected_indices: vec![1],
+        };
+
+        let markup = interaction_reply_markup_for_pending(&interaction)
+            .expect("multi-select interactions should render buttons");
+        let rows = markup["inline_keyboard"]
+            .as_array()
+            .expect("inline keyboard rows");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0][0]["callback_data"], "ia:toggle:0");
+        assert_eq!(rows[1][0]["text"], "☑ cli");
+        assert_eq!(rows[2][0]["callback_data"], "ia:submit");
+    }
+
+    #[test]
+    fn multi_select_submit_synthesizes_text_from_selected_options() {
+        let interaction = TelegramPendingInteraction {
+            session_id: "s".into(),
+            prompt: "Choose repositories".into(),
+            source_label: None,
+            kind: TelegramInteractionKind::MultiSelect,
+            options: vec!["core".into(), "cli".into(), "harness".into()],
+            allow_freeform: false,
+            selected_indices: vec![0, 2],
+        };
+
+        assert_eq!(
+            interaction.response_text_for(&interaction.selected_indices, ""),
+            "core, harness"
+        );
+    }
+
+    #[test]
+    fn state_view_summarizes_large_system_prompt() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: Some("x".repeat(1_000)),
+            skills: Vec::new(),
+            working_directory: PathBuf::from("/tmp"),
+            plan_mode: false,
+            available_tools: Vec::new(),
+            loaded_skills: Vec::new(),
+            plans: Vec::new(),
+            lineage: crate::context_debug::SessionLineageSnapshot {
+                parent_id: None,
+                root_id: "root".into(),
+                depth: 0,
+                child_ids: Vec::new(),
+            },
+            prompt_memory: None,
+            compact_memory_summary_markdown: None,
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            history: Vec::new(),
+        };
+
+        let rendered = render_state_view(&snapshot, SessionStateTab::Overview);
+        assert!(rendered.contains("System prompt: configured (1000 chars)"));
+        assert!(!rendered.contains(&"x".repeat(40)));
+        assert!(rendered.len() < 900);
+    }
+
 }

@@ -3,7 +3,11 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::client::IpcClient;
-use crate::interaction::{maybe_auto_approve, prompt as interaction_prompt, source_label};
+use crate::interaction::{
+    allow_freeform as interaction_allow_freeform, kind as interaction_kind,
+    maybe_auto_approve, options as interaction_options, prompt as interaction_prompt,
+    source_label,
+};
 use crate::session::resolve_resume_target;
 use quine_harness::{
     protocol::{methods, notifications},
@@ -61,6 +65,11 @@ pub struct InteractionNeededOutput {
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_label: Option<String>,
+    pub kind: String,
+    #[serde(default)]
+    pub options: Vec<String>,
+    #[serde(default)]
+    pub allow_freeform: bool,
     pub response: String,
     pub tool_calls: Vec<ToolCallRecord>,
 }
@@ -90,12 +99,33 @@ pub struct RunOneshotOptions<'a> {
     pub model_profile: Option<&'a str>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) enum OneshotProgressEvent {
+    Streaming,
+    ToolRequested { tool_name: String },
+    InteractionNeeded,
+    TurnComplete,
+}
+
 pub(crate) async fn execute_oneshot(
     socket_path: &Path,
     message: &str,
     options: RunOneshotOptions<'_>,
     allow_daemon_launch: bool,
 ) -> anyhow::Result<OneshotOutput> {
+    execute_oneshot_with_progress(socket_path, message, options, allow_daemon_launch, |_| {}).await
+}
+
+pub(crate) async fn execute_oneshot_with_progress<F>(
+    socket_path: &Path,
+    message: &str,
+    options: RunOneshotOptions<'_>,
+    allow_daemon_launch: bool,
+    mut on_progress: F,
+) -> anyhow::Result<OneshotOutput>
+where
+    F: FnMut(OneshotProgressEvent),
+{
     let RunOneshotOptions {
         session_id,
         resume_checkpoint,
@@ -168,6 +198,7 @@ pub(crate) async fn execute_oneshot(
     let mut tool_calls = Vec::new();
     let mut turn_duration_us: Option<u64> = None;
     let mut turn_usage: Option<TokenUsageOutput> = None;
+    let mut saw_stream_delta = false;
 
     loop {
         match client.recv_notification().await {
@@ -175,6 +206,10 @@ pub(crate) async fn execute_oneshot(
                 notifications::STREAM_DELTA => {
                     if let Some(params) = &notif.params {
                         if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
+                            if !saw_stream_delta {
+                                saw_stream_delta = true;
+                                on_progress(OneshotProgressEvent::Streaming);
+                            }
                             delta_buffer.push_str(delta);
                         }
                     }
@@ -204,6 +239,9 @@ pub(crate) async fn execute_oneshot(
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown")
                             .to_string();
+                        on_progress(OneshotProgressEvent::ToolRequested {
+                            tool_name: tool_name.clone(),
+                        });
                         tool_calls.push(ToolCallRecord {
                             tool_name,
                             tool_use_id,
@@ -211,12 +249,16 @@ pub(crate) async fn execute_oneshot(
                     }
                 }
                 notifications::INTERACTION_NEEDED => {
+                    on_progress(OneshotProgressEvent::InteractionNeeded);
                     if maybe_auto_approve(&mut client, &session_id, &notif, auto_approve).await? {
                         continue;
                     }
 
                     let prompt = interaction_prompt(&notif).to_string();
                     let source_label = source_label(&notif).map(ToString::to_string);
+                    let kind = interaction_kind(&notif).to_string();
+                    let options = interaction_options(&notif);
+                    let allow_freeform = interaction_allow_freeform(&notif);
                     let partial = if !completed_text.is_empty() {
                         completed_text.clone()
                     } else {
@@ -232,6 +274,9 @@ pub(crate) async fn execute_oneshot(
                         interaction_needed: Some(InteractionNeededOutput {
                             prompt,
                             source_label,
+                            kind,
+                            options,
+                            allow_freeform,
                             response: partial,
                             tool_calls,
                         }),
@@ -254,6 +299,7 @@ pub(crate) async fn execute_oneshot(
                             })
                         });
                     }
+                    on_progress(OneshotProgressEvent::TurnComplete);
                     break;
                 }
                 _ => {}
@@ -357,12 +403,35 @@ pub async fn run_respond(
     response: &str,
     json_output: bool,
 ) -> anyhow::Result<()> {
-    let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
+    let output =
+        execute_interaction_response(socket_path, session_id, response, Vec::new(), true).await?;
 
-    // Submit the interaction response.
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("{}", output.response);
+    }
+
+    Ok(())
+}
+
+pub(crate) async fn execute_interaction_response(
+    socket_path: &Path,
+    session_id: &str,
+    response: &str,
+    selected_indices: Vec<usize>,
+    allow_daemon_launch: bool,
+) -> anyhow::Result<OneshotOutput> {
+    let (mut client, _daemon_spawned) = if allow_daemon_launch {
+        IpcClient::connect_or_launch(socket_path).await?
+    } else {
+        (connect_existing_client(socket_path).await?, false)
+    };
+
     let params = serde_json::json!({
         "session_id": session_id,
         "response": response,
+        "selected_indices": selected_indices,
     });
     let result = client
         .call(methods::SUBMIT_INTERACTION_RESPONSE, Some(params))
@@ -420,40 +489,33 @@ pub async fn run_respond(
                     }
                 }
                 notifications::INTERACTION_NEEDED => {
-                    // Another interaction needed — output and exit for caller to respond again.
-                    let prompt = interaction_prompt(&notif);
-                    let source_label = source_label(&notif);
-
+                    let prompt = interaction_prompt(&notif).to_string();
+                    let source_label = source_label(&notif).map(ToString::to_string);
+                    let kind = interaction_kind(&notif).to_string();
+                    let options = interaction_options(&notif);
+                    let allow_freeform = interaction_allow_freeform(&notif);
                     let partial = if !completed_text.is_empty() {
-                        &completed_text
+                        completed_text.clone()
                     } else {
-                        &delta_buffer
+                        delta_buffer.clone()
                     };
 
-                    if json_output {
-                        let mut output = serde_json::json!({
-                            "session_id": session_id,
-                            "interaction_needed": true,
-                            "prompt": prompt,
-                            "response": partial,
-                            "tool_calls": tool_calls,
-                        });
-                        if let Some(label) = source_label {
-                            output["source_label"] = serde_json::Value::String(label.to_string());
-                        }
-                        println!("{}", serde_json::to_string_pretty(&output)?);
-                    } else if let Some(label) = source_label {
-                        eprintln!("interaction needed [{label}]: {prompt}");
-                        if !partial.is_empty() {
-                            println!("{partial}");
-                        }
-                    } else {
-                        eprintln!("interaction needed: {prompt}");
-                        if !partial.is_empty() {
-                            println!("{partial}");
-                        }
-                    }
-                    return Ok(());
+                    return Ok(OneshotOutput {
+                        session_id: session_id.to_string(),
+                        response: partial.clone(),
+                        tool_calls: tool_calls.clone(),
+                        duration_us: turn_duration_us,
+                        usage: turn_usage,
+                        interaction_needed: Some(InteractionNeededOutput {
+                            prompt,
+                            source_label,
+                            kind,
+                            options,
+                            allow_freeform,
+                            response: partial,
+                            tool_calls,
+                        }),
+                    });
                 }
                 notifications::SESSION_ERROR => {
                     if let Some(params) = &notif.params {
@@ -487,22 +549,14 @@ pub async fn run_respond(
     } else {
         delta_buffer
     };
-
-    if json_output {
-        let output = OneshotOutput {
-            session_id: session_id.to_string(),
-            response: full_response,
-            tool_calls,
-            duration_us: turn_duration_us,
-            usage: turn_usage,
-            interaction_needed: None,
-        };
-        println!("{}", serde_json::to_string_pretty(&output)?);
-    } else {
-        println!("{full_response}");
-    }
-
-    Ok(())
+    Ok(OneshotOutput {
+        session_id: session_id.to_string(),
+        response: full_response,
+        tool_calls,
+        duration_us: turn_duration_us,
+        usage: turn_usage,
+        interaction_needed: None,
+    })
 }
 
 /// List all available skills.
