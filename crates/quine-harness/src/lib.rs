@@ -2,6 +2,7 @@ pub mod config;
 pub mod error;
 pub mod local;
 mod memory_store;
+mod metrics;
 pub mod model_profiles;
 pub mod protocol;
 pub mod server;
@@ -17,6 +18,10 @@ pub use config::{
 pub use error::HarnessError;
 pub use local::LocalHarness;
 pub(crate) use memory_store::MemoryStore;
+pub use metrics::{
+    default_historical_metrics_path, default_metrics_dir, default_session_metrics_path,
+    HistoricalMetricsSummary, SessionMetricsSummary, UsageTotals,
+};
 pub use model_profiles::{
     create_provider_from_config, max_context_window_for_provider_config,
     resolve_env_provider_selection, resolve_named_model_profile, ResolvedProviderSelection,

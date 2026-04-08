@@ -134,7 +134,7 @@ struct OpenAiToolCall {
 #[derive(Deserialize, Clone)]
 struct OpenAiToolCallDelta {
     #[serde(default)]
-    index: usize,
+    index: Option<usize>,
     #[serde(default)]
     id: Option<String>,
     #[serde(default)]
@@ -171,7 +171,92 @@ fn use_qwen_tool_call_parser(model: &str) -> bool {
     model.to_ascii_lowercase().contains("qwen")
 }
 
-fn convert_message(msg: &Message, structured_tool_call_arguments: bool) -> ChatMessage {
+fn use_structured_tool_result_content(model: &str) -> bool {
+    model.to_ascii_lowercase().contains("qwen")
+}
+
+fn infer_tool_error_type(output: &str) -> &'static str {
+    let normalized = output.trim().to_ascii_lowercase();
+    if normalized.starts_with("filesystem error: ") {
+        return infer_tool_error_type(
+            output
+                .trim()
+                .split_once(':')
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or(output),
+        );
+    }
+    if normalized.starts_with("not found:") || normalized.contains(" no such file or directory") {
+        "not_found"
+    } else if normalized.starts_with("permission denied:") {
+        "permission_denied"
+    } else if normalized.starts_with("path traversal denied:") {
+        "path_traversal"
+    } else if normalized.starts_with("invalid arguments:") {
+        "invalid_arguments"
+    } else if normalized.starts_with("wrong entry type") {
+        "wrong_entry_type"
+    } else if normalized.starts_with("i/o error:") {
+        "io_error"
+    } else if normalized.starts_with("execution timed out after")
+        || normalized.ends_with(" timed out")
+        || normalized.contains(" timed out ")
+    {
+        "timeout"
+    } else if normalized == "tool execution cancelled"
+        || normalized.contains(" cancelled")
+        || normalized.contains("canceled")
+    {
+        "cancelled"
+    } else if normalized.starts_with("unknown tool:") {
+        "unknown_tool"
+    } else if normalized.starts_with("internal error:")
+        || normalized.starts_with("failed to spawn:")
+        || normalized.starts_with("failed to execute command:")
+        || normalized.starts_with("tool task panicked:")
+        || normalized.starts_with("input channel closed")
+        || normalized.starts_with("session not found")
+    {
+        "internal_error"
+    } else if normalized.starts_with("missing required parameter:") {
+        "invalid_arguments"
+    } else {
+        "tool_error"
+    }
+}
+
+fn format_tool_result_content(
+    output: &str,
+    is_error: bool,
+    structured_tool_result_content: bool,
+) -> String {
+    if !structured_tool_result_content {
+        return output.to_string();
+    }
+
+    let content = if is_error {
+        serde_json::json!({
+            "ok": false,
+            "error": {
+                "type": infer_tool_error_type(output),
+                "message": output,
+            }
+        })
+    } else {
+        serde_json::json!({
+            "ok": true,
+            "content": output,
+        })
+    };
+
+    serde_json::to_string(&content).unwrap_or_else(|_| output.to_string())
+}
+
+fn convert_message(
+    msg: &Message,
+    structured_tool_call_arguments: bool,
+    structured_tool_result_content: bool,
+) -> ChatMessage {
     let role = match msg.role {
         Role::System => "system",
         Role::User => "user",
@@ -189,10 +274,14 @@ fn convert_message(msg: &Message, structured_tool_call_arguments: bool) -> ChatM
         MessageContent::ToolResult {
             tool_use_id,
             output,
-            ..
+            is_error,
         } => ChatMessage {
             role: "tool".into(),
-            content: Some(output.clone()),
+            content: Some(format_tool_result_content(
+                output,
+                *is_error,
+                structured_tool_result_content,
+            )),
             tool_call_id: Some(tool_use_id.clone()),
             tool_calls: None,
         },
@@ -398,8 +487,33 @@ impl ToolCallAccumulator {
         format!("openai-tool-call-{}", self.next_tool_call_index)
     }
 
-    fn process_delta(&mut self, delta: &OpenAiToolCallDelta) {
-        let index = delta.index;
+    fn process_delta(&mut self, delta: &OpenAiToolCallDelta, missing_index_starts_new_call: bool) {
+        let index = match delta.index {
+            Some(index) => index,
+            None if missing_index_starts_new_call => {
+                if let Some(id) = &delta.id {
+                    if let Some(existing_index) = self.calls.iter().position(|call| call.id == *id)
+                    {
+                        existing_index
+                    } else {
+                        self.calls.push(AccumulatedToolCall {
+                            id: String::new(),
+                            name: String::new(),
+                            arguments: String::new(),
+                        });
+                        self.calls.len() - 1
+                    }
+                } else {
+                    self.calls.push(AccumulatedToolCall {
+                        id: String::new(),
+                        name: String::new(),
+                        arguments: String::new(),
+                    });
+                    self.calls.len() - 1
+                }
+            }
+            None => 0,
+        };
         // Grow the accumulator if needed
         while self.calls.len() <= index {
             self.calls.push(AccumulatedToolCall {
@@ -451,6 +565,7 @@ impl LlmProvider for OpenAiCompatProvider {
         tools: &[ToolDefinition],
     ) -> anyhow::Result<Pin<Box<dyn Stream<Item = anyhow::Result<LlmEvent>> + Send>>> {
         let structured_tool_call_arguments = use_structured_tool_call_arguments(&self.config.model);
+        let structured_tool_result_content = use_structured_tool_result_content(&self.config.model);
         let qwen_tool_call_parser_enabled = use_qwen_tool_call_parser(&self.config.model);
         let url = format!(
             "{}/chat/completions",
@@ -461,7 +576,13 @@ impl LlmProvider for OpenAiCompatProvider {
             model: self.config.model.clone(),
             messages: messages
                 .iter()
-                .map(|message| convert_message(message, structured_tool_call_arguments))
+                .map(|message| {
+                    convert_message(
+                        message,
+                        structured_tool_call_arguments,
+                        structured_tool_result_content,
+                    )
+                })
                 .collect(),
             stream: true,
             stream_options: Some(StreamOptions {
@@ -596,7 +717,10 @@ impl LlmProvider for OpenAiCompatProvider {
                                         }
                                         if let Some(tool_calls) = &choice.delta.tool_calls {
                                             for tc_delta in tool_calls {
-                                                tool_acc.process_delta(tc_delta);
+                                                tool_acc.process_delta(
+                                                    tc_delta,
+                                                    qwen_tool_call_parser_enabled,
+                                                );
                                             }
                                         }
                                         if choice.finish_reason.as_deref() == Some("tool_calls") {
@@ -706,7 +830,7 @@ mod tests {
     #[test]
     fn convert_message_user() {
         let msg = Message::user("hello");
-        let chat = convert_message(&msg, false);
+        let chat = convert_message(&msg, false, false);
         assert_eq!(chat.role, "user");
         assert_eq!(chat.content.unwrap(), "hello");
     }
@@ -714,7 +838,7 @@ mod tests {
     #[test]
     fn convert_message_tool_result() {
         let msg = Message::tool_result("id-1", "output", false);
-        let chat = convert_message(&msg, false);
+        let chat = convert_message(&msg, false, false);
         assert_eq!(chat.role, "tool");
         assert_eq!(chat.tool_call_id.unwrap(), "id-1");
     }
@@ -729,7 +853,7 @@ mod tests {
                 arguments: serde_json::json!({"file_path": "/tmp/test.txt"}),
             }],
         );
-        let chat = convert_message(&msg, false);
+        let chat = convert_message(&msg, false, false);
         assert_eq!(chat.role, "assistant");
         assert_eq!(chat.content.as_deref(), Some(""));
         assert!(chat.tool_calls.is_some());
@@ -745,7 +869,7 @@ mod tests {
                 arguments: serde_json::json!({"file_path": "/tmp/test.txt"}),
             }],
         );
-        let chat = convert_message(&msg, true);
+        let chat = convert_message(&msg, true, false);
         let tool_calls = chat.tool_calls.expect("tool calls");
         let json = serde_json::to_value(&tool_calls[0]).unwrap();
         assert_eq!(json["function"]["arguments"]["file_path"], "/tmp/test.txt");
@@ -757,6 +881,57 @@ mod tests {
         assert!(use_qwen_tool_call_parser("qwen2.5"));
         assert!(!use_qwen_tool_call_parser("gpt-4.1"));
         assert!(!use_qwen_tool_call_parser("claude-sonnet-4"));
+    }
+
+    #[test]
+    fn convert_message_tool_result_can_emit_structured_qwen_error() {
+        let msg = Message::tool_result("id-1", "not found: missing.txt", true);
+        let chat = convert_message(&msg, false, true);
+        let content = chat.content.expect("tool content");
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json["ok"], false);
+        assert_eq!(json["error"]["type"], "not_found");
+        assert_eq!(json["error"]["message"], "not found: missing.txt");
+    }
+
+    #[test]
+    fn convert_message_tool_result_can_emit_structured_qwen_success() {
+        let msg = Message::tool_result("id-1", "file contents", false);
+        let chat = convert_message(&msg, false, true);
+        let content = chat.content.expect("tool content");
+        let json: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(json["ok"], true);
+        assert_eq!(json["content"], "file contents");
+    }
+
+    #[test]
+    fn infer_tool_error_type_covers_common_tool_failures() {
+        assert_eq!(
+            infer_tool_error_type("invalid arguments: missing required parameter: file_path"),
+            "invalid_arguments"
+        );
+        assert_eq!(
+            infer_tool_error_type("filesystem error: not found: missing.txt"),
+            "not_found"
+        );
+        assert_eq!(
+            infer_tool_error_type("permission denied: bash command rejected"),
+            "permission_denied"
+        );
+        assert_eq!(
+            infer_tool_error_type("execution timed out after 30s"),
+            "timeout"
+        );
+        assert_eq!(infer_tool_error_type("recv_message timed out"), "timeout");
+        assert_eq!(
+            infer_tool_error_type("tool execution cancelled"),
+            "cancelled"
+        );
+        assert_eq!(infer_tool_error_type("unknown tool: nope"), "unknown_tool");
+        assert_eq!(
+            infer_tool_error_type("internal error: failed to create session"),
+            "internal_error"
+        );
     }
 
     #[test]
@@ -849,14 +1024,17 @@ mod tests {
     #[test]
     fn tool_call_accumulator_generates_id_when_provider_omits_one() {
         let mut acc = ToolCallAccumulator::default();
-        acc.process_delta(&OpenAiToolCallDelta {
-            index: 0,
-            id: None,
-            function: Some(OpenAiToolCallFunctionDelta {
-                name: Some("read_file".into()),
-                arguments: Some("{\"file_path\":\"/tmp/test.txt\"}".into()),
-            }),
-        });
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: Some(0),
+                id: None,
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: Some("read_file".into()),
+                    arguments: Some("{\"file_path\":\"/tmp/test.txt\"}".into()),
+                }),
+            },
+            false,
+        );
 
         let events = acc.take_completed();
         assert_eq!(events.len(), 1);
@@ -895,24 +1073,128 @@ mod tests {
         let mut acc = ToolCallAccumulator::default();
 
         // First delta has id and name
-        acc.process_delta(&OpenAiToolCallDelta {
-            index: 0,
-            id: Some("call_1".into()),
-            function: Some(OpenAiToolCallFunctionDelta {
-                name: Some("read_file".into()),
-                arguments: Some("{\"path\":".into()),
-            }),
-        });
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: Some(0),
+                id: Some("call_1".into()),
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: Some("read_file".into()),
+                    arguments: Some("{\"path\":".into()),
+                }),
+            },
+            false,
+        );
 
         // Second delta has more arguments
-        acc.process_delta(&OpenAiToolCallDelta {
-            index: 0,
-            id: None,
-            function: Some(OpenAiToolCallFunctionDelta {
-                name: None,
-                arguments: Some("\"/tmp/test\"}".into()),
-            }),
-        });
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: Some(0),
+                id: None,
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: None,
+                    arguments: Some("\"/tmp/test\"}".into()),
+                }),
+            },
+            false,
+        );
+
+        let events = acc.take_completed();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            LlmEvent::ToolCall {
+                tool_use_id,
+                tool_name,
+                arguments,
+            } => {
+                assert_eq!(tool_use_id, "call_1");
+                assert_eq!(tool_name, "read_file");
+                assert_eq!(arguments["path"], "/tmp/test");
+            }
+            _ => panic!("expected ToolCall event"),
+        }
+    }
+
+    #[test]
+    fn qwen_missing_index_tool_calls_do_not_merge_into_one_call() {
+        let mut acc = ToolCallAccumulator::default();
+
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: None,
+                id: None,
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: Some("search".into()),
+                    arguments: Some("{\"pattern\":\"spawn\"}".into()),
+                }),
+            },
+            true,
+        );
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: None,
+                id: None,
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: Some("read_file".into()),
+                    arguments: Some("{\"file_path\":\"/tmp/test.txt\"}".into()),
+                }),
+            },
+            true,
+        );
+
+        let events = acc.take_completed();
+        assert_eq!(events.len(), 2);
+
+        match &events[0] {
+            LlmEvent::ToolCall {
+                tool_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(tool_name, "search");
+                assert_eq!(arguments["pattern"], "spawn");
+            }
+            _ => panic!("expected ToolCall event"),
+        }
+
+        match &events[1] {
+            LlmEvent::ToolCall {
+                tool_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(tool_name, "read_file");
+                assert_eq!(arguments["file_path"], "/tmp/test.txt");
+            }
+            _ => panic!("expected ToolCall event"),
+        }
+    }
+
+    #[test]
+    fn non_qwen_missing_index_tool_calls_preserve_existing_merge_behavior() {
+        let mut acc = ToolCallAccumulator::default();
+
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: None,
+                id: Some("call_1".into()),
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: Some("read_file".into()),
+                    arguments: Some("{\"path\":".into()),
+                }),
+            },
+            false,
+        );
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: None,
+                id: None,
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: None,
+                    arguments: Some("\"/tmp/test\"}".into()),
+                }),
+            },
+            false,
+        );
 
         let events = acc.take_completed();
         assert_eq!(events.len(), 1);

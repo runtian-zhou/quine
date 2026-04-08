@@ -11,6 +11,7 @@ mod session;
 mod slash_command;
 mod test_runner;
 mod tui;
+mod usage;
 
 use std::io::IsTerminal;
 
@@ -99,6 +100,15 @@ enum Commands {
         /// Socket path to connect to the harness daemon.
         #[arg(long)]
         socket: Option<String>,
+    },
+    /// View recorded token usage metrics.
+    Usage {
+        /// Show usage for a specific session ID.
+        #[arg(long)]
+        session: Option<String>,
+        /// Output structured JSON instead of plain text.
+        #[arg(long)]
+        json: bool,
     },
     /// Manage the harness daemon.
     Daemon {
@@ -291,12 +301,14 @@ async fn main() -> anyhow::Result<()> {
             run::run_oneshot(
                 &socket_path,
                 &message,
-                session.as_deref(),
-                resume.as_deref(),
-                json,
-                &skill,
-                auto_approve,
-                model_profile.as_deref(),
+                run::RunOneshotOptions {
+                    session_id: session.as_deref(),
+                    resume_checkpoint: resume.as_deref(),
+                    json_output: json,
+                    skills: &skill,
+                    auto_approve,
+                    model_profile: model_profile.as_deref(),
+                },
             )
             .await?;
         }
@@ -323,6 +335,9 @@ async fn main() -> anyhow::Result<()> {
             } else if let Some(sid) = session_id {
                 log::dump_session_log(&sid, socket_path.as_deref().or(Some(&default_path))).await?;
             }
+        }
+        Commands::Usage { session, json } => {
+            usage::show_usage(session.as_deref(), json).await?;
         }
         Commands::Daemon { command } => match command {
             DaemonCommands::Start { socket } => {

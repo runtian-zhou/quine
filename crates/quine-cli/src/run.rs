@@ -51,6 +51,15 @@ pub struct ToolCallRecord {
     pub tool_use_id: String,
 }
 
+pub struct RunOneshotOptions<'a> {
+    pub session_id: Option<&'a str>,
+    pub resume_checkpoint: Option<&'a str>,
+    pub json_output: bool,
+    pub skills: &'a [String],
+    pub auto_approve: bool,
+    pub model_profile: Option<&'a str>,
+}
+
 pub async fn fetch_available_skills(client: &mut IpcClient) -> anyhow::Result<Vec<String>> {
     let result = client.call(methods::LIST_SKILLS, None).await?;
     let value = result.map_err(|message| anyhow::anyhow!(message))?;
@@ -70,13 +79,16 @@ pub async fn fetch_available_skills(client: &mut IpcClient) -> anyhow::Result<Ve
 pub async fn run_oneshot(
     socket_path: &Path,
     message: &str,
-    session_id: Option<&str>,
-    resume_checkpoint: Option<&str>,
-    json_output: bool,
-    skills: &[String],
-    auto_approve: bool,
-    model_profile: Option<&str>,
+    options: RunOneshotOptions<'_>,
 ) -> anyhow::Result<()> {
+    let RunOneshotOptions {
+        session_id,
+        resume_checkpoint,
+        json_output,
+        skills,
+        auto_approve,
+        model_profile,
+    } = options;
     let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
     let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;

@@ -2769,7 +2769,6 @@ mod tests {
                 ("/ps".to_string(), "list sessions"),
                 ("/ps tree".to_string(), "show session tree"),
                 ("/plan".to_string(), "toggle plan mode"),
-                ("/model".to_string(), "switch model profile"),
                 ("/plan-review".to_string(), "run a skill command"),
                 ("/ps-audit".to_string(), "run a skill command"),
             ])

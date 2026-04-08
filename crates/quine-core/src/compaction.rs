@@ -16,6 +16,7 @@ pub const AUTO_COMPACT_THRESHOLD_DENOMINATOR: u64 = 5;
 pub const MAX_TOOL_RESULT_CHARS_IN_HISTORY: usize = 256_000;
 const TOOL_RESULT_PREVIEW_HEAD_CHARS: usize = 8_000;
 const TOOL_RESULT_PREVIEW_TAIL_CHARS: usize = 2_000;
+const INITIAL_TOOL_RESULT_PREVIEW_LINES: usize = 12;
 const SESSION_MEMORY_REFRESH_WAIT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +306,40 @@ pub fn render_archived_tool_result(
     }
     format!(
         "[tool result archived: {tool_name}, {status}, {total_chars} chars, id={tool_use_id}, archive={archive_ref}]\n{preview}"
+    )
+}
+
+pub fn render_initial_archived_tool_result(
+    tool_name: &str,
+    tool_use_id: &str,
+    is_error: bool,
+    output: &str,
+    archive_ref: &str,
+) -> String {
+    let status = if is_error { "error" } else { "ok" };
+    let total_chars = output.chars().count();
+    let total_lines = output.lines().count();
+    let preview = output
+        .lines()
+        .take(INITIAL_TOOL_RESULT_PREVIEW_LINES)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let omitted_notice = if total_lines > INITIAL_TOOL_RESULT_PREVIEW_LINES {
+        format!(
+            "\n\n[... omitted {} more line(s); full tool result archived at {archive_ref} ...]",
+            total_lines - INITIAL_TOOL_RESULT_PREVIEW_LINES
+        )
+    } else if total_chars > preview.chars().count() {
+        format!(
+            "\n\n[... remaining content omitted; full tool result archived at {archive_ref} ...]"
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        "[tool result archived: {tool_name}, {status}, {total_chars} chars, id={tool_use_id}, archive={archive_ref}]\n{preview}{omitted_notice}"
     )
 }
 

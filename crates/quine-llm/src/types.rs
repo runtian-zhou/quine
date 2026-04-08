@@ -120,6 +120,37 @@ pub struct TokenUsage {
     pub output_tokens: u64,
 }
 
+/// Estimated cache usage for a prompt relative to the previous request.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PromptCacheUsage {
+    pub estimated_hit_tokens: u64,
+    pub estimated_miss_tokens: u64,
+}
+
+impl PromptCacheUsage {
+    pub fn total_tokens(&self) -> u64 {
+        self.estimated_hit_tokens + self.estimated_miss_tokens
+    }
+
+    pub fn hit_rate(&self) -> f64 {
+        let total = self.total_tokens();
+        if total == 0 {
+            0.0
+        } else {
+            self.estimated_hit_tokens as f64 / total as f64
+        }
+    }
+
+    pub fn miss_rate(&self) -> f64 {
+        let total = self.total_tokens();
+        if total == 0 {
+            0.0
+        } else {
+            self.estimated_miss_tokens as f64 / total as f64
+        }
+    }
+}
+
 /// Events streamed from the LLM provider.
 #[derive(Debug, Clone)]
 pub enum LlmEvent {
@@ -190,6 +221,17 @@ mod tests {
         let deserialized: TokenUsage = serde_json::from_str(&json).unwrap();
         assert_eq!(deserialized.input_tokens, 1200);
         assert_eq!(deserialized.output_tokens, 350);
+    }
+
+    #[test]
+    fn prompt_cache_usage_rates() {
+        let usage = PromptCacheUsage {
+            estimated_hit_tokens: 80,
+            estimated_miss_tokens: 20,
+        };
+        assert_eq!(usage.total_tokens(), 100);
+        assert!((usage.hit_rate() - 0.8).abs() < f64::EPSILON);
+        assert!((usage.miss_rate() - 0.2).abs() < f64::EPSILON);
     }
 
     #[test]

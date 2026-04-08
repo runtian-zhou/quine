@@ -2406,7 +2406,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_harness_schedule_agent_one_shot() {
-        let harness = LocalHarness::new(Arc::new(MockProvider), None)
+        let harness = LocalHarness::new(Arc::new(MockProvider), Some(temp_storage()))
             .await
             .unwrap();
         harness
@@ -2524,7 +2524,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn local_harness_scheduled_message_runs_after_delay() {
-        let harness = LocalHarness::new(Arc::new(EchoProvider), None)
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(temp_storage()))
             .await
             .unwrap();
         let mut rx = harness.subscribe();
@@ -2541,7 +2541,6 @@ mod tests {
                 ..
             }
         ));
-        let _ = rx.recv().await.unwrap();
 
         harness
             .schedule_message(session_id, "scheduled".into(), Duration::from_secs(60))
@@ -2551,6 +2550,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
 
         let mut full_text = None;
         while full_text.is_none() {
@@ -2585,7 +2585,6 @@ mod tests {
                 ..
             }
         ));
-        let _ = rx.recv().await.unwrap();
 
         harness
             .schedule_message(session_id, "later".into(), Duration::from_secs(30))
@@ -2606,6 +2605,7 @@ mod tests {
         assert_eq!(completions, vec!["now"]);
 
         tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
 
         while completions.len() < 2 {
             if let CoreOutput::TextComplete { full_text, .. } = rx.recv().await.unwrap() {
