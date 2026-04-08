@@ -4,9 +4,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::IpcClient;
 use crate::interaction::{
-    allow_freeform as interaction_allow_freeform, kind as interaction_kind,
-    maybe_auto_approve, options as interaction_options, prompt as interaction_prompt,
-    source_label,
+    allow_freeform as interaction_allow_freeform, kind as interaction_kind, maybe_auto_approve,
+    options as interaction_options, prompt as interaction_prompt, source_label,
 };
 use crate::session::resolve_resume_target;
 use quine_harness::{

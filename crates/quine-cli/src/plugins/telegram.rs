@@ -538,18 +538,19 @@ impl TelegramBot {
         chat_id: i64,
         output: &OneshotOutput,
     ) -> (String, Option<serde_json::Value>) {
-        let pending_interaction = output
-            .interaction_needed
-            .as_ref()
-            .map(|interaction| TelegramPendingInteraction {
-                session_id: output.session_id.clone(),
-                prompt: interaction.prompt.clone(),
-                source_label: interaction.source_label.clone(),
-                kind: TelegramInteractionKind::from_output_kind(&interaction.kind),
-                options: interaction.options.clone(),
-                allow_freeform: interaction.allow_freeform,
-                selected_indices: Vec::new(),
-            });
+        let pending_interaction =
+            output
+                .interaction_needed
+                .as_ref()
+                .map(|interaction| TelegramPendingInteraction {
+                    session_id: output.session_id.clone(),
+                    prompt: interaction.prompt.clone(),
+                    source_label: interaction.source_label.clone(),
+                    kind: TelegramInteractionKind::from_output_kind(&interaction.kind),
+                    options: interaction.options.clone(),
+                    allow_freeform: interaction.allow_freeform,
+                    selected_indices: Vec::new(),
+                });
         let reply = if let Some(pending) = &pending_interaction {
             format_pending_interaction(pending, &output.response)
         } else {
@@ -609,12 +610,7 @@ impl TelegramBot {
             Self::render_progress_message(&state)
         };
         let status_message_id = self
-            .send_message(
-                chat_id,
-                &progress_text,
-                Some(reply_to_message_id),
-                None,
-            )
+            .send_message(chat_id, &progress_text, Some(reply_to_message_id), None)
             .await?;
         let updater = self.spawn_progress_updater(chat_id, status_message_id, progress.clone());
         let output = match run::execute_interaction_response(
@@ -633,20 +629,10 @@ impl TelegramBot {
                 let message = format!("Quine error: {error}");
                 self.set_pending_interaction(chat_id, Some(pending)).await;
                 let _ = self
-                    .edit_message(
-                        chat_id,
-                        status_message_id,
-                        &message,
-                        None,
-                    )
+                    .edit_message(chat_id, status_message_id, &message, None)
                     .await;
                 return self
-                    .send_reply(
-                        chat_id,
-                        reply_to_message_id,
-                        &message,
-                        None,
-                    )
+                    .send_reply(chat_id, reply_to_message_id, &message, None)
                     .await;
             }
         };
@@ -726,12 +712,7 @@ impl TelegramBot {
             Self::render_progress_message(&state)
         };
         let status_message_id = self
-            .send_message(
-                chat_id,
-                &progress_text,
-                Some(reply_to_message_id),
-                None,
-            )
+            .send_message(chat_id, &progress_text, Some(reply_to_message_id), None)
             .await?;
         let updater = self.spawn_progress_updater(chat_id, status_message_id, progress.clone());
         let output = match run::execute_oneshot_with_progress(
@@ -756,22 +737,12 @@ impl TelegramBot {
                 let _ = updater.await;
                 let message = format!("Quine error: {error}");
                 if self
-                    .edit_message(
-                        chat_id,
-                        status_message_id,
-                        &message,
-                        None,
-                    )
+                    .edit_message(chat_id, status_message_id, &message, None)
                     .await
                     .is_err()
                 {
                     let _ = self
-                        .send_reply(
-                            chat_id,
-                            reply_to_message_id,
-                            &message,
-                            None,
-                        )
+                        .send_reply(chat_id, reply_to_message_id, &message, None)
                         .await;
                 }
                 return Ok(());
@@ -831,12 +802,7 @@ impl TelegramBot {
             Self::render_progress_message(&state)
         };
         let status_message_id = self
-            .send_message(
-                chat_id,
-                &progress_text,
-                Some(reply_to_message_id),
-                None,
-            )
+            .send_message(chat_id, &progress_text, Some(reply_to_message_id), None)
             .await?;
         let updater = self.spawn_progress_updater(chat_id, status_message_id, progress.clone());
 
@@ -862,20 +828,10 @@ impl TelegramBot {
                 let _ = updater.await;
                 let message = format!("Quine error: {error}");
                 let _ = self
-                    .edit_message(
-                        chat_id,
-                        status_message_id,
-                        &message,
-                        None,
-                    )
+                    .edit_message(chat_id, status_message_id, &message, None)
                     .await;
                 return self
-                    .send_reply(
-                        chat_id,
-                        reply_to_message_id,
-                        &message,
-                        None,
-                    )
+                    .send_reply(chat_id, reply_to_message_id, &message, None)
                     .await;
             }
         };
@@ -919,12 +875,7 @@ impl TelegramBot {
             Self::render_progress_message(&state)
         };
         let status_message_id = self
-            .send_message(
-                chat_id,
-                &progress_text,
-                Some(reply_to_message_id),
-                None,
-            )
+            .send_message(chat_id, &progress_text, Some(reply_to_message_id), None)
             .await?;
         let updater = self.spawn_progress_updater(chat_id, status_message_id, progress.clone());
         let output = match run::execute_oneshot_with_progress(
@@ -948,20 +899,10 @@ impl TelegramBot {
                 updater.abort();
                 let message = format!("Quine error: {error}");
                 let _ = self
-                    .edit_message(
-                        chat_id,
-                        status_message_id,
-                        &message,
-                        None,
-                    )
+                    .edit_message(chat_id, status_message_id, &message, None)
                     .await;
                 return self
-                    .send_reply(
-                        chat_id,
-                        reply_to_message_id,
-                        &message,
-                        None,
-                    )
+                    .send_reply(chat_id, reply_to_message_id, &message, None)
                     .await;
             }
         };
@@ -1401,13 +1342,8 @@ impl TelegramBot {
                         eprintln!(
                             "[telegram] /context fetched context chat_id={chat_id} session_id={session_id}"
                         );
-                        self.set_active_session_state(
-                            chat_id,
-                            session_id,
-                            snapshot.plan_mode,
-                            tab,
-                        )
-                        .await;
+                        self.set_active_session_state(chat_id, session_id, snapshot.plan_mode, tab)
+                            .await;
                         let reply = if tab == SessionStateTab::Overview {
                             render_context_view(&snapshot)
                         } else {
@@ -1465,12 +1401,12 @@ impl TelegramBot {
                     TelegramChatState {
                         session_id: Some(created.session_id.clone()),
                         plan_mode: false,
-                    model_profile: self.default_model_profile.clone(),
-                    state_tab: SessionStateTab::Overview,
-                    session_picker_page: 0,
-                    pending_interaction: None,
-                },
-            );
+                        model_profile: self.default_model_profile.clone(),
+                        state_tab: SessionStateTab::Overview,
+                        session_picker_page: 0,
+                        pending_interaction: None,
+                    },
+                );
                 self.send_reply(
                     chat_id,
                     reply_to_message_id,
@@ -1734,7 +1670,8 @@ impl TelegramBot {
             let reply = format_pending_interaction(&pending, "");
             let markup = interaction_reply_markup_for_pending(&pending)
                 .or_else(|| Some(default_slash_reply_markup()));
-            self.set_pending_interaction(message.chat.id, Some(pending)).await;
+            self.set_pending_interaction(message.chat.id, Some(pending))
+                .await;
             self.edit_message(message.chat.id, message.message_id, &reply, markup)
                 .await?;
             self.answer_callback_query(&query.id, Some("Selection updated."))
@@ -1752,7 +1689,8 @@ impl TelegramBot {
             let reply = format_pending_interaction(&pending, "");
             let markup = interaction_reply_markup_for_pending(&pending)
                 .or_else(|| Some(default_slash_reply_markup()));
-            self.set_pending_interaction(message.chat.id, Some(pending)).await;
+            self.set_pending_interaction(message.chat.id, Some(pending))
+                .await;
             self.edit_message(message.chat.id, message.message_id, &reply, markup)
                 .await?;
             self.answer_callback_query(&query.id, Some("Selection cleared."))
@@ -2459,15 +2397,24 @@ fn context_reply_markup(active_tab: SessionStateTab) -> serde_json::Value {
                 "History".to_string(),
                 SessionStateTab::History.context_command(),
             ),
-            ("Tools".to_string(), SessionStateTab::Tools.context_command()),
+            (
+                "Tools".to_string(),
+                SessionStateTab::Tools.context_command(),
+            ),
         ],
         vec![
             (
                 "Skills".to_string(),
                 SessionStateTab::Skills.context_command(),
             ),
-            ("Plans".to_string(), SessionStateTab::Plans.context_command()),
-            ("Memory".to_string(), SessionStateTab::Memory.context_command()),
+            (
+                "Plans".to_string(),
+                SessionStateTab::Plans.context_command(),
+            ),
+            (
+                "Memory".to_string(),
+                SessionStateTab::Memory.context_command(),
+            ),
         ],
         vec![
             (
@@ -3042,5 +2989,4 @@ mod tests {
         assert!(!rendered.contains(&"x".repeat(40)));
         assert!(rendered.len() < 900);
     }
-
 }
