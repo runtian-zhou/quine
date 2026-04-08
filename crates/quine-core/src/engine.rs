@@ -16,7 +16,7 @@ use tokio::time::{Duration, Instant};
 use crate::channel::{
     CoreHandle, CoreInput, CoreOutput, MailboxMessage, MessageSource, ToolOutcome,
 };
-use crate::compaction::{self, CompactionTrigger};
+use crate::compaction::{self, CompactionTrigger, DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT};
 use crate::error::CoreError;
 use crate::filesystem::OverlayFilesystem;
 use crate::memory::{
@@ -267,6 +267,8 @@ struct SessionContext {
     max_context_window: Option<u64>,
     /// Archive generation counter for this session.
     compaction_generation: u64,
+    /// Auto-compaction threshold as a percentage of the model context window.
+    auto_compact_threshold_percent: u8,
     /// Serializable creation-time configuration needed for restore.
     persisted_config: PersistedSessionConfig,
     /// Stable creation timestamp used for checkpoint listings.
@@ -361,6 +363,7 @@ struct SessionInit {
     team_key: Option<String>,
     memory_policy: MemoryPolicyConfig,
     model_profile: Option<String>,
+    auto_compact_threshold_percent: u8,
 }
 
 impl SessionInit {
@@ -380,6 +383,7 @@ impl SessionInit {
             team_key: self.team_key.clone(),
             memory_policy: self.memory_policy.clone(),
             model_profile: self.model_profile.clone(),
+            auto_compact_threshold_percent: self.auto_compact_threshold_percent.clamp(1, 100),
         }
     }
 }
@@ -608,7 +612,6 @@ impl SessionContext {
             agent_key,
             team_key,
             memory_policy,
-            model_profile: _,
             ..
         } = init;
         let filesystem = Arc::new(
@@ -679,6 +682,7 @@ impl SessionContext {
             archive_root,
             max_context_window,
             compaction_generation: 0,
+            auto_compact_threshold_percent: persisted_config.auto_compact_threshold_percent,
             persisted_config: persisted_config.clone(),
             created_at: Utc::now(),
             mailbox: VecDeque::new(),
@@ -742,6 +746,7 @@ impl SessionContext {
                 team_key: config.team_key.clone(),
                 memory_policy: config.memory_policy.clone(),
                 model_profile: config.model_profile.clone(),
+                auto_compact_threshold_percent: config.auto_compact_threshold_percent,
             },
             provider,
             web_provider,
@@ -749,6 +754,7 @@ impl SessionContext {
         .await?;
         session.state = state.into();
         session.history = history;
+        session.auto_compact_threshold_percent = config.auto_compact_threshold_percent;
         session.plan_store = crate::tool::plan::restore_plan_store(plan_store).await;
         session.tool_registry = {
             let mut registry = ToolRegistry::new();
@@ -925,6 +931,7 @@ impl SessionContext {
     ) -> Result<(), CoreError> {
         self.provider = provider;
         self.persisted_config.model_profile = model_profile;
+        self.auto_compact_threshold_percent = self.persisted_config.auto_compact_threshold_percent;
         self.max_context_window = max_context_window;
         self.rebuild_session_config_with_web_provider(web_provider)
             .await
@@ -1225,7 +1232,7 @@ async fn build_provider_messages(session: &mut SessionContext) -> Result<Vec<Mes
         injection.diagnostics.conflict_winner_scope.clone();
     session.last_memory_diagnostics = Some(diagnostics);
 
-    let mut messages = compaction::build_micro_compacted_history(&session.history);
+    let mut messages = session.history.clone();
     if let Some(system_suffix) = injection.system_prompt_suffix.as_deref() {
         if let Some(first) = messages.first_mut() {
             if first.role == quine_llm::Role::System {
@@ -2307,6 +2314,7 @@ async fn start_child_session(
             team_key: None,
             memory_policy: MemoryPolicyConfig::default(),
             model_profile: inherited_model_profile,
+            auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
         },
         &inherited_provider,
     )
@@ -3167,7 +3175,11 @@ async fn handle_llm_turn(
         }
 
         let Some(should_auto_compact) = sessions.get(&session_id).map(|session| {
-            compaction::should_auto_compact(session.max_context_window, session.last_input_tokens)
+            compaction::should_auto_compact(
+                session.max_context_window,
+                session.last_input_tokens,
+                session.auto_compact_threshold_percent,
+            )
         }) else {
             return TurnOutcome::Failed("session not found".into());
         };
@@ -3986,6 +3998,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 team_key,
                 memory_policy,
                 session_llm,
+                auto_compact_threshold_percent,
                 permission_rules,
                 reply,
             } => {
@@ -4022,6 +4035,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         team_key,
                         memory_policy,
                         model_profile: session_llm.model_profile.clone(),
+                        auto_compact_threshold_percent,
                     },
                     &session_llm.provider,
                     &web_provider,
@@ -4835,6 +4849,7 @@ mod tests {
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -4876,6 +4891,7 @@ mod tests {
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -4909,6 +4925,7 @@ mod tests {
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -4954,6 +4971,7 @@ mod tests {
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             provider,
         )
@@ -5069,6 +5087,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -5136,6 +5155,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -5425,7 +5445,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         session.persisted_config.prompt_memory_mode = PromptMemoryMode::Disabled;
 
         let built = build_provider_messages(&mut session).await.unwrap();
-        let expected = compaction::build_micro_compacted_history(&history);
+        let expected = history.clone();
         assert_eq!(built.len(), expected.len());
         for (left, right) in built.iter().zip(expected.iter()) {
             assert_eq!(left.role, right.role);
@@ -5648,6 +5668,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 },
                 &provider,
             ))
@@ -5669,6 +5690,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 },
                 &provider,
             ))
@@ -5690,6 +5712,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 },
                 &provider,
             ))
@@ -5747,6 +5770,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 },
                 &provider,
             ))
@@ -5768,6 +5792,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 },
                 &provider,
             ))
@@ -5810,6 +5835,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -5885,6 +5911,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -5958,6 +5985,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -6033,6 +6061,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -6123,6 +6152,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -6229,6 +6259,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -6322,6 +6353,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -6421,6 +6453,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 },
                 &provider,
             ))
@@ -6711,6 +6744,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -6759,6 +6793,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -6809,6 +6844,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -6850,6 +6886,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -6919,6 +6956,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -7001,6 +7039,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -7099,6 +7138,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -7185,6 +7225,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -7269,6 +7310,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -7345,6 +7387,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -7406,6 +7449,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -7477,6 +7521,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -7521,6 +7566,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -7590,6 +7636,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: create_reply_tx,
             })
             .await
@@ -7672,6 +7719,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -7713,6 +7761,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -7801,6 +7850,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -7899,6 +7949,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -7971,6 +8022,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     permission_rules: PermissionRuleSet::default(),
                     memory_policy: MemoryPolicyConfig::default(),
                     session_llm: session_llm_config(provider.clone()),
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     reply: reply_tx,
                 })
                 .await
@@ -8025,6 +8077,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 },
                 history: vec![
                     Message::user("seed session memory"),
@@ -8143,6 +8196,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -8201,6 +8255,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -8265,6 +8320,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -8287,6 +8343,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -8322,6 +8379,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -8436,6 +8494,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -8569,6 +8628,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             },
             &provider,
         )
@@ -8711,6 +8771,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -8831,6 +8892,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -8945,6 +9007,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -9061,6 +9124,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -9142,6 +9206,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
@@ -9179,6 +9244,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     session_llm: session_llm_config(provider.clone()),
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     reply: reply_tx,
                 })
                 .await
@@ -9321,6 +9387,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await

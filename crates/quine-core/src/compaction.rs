@@ -11,13 +11,36 @@ use crate::memory::{
     load_compaction_snapshot, SessionMemoryCompactionSnapshot, SessionMemoryState,
 };
 
-pub const AUTO_COMPACT_THRESHOLD_NUMERATOR: u64 = 3;
-pub const AUTO_COMPACT_THRESHOLD_DENOMINATOR: u64 = 5;
+pub const DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT: u8 = 60;
 pub const MAX_TOOL_RESULT_CHARS_IN_HISTORY: usize = 256_000;
 const TOOL_RESULT_PREVIEW_HEAD_CHARS: usize = 8_000;
 const TOOL_RESULT_PREVIEW_TAIL_CHARS: usize = 2_000;
 const INITIAL_TOOL_RESULT_PREVIEW_LINES: usize = 12;
 const SESSION_MEMORY_REFRESH_WAIT: Duration = Duration::from_millis(250);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MicroCompactionOptions {
+    pub preserve_live_segments: usize,
+}
+
+impl Default for MicroCompactionOptions {
+    fn default() -> Self {
+        Self {
+            preserve_live_segments: 1,
+        }
+    }
+}
+
+fn micro_compaction_options_from_env() -> MicroCompactionOptions {
+    let preserve_live_segments = std::env::var("QUINE_TOOL_RESULT_PRESERVE_SEGMENTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(1);
+    MicroCompactionOptions {
+        preserve_live_segments,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompactionTrigger {
@@ -62,53 +85,26 @@ struct TranscriptArchive {
     history: Vec<Message>,
 }
 
-pub fn auto_compact_threshold(max_context_window: Option<u64>) -> Option<u64> {
-    max_context_window.map(|window| {
-        window.saturating_mul(AUTO_COMPACT_THRESHOLD_NUMERATOR) / AUTO_COMPACT_THRESHOLD_DENOMINATOR
-    })
+pub fn auto_compact_threshold(
+    max_context_window: Option<u64>,
+    threshold_percent: u8,
+) -> Option<u64> {
+    let threshold_percent = threshold_percent.clamp(1, 100);
+    max_context_window.map(|window| window.saturating_mul(u64::from(threshold_percent)) / 100)
 }
 
 pub fn should_auto_compact(
     max_context_window: Option<u64>,
     last_input_tokens: Option<u64>,
+    threshold_percent: u8,
 ) -> bool {
     match (
-        auto_compact_threshold(max_context_window),
+        auto_compact_threshold(max_context_window, threshold_percent),
         last_input_tokens,
     ) {
         (Some(threshold), Some(tokens)) => tokens >= threshold,
         _ => false,
     }
-}
-
-pub fn build_micro_compacted_history(history: &[Message]) -> Vec<Message> {
-    let preserve_from = live_tail_start(history).unwrap_or(history.len());
-    let tool_names = tool_name_map(history);
-
-    history
-        .iter()
-        .enumerate()
-        .map(|(index, message)| match &message.content {
-            MessageContent::ToolResult {
-                tool_use_id,
-                output,
-                is_error,
-            } if index < preserve_from => Message {
-                role: message.role.clone(),
-                content: MessageContent::ToolResult {
-                    tool_use_id: tool_use_id.clone(),
-                    output: render_tool_placeholder(
-                        tool_names.get(tool_use_id).map(String::as_str),
-                        tool_use_id,
-                        *is_error,
-                        output.len(),
-                    ),
-                    is_error: *is_error,
-                },
-            },
-            _ => message.clone(),
-        })
-        .collect()
 }
 
 pub fn split_history_for_compaction(history: &[Message]) -> (Vec<Message>, Vec<Message>) {
@@ -242,7 +238,23 @@ pub async fn archive_old_tool_results(
     session_id: &str,
     history: &[Message],
 ) -> std::io::Result<Vec<Message>> {
-    let preserve_from = live_tail_start(history).unwrap_or(history.len());
+    archive_old_tool_results_with_options(
+        archive_root,
+        session_id,
+        history,
+        micro_compaction_options_from_env(),
+    )
+    .await
+}
+
+pub async fn archive_old_tool_results_with_options(
+    archive_root: &Path,
+    session_id: &str,
+    history: &[Message],
+    options: MicroCompactionOptions,
+) -> std::io::Result<Vec<Message>> {
+    let preserve_from = live_tail_start_with_segments(history, options.preserve_live_segments)
+        .unwrap_or(history.len());
     let tool_names = tool_name_map(history);
     let mut remapped = Vec::with_capacity(history.len());
 
@@ -344,10 +356,34 @@ pub fn render_initial_archived_tool_result(
 }
 
 fn live_tail_start(history: &[Message]) -> Option<usize> {
-    let last = history.last()?;
+    live_tail_start_with_segments(history, 1)
+}
+
+fn live_tail_start_with_segments(history: &[Message], preserve_segments: usize) -> Option<usize> {
+    if preserve_segments == 0 {
+        return Some(history.len());
+    }
+
+    let mut start = history.len();
+    let mut remaining_segments = preserve_segments;
+
+    while remaining_segments > 0 {
+        let next_start = previous_live_segment_start(history, start)?;
+        start = next_start;
+        remaining_segments -= 1;
+        if start == 0 {
+            break;
+        }
+    }
+
+    Some(start)
+}
+
+fn previous_live_segment_start(history: &[Message], end_exclusive: usize) -> Option<usize> {
+    let last = history.get(end_exclusive.checked_sub(1)?)?;
     match &last.content {
         MessageContent::ToolResult { .. } => {
-            let mut start = history.len() - 1;
+            let mut start = end_exclusive - 1;
             while start > 0
                 && matches!(
                     history[start - 1].content,
@@ -361,8 +397,8 @@ fn live_tail_start(history: &[Message]) -> Option<usize> {
             }
             Some(start)
         }
-        MessageContent::ToolUse { .. } => Some(history.len() - 1),
-        MessageContent::Text(_) if last.role == Role::User => Some(history.len() - 1),
+        MessageContent::ToolUse { .. } => Some(end_exclusive - 1),
+        MessageContent::Text(_) if last.role == Role::User => Some(end_exclusive - 1),
         _ => None,
     }
 }
@@ -407,21 +443,6 @@ fn tool_name_map(history: &[Message]) -> HashMap<String, String> {
         }
     }
     names
-}
-
-fn render_tool_placeholder(
-    tool_name: Option<&str>,
-    tool_use_id: &str,
-    is_error: bool,
-    output_len: usize,
-) -> String {
-    let status = if is_error { "error" } else { "ok" };
-    match tool_name {
-        Some(name) => {
-            format!("[tool result elided: {name}, {status}, {output_len} chars, id={tool_use_id}]")
-        }
-        None => format!("[tool result elided: {status}, {output_len} chars, id={tool_use_id}]"),
-    }
 }
 
 fn render_transcript(history: &[Message]) -> String {
@@ -482,56 +503,6 @@ mod tests {
     use uuid::Uuid;
 
     #[test]
-    fn micro_compact_replaces_old_tool_results() {
-        let history = vec![
-            Message::user("first"),
-            Message::assistant_tool_use(
-                None,
-                vec![ToolUseRequest {
-                    tool_use_id: "id-1".into(),
-                    tool_name: "bash".into(),
-                    arguments: serde_json::json!({"cmd": "pwd"}),
-                }],
-            ),
-            Message::tool_result("id-1", "very long output", false),
-            Message::user("second"),
-        ];
-
-        let compacted = build_micro_compacted_history(&history);
-        match &compacted[2].content {
-            MessageContent::ToolResult { output, .. } => {
-                assert!(output.contains("bash"));
-                assert!(output.contains("elided"));
-            }
-            _ => panic!("expected tool result"),
-        }
-    }
-
-    #[test]
-    fn micro_compact_preserves_live_tool_tail() {
-        let history = vec![
-            Message::user("first"),
-            Message::assistant_tool_use(
-                None,
-                vec![ToolUseRequest {
-                    tool_use_id: "id-1".into(),
-                    tool_name: "bash".into(),
-                    arguments: serde_json::json!({"cmd": "pwd"}),
-                }],
-            ),
-            Message::tool_result("id-1", "tail output", false),
-        ];
-
-        let compacted = build_micro_compacted_history(&history);
-        match &compacted[2].content {
-            MessageContent::ToolResult { output, .. } => {
-                assert_eq!(output, "tail output");
-            }
-            _ => panic!("expected tool result"),
-        }
-    }
-
-    #[test]
     fn split_history_keeps_latest_user_message_live() {
         let history = vec![
             Message::system("system"),
@@ -581,6 +552,73 @@ mod tests {
             _ => panic!("expected archived old tool result"),
         }
         match &rewritten[3].content {
+            MessageContent::ToolResult { output, .. } => {
+                assert_eq!(output, "live output");
+            }
+            _ => panic!("expected live tool result"),
+        }
+
+        let _ = std::fs::remove_dir_all(archive_root);
+    }
+
+    #[tokio::test]
+    async fn archive_old_tool_results_can_preserve_multiple_live_segments() {
+        let history = vec![
+            Message::assistant_tool_use(
+                None,
+                vec![ToolUseRequest {
+                    tool_use_id: "id-1".into(),
+                    tool_name: "bash".into(),
+                    arguments: serde_json::json!({"cmd": "pwd"}),
+                }],
+            ),
+            Message::tool_result("id-1", "old output", false),
+            Message::assistant_tool_use(
+                None,
+                vec![ToolUseRequest {
+                    tool_use_id: "id-2".into(),
+                    tool_name: "bash".into(),
+                    arguments: serde_json::json!({"cmd": "ls"}),
+                }],
+            ),
+            Message::tool_result("id-2", "newer output", false),
+            Message::assistant_tool_use(
+                None,
+                vec![ToolUseRequest {
+                    tool_use_id: "id-3".into(),
+                    tool_name: "bash".into(),
+                    arguments: serde_json::json!({"cmd": "git status"}),
+                }],
+            ),
+            Message::tool_result("id-3", "live output", false),
+        ];
+        let archive_root =
+            std::env::temp_dir().join(format!("quine-core-compaction-{}", Uuid::new_v4()));
+
+        let rewritten = archive_old_tool_results_with_options(
+            &archive_root,
+            "session-1",
+            &history,
+            MicroCompactionOptions {
+                preserve_live_segments: 2,
+            },
+        )
+        .await
+        .unwrap();
+
+        match &rewritten[1].content {
+            MessageContent::ToolResult { output, .. } => {
+                assert!(output.starts_with("[tool result archived: bash, ok"));
+            }
+            _ => panic!("expected archived old tool result"),
+        }
+        match &rewritten[3].content {
+            MessageContent::ToolResult { output, .. } => {
+                assert_eq!(output, "newer output");
+            }
+            _ => panic!("expected preserved tool result"),
+        }
+        match &rewritten[5].content {
             MessageContent::ToolResult { output, .. } => {
                 assert_eq!(output, "live output");
             }

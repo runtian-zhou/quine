@@ -437,6 +437,14 @@ async fn handle_request(
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
+            let auto_compact_threshold_percent = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("auto_compact_threshold_percent"))
+                .and_then(|v| v.as_u64())
+                .and_then(|value| u8::try_from(value).ok())
+                .unwrap_or_else(crate::config::auto_compact_threshold_percent_from_env);
+
             let config = crate::config::SessionConfig {
                 system_prompt,
                 working_directory: None,
@@ -448,6 +456,7 @@ async fn handle_request(
                 team_key,
                 memory_policy,
                 model_profile: model_profile.clone(),
+                auto_compact_threshold_percent,
             };
 
             match service.create_session(config).await {

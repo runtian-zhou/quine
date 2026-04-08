@@ -16,7 +16,7 @@ use crate::model_profiles::{
 };
 
 /// Configuration for a single agent session.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionConfig {
     /// Optional system prompt override.
     pub system_prompt: Option<String>,
@@ -46,10 +46,45 @@ pub struct SessionConfig {
     /// Optional named model profile for this session.
     #[serde(default)]
     pub model_profile: Option<String>,
+    /// Auto-compaction threshold as a percentage of the model context window.
+    #[serde(default = "default_auto_compact_threshold_percent")]
+    pub auto_compact_threshold_percent: u8,
+}
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            system_prompt: None,
+            working_directory: None,
+            skills: Vec::new(),
+            plan_mode: false,
+            prompt_behavior: default_permission_prompt_behavior(),
+            initial_messages: Vec::new(),
+            agent_key: None,
+            team_key: None,
+            memory_policy: MemoryPolicyConfig::default(),
+            model_profile: None,
+            auto_compact_threshold_percent: default_auto_compact_threshold_percent(),
+        }
+    }
+}
+
+const DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT: u8 = 60;
+
+fn default_auto_compact_threshold_percent() -> u8 {
+    DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT
 }
 
 fn default_permission_prompt_behavior() -> PermissionPromptBehavior {
     PermissionPromptBehavior::Interactive
+}
+
+pub fn auto_compact_threshold_percent_from_env() -> u8 {
+    std::env::var("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT")
+        .ok()
+        .and_then(|value| value.parse::<u8>().ok())
+        .filter(|value| (1..=100).contains(value))
+        .unwrap_or_else(default_auto_compact_threshold_percent)
 }
 
 /// Configuration for the harness daemon.
@@ -291,6 +326,10 @@ mod tests {
     fn session_config_default() {
         let config = SessionConfig::default();
         assert!(config.system_prompt.is_none());
+        assert_eq!(
+            config.auto_compact_threshold_percent,
+            default_auto_compact_threshold_percent()
+        );
     }
 
     #[test]
@@ -306,6 +345,7 @@ mod tests {
             team_key: None,
             memory_policy: MemoryPolicyConfig::default(),
             model_profile: None,
+            auto_compact_threshold_percent: default_auto_compact_threshold_percent(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: SessionConfig = serde_json::from_str(&json).unwrap();
@@ -316,6 +356,10 @@ mod tests {
         assert_eq!(
             deserialized.prompt_behavior,
             PermissionPromptBehavior::Headless
+        );
+        assert_eq!(
+            deserialized.auto_compact_threshold_percent,
+            default_auto_compact_threshold_percent()
         );
     }
 
@@ -354,6 +398,52 @@ mod tests {
             match previous_context_window {
                 Some(value) => unsafe { std::env::set_var("LLM_CONTEXT_WINDOW", value) },
                 None => unsafe { std::env::remove_var("LLM_CONTEXT_WINDOW") },
+            }
+        });
+    }
+
+    #[test]
+    fn auto_compact_threshold_percent_from_env_uses_default_when_unset_or_invalid() {
+        with_env_lock(|| {
+            let previous = std::env::var_os("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT");
+            unsafe { std::env::remove_var("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT") };
+            assert_eq!(
+                auto_compact_threshold_percent_from_env(),
+                default_auto_compact_threshold_percent()
+            );
+
+            unsafe { std::env::set_var("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT", "0") };
+            assert_eq!(
+                auto_compact_threshold_percent_from_env(),
+                default_auto_compact_threshold_percent()
+            );
+
+            unsafe { std::env::set_var("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT", "101") };
+            assert_eq!(
+                auto_compact_threshold_percent_from_env(),
+                default_auto_compact_threshold_percent()
+            );
+
+            match previous {
+                Some(value) => unsafe {
+                    std::env::set_var("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT", value)
+                },
+                None => unsafe { std::env::remove_var("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT") },
+            }
+        });
+    }
+
+    #[test]
+    fn auto_compact_threshold_percent_from_env_uses_valid_value() {
+        with_env_lock(|| {
+            let previous = std::env::var_os("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT");
+            unsafe { std::env::set_var("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT", "75") };
+            assert_eq!(auto_compact_threshold_percent_from_env(), 75);
+            match previous {
+                Some(value) => unsafe {
+                    std::env::set_var("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT", value)
+                },
+                None => unsafe { std::env::remove_var("QUINE_AUTO_COMPACT_THRESHOLD_PERCENT") },
             }
         });
     }

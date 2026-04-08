@@ -14,8 +14,9 @@ use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio::time::Duration;
 
 use crate::config::{
-    default_memory_dir_from_state_dir, default_state_dir, load_persisted_permission_rules,
-    max_context_window_from_env, resolve_session_llm_config, SessionConfig,
+    auto_compact_threshold_percent_from_env, default_memory_dir_from_state_dir, default_state_dir,
+    load_persisted_permission_rules, max_context_window_from_env, resolve_session_llm_config,
+    SessionConfig,
 };
 
 use crate::error::HarnessError;
@@ -513,6 +514,11 @@ impl HarnessService for LocalHarness {
         let session_llm = self
             .provider_manager
             .resolve(config.model_profile.as_deref())?;
+        let auto_compact_threshold_percent = if config.auto_compact_threshold_percent == 0 {
+            auto_compact_threshold_percent_from_env()
+        } else {
+            config.auto_compact_threshold_percent.clamp(1, 100)
+        };
 
         self.core_input
             .send(CoreInput::CreateSession {
@@ -528,6 +534,7 @@ impl HarnessService for LocalHarness {
                 team_key: config.team_key,
                 memory_policy: config.memory_policy,
                 session_llm: session_llm.clone(),
+                auto_compact_threshold_percent,
                 reply: reply_tx,
             })
             .await
@@ -989,6 +996,7 @@ mod tests {
                 team_key: None,
                 memory_policy: quine_core::MemoryPolicyConfig::default(),
                 model_profile: None,
+                auto_compact_threshold_percent: 60,
             },
             history: Vec::new(),
             plan_store: quine_core::PersistedPlanStore::default(),
@@ -1764,6 +1772,7 @@ mod tests {
                         team_key: None,
                         memory_policy: quine_core::MemoryPolicyConfig::default(),
                         model_profile: Some("missing-profile".into()),
+                        auto_compact_threshold_percent: 60,
                     },
                     history: Vec::new(),
                     plan_store: quine_core::PersistedPlanStore::default(),
