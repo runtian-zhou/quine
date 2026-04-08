@@ -9,6 +9,8 @@ use quine_harness::protocol::{
     JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest, JsonRpcResponse,
 };
 
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// IPC client that connects to the harness daemon via Unix domain socket.
 pub struct IpcClient {
     writer: tokio::io::WriteHalf<UnixStream>,
@@ -75,9 +77,7 @@ impl IpcClient {
         self.writer.flush().await?;
 
         // Wait for a response with matching id.
-        match tokio::time::timeout(std::time::Duration::from_secs(30), self.response_rx.recv())
-            .await
-        {
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.response_rx.recv()).await {
             Ok(Some(resp_line)) => {
                 // Try as success response first, then error.
                 if let Ok(resp) = serde_json::from_str::<JsonRpcResponse>(&resp_line) {

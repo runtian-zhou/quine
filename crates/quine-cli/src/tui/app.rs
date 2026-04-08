@@ -915,6 +915,7 @@ impl App {
 
         let commands = [
             "ps", "ps tree", "plan", "loop", "compact", "context", "clear", "switch", "model",
+            "state",
         ];
         let matches: Vec<&str> = commands
             .into_iter()
@@ -973,6 +974,11 @@ impl App {
                 "model".to_string(),
                 "/model".to_string(),
                 "switch model profile",
+            ),
+            (
+                "state".to_string(),
+                "/state".to_string(),
+                "show current session state",
             ),
         ];
         commands.extend(self.loaded_skill_commands.iter().cloned().map(|skill| {
@@ -1124,6 +1130,16 @@ impl App {
                             } else {
                                 self.messages
                                     .push(ConversationEntry::Error("Usage: /context".into()));
+                                self.auto_scroll();
+                                None
+                            }
+                        }
+                        "state" => {
+                            if arguments.is_empty() {
+                                Some(AppAction::ShowContext)
+                            } else {
+                                self.messages
+                                    .push(ConversationEntry::Error("Usage: /state".into()));
                                 self.auto_scroll();
                                 None
                             }
@@ -2740,6 +2756,7 @@ mod tests {
                 ("/clear".to_string(), "start a fresh session"),
                 ("/switch".to_string(), "switch to another session"),
                 ("/model".to_string(), "switch model profile"),
+                ("/state".to_string(), "show current session state"),
                 ("/review".to_string(), "run a skill command"),
                 ("/ship-it".to_string(), "run a skill command"),
             ])

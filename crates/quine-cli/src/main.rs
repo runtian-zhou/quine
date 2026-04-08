@@ -4,6 +4,7 @@ mod client;
 mod context_debug;
 mod interaction;
 mod log;
+mod plugins;
 mod ps;
 mod render;
 mod run;
@@ -195,6 +196,11 @@ enum Commands {
         #[command(subcommand)]
         command: SkillsCommands,
     },
+    /// Manage CLI plugins.
+    Plugins {
+        #[command(subcommand)]
+        command: PluginCommands,
+    },
     /// Run a scripted test scenario against the daemon.
     Test {
         /// Path to a test scenario TOML file, or a directory of scenarios.
@@ -225,6 +231,30 @@ enum SkillsCommands {
     Show {
         /// Skill name.
         name: String,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum PluginCommands {
+    /// List available built-in plugins.
+    List,
+    /// Telegram plugin commands.
+    Telegram {
+        #[command(subcommand)]
+        command: TelegramCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum TelegramCommands {
+    /// Run the Telegram bot long-polling loop.
+    Serve {
+        /// Path to the Telegram plugin config file.
+        #[arg(long)]
+        config: Option<String>,
         /// Socket path to connect to the harness daemon.
         #[arg(long)]
         socket: Option<String>,
@@ -356,6 +386,7 @@ async fn main() -> anyhow::Result<()> {
                     )
                     .await?,
                 );
+                plugins::spawn_autostart_plugins(socket_path.clone());
                 quine_harness::server::run_ipc_server(&socket_path, harness).await?;
             }
             DaemonCommands::Stop { socket } => {
@@ -449,6 +480,23 @@ async fn main() -> anyhow::Result<()> {
                     .unwrap_or_else(default_socket_path);
                 run::run_skills_show(&socket_path, &name).await?;
             }
+        },
+        Commands::Plugins { command } => match command {
+            PluginCommands::List => {
+                plugins::list_plugins();
+            }
+            PluginCommands::Telegram { command } => match command {
+                TelegramCommands::Serve { config, socket } => {
+                    let socket_path = socket
+                        .map(std::path::PathBuf::from)
+                        .unwrap_or_else(default_socket_path);
+                    plugins::telegram::serve(
+                        &socket_path,
+                        config.as_deref().map(std::path::Path::new),
+                    )
+                    .await?;
+                }
+            },
         },
         Commands::Test {
             scenario,

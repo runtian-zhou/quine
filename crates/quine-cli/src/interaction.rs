@@ -32,6 +32,24 @@ pub(crate) fn options(notif: &JsonRpcNotification) -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub(crate) fn kind(notif: &JsonRpcNotification) -> &str {
+    notif
+        .params
+        .as_ref()
+        .and_then(|params| params.get("kind"))
+        .and_then(|value| value.as_str())
+        .unwrap_or("Question")
+}
+
+pub(crate) fn allow_freeform(notif: &JsonRpcNotification) -> bool {
+    notif
+        .params
+        .as_ref()
+        .and_then(|params| params.get("allow_freeform"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
 pub(crate) fn source_label(notif: &JsonRpcNotification) -> Option<&str> {
     notif
         .params
@@ -108,6 +126,8 @@ mod tests {
         let notif = make_interaction(Some("permission:1234"));
 
         assert_eq!(prompt(&notif), "Permission approval required");
+        assert_eq!(kind(&notif), "SingleSelect");
+        assert!(!allow_freeform(&notif));
         assert_eq!(source_label(&notif), Some("permission:1234"));
         assert_eq!(
             options(&notif),

@@ -842,6 +842,17 @@ async fn handle_request(
             let response_text = params
                 .and_then(|p| p.get("response"))
                 .and_then(|v| v.as_str());
+            let selected_indices = params
+                .and_then(|p| p.get("selected_indices"))
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.as_u64())
+                        .filter_map(|value| usize::try_from(value).ok())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
 
             match (session_id_str, response_text) {
                 (Some(sid), Some(response)) => {
@@ -860,7 +871,7 @@ async fn handle_request(
 
                     let interaction_response = quine_core::InteractionResponse {
                         response: response.to_string(),
-                        selected_indices: Vec::new(),
+                        selected_indices,
                     };
 
                     match service
