@@ -11,6 +11,7 @@ pub struct SessionTree {
     children: HashMap<SessionId, Vec<SessionId>>,
     exit_statuses: HashMap<SessionId, ExitStatus>,
     waiters: HashMap<SessionId, Vec<oneshot::Sender<ExitStatus>>>,
+    active_waits: HashMap<SessionId, SessionId>,
 }
 
 impl SessionTree {
@@ -21,6 +22,7 @@ impl SessionTree {
             children: HashMap::new(),
             exit_statuses: HashMap::new(),
             waiters: HashMap::new(),
+            active_waits: HashMap::new(),
         }
     }
 
@@ -43,8 +45,47 @@ impl SessionTree {
             .unwrap_or(&[])
     }
 
+    /// Record that `waiter` is blocked on `dependency`.
+    pub fn register_active_wait(
+        &mut self,
+        waiter: SessionId,
+        dependency: SessionId,
+    ) -> Result<(), String> {
+        if self.wait_would_cycle(waiter, dependency) {
+            return Err(format!(
+                "deadlock detected: waiting for child {dependency:?} would create a wait cycle"
+            ));
+        }
+        self.active_waits.insert(waiter, dependency);
+        Ok(())
+    }
+
+    /// Clear any active wait registered for `waiter`.
+    pub fn clear_active_wait(&mut self, waiter: SessionId) {
+        self.active_waits.remove(&waiter);
+    }
+
+    /// Returns true when adding `waiter -> dependency` would introduce a cycle.
+    pub fn wait_would_cycle(&self, waiter: SessionId, dependency: SessionId) -> bool {
+        let mut current = dependency;
+        let mut visited = std::collections::HashSet::new();
+        while visited.insert(current) {
+            if current == waiter {
+                return true;
+            }
+            let Some(next) = self.active_waits.get(&current).copied() else {
+                return false;
+            };
+            current = next;
+        }
+        false
+    }
+
     /// Record that a session has exited. All registered waiters are notified.
     pub fn record_exit(&mut self, session: SessionId, status: ExitStatus) {
+        self.active_waits.retain(|waiter, dependency| {
+            *waiter != session && *dependency != session
+        });
         if let Some(waiters) = self.waiters.remove(&session) {
             for waiter in waiters {
                 // Ignore send errors — the receiver may have been dropped.
@@ -91,6 +132,7 @@ impl SessionTree {
             children: snapshot.children,
             exit_statuses: snapshot.exit_statuses,
             waiters: HashMap::new(),
+            active_waits: HashMap::new(),
         }
     }
 }
@@ -205,6 +247,25 @@ mod tests {
 
         assert!(matches!(rx1.await.unwrap(), ExitStatus::Killed));
         assert!(matches!(rx2.await.unwrap(), ExitStatus::Killed));
+    }
+
+    #[test]
+    fn active_waits_detect_cycle_and_clear() {
+        let mut tree = SessionTree::new();
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        let session_c = SessionId::new();
+
+        tree.register_active_wait(session_a, session_b).unwrap();
+        tree.register_active_wait(session_b, session_c).unwrap();
+
+        let error = tree.register_active_wait(session_c, session_a).unwrap_err();
+        assert!(error.contains("deadlock detected"));
+        assert!(tree.wait_would_cycle(session_c, session_a));
+
+        tree.clear_active_wait(session_b);
+        assert!(!tree.wait_would_cycle(session_c, session_a));
+        tree.register_active_wait(session_c, session_a).unwrap();
     }
 
     #[test]

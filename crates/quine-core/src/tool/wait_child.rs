@@ -92,11 +92,12 @@ impl Tool for WaitChildTool {
             })?;
 
         match reply_rx.await {
-            Ok(Some(status)) => {
+            Ok(Ok(Some(status))) => {
                 let json = serde_json::to_string(&status).unwrap_or_else(|_| "unknown".into());
                 Ok(ToolOutput::success(json))
             }
-            Ok(None) => Ok(ToolOutput::success("null")),
+            Ok(Ok(None)) => Ok(ToolOutput::success("null")),
+            Ok(Err(error)) => Ok(ToolOutput::error(error)),
             Err(_) => Ok(ToolOutput::error("wait reply channel dropped")),
         }
     }
