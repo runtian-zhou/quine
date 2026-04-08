@@ -10,6 +10,23 @@ use quine_harness::{
     PermissionPromptBehavior,
 };
 
+pub(crate) async fn connect_existing_client(socket_path: &Path) -> anyhow::Result<IpcClient> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    let mut interval = std::time::Duration::from_millis(50);
+
+    loop {
+        match IpcClient::connect(socket_path).await {
+            Ok(client) => return Ok(client),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                let _ = error;
+                tokio::time::sleep(interval).await;
+                interval = (interval * 2).min(std::time::Duration::from_millis(500));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 fn print_resume_command(socket_path: &Path, session_id: &str) {
     eprintln!(
         "Resume from this checkpoint with: `quine run --session {} --socket {} \"<message>\"`",
@@ -19,7 +36,7 @@ fn print_resume_command(socket_path: &Path, session_id: &str) {
 }
 
 /// Structured JSON output for one-shot mode.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OneshotOutput {
     /// The session ID used for this run.
     pub session_id: String,
@@ -33,17 +50,30 @@ pub struct OneshotOutput {
     /// Token usage for the turn (if available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<TokenUsageOutput>,
+    /// Interaction details when the turn pauses for input.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interaction_needed: Option<InteractionNeededOutput>,
+}
+
+/// Interaction details captured when a turn stops early.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InteractionNeededOutput {
+    pub prompt: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_label: Option<String>,
+    pub response: String,
+    pub tool_calls: Vec<ToolCallRecord>,
 }
 
 /// Token usage in one-shot output.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TokenUsageOutput {
     pub input_tokens: u64,
     pub output_tokens: u64,
 }
 
 /// A record of a single tool call during a one-shot run.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCallRecord {
     /// The tool name.
     pub tool_name: String,
@@ -60,40 +90,28 @@ pub struct RunOneshotOptions<'a> {
     pub model_profile: Option<&'a str>,
 }
 
-pub async fn fetch_available_skills(client: &mut IpcClient) -> anyhow::Result<Vec<String>> {
-    let result = client.call(methods::LIST_SKILLS, None).await?;
-    let value = result.map_err(|message| anyhow::anyhow!(message))?;
-    Ok(value
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|skill| skill.get("name").and_then(|name| name.as_str()))
-        .map(ToString::to_string)
-        .collect())
-}
-
-///
-/// If `session_id` is `None`, creates a new session. If `json_output` is true,
-/// prints structured JSON to stdout. Otherwise prints the text response to stdout
-/// and the session ID to stderr.
-pub async fn run_oneshot(
+pub(crate) async fn execute_oneshot(
     socket_path: &Path,
     message: &str,
     options: RunOneshotOptions<'_>,
-) -> anyhow::Result<()> {
+    allow_daemon_launch: bool,
+) -> anyhow::Result<OneshotOutput> {
     let RunOneshotOptions {
         session_id,
         resume_checkpoint,
-        json_output,
+        json_output: _,
         skills,
         auto_approve,
         model_profile,
     } = options;
-    let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
+    let (mut client, _daemon_spawned) = if allow_daemon_launch {
+        IpcClient::connect_or_launch(socket_path).await?
+    } else {
+        (connect_existing_client(socket_path).await?, false)
+    };
 
     let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
 
-    // Create or reuse session.
     let session_id = match (session_id, resumed) {
         (Some(sid), _) => sid.to_string(),
         (None, Some(target)) => target.session_id,
@@ -136,7 +154,6 @@ pub async fn run_oneshot(
         }
     };
 
-    // Send message.
     let params = serde_json::json!({
         "session_id": session_id,
         "content": message,
@@ -146,10 +163,6 @@ pub async fn run_oneshot(
         anyhow::bail!("failed to send message: {e}");
     }
 
-    // Collect response notifications until TurnComplete.
-    // `completed_text` accumulates authoritative TextComplete events (one per LLM call).
-    // `delta_buffer` accumulates streaming deltas for real-time display.
-    // TextComplete is the source of truth for the final response.
     let mut completed_text = String::new();
     let mut delta_buffer = String::new();
     let mut tool_calls = Vec::new();
@@ -167,9 +180,6 @@ pub async fn run_oneshot(
                     }
                 }
                 notifications::TEXT_COMPLETE => {
-                    // Append non-empty text from each LLM call. Multiple TextComplete
-                    // events fire in multi-tool turns. Clear delta_buffer since
-                    // TextComplete is authoritative for its LLM call.
                     if let Some(params) = &notif.params {
                         if let Some(full_text) = params.get("full_text").and_then(|v| v.as_str()) {
                             if !full_text.trim().is_empty() {
@@ -205,59 +215,27 @@ pub async fn run_oneshot(
                         continue;
                     }
 
-                    // Output the interaction prompt so the caller can respond
-                    // via `quine respond --session <id> "answer"`.
-                    let prompt = interaction_prompt(&notif);
-                    let source_label = source_label(&notif);
-
+                    let prompt = interaction_prompt(&notif).to_string();
+                    let source_label = source_label(&notif).map(ToString::to_string);
                     let partial = if !completed_text.is_empty() {
-                        &completed_text
+                        completed_text.clone()
                     } else {
-                        &delta_buffer
+                        delta_buffer.clone()
                     };
 
-                    if json_output {
-                        let mut output = serde_json::json!({
-                            "session_id": session_id,
-                            "interaction_needed": true,
-                            "prompt": prompt,
-                            "response": partial,
-                            "tool_calls": tool_calls,
-                            "resume_command": format!(
-                                "quine respond --session {} --socket {} \"<response>\"",
-                                session_id,
-                                socket_path.display()
-                            ),
-                        });
-                        if let Some(label) = source_label {
-                            output["source_label"] = serde_json::Value::String(label.to_string());
-                        }
-                        println!("{}", serde_json::to_string_pretty(&output)?);
-                    } else if let Some(label) = source_label {
-                        eprintln!("interaction needed [{label}]: {prompt}");
-                        eprintln!(
-                            "Resume with: `quine respond --session {} --socket {} \"<response>\"`",
-                            session_id,
-                            socket_path.display()
-                        );
-                        // Print any partial response accumulated so far.
-                        if !partial.is_empty() {
-                            println!("{partial}");
-                        }
-                    } else {
-                        eprintln!("interaction needed: {prompt}");
-                        eprintln!(
-                            "Resume with: `quine respond --session {} --socket {} \"<response>\"`",
-                            session_id,
-                            socket_path.display()
-                        );
-                        // Print any partial response accumulated so far.
-                        if !partial.is_empty() {
-                            println!("{partial}");
-                        }
-                    }
-                    // Exit so the caller can use `quine respond` to continue.
-                    return Ok(());
+                    return Ok(OneshotOutput {
+                        session_id,
+                        response: partial.clone(),
+                        tool_calls: tool_calls.clone(),
+                        duration_us: turn_duration_us,
+                        usage: turn_usage,
+                        interaction_needed: Some(InteractionNeededOutput {
+                            prompt,
+                            source_label,
+                            response: partial,
+                            tool_calls,
+                        }),
+                    });
                 }
                 notifications::SESSION_ERROR => {
                     if let Some(params) = &notif.params {
@@ -269,10 +247,10 @@ pub async fn run_oneshot(
                 notifications::TURN_COMPLETE => {
                     if let Some(params) = &notif.params {
                         turn_duration_us = params.get("duration_us").and_then(|v| v.as_u64());
-                        turn_usage = params.get("usage").and_then(|v| {
+                        turn_usage = params.get("usage").and_then(|usage| {
                             Some(TokenUsageOutput {
-                                input_tokens: v.get("input_tokens")?.as_u64()?,
-                                output_tokens: v.get("output_tokens")?.as_u64()?,
+                                input_tokens: usage.get("input_tokens")?.as_u64()?,
+                                output_tokens: usage.get("output_tokens")?.as_u64()?,
                             })
                         });
                     }
@@ -286,26 +264,84 @@ pub async fn run_oneshot(
         }
     }
 
-    // Use completed_text (from TextComplete) if available, fall back to deltas.
     let full_response = if !completed_text.is_empty() {
         completed_text
     } else {
         delta_buffer
     };
 
-    // Output results.
+    Ok(OneshotOutput {
+        session_id,
+        response: full_response,
+        tool_calls,
+        duration_us: turn_duration_us,
+        usage: turn_usage,
+        interaction_needed: None,
+    })
+}
+
+pub async fn fetch_available_skills(client: &mut IpcClient) -> anyhow::Result<Vec<String>> {
+    let result = client.call(methods::LIST_SKILLS, None).await?;
+    let value = result.map_err(|message| anyhow::anyhow!(message))?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|skill| skill.get("name").and_then(|name| name.as_str()))
+        .map(ToString::to_string)
+        .collect())
+}
+
+///
+/// If `session_id` is `None`, creates a new session. If `json_output` is true,
+/// prints structured JSON to stdout. Otherwise prints the text response to stdout
+/// and the session ID to stderr.
+pub async fn run_oneshot(
+    socket_path: &Path,
+    message: &str,
+    options: RunOneshotOptions<'_>,
+) -> anyhow::Result<()> {
+    let json_output = options.json_output;
+    let output = execute_oneshot(socket_path, message, options, true).await?;
+
     if json_output {
-        let output = OneshotOutput {
-            session_id,
-            response: full_response,
-            tool_calls,
-            duration_us: turn_duration_us,
-            usage: turn_usage,
-        };
-        println!("{}", serde_json::to_string_pretty(&output)?);
+        let mut json_output = serde_json::to_value(&output)?;
+        if let Some(interaction) = &output.interaction_needed {
+            if let Some(object) = json_output.as_object_mut() {
+                object.insert(
+                    "resume_command".to_string(),
+                    serde_json::Value::String(format!(
+                        "quine respond --session {} --socket {} \"<response>\"",
+                        output.session_id,
+                        socket_path.display()
+                    )),
+                );
+                object.insert(
+                    "prompt".to_string(),
+                    serde_json::Value::String(interaction.prompt.clone()),
+                );
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&json_output)?);
     } else {
-        println!("{full_response}");
-        print_resume_command(socket_path, &session_id);
+        if let Some(interaction) = output.interaction_needed.clone() {
+            if let Some(label) = interaction.source_label.as_deref() {
+                eprintln!("interaction needed [{label}]: {}", interaction.prompt);
+            } else {
+                eprintln!("interaction needed: {}", interaction.prompt);
+            }
+            eprintln!(
+                "Resume with: `quine respond --session {} --socket {} \"<response>\"`",
+                output.session_id,
+                socket_path.display()
+            );
+            if !interaction.response.is_empty() {
+                println!("{}", interaction.response);
+            }
+        } else {
+            println!("{}", output.response);
+            print_resume_command(socket_path, &output.session_id);
+        }
     }
 
     Ok(())
@@ -459,6 +495,7 @@ pub async fn run_respond(
             tool_calls,
             duration_us: turn_duration_us,
             usage: turn_usage,
+            interaction_needed: None,
         };
         println!("{}", serde_json::to_string_pretty(&output)?);
     } else {
@@ -616,6 +653,7 @@ mod tests {
                 input_tokens: 100,
                 output_tokens: 50,
             }),
+            interaction_needed: None,
         };
 
         let json = serde_json::to_string(&output).unwrap();

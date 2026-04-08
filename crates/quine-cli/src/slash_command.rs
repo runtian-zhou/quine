@@ -13,12 +13,11 @@ pub(crate) fn parse_slash_command(input: &str) -> Option<SlashCommand> {
     };
 
     match name {
-        "quit" | "plan" | "loop" | "compact" | "context" | "ps" | "clear" | "switch" | "model" => {
-            Some(SlashCommand::BuiltIn {
-                name: name.to_string(),
-                arguments: arguments.to_string(),
-            })
-        }
+        "quit" | "plan" | "loop" | "compact" | "context" | "ps" | "clear" | "switch" | "model"
+        | "state" => Some(SlashCommand::BuiltIn {
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        }),
         _ if !name.is_empty() => Some(SlashCommand::Skill {
             name: name.to_string(),
             arguments: arguments.to_string(),
@@ -148,6 +147,17 @@ mod tests {
             Some(SlashCommand::BuiltIn {
                 name: "model".into(),
                 arguments: "claude-sonnet".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_state_command() {
+        assert_eq!(
+            parse_slash_command("/state history"),
+            Some(SlashCommand::BuiltIn {
+                name: "state".into(),
+                arguments: "history".into(),
             })
         );
     }
