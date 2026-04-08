@@ -95,6 +95,7 @@ async fn run_tool_turn(
             memory_policy: MemoryPolicyConfig::default(),
             session_llm: session_llm_config(provider),
             auto_compact_threshold_percent: 60,
+            status_report_min_tool_rounds: quine_core::default_status_report_min_tool_rounds(),
             reply: reply_tx,
         })
         .await

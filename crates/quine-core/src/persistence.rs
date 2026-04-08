@@ -8,6 +8,7 @@ use crate::memory::{MemoryPolicyConfig, ScopedPersistentMemoryState};
 use crate::permission::{PermissionPromptBehavior, PermissionRuntimeSnapshot};
 use crate::planner::ActionPlan;
 use crate::session::{ExitStatus, SessionId, SessionState};
+use crate::status_report::{default_status_report_min_tool_rounds, SessionStatusReport};
 
 pub const CORE_CHECKPOINT_FORMAT_VERSION: u32 = 1;
 
@@ -40,6 +41,8 @@ pub struct PersistedSession {
     pub memory_state: Option<PersistedMemoryState>,
     #[serde(default)]
     pub permission_state: Option<PermissionRuntimeSnapshot>,
+    #[serde(default)]
+    pub status_report: Option<SessionStatusReport>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -62,6 +65,8 @@ pub struct PersistedSessionConfig {
     pub model_profile: Option<String>,
     #[serde(default = "default_auto_compact_threshold_percent")]
     pub auto_compact_threshold_percent: u8,
+    #[serde(default = "default_status_report_min_tool_rounds")]
+    pub status_report_min_tool_rounds: u32,
 }
 
 fn default_auto_compact_threshold_percent() -> u8 {
@@ -246,6 +251,11 @@ mod tests {
         let roundtrip: PersistedSession = serde_json::from_value(json).unwrap();
         assert!(roundtrip.memory_state.is_none());
         assert!(roundtrip.permission_state.is_none());
+        assert!(roundtrip.status_report.is_none());
+        assert_eq!(
+            roundtrip.config.status_report_min_tool_rounds,
+            default_status_report_min_tool_rounds()
+        );
     }
 
     #[test]

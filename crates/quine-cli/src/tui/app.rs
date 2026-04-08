@@ -3,7 +3,7 @@ use std::fmt;
 
 use std::time::{Duration, Instant};
 
-use crate::context_debug::{HistoryEntry, SessionContextSnapshot};
+use crate::context_debug::{HistoryEntry, SessionContextSnapshot, SessionStatusReportSnapshot};
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{notifications, JsonRpcNotification};
 use ratatui::text::Line;
@@ -493,6 +493,7 @@ pub struct App {
     pub reasoning_buffer: String,
     pub streaming_buffer: String,
     pub current_turn_assistant_text: Option<String>,
+    pub status_report: Option<SessionStatusReportSnapshot>,
     last_backend_event_at: Option<Instant>,
     last_backend_event_label: Option<&'static str>,
     pub scroll_offset: u32,
@@ -648,6 +649,7 @@ impl App {
             reasoning_buffer: String::new(),
             streaming_buffer: String::new(),
             current_turn_assistant_text: None,
+            status_report: None,
             last_backend_event_at: None,
             last_backend_event_label: None,
             scroll_offset: 0,
@@ -709,6 +711,7 @@ impl App {
             self.invalidate_conversation_cache();
         }
         self.current_turn_assistant_text = None;
+        self.status_report = None;
         self.interaction_queue.clear();
         self.option_select = None;
         self.slash_select_active = false;
@@ -730,6 +733,7 @@ impl App {
         self.reasoning_buffer.clear();
         self.streaming_buffer.clear();
         self.current_turn_assistant_text = None;
+        self.status_report = None;
         self.last_backend_event_at = None;
         self.last_backend_event_label = None;
         self.scroll_offset = 0;
@@ -767,6 +771,7 @@ impl App {
             .iter()
             .map(|skill| skill.name.clone())
             .collect();
+        self.status_report = snapshot.status_report.clone();
         self.messages.clear();
 
         for entry in snapshot.history {
@@ -1289,6 +1294,7 @@ impl App {
 
     pub fn begin_turn(&mut self) {
         self.current_turn_assistant_text = None;
+        self.status_report = None;
     }
 
     /// Move option selector cursor up.
@@ -2009,6 +2015,18 @@ impl App {
                     self.auto_scroll();
                 }
             }
+            notifications::SESSION_STATUS_REPORT => {
+                self.note_backend_event("status report");
+                self.status_report = notif
+                    .params
+                    .as_ref()
+                    .and_then(|p| p.get("report"))
+                    .cloned()
+                    .map(serde_json::from_value)
+                    .transpose()
+                    .ok()
+                    .flatten();
+            }
             notifications::SESSION_ERROR => {
                 self.note_backend_event("error");
                 if let Some(err) = notif
@@ -2138,6 +2156,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -2194,6 +2213,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),

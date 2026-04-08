@@ -138,6 +138,7 @@ pub mod notifications {
     pub const SESSION_ERROR: &str = "session_error";
     pub const INTERACTION_NEEDED: &str = "interaction_needed";
     pub const PLAN_PROGRESS: &str = "plan_progress";
+    pub const SESSION_STATUS_REPORT: &str = "session_status_report";
     pub const TURN_COMPLETE: &str = "turn_complete";
     pub const CHILD_SPAWNED: &str = "child_spawned";
     pub const CHILD_EXITED: &str = "child_exited";

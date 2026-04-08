@@ -75,6 +75,28 @@ fn format_context_status(
     }
 }
 
+fn status_report_panel_height(app: &App) -> u16 {
+    if app.status_report.is_some() {
+        5
+    } else {
+        0
+    }
+}
+
+fn status_report_bar(progress_percent: u8, width: usize) -> String {
+    let width = width.max(8);
+    let filled = usize::from(progress_percent)
+        .saturating_mul(width)
+        .div_ceil(100);
+    let mut bar = String::with_capacity(width + 2);
+    bar.push('[');
+    for index in 0..width {
+        bar.push(if index < filled { '#' } else { '-' });
+    }
+    bar.push(']');
+    bar
+}
+
 /// Render the entire TUI frame.
 pub fn draw(frame: &mut Frame, app: &mut App) {
     // Dynamic input box height: expand for option selection or multi-line input.
@@ -94,20 +116,29 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         (content_rows + 2).max(3).min(max_height) // +2 for borders
     };
+    let report_height = status_report_panel_height(app);
+    let mut constraints = vec![Constraint::Length(1)];
+    if report_height > 0 {
+        constraints.push(Constraint::Length(report_height));
+    }
+    constraints.push(Constraint::Min(3));
+    constraints.push(Constraint::Length(input_height));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),            // status bar
-            Constraint::Min(3),               // conversation view
-            Constraint::Length(input_height), // input box
-        ])
+        .constraints(constraints)
         .split(frame.area());
 
     draw_status_bar(frame, app, chunks[0]);
-    draw_conversation(frame, app, chunks[1]);
-    draw_input(frame, app, chunks[2]);
+    let conversation_index = if report_height > 0 {
+        draw_status_report_panel(frame, app, chunks[1]);
+        2
+    } else {
+        1
+    };
+    draw_conversation(frame, app, chunks[conversation_index]);
+    draw_input(frame, app, chunks[conversation_index + 1]);
     if let Some(explorer) = app.context_explorer.as_ref() {
-        draw_context_explorer(frame, chunks[1], explorer);
+        draw_context_explorer(frame, chunks[conversation_index], explorer);
     }
 }
 
@@ -764,6 +795,60 @@ fn draw_status_bar(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
 
     frame.render_widget(left_widget, chunks[0]);
     frame.render_widget(right_widget, chunks[1]);
+}
+
+fn draw_status_report_panel(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(report) = app.status_report.as_ref() else {
+        return;
+    };
+
+    let inner_width = usize::from(area.width.saturating_sub(4)).max(12);
+    let progress = status_report_bar(report.progress_percent, inner_width.min(24));
+    let heading = if report.active {
+        format!(
+            "Status report · {}% · {} rounds",
+            report.progress_percent, report.tool_rounds_observed
+        )
+    } else {
+        format!(
+            "Last status report · {}% · {} rounds",
+            report.progress_percent, report.tool_rounds_observed
+        )
+    };
+    let text = Text::from(vec![
+        Line::from(Span::styled(
+            heading,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(vec![
+            Span::styled(progress, Style::default().fg(Color::Green)),
+            Span::raw(format!(" {}%", report.progress_percent)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Done: ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(report.completed_summary.clone()),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Next: ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(report.remaining_summary.clone()),
+        ]),
+    ]);
+    let widget = Paragraph::new(text)
+        .block(Block::default().borders(Borders::ALL).title(" Status "))
+        .wrap(Wrap { trim: true });
+    frame.render_widget(widget, area);
 }
 
 /// Render the scrollable conversation view.
@@ -1689,6 +1774,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1735,6 +1821,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1785,6 +1872,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![HistoryEntry::Text {
                 role: "user".into(),
                 text: "hello world".into(),
@@ -1832,6 +1920,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "user".into(),
@@ -1887,6 +1976,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![
                 HistoryEntry::ToolUse {
                     role: "assistant".into(),
@@ -1942,6 +2032,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![],
         };
         let mut app = App::new("test".into(), false, None);
@@ -1983,6 +2074,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![],
         };
         let mut app = App::new("test".into(), false, None);
@@ -2029,6 +2121,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![],
         };
         let mut app = App::new("test".into(), false, None);
@@ -2132,6 +2225,7 @@ mod tests {
             ),
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![],
         };
         let mut app = App::new("test".into(), false, None);
@@ -2668,6 +2762,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: vec![
                 HistoryEntry::Text {
                     role: "assistant".into(),
