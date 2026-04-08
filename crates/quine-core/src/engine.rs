@@ -5,7 +5,8 @@ use std::sync::Arc;
 use chrono::Utc;
 use futures::StreamExt;
 use quine_llm::{
-    LlmEvent, LlmProvider, Message, MessageContent, NoopWebProvider, ToolDefinition, WebProvider,
+    LlmEvent, LlmProvider, Message, MessageContent, NoopWebProvider, PromptCacheUsage,
+    ToolDefinition, WebProvider,
 };
 use tokio::sync::{mpsc, oneshot, Notify};
 
@@ -293,6 +294,8 @@ struct SessionContext {
     last_permission_outcome: Option<PermissionOutcome>,
     /// Pending permission approval request, if any.
     pending_permission_approval: Option<PendingPermissionApproval>,
+    /// Canonical prompt tokens for the most recent provider request.
+    last_prompt_cache_tokens: Option<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -435,6 +438,7 @@ fn build_combined_system_prompt(
     working_directory: &std::path::Path,
     persisted_config: &PersistedSessionConfig,
     skills: &[Skill],
+    tools: &[ToolDefinition],
     prompt_memory_suffix: Option<&str>,
 ) -> Option<String> {
     let mut prompt_parts = Vec::new();
@@ -442,6 +446,9 @@ fn build_combined_system_prompt(
     if persisted_config.plan_mode {
         prompt_parts.push(PLAN_MODE_SYSTEM_PROMPT.to_string());
     }
+
+    prompt_parts.push(DEFAULT_SYSTEM_PROMPT.to_string());
+    prompt_parts.push(render_available_tool_descriptions(tools));
 
     if let Some(claude_md_path) = find_claude_md(working_directory) {
         if let Ok(content) = std::fs::read_to_string(&claude_md_path) {
@@ -464,11 +471,112 @@ fn build_combined_system_prompt(
         prompt_parts.push(suffix.to_string());
     }
 
-    if prompt_parts.is_empty() {
-        prompt_parts.push(DEFAULT_SYSTEM_PROMPT.to_string());
+    Some(prompt_parts.join("\n\n"))
+}
+
+fn render_available_tool_descriptions(tools: &[ToolDefinition]) -> String {
+    if tools.is_empty() {
+        return "## Available Tools\n\nNo tools are currently available.".to_string();
     }
 
-    Some(prompt_parts.join("\n\n"))
+    let mut lines = Vec::with_capacity(tools.len() + 2);
+    lines.push("## Available Tools".to_string());
+    lines.push(String::new());
+    for tool in tools {
+        let mut qualifiers = Vec::new();
+        if tool.read_only {
+            qualifiers.push("read-only");
+        }
+        if tool.idempotent {
+            qualifiers.push("idempotent");
+        }
+        let qualifier_suffix = if qualifiers.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", qualifiers.join(", "))
+        };
+        lines.push(format!(
+            "- `{}`{}: {}",
+            tool.name, qualifier_suffix, tool.description
+        ));
+    }
+    lines.join("\n")
+}
+
+fn canonicalize_prompt_cache_tokens(messages: &[Message], tools: &[ToolDefinition]) -> Vec<String> {
+    fn push_text_tokens(tokens: &mut Vec<String>, text: &str) {
+        tokens.extend(
+            text.split_whitespace()
+                .map(str::trim)
+                .filter(|token| !token.is_empty())
+                .map(|token| token.to_ascii_lowercase()),
+        );
+    }
+
+    let mut tokens = Vec::new();
+    for message in messages {
+        let role = match message.role {
+            quine_llm::Role::System => "system",
+            quine_llm::Role::User => "user",
+            quine_llm::Role::Assistant => "assistant",
+            quine_llm::Role::Tool => "tool",
+        };
+        tokens.push(format!("role:{role}"));
+        match &message.content {
+            MessageContent::Text(text) => push_text_tokens(&mut tokens, text),
+            MessageContent::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+            } => {
+                tokens.push(format!("tool_use_id:{tool_use_id}"));
+                tokens.push(format!("tool_error:{is_error}"));
+                push_text_tokens(&mut tokens, output);
+            }
+            MessageContent::ToolUse { text, tool_calls } => {
+                if let Some(text) = text {
+                    push_text_tokens(&mut tokens, text);
+                }
+                for call in tool_calls {
+                    tokens.push(format!("tool_call:{}", call.tool_name));
+                    tokens.push(format!("tool_use_id:{}", call.tool_use_id));
+                    push_text_tokens(&mut tokens, &call.arguments.to_string());
+                }
+            }
+        }
+    }
+
+    let mut sorted_tools = tools.to_vec();
+    sorted_tools.sort_by(|a, b| a.name.cmp(&b.name));
+    for tool in sorted_tools {
+        tokens.push(format!("tool:{}", tool.name));
+        tokens.push(format!("tool_ro:{}", tool.read_only));
+        tokens.push(format!("tool_idempotent:{}", tool.idempotent));
+        push_text_tokens(&mut tokens, &tool.description);
+        push_text_tokens(&mut tokens, &tool.parameters.to_string());
+    }
+
+    tokens
+}
+
+fn estimate_prompt_cache_usage(
+    previous_tokens: Option<&[String]>,
+    current_tokens: &[String],
+) -> PromptCacheUsage {
+    let estimated_hit_tokens = previous_tokens
+        .map(|previous| {
+            previous
+                .iter()
+                .zip(current_tokens.iter())
+                .take_while(|(left, right)| left == right)
+                .count() as u64
+        })
+        .unwrap_or(0);
+
+    PromptCacheUsage {
+        estimated_hit_tokens,
+        estimated_miss_tokens: current_tokens.len() as u64 - estimated_hit_tokens,
+    }
 }
 
 impl SessionContext {
@@ -540,8 +648,13 @@ impl SessionContext {
         );
         let tools = tool_registry.tool_definitions();
 
-        let combined_prompt =
-            build_combined_system_prompt(&working_directory, &persisted_config, &skills, None);
+        let combined_prompt = build_combined_system_prompt(
+            &working_directory,
+            &persisted_config,
+            &skills,
+            &tools,
+            None,
+        );
 
         let mut history = Vec::new();
         if let Some(prompt) = &combined_prompt {
@@ -590,6 +703,7 @@ impl SessionContext {
             permission_context,
             last_permission_outcome: None,
             pending_permission_approval: None,
+            last_prompt_cache_tokens: None,
         })
     }
 
@@ -747,6 +861,7 @@ impl SessionContext {
             &self.persisted_config.working_directory,
             &self.persisted_config,
             &skills,
+            &self.tools,
             None,
         );
         refresh_scoped_memory_state(self);
@@ -3026,6 +3141,7 @@ async fn handle_llm_turn(
 ) -> TurnOutcome {
     let turn_start = std::time::Instant::now();
     let mut accumulated_usage: Option<quine_llm::TokenUsage> = None;
+    let mut accumulated_cache_usage: Option<PromptCacheUsage> = None;
     debug_log_session(
         session_id,
         format!(
@@ -3088,6 +3204,7 @@ async fn handle_llm_turn(
                     session_id,
                     duration_us,
                     usage: accumulated_usage.clone(),
+                    cache_usage: accumulated_cache_usage.clone(),
                 })
                 .await;
             return TurnOutcome::Cancelled;
@@ -3109,6 +3226,16 @@ async fn handle_llm_turn(
             Some(session) => session.tools.clone(),
             None => return TurnOutcome::Failed("session not found".into()),
         };
+        let prompt_cache_tokens = canonicalize_prompt_cache_tokens(&history, &tools);
+        let cache_usage = sessions
+            .get(&session_id)
+            .map(|session| {
+                estimate_prompt_cache_usage(
+                    session.last_prompt_cache_tokens.as_deref(),
+                    &prompt_cache_tokens,
+                )
+            })
+            .unwrap_or_default();
         let provider = sessions
             .get(&session_id)
             .map(|session| Arc::clone(&session.provider))
@@ -3134,6 +3261,7 @@ async fn handle_llm_turn(
                         session_id,
                         duration_us,
                         usage: accumulated_usage.clone(),
+                        cache_usage: accumulated_cache_usage.clone(),
                     })
                     .await;
                 return TurnOutcome::Cancelled;
@@ -3141,7 +3269,12 @@ async fn handle_llm_turn(
             Ok(Some(LlmCallResult {
                 turn: LlmTurnResult::Text(full_text),
                 usage,
+                ..
             })) => {
+                let acc = accumulated_cache_usage.get_or_insert_with(PromptCacheUsage::default);
+                acc.estimated_hit_tokens += cache_usage.estimated_hit_tokens;
+                acc.estimated_miss_tokens += cache_usage.estimated_miss_tokens;
+
                 // Accumulate usage from this LLM call.
                 if let Some(u) = usage {
                     let acc = accumulated_usage.get_or_insert(quine_llm::TokenUsage::default());
@@ -3152,6 +3285,9 @@ async fn handle_llm_turn(
                     }
                 } else if let Some(session) = sessions.get_mut(&session_id) {
                     session.last_input_tokens = None;
+                }
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.last_prompt_cache_tokens = Some(prompt_cache_tokens);
                 }
 
                 if let Some(session) = sessions.get_mut(&session_id) {
@@ -3183,6 +3319,7 @@ async fn handle_llm_turn(
                         session_id,
                         duration_us,
                         usage: accumulated_usage,
+                        cache_usage: accumulated_cache_usage,
                     })
                     .await;
                 let _ = io
@@ -3210,7 +3347,12 @@ async fn handle_llm_turn(
                         mut calls,
                     },
                 usage,
+                ..
             })) => {
+                let acc = accumulated_cache_usage.get_or_insert_with(PromptCacheUsage::default);
+                acc.estimated_hit_tokens += cache_usage.estimated_hit_tokens;
+                acc.estimated_miss_tokens += cache_usage.estimated_miss_tokens;
+
                 // Accumulate usage from this LLM call.
                 if let Some(u) = usage {
                     let acc = accumulated_usage.get_or_insert(quine_llm::TokenUsage::default());
@@ -3221,6 +3363,9 @@ async fn handle_llm_turn(
                     }
                 } else if let Some(session) = sessions.get_mut(&session_id) {
                     session.last_input_tokens = None;
+                }
+                if let Some(session) = sessions.get_mut(&session_id) {
+                    session.last_prompt_cache_tokens = Some(prompt_cache_tokens);
                 }
 
                 // Flush any text that preceded the tool calls to the TUI.
@@ -3350,6 +3495,7 @@ async fn handle_llm_turn(
                                         session_id,
                                         duration_us,
                                         usage: accumulated_usage.clone(),
+                                        cache_usage: accumulated_cache_usage.clone(),
                                     })
                                     .await;
                                 return TurnOutcome::Cancelled;
@@ -3415,6 +3561,7 @@ async fn handle_llm_turn(
                                     session_id,
                                     duration_us,
                                     usage: accumulated_usage.clone(),
+                                    cache_usage: accumulated_cache_usage.clone(),
                                 })
                                 .await;
                             return TurnOutcome::Cancelled;
@@ -3529,6 +3676,7 @@ async fn handle_llm_turn(
                                         session_id,
                                         duration_us,
                                         usage: accumulated_usage.clone(),
+                                        cache_usage: accumulated_cache_usage.clone(),
                                     })
                                     .await;
                                 return TurnOutcome::Failed(error.to_string());
@@ -3578,6 +3726,7 @@ async fn handle_llm_turn(
                                 session_id,
                                 duration_us,
                                 usage: accumulated_usage.clone(),
+                                cache_usage: accumulated_cache_usage.clone(),
                             })
                             .await;
                         emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
@@ -3641,6 +3790,7 @@ async fn handle_llm_turn(
                             session_id,
                             duration_us,
                             usage: accumulated_usage.clone(),
+                            cache_usage: accumulated_cache_usage.clone(),
                         })
                         .await;
                     if let Some(session) = sessions.get_mut(&session_id) {
@@ -4956,6 +5106,72 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 MessageContent::Text(text) => !text.contains("Relevant durable memory"),
                 _ => true,
             }));
+    }
+
+    #[tokio::test]
+    async fn system_prompt_includes_default_tools_and_claude() {
+        let tempdir = TempDir::new().unwrap();
+        let working_directory = tempdir.path().join("workspace");
+        std::fs::create_dir_all(&working_directory).unwrap();
+        std::fs::write(
+            tempdir.path().join("CLAUDE.md"),
+            "# Project Rules\n\nUse cargo test before merging.",
+        )
+        .unwrap();
+
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session = SessionContext::new(
+            SessionId::new(),
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory,
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                initial_messages: Vec::new(),
+                archive_root: tempdir.path().join("archive"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+
+        let prompt = match &session.history[0].content {
+            MessageContent::Text(text) => text,
+            other => panic!("expected system prompt text, got {other:?}"),
+        };
+        assert!(prompt.contains("You are a helpful coding assistant."));
+        assert!(prompt.contains("## Available Tools"));
+        assert!(prompt.contains("`read_file` (read-only, idempotent)"));
+        assert!(prompt.contains("# Project Instructions (from CLAUDE.md)"));
+        assert!(prompt.contains("Use cargo test before merging."));
+    }
+
+    #[test]
+    fn estimate_prompt_cache_usage_uses_shared_prefix() {
+        let previous = vec![
+            "system".into(),
+            "alpha".into(),
+            "beta".into(),
+            "gamma".into(),
+        ];
+        let current = vec![
+            "system".into(),
+            "alpha".into(),
+            "beta".into(),
+            "delta".into(),
+            "epsilon".into(),
+        ];
+
+        let usage = estimate_prompt_cache_usage(Some(&previous), &current);
+        assert_eq!(usage.estimated_hit_tokens, 3);
+        assert_eq!(usage.estimated_miss_tokens, 2);
     }
 
     #[tokio::test]
@@ -7315,7 +7531,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .map(|line| format!("line {line}"))
             .collect::<Vec<_>>()
             .join("\n")
-            + &"\n"
+            + "\n"
             + &"x".repeat(compaction::MAX_TOOL_RESULT_CHARS_IN_HISTORY + 128);
 
         let output = prepare_tool_result_for_history(

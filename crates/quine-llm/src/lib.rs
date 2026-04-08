@@ -13,7 +13,8 @@ pub use error::LlmError;
 pub use openai_web::{OpenAiWebConfig, OpenAiWebProvider};
 pub use provider::LlmProvider;
 pub use types::{
-    LlmEvent, Message, MessageContent, Role, TokenUsage, ToolDefinition, ToolUseRequest,
+    LlmEvent, Message, MessageContent, PromptCacheUsage, Role, TokenUsage, ToolDefinition,
+    ToolUseRequest,
 };
 pub use web::{
     NoopWebProvider, WebCitation, WebOpenRequest, WebProvider, WebResult, WebSearchRequest,

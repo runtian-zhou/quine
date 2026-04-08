@@ -52,15 +52,9 @@ struct TurnResult {
     tool_outcome: ToolOutcome,
 }
 
-fn test_session_llm_config() -> SessionLlmConfig {
+fn session_llm_config(provider: Arc<dyn LlmProvider>) -> SessionLlmConfig {
     SessionLlmConfig {
-        provider: Arc::new(ScriptedToolProvider {
-            call_count: AtomicU32::new(0),
-            tool_use_id: "unused".into(),
-            tool_name: "unused".into(),
-            arguments: serde_json::json!({}),
-            final_text: String::new(),
-        }),
+        provider,
         max_context_window: None,
         model_profile: None,
     }
@@ -81,7 +75,7 @@ async fn run_tool_turn(
         arguments,
         final_text: format!("{tool_name} completed"),
     });
-    let core_task = tokio::spawn(run_core_loop(core, provider, None));
+    let core_task = tokio::spawn(run_core_loop(core, Arc::clone(&provider), None));
 
     let session_id = SessionId::new();
     let (reply_tx, reply_rx) = oneshot::channel();
@@ -99,7 +93,7 @@ async fn run_tool_turn(
             agent_key: None,
             team_key: None,
             memory_policy: MemoryPolicyConfig::default(),
-            session_llm: test_session_llm_config(),
+            session_llm: session_llm_config(provider),
             reply: reply_tx,
         })
         .await

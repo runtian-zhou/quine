@@ -6,6 +6,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 
+use crate::metrics;
 use crate::protocol::{
     error_codes, methods, notifications, JsonRpcErrorResponse, JsonRpcNotification, JsonRpcRequest,
     JsonRpcResponse,
@@ -239,6 +240,7 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
             session_id,
             duration_us,
             usage,
+            cache_usage,
         } => {
             let mut payload = serde_json::json!({
                 "duration_us": duration_us,
@@ -247,6 +249,14 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
                 payload["usage"] = serde_json::json!({
                     "input_tokens": u.input_tokens,
                     "output_tokens": u.output_tokens,
+                });
+            }
+            if let Some(cache) = cache_usage {
+                payload["cache_usage"] = serde_json::json!({
+                    "estimated_hit_tokens": cache.estimated_hit_tokens,
+                    "estimated_miss_tokens": cache.estimated_miss_tokens,
+                    "hit_rate": cache.hit_rate(),
+                    "miss_rate": cache.miss_rate(),
                 });
             }
             (
@@ -308,6 +318,24 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
 
     if let Err(e) = session_log::append_log_entry(&entry).await {
         tracing::warn!("failed to write session log: {e}");
+    }
+
+    if let quine_core::CoreOutput::TurnComplete {
+        session_id,
+        usage,
+        cache_usage,
+        ..
+    } = event
+    {
+        let session_id = serde_json::to_value(session_id)
+            .ok()
+            .and_then(|v| v.as_str().map(String::from))
+            .unwrap_or_default();
+        if let Err(e) =
+            metrics::record_turn_metrics(&session_id, usage.as_ref(), cache_usage.as_ref()).await
+        {
+            tracing::warn!("failed to write metrics: {e}");
+        }
     }
 }
 
@@ -1365,6 +1393,7 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
             session_id,
             duration_us,
             usage,
+            cache_usage,
         } => {
             let mut params = serde_json::json!({
                 "session_id": session_id,
@@ -1374,6 +1403,14 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
                 params["usage"] = serde_json::json!({
                     "input_tokens": u.input_tokens,
                     "output_tokens": u.output_tokens,
+                });
+            }
+            if let Some(cache) = cache_usage {
+                params["cache_usage"] = serde_json::json!({
+                    "estimated_hit_tokens": cache.estimated_hit_tokens,
+                    "estimated_miss_tokens": cache.estimated_miss_tokens,
+                    "hit_rate": cache.hit_rate(),
+                    "miss_rate": cache.miss_rate(),
                 });
             }
             JsonRpcNotification::new(notifications::TURN_COMPLETE, Some(params))

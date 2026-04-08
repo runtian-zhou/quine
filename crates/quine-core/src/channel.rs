@@ -31,6 +31,7 @@ impl std::fmt::Debug for SessionLlmConfig {
 
 /// Operations the harness sends into the core event loop.
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum CoreInput {
     /// Start a new agent session.
     CreateSession {
@@ -308,6 +309,7 @@ pub enum CoreOutput {
         session_id: SessionId,
         duration_us: u64,
         usage: Option<quine_llm::TokenUsage>,
+        cache_usage: Option<quine_llm::PromptCacheUsage>,
     },
 
     /// A stable checkpoint was requested after a committed state transition.
