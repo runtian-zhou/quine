@@ -368,25 +368,23 @@ pub async fn run_oneshot(
             }
         }
         println!("{}", serde_json::to_string_pretty(&json_output)?);
-    } else {
-        if let Some(interaction) = output.interaction_needed.clone() {
-            if let Some(label) = interaction.source_label.as_deref() {
-                eprintln!("interaction needed [{label}]: {}", interaction.prompt);
-            } else {
-                eprintln!("interaction needed: {}", interaction.prompt);
-            }
-            eprintln!(
-                "Resume with: `quine respond --session {} --socket {} \"<response>\"`",
-                output.session_id,
-                socket_path.display()
-            );
-            if !interaction.response.is_empty() {
-                println!("{}", interaction.response);
-            }
+    } else if let Some(interaction) = output.interaction_needed.clone() {
+        if let Some(label) = interaction.source_label.as_deref() {
+            eprintln!("interaction needed [{label}]: {}", interaction.prompt);
         } else {
-            println!("{}", output.response);
-            print_resume_command(socket_path, &output.session_id);
+            eprintln!("interaction needed: {}", interaction.prompt);
         }
+        eprintln!(
+            "Resume with: `quine respond --session {} --socket {} \"<response>\"`",
+            output.session_id,
+            socket_path.display()
+        );
+        if !interaction.response.is_empty() {
+            println!("{}", interaction.response);
+        }
+    } else {
+        println!("{}", output.response);
+        print_resume_command(socket_path, &output.session_id);
     }
 
     Ok(())
