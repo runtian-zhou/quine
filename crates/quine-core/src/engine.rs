@@ -974,6 +974,16 @@ fn waiting_would_cycle(
     false
 }
 
+fn waiting_would_cycle_including_session_tree(
+    sessions: &HashMap<SessionId, SessionContext>,
+    session_tree: &SessionTree,
+    waiter: SessionId,
+    dependency: SessionId,
+) -> bool {
+    waiting_would_cycle(sessions, waiter, dependency)
+        || session_tree.wait_would_cycle(waiter, dependency)
+}
+
 async fn emit_session_waiting(
     sessions: &HashMap<SessionId, SessionContext>,
     session_id: SessionId,
@@ -1038,6 +1048,7 @@ async fn resume_session_from_wait(
 
     if let Some(session) = sessions.get_mut(&session_id) {
         session.suspended_wait = None;
+        engine.session_tree.clear_active_wait(session_id);
         session.history.push(Message::tool_result(
             &tool_use_id,
             &history_output,
@@ -1334,6 +1345,7 @@ async fn call_llm_interruptible(
     session_id: SessionId,
     io: &mut CoreIo<'_>,
     sessions: &mut HashMap<SessionId, SessionContext>,
+    session_tree: &mut SessionTree,
 ) -> Result<Option<LlmCallResult>, CoreError> {
     let send_future = provider.send(&history, &tools);
     tokio::pin!(send_future);
@@ -1353,6 +1365,7 @@ async fn call_llm_interruptible(
                                 input,
                                 session_id,
                                 sessions,
+                                session_tree,
                                 io.deferred_inputs,
                             ),
                             SessionControlFlow::Interrupted
@@ -1431,6 +1444,7 @@ async fn call_llm_interruptible(
                                 input,
                                 session_id,
                                 sessions,
+                                session_tree,
                                 io.deferred_inputs,
                             ),
                             SessionControlFlow::Interrupted
@@ -1824,13 +1838,14 @@ fn handle_session_control_input(
     input: CoreInput,
     session_id: SessionId,
     sessions: &mut HashMap<SessionId, SessionContext>,
+    session_tree: &mut SessionTree,
     deferred_inputs: &mut VecDeque<CoreInput>,
 ) -> SessionControlFlow {
     match input {
         CoreInput::Cancel {
             session_id: cancel_sid,
         } if cancel_sid == session_id => {
-            clear_suspended_wait(sessions, session_id);
+            clear_suspended_wait(sessions, session_tree, session_id);
             interrupt_session(sessions, deferred_inputs, session_id);
             SessionControlFlow::Interrupted
         }
@@ -1843,7 +1858,7 @@ fn handle_session_control_input(
                 SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill
             ) =>
         {
-            clear_suspended_wait(sessions, session_id);
+            clear_suspended_wait(sessions, session_tree, session_id);
             interrupt_session(sessions, deferred_inputs, session_id);
             SessionControlFlow::Interrupted
         }
@@ -2096,7 +2111,12 @@ async fn compact_session_history(
     Ok(true)
 }
 
-fn clear_suspended_wait(sessions: &mut HashMap<SessionId, SessionContext>, session_id: SessionId) {
+fn clear_suspended_wait(
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    session_tree: &mut SessionTree,
+    session_id: SessionId,
+) {
+    session_tree.clear_active_wait(session_id);
     if let Some(session) = sessions.get_mut(&session_id) {
         session.suspended_wait = None;
         if session.state == SessionState::Waiting {
@@ -2216,6 +2236,7 @@ async fn finalize_child_session(
 
     let parent_id = session_tree.parent_of(session_id);
     session_tree.record_exit(session_id, status.clone());
+    session_tree.clear_active_wait(session_id);
 
     let waiting_parents: Vec<SessionId> = sessions
         .iter()
@@ -2672,7 +2693,7 @@ async fn execute_tool_call(
             };
         }
 
-        if waiting_would_cycle(sessions, session_id, child_id) {
+        if waiting_would_cycle_including_session_tree(sessions, engine.session_tree, session_id, child_id) {
             if let Some(session) = sessions.get_mut(&session_id) {
                 session.cancel_tx = None;
             }
@@ -2691,6 +2712,7 @@ async fn execute_tool_call(
                 child_id,
                 timeout_at: timeout.map(|value| Instant::now() + value),
             });
+            let _ = engine.session_tree.register_active_wait(session_id, child_id);
         }
         emit_session_waiting(sessions, session_id, io.output, engine.session_tree).await;
         return ToolOutcome::Cancelled;
@@ -3244,7 +3266,7 @@ async fn handle_llm_turn(
             Ok(provider) => provider,
             Err(outcome) => return outcome,
         };
-        match call_llm_interruptible(&*provider, history, tools, session_id, io, sessions).await {
+        match call_llm_interruptible(&*provider, history, tools, session_id, io, sessions, engine.session_tree).await {
             Ok(None) => {
                 debug_log_session(session_id, "LLM turn interrupted");
                 let duration_us = turn_start.elapsed().as_micros() as u64;
@@ -4132,6 +4154,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     {
                         let session = sessions.get_mut(&session_id).unwrap();
                         session.interrupted = false;
+                        session_tree.clear_active_wait(session_id);
                         session.suspended_wait = None;
                         session.state = SessionState::Streaming;
                         session.history.push(Message::user(&content));
@@ -4573,7 +4596,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill => {
                         if sessions.contains_key(&session_id) {
                             interrupt_session(&mut sessions, &mut deferred_inputs, session_id);
-                            clear_suspended_wait(&mut sessions, session_id);
+                            clear_suspended_wait(&mut sessions, &mut session_tree, session_id);
                             let _ = handle
                                 .output
                                 .send(CoreOutput::SessionStateChanged {
@@ -4663,11 +4686,15 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 } else {
                     None
                 };
-                let _ = reply.send(if result.is_some() || non_blocking {
-                    result
+                let response = if result.is_some() || non_blocking {
+                    Ok(result)
                 } else {
-                    None
-                });
+                    match session_tree.register_active_wait(parent_id, child_id) {
+                        Ok(()) => Ok(None),
+                        Err(error) => Err(error),
+                    }
+                };
+                let _ = reply.send(response);
             }
         }
     }
@@ -5718,6 +5745,81 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         assert!(waiting_would_cycle(&sessions, id_c, id_a));
         assert!(waiting_would_cycle(&sessions, id_b, id_b));
         assert!(!waiting_would_cycle(&sessions, id_c, SessionId::new()));
+    }
+
+    #[test]
+    fn waiting_would_cycle_including_session_tree_detects_mixed_wait_cycles() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut sessions = HashMap::new();
+        let mut session_tree = SessionTree::new();
+
+        let waiter_id = SessionId::new();
+        let dependency_id = SessionId::new();
+        let transitive_id = SessionId::new();
+
+        let mut waiter_session = runtime
+            .block_on(SessionContext::new(
+                waiter_id,
+                SessionInit {
+                    system_prompt: None,
+                    skills: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap_or_default(),
+                    plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
+                    initial_messages: Vec::new(),
+                    archive_root: std::env::temp_dir().join("quine-core-mixed-wait-cycle-a"),
+                    max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
+                },
+                &provider,
+            ))
+            .unwrap();
+        let dependency_session = runtime
+            .block_on(SessionContext::new(
+                dependency_id,
+                SessionInit {
+                    system_prompt: None,
+                    skills: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap_or_default(),
+                    plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
+                    initial_messages: Vec::new(),
+                    archive_root: std::env::temp_dir().join("quine-core-mixed-wait-cycle-b"),
+                    max_context_window: None,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
+                },
+                &provider,
+            ))
+            .unwrap();
+
+        waiter_session.suspended_wait = Some(SuspendedWait::Mailbox {
+            tool_use_id: "toolu_waiter".into(),
+            source: MessageSource::Session(dependency_id),
+            timeout_at: None,
+        });
+        sessions.insert(waiter_id, waiter_session);
+        sessions.insert(dependency_id, dependency_session);
+        session_tree.register_active_wait(dependency_id, transitive_id).unwrap();
+        session_tree.register_active_wait(transitive_id, waiter_id).unwrap();
+
+        assert!(waiting_would_cycle_including_session_tree(
+            &sessions,
+            &session_tree,
+            waiter_id,
+            dependency_id,
+        ));
     }
 
     #[test]
@@ -7635,7 +7737,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .expect("child should exit successfully");
 
         match status {
-            ExitStatus::Success { output } => {
+            Some(ExitStatus::Success { output }) => {
                 assert!(
                     output.contains("73"),
                     "expected child output in wait result: {output}"

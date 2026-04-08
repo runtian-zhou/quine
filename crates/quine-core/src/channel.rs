@@ -142,7 +142,7 @@ pub enum CoreInput {
     WaitSession {
         parent_id: SessionId,
         child_id: SessionId,
-        reply: oneshot::Sender<Option<ExitStatus>>,
+        reply: oneshot::Sender<Result<Option<ExitStatus>, String>>,
         non_blocking: bool,
         timeout: Option<Duration>,
     },
