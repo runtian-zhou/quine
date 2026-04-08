@@ -60,6 +60,12 @@ pub struct PersistedSessionConfig {
     pub memory_policy: MemoryPolicyConfig,
     #[serde(default)]
     pub model_profile: Option<String>,
+    #[serde(default = "default_auto_compact_threshold_percent")]
+    pub auto_compact_threshold_percent: u8,
+}
+
+fn default_auto_compact_threshold_percent() -> u8 {
+    crate::compaction::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT
 }
 
 fn default_permission_prompt_behavior() -> PermissionPromptBehavior {

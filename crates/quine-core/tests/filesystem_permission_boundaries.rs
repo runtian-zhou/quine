@@ -94,6 +94,7 @@ async fn run_tool_turn(
             team_key: None,
             memory_policy: MemoryPolicyConfig::default(),
             session_llm: session_llm_config(provider),
+            auto_compact_threshold_percent: 60,
             reply: reply_tx,
         })
         .await

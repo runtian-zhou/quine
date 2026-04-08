@@ -11,3 +11,9 @@ profiles:
     base_url: http://host.docker.internal:8080/v1
     max_tokens: 4096
     parallel_tool_calls: false
+  local-qwen-lm-studio:
+    provider: openai
+    model: qwen/qwen3-coder-next
+    base_url: http://host.docker.internal:1234/v1
+    max_tokens: 4096
+    parallel_tool_calls: false

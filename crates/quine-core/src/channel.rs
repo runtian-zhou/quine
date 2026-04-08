@@ -58,6 +58,8 @@ pub enum CoreInput {
         memory_policy: crate::memory::MemoryPolicyConfig,
         /// Selected LLM provider/runtime config for this session.
         session_llm: SessionLlmConfig,
+        /// Auto-compaction threshold as a percentage of the model context window.
+        auto_compact_threshold_percent: u8,
         /// Acknowledges session creation.
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -461,6 +463,8 @@ mod tests {
                 team_key: None,
                 memory_policy: crate::memory::MemoryPolicyConfig::default(),
                 session_llm: test_session_llm_config(),
+                auto_compact_threshold_percent:
+                    crate::compaction::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 reply: reply_tx,
             })
             .await
