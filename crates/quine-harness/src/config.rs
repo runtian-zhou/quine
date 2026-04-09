@@ -2,8 +2,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use quine_core::{
-    MemoryPolicyConfig, PermissionPromptBehavior, PermissionRule, PermissionRuleEffect,
-    PermissionRuleSet, PermissionRuleSource, PermissionTarget, RuleScope, SessionLlmConfig,
+    default_status_report_min_tool_rounds, MemoryPolicyConfig, PermissionPromptBehavior,
+    PermissionRule, PermissionRuleEffect, PermissionRuleSet, PermissionRuleSource,
+    PermissionTarget, RuleScope, SessionLlmConfig,
 };
 use quine_llm::config::WebProviderConfig;
 use quine_llm::openai_web::OpenAiWebConfig;
@@ -49,6 +50,9 @@ pub struct SessionConfig {
     /// Auto-compaction threshold as a percentage of the model context window.
     #[serde(default = "default_auto_compact_threshold_percent")]
     pub auto_compact_threshold_percent: u8,
+    /// Minimum number of tool rounds before status reporting begins.
+    #[serde(default = "default_status_report_min_tool_rounds")]
+    pub status_report_min_tool_rounds: u32,
 }
 
 impl Default for SessionConfig {
@@ -65,6 +69,7 @@ impl Default for SessionConfig {
             memory_policy: MemoryPolicyConfig::default(),
             model_profile: None,
             auto_compact_threshold_percent: default_auto_compact_threshold_percent(),
+            status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
         }
     }
 }
@@ -330,6 +335,10 @@ mod tests {
             config.auto_compact_threshold_percent,
             default_auto_compact_threshold_percent()
         );
+        assert_eq!(
+            config.status_report_min_tool_rounds,
+            default_status_report_min_tool_rounds()
+        );
     }
 
     #[test]
@@ -346,6 +355,7 @@ mod tests {
             memory_policy: MemoryPolicyConfig::default(),
             model_profile: None,
             auto_compact_threshold_percent: default_auto_compact_threshold_percent(),
+            status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: SessionConfig = serde_json::from_str(&json).unwrap();

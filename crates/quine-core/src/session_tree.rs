@@ -83,9 +83,8 @@ impl SessionTree {
 
     /// Record that a session has exited. All registered waiters are notified.
     pub fn record_exit(&mut self, session: SessionId, status: ExitStatus) {
-        self.active_waits.retain(|waiter, dependency| {
-            *waiter != session && *dependency != session
-        });
+        self.active_waits
+            .retain(|waiter, dependency| *waiter != session && *dependency != session);
         if let Some(waiters) = self.waiters.remove(&session) {
             for waiter in waiters {
                 // Ignore send errors — the receiver may have been dropped.

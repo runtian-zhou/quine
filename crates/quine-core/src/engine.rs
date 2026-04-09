@@ -8,6 +8,7 @@ use quine_llm::{
     LlmEvent, LlmProvider, Message, MessageContent, NoopWebProvider, PromptCacheUsage,
     ToolDefinition, WebProvider,
 };
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot, Notify};
 
 use tokio::task::JoinSet;
@@ -43,6 +44,7 @@ use crate::scheduler::spawn_scheduler;
 use crate::session::{ExitStatus, SessionId, SessionSignal, SessionState};
 use crate::session_tree::SessionTree;
 use crate::skill::Skill;
+use crate::status_report::{default_status_report_min_tool_rounds, SessionStatusReport};
 use crate::tool::{
     ask_user::AskUserTool, bash::BashTool, find::FindTool, plan::PlanTool, read::ReadTool,
     recv_message::RecvMessageTool, send_message::SendMessageTool, signal::SignalTool,
@@ -298,6 +300,10 @@ struct SessionContext {
     pending_permission_approval: Option<PendingPermissionApproval>,
     /// Canonical prompt tokens for the most recent provider request.
     last_prompt_cache_tokens: Option<Vec<String>>,
+    /// Latest status report for this session's most recent tool loop.
+    status_report: Option<SessionStatusReport>,
+    /// Number of assistant-emitted tool rounds observed in the current user turn.
+    current_turn_tool_rounds: u32,
 }
 
 #[derive(Clone)]
@@ -364,6 +370,7 @@ struct SessionInit {
     memory_policy: MemoryPolicyConfig,
     model_profile: Option<String>,
     auto_compact_threshold_percent: u8,
+    status_report_min_tool_rounds: u32,
 }
 
 impl SessionInit {
@@ -384,6 +391,7 @@ impl SessionInit {
             memory_policy: self.memory_policy.clone(),
             model_profile: self.model_profile.clone(),
             auto_compact_threshold_percent: self.auto_compact_threshold_percent.clamp(1, 100),
+            status_report_min_tool_rounds: self.status_report_min_tool_rounds.max(1),
         }
     }
 }
@@ -708,6 +716,8 @@ impl SessionContext {
             last_permission_outcome: None,
             pending_permission_approval: None,
             last_prompt_cache_tokens: None,
+            status_report: None,
+            current_turn_tool_rounds: 0,
         })
     }
 
@@ -727,6 +737,7 @@ impl SessionContext {
             plan_store,
             memory_state,
             permission_state,
+            status_report,
         } = persisted;
         let skills =
             crate::skill::load_skills(&config.working_directory, &config.skill_names).await;
@@ -747,6 +758,7 @@ impl SessionContext {
                 memory_policy: config.memory_policy.clone(),
                 model_profile: config.model_profile.clone(),
                 auto_compact_threshold_percent: config.auto_compact_threshold_percent,
+                status_report_min_tool_rounds: config.status_report_min_tool_rounds,
             },
             provider,
             web_provider,
@@ -818,6 +830,7 @@ impl SessionContext {
             session.last_permission_outcome = permission_state.last_decision.clone();
             session.pending_permission_approval = permission_state.pending_approval.clone();
         }
+        session.status_report = status_report;
         Ok((session_id, session))
     }
 
@@ -843,6 +856,7 @@ impl SessionContext {
                 self.last_permission_outcome.clone(),
                 self.pending_permission_approval.clone(),
             )),
+            status_report: self.status_report.clone(),
         })
     }
 
@@ -2031,8 +2045,8 @@ async fn execute_concurrent_tool_batch(
                         interrupt_session(sessions, io.deferred_inputs, session_id);
                         let _ = cancel_tx.send(true);
                     }
-                    Some(other) => {
-                        io.deferred_inputs.push_back(other);
+                    Some(input) => {
+                        io.deferred_inputs.push_back(input);
                     }
                     None => {
                         debug_log_session(
@@ -2137,6 +2151,311 @@ fn session_id_string(session_id: SessionId) -> String {
         .ok()
         .and_then(|value| value.as_str().map(ToOwned::to_owned))
         .unwrap_or_else(|| "unknown-session".to_string())
+}
+
+#[derive(Clone, Copy)]
+enum StatusReportStage {
+    ReviewingResults,
+    Completed,
+}
+
+fn tool_call_count_label(count: usize) -> String {
+    if count == 1 {
+        "1 tool call".to_string()
+    } else {
+        format!("{count} tool calls")
+    }
+}
+
+fn should_emit_periodic_status_report(tool_rounds_observed: u32, threshold: u32) -> bool {
+    let threshold = threshold.max(1);
+    tool_rounds_observed >= threshold && tool_rounds_observed % threshold == 0
+}
+
+fn should_emit_completed_status_report(
+    tool_rounds_observed: u32,
+    threshold: u32,
+    prior_report_exists: bool,
+) -> bool {
+    prior_report_exists || should_emit_periodic_status_report(tool_rounds_observed, threshold)
+}
+
+fn fallback_status_report_progress(stage: StatusReportStage, prior_progress: Option<u8>) -> u8 {
+    match stage {
+        StatusReportStage::Completed => 100,
+        StatusReportStage::ReviewingResults => prior_progress.unwrap_or(50).clamp(10, 95),
+    }
+}
+
+fn fallback_status_report_confidence(stage: StatusReportStage, prior_confidence: Option<u8>) -> u8 {
+    match stage {
+        StatusReportStage::Completed => prior_confidence.unwrap_or(85).clamp(1, 100),
+        StatusReportStage::ReviewingResults => prior_confidence.unwrap_or(60).clamp(1, 95),
+    }
+}
+
+fn build_status_report(
+    tool_rounds_observed: u32,
+    current_round_tool_calls: usize,
+    stage: StatusReportStage,
+    prior_progress: Option<u8>,
+    prior_confidence: Option<u8>,
+) -> SessionStatusReport {
+    let tool_calls = tool_call_count_label(current_round_tool_calls);
+    let completed_summary = match stage {
+        StatusReportStage::ReviewingResults => {
+            format!("Completed another work step for the current request; the latest round finished {tool_calls}.")
+        }
+        StatusReportStage::Completed => {
+            "Finished the work needed for the current request and completed the response for this turn.".to_string()
+        }
+    };
+    let remaining_summary = match stage {
+        StatusReportStage::ReviewingResults => {
+            "Compare the latest results against the user's request, finish any remaining work, and then produce the final response.".to_string()
+        }
+        StatusReportStage::Completed => {
+            "Nothing remains in this turn; wait for the next user request.".to_string()
+        }
+    };
+
+    SessionStatusReport::new(
+        !matches!(stage, StatusReportStage::Completed),
+        fallback_status_report_progress(stage, prior_progress),
+        fallback_status_report_confidence(stage, prior_confidence),
+        completed_summary,
+        remaining_summary,
+        tool_rounds_observed,
+    )
+}
+
+async fn set_session_status_report(
+    sessions: &mut HashMap<SessionId, SessionContext>,
+    session_id: SessionId,
+    output: &mpsc::Sender<CoreOutput>,
+    report: Option<SessionStatusReport>,
+) {
+    let Some(session) = sessions.get_mut(&session_id) else {
+        return;
+    };
+    if session.status_report == report {
+        return;
+    }
+    session.status_report = report.clone();
+    let _ = output
+        .send(CoreOutput::SessionStatusReport { session_id, report })
+        .await;
+}
+
+#[derive(Deserialize)]
+struct ModelStatusReportPayload {
+    progress_percent: u8,
+    confidence_percent: u8,
+    completed_summary: String,
+    remaining_summary: String,
+}
+
+fn current_turn_messages(history: &[Message]) -> &[Message] {
+    latest_user_message_index(history)
+        .map(|index| &history[index..])
+        .unwrap_or(history)
+}
+
+fn latest_user_request_text(history: &[Message]) -> Option<&str> {
+    current_turn_messages(history).iter().find_map(|message| {
+        if message.role != quine_llm::Role::User {
+            return None;
+        }
+        match &message.content {
+            MessageContent::Text(text) => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then_some(trimmed)
+            }
+            MessageContent::ToolUse { .. } | MessageContent::ToolResult { .. } => None,
+        }
+    })
+}
+
+fn truncate_status_report_text(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let mut truncated = String::with_capacity(max_chars + 1);
+    for (index, ch) in trimmed.chars().enumerate() {
+        if index >= max_chars.saturating_sub(1) {
+            break;
+        }
+        truncated.push(ch);
+    }
+    truncated.push('…');
+    truncated
+}
+
+fn render_status_report_transcript(history: &[Message]) -> String {
+    current_turn_messages(history)
+        .iter()
+        .map(|message| match &message.content {
+            MessageContent::Text(text) => format!(
+                "{}: {}",
+                match message.role {
+                    quine_llm::Role::System => "system",
+                    quine_llm::Role::User => "user",
+                    quine_llm::Role::Assistant => "assistant",
+                    quine_llm::Role::Tool => "tool",
+                },
+                truncate_status_report_text(text, 400)
+            ),
+            MessageContent::ToolUse { text, tool_calls } => {
+                let tool_names = tool_calls
+                    .iter()
+                    .map(|call| call.tool_name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let prefix = text
+                    .as_deref()
+                    .map(|value| truncate_status_report_text(value, 240))
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or_else(|| "assistant requested tools".to_string());
+                format!(
+                    "assistant: {prefix} [tool round with {}: {tool_names}]",
+                    tool_call_count_label(tool_calls.len())
+                )
+            }
+            MessageContent::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+            } => format!(
+                "tool: {} result for {tool_use_id}: {}",
+                if *is_error { "error" } else { "ok" },
+                truncate_status_report_text(output, 400)
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn parse_status_report_payload(raw: &str) -> Option<ModelStatusReportPayload> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if let Ok(parsed) = serde_json::from_str::<ModelStatusReportPayload>(trimmed) {
+        return Some(parsed);
+    }
+
+    let start = trimmed.find('{')?;
+    let end = trimmed.rfind('}')?;
+    (start < end)
+        .then(|| serde_json::from_str::<ModelStatusReportPayload>(&trimmed[start..=end]).ok())
+        .flatten()
+}
+
+fn build_status_report_request_prompt(
+    latest_user_request: &str,
+    transcript: &str,
+    tool_rounds_observed: u32,
+    current_round_tool_calls: usize,
+    stage: StatusReportStage,
+) -> String {
+    let completion_hint = match stage {
+        StatusReportStage::Completed => "The turn has completed. Set progress_percent to 100.",
+        StatusReportStage::ReviewingResults => {
+            "The turn is still active after a tool round. Set progress_percent between 1 and 95."
+        }
+    };
+    format!(
+        "Generate a concise status report for this coding turn.\n\
+         Latest user request:\n{latest_user_request}\n\n\
+         Evaluate progress_percent against the entire scope of that latest user request.\n\
+         Also estimate confidence_percent as your confidence that the agent can fully complete that latest user request from the current trajectory and evidence.\n\
+         Estimate how much of the requested work is actually complete and how much remains.\n\
+         Do not use tool rounds, tool calls, or transcript length as a proxy for progress.\n\
+         Use tool activity only as evidence for what is done and what still needs work.\n\
+         Tool rounds observed in this turn (context only): {tool_rounds_observed}\n\
+         Current round tool calls (context only): {current_round_tool_calls}\n\
+         {completion_hint}\n\n\
+         Current user-turn transcript:\n{transcript}"
+    )
+}
+
+async fn generate_status_report_with_model(
+    session: &SessionContext,
+    session_id: SessionId,
+    current_round_tool_calls: usize,
+    stage: StatusReportStage,
+) -> SessionStatusReport {
+    let transcript = render_status_report_transcript(&session.history);
+    let latest_user_request =
+        latest_user_request_text(&session.history).unwrap_or("No explicit user request captured.");
+    let tool_rounds_observed = session.current_turn_tool_rounds;
+    let messages = [
+        Message::system(
+            "You generate internal status reports for a coding-agent UI. Return JSON only with keys progress_percent, confidence_percent, completed_summary, and remaining_summary. completed_summary and remaining_summary must each be exactly one sentence. Evaluate progress_percent against the full amount of work required by the latest user request, not against tool counts, elapsed time, or transcript length. Set confidence_percent to your confidence that the agent can fully complete the latest user request from the current trajectory and evidence. Do not include markdown fences or extra commentary.",
+        ),
+        Message::user(build_status_report_request_prompt(
+            latest_user_request,
+            &transcript,
+            tool_rounds_observed,
+            current_round_tool_calls,
+            stage,
+        )),
+    ];
+
+    match call_llm_with_messages(session.provider.as_ref(), &messages, &[], session_id, None).await
+    {
+        Ok(LlmCallResult {
+            turn: LlmTurnResult::Text(text),
+            ..
+        }) => {
+            if let Some(payload) = parse_status_report_payload(&text) {
+                let progress_percent = match stage {
+                    StatusReportStage::Completed => 100,
+                    _ => payload.progress_percent.clamp(1, 95),
+                };
+                let confidence_percent = payload.confidence_percent.clamp(1, 100);
+                SessionStatusReport::new(
+                    !matches!(stage, StatusReportStage::Completed),
+                    progress_percent,
+                    confidence_percent,
+                    payload
+                        .completed_summary
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    payload
+                        .remaining_summary
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    tool_rounds_observed,
+                )
+            } else {
+                build_status_report(
+                    tool_rounds_observed,
+                    current_round_tool_calls,
+                    stage,
+                    session.status_report.as_ref().map(|report| report.progress_percent),
+                    session
+                        .status_report
+                        .as_ref()
+                        .map(|report| report.confidence_percent),
+                )
+            }
+        }
+        _ => build_status_report(
+            tool_rounds_observed,
+            current_round_tool_calls,
+            stage,
+            session.status_report.as_ref().map(|report| report.progress_percent),
+            session
+                .status_report
+                .as_ref()
+                .map(|report| report.confidence_percent),
+        ),
+    }
 }
 
 async fn prepare_tool_result_for_history(
@@ -2336,6 +2655,7 @@ async fn start_child_session(
             memory_policy: MemoryPolicyConfig::default(),
             model_profile: inherited_model_profile,
             auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+            status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
         },
         &inherited_provider,
     )
@@ -2531,11 +2851,9 @@ async fn execute_tool_call(
                         interrupt_session(sessions, io.deferred_inputs, session_id);
                         return ToolOutcome::Cancelled;
                     }
-                    Some(CoreInput::RequestCheckpoint { reply }) => {
-                        emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
-                        let _ = reply.send(());
+                    Some(input) => {
+                        io.deferred_inputs.push_back(input);
                     }
-                    Some(other) => io.deferred_inputs.push_back(other),
                     None => {
                         if let Some(session) = sessions.get_mut(&session_id) {
                             session.state = SessionState::Streaming;
@@ -2701,7 +3019,12 @@ async fn execute_tool_call(
             };
         }
 
-        if waiting_would_cycle_including_session_tree(sessions, engine.session_tree, session_id, child_id) {
+        if waiting_would_cycle_including_session_tree(
+            sessions,
+            engine.session_tree,
+            session_id,
+            child_id,
+        ) {
             if let Some(session) = sessions.get_mut(&session_id) {
                 session.cancel_tx = None;
             }
@@ -2720,7 +3043,9 @@ async fn execute_tool_call(
                 child_id,
                 timeout_at: timeout.map(|value| Instant::now() + value),
             });
-            let _ = engine.session_tree.register_active_wait(session_id, child_id);
+            let _ = engine
+                .session_tree
+                .register_active_wait(session_id, child_id);
         }
         emit_session_waiting(sessions, session_id, io.output, engine.session_tree).await;
         return ToolOutcome::Cancelled;
@@ -2953,8 +3278,8 @@ async fn execute_tool_call(
                                     drop(reply_tx);
                                     break 'tool_loop ToolOutcome::Cancelled;
                                 }
-                                Some(other) => {
-                                    io.deferred_inputs.push_back(other);
+                                Some(input) => {
+                                    io.deferred_inputs.push_back(input);
                                     continue;
                                 }
                                 None => {
@@ -3052,8 +3377,8 @@ async fn execute_tool_call(
                             interrupt_session(sessions, io.deferred_inputs, session_id);
                             break ToolOutcome::Cancelled;
                         }
-                        Some(other) => {
-                            io.deferred_inputs.push_back(other);
+                        Some(input) => {
+                            io.deferred_inputs.push_back(input);
                             continue;
                         }
                         None => {
@@ -3278,9 +3603,20 @@ async fn handle_llm_turn(
             Ok(provider) => provider,
             Err(outcome) => return outcome,
         };
-        match call_llm_interruptible(&*provider, history, tools, session_id, io, sessions, engine.session_tree).await {
+        match call_llm_interruptible(
+            &*provider,
+            history,
+            tools,
+            session_id,
+            io,
+            sessions,
+            engine.session_tree,
+        )
+        .await
+        {
             Ok(None) => {
                 debug_log_session(session_id, "LLM turn interrupted");
+                set_session_status_report(sessions, session_id, io.output, None).await;
                 let duration_us = turn_start.elapsed().as_micros() as u64;
                 let _ = io
                     .output
@@ -3334,6 +3670,34 @@ async fn handle_llm_turn(
                         full_text.len()
                     ),
                 );
+                let status_report_update = if let Some(session) = sessions.get(&session_id) {
+                    let threshold = session
+                        .persisted_config
+                        .status_report_min_tool_rounds
+                        .max(1);
+                    if should_emit_completed_status_report(
+                        session.current_turn_tool_rounds,
+                        threshold,
+                        session.status_report.is_some(),
+                    ) {
+                        Some(
+                            generate_status_report_with_model(
+                                session,
+                                session_id,
+                                0,
+                                StatusReportStage::Completed,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(report) = status_report_update {
+                    set_session_status_report(sessions, session_id, io.output, Some(report)).await;
+                }
 
                 let _ = io
                     .output
@@ -3431,6 +3795,8 @@ async fn handle_llm_turn(
                         text_before.clone(),
                         tool_use_requests,
                     ));
+                    session.current_turn_tool_rounds =
+                        session.current_turn_tool_rounds.saturating_add(1);
                 }
 
                 if let Some(session) = sessions.get(&session_id) {
@@ -3742,6 +4108,7 @@ async fn handle_llm_turn(
                             session_id,
                             "LLM turn aborted because tool execution was cancelled",
                         );
+                        set_session_status_report(sessions, session_id, io.output, None).await;
                         if let Some(session) = sessions.get_mut(&session_id) {
                             session.cancel_tx = None;
                             session.state = SessionState::Idle;
@@ -3806,6 +4173,7 @@ async fn handle_llm_turn(
                         session_id,
                         "LLM turn aborted because concurrent tool execution was cancelled",
                     );
+                    set_session_status_report(sessions, session_id, io.output, None).await;
                     if let Some(session) = sessions.get_mut(&session_id) {
                         session.cancel_tx = None;
                         session.state = SessionState::Idle;
@@ -3840,11 +4208,39 @@ async fn handle_llm_turn(
                 }
 
                 // Call LLM again with tool results
+                let status_report_update = if let Some(session) = sessions.get(&session_id) {
+                    let threshold = session
+                        .persisted_config
+                        .status_report_min_tool_rounds
+                        .max(1);
+                    if should_emit_periodic_status_report(
+                        session.current_turn_tool_rounds,
+                        threshold,
+                    ) {
+                        Some(
+                            generate_status_report_with_model(
+                                session,
+                                session_id,
+                                completed_calls.len(),
+                                StatusReportStage::ReviewingResults,
+                            )
+                            .await,
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(report) = status_report_update {
+                    set_session_status_report(sessions, session_id, io.output, Some(report)).await;
+                }
                 debug_log_session(session_id, "continuing LLM turn after tool results");
                 continue;
             }
             Err(error) => {
                 debug_log_session(session_id, format!("LLM turn failed: {error}"));
+                set_session_status_report(sessions, session_id, io.output, None).await;
                 if let Some(session) = sessions.get_mut(&session_id) {
                     session.state = SessionState::Idle;
                 }
@@ -4021,6 +4417,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 memory_policy,
                 session_llm,
                 auto_compact_threshold_percent,
+                status_report_min_tool_rounds,
                 permission_rules,
                 reply,
             } => {
@@ -4058,6 +4455,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         memory_policy,
                         model_profile: session_llm.model_profile.clone(),
                         auto_compact_threshold_percent,
+                        status_report_min_tool_rounds,
                     },
                     &session_llm.provider,
                     &web_provider,
@@ -4171,10 +4569,13 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         session_tree.clear_active_wait(session_id);
                         session.suspended_wait = None;
                         session.state = SessionState::Streaming;
+                        session.current_turn_tool_rounds = 0;
                         session.history.push(Message::user(&content));
                         session.last_memory_diagnostics =
                             Some(default_turn_diagnostics_for_session(session));
                     }
+                    set_session_status_report(&mut sessions, session_id, &handle.output, None)
+                        .await;
                     let _ = handle
                         .output
                         .send(CoreOutput::SessionStateChanged {
@@ -4877,6 +5278,7 @@ mod tests {
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -4919,6 +5321,7 @@ mod tests {
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -4953,6 +5356,7 @@ mod tests {
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -4999,6 +5403,7 @@ mod tests {
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             provider,
         )
@@ -5115,6 +5520,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -5183,6 +5589,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -5696,6 +6103,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
                 &provider,
             ))
@@ -5718,6 +6126,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
                 &provider,
             ))
@@ -5740,6 +6149,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
                 &provider,
             ))
@@ -5801,6 +6211,8 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
                 &provider,
             ))
@@ -5822,6 +6234,8 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
                 &provider,
             ))
@@ -5834,8 +6248,12 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         });
         sessions.insert(waiter_id, waiter_session);
         sessions.insert(dependency_id, dependency_session);
-        session_tree.register_active_wait(dependency_id, transitive_id).unwrap();
-        session_tree.register_active_wait(transitive_id, waiter_id).unwrap();
+        session_tree
+            .register_active_wait(dependency_id, transitive_id)
+            .unwrap();
+        session_tree
+            .register_active_wait(transitive_id, waiter_id)
+            .unwrap();
 
         assert!(waiting_would_cycle_including_session_tree(
             &sessions,
@@ -5873,6 +6291,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
                 &provider,
             ))
@@ -5895,6 +6314,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
                 &provider,
             ))
@@ -5938,6 +6358,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -6014,6 +6435,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -6088,6 +6510,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -6164,6 +6587,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -6255,6 +6679,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -6362,6 +6787,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -6456,6 +6882,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -6532,6 +6959,84 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[test]
+    fn periodic_status_reports_fire_only_on_threshold_multiples() {
+        assert!(!should_emit_periodic_status_report(9, 10));
+        assert!(should_emit_periodic_status_report(10, 10));
+        assert!(!should_emit_periodic_status_report(11, 10));
+        assert!(should_emit_periodic_status_report(20, 10));
+    }
+
+    #[test]
+    fn completed_status_report_closes_out_existing_periodic_report() {
+        assert!(!should_emit_completed_status_report(9, 10, false));
+        assert!(should_emit_completed_status_report(10, 10, false));
+        assert!(!should_emit_completed_status_report(11, 10, false));
+        assert!(should_emit_completed_status_report(11, 10, true));
+    }
+
+    #[test]
+    fn fallback_status_report_progress_is_not_round_count_based() {
+        assert_eq!(
+            fallback_status_report_progress(StatusReportStage::ReviewingResults, None),
+            50
+        );
+        assert_eq!(
+            fallback_status_report_progress(StatusReportStage::ReviewingResults, Some(72)),
+            72
+        );
+        assert_eq!(
+            fallback_status_report_progress(StatusReportStage::ReviewingResults, Some(100)),
+            95
+        );
+        assert_eq!(
+            fallback_status_report_progress(StatusReportStage::Completed, Some(72)),
+            100
+        );
+    }
+
+    #[test]
+    fn fallback_status_report_confidence_is_present_and_clamped() {
+        assert_eq!(
+            fallback_status_report_confidence(StatusReportStage::ReviewingResults, None),
+            60
+        );
+        assert_eq!(
+            fallback_status_report_confidence(StatusReportStage::ReviewingResults, Some(99)),
+            95
+        );
+        assert_eq!(
+            fallback_status_report_confidence(StatusReportStage::Completed, None),
+            85
+        );
+        assert_eq!(
+            fallback_status_report_confidence(StatusReportStage::Completed, Some(120)),
+            100
+        );
+    }
+
+    #[test]
+    fn status_report_prompt_anchors_progress_to_latest_user_request_scope() {
+        let prompt = build_status_report_request_prompt(
+            "fix the session status report progress calculation",
+            "user: fix the session status report progress calculation\ntool: ok result",
+            12,
+            3,
+            StatusReportStage::ReviewingResults,
+        );
+
+        assert!(prompt.contains("Latest user request:\nfix the session status report progress calculation"));
+        assert!(prompt.contains(
+            "Evaluate progress_percent against the entire scope of that latest user request."
+        ));
+        assert!(prompt.contains(
+            "Also estimate confidence_percent as your confidence that the agent can fully complete that latest user request from the current trajectory and evidence."
+        ));
+        assert!(prompt.contains(
+            "Do not use tool rounds, tool calls, or transcript length as a proxy for progress."
+        ));
+    }
+
+    #[test]
     fn normalize_plan_tool_arguments_recovers_plan_id_from_prior_tool_result() {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -6556,6 +7061,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
                 &provider,
             ))
@@ -6847,6 +7353,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -6896,6 +7403,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -6947,6 +7455,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -6989,6 +7498,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -7059,6 +7569,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -7142,6 +7653,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -7241,6 +7753,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -7328,6 +7841,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -7413,6 +7927,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -7490,6 +8005,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -7552,6 +8068,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -7624,6 +8141,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -7669,6 +8187,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -7739,6 +8258,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: create_reply_tx,
             })
             .await
@@ -7822,6 +8342,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -7864,6 +8385,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -7953,6 +8475,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -8052,6 +8575,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -8125,6 +8649,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     memory_policy: MemoryPolicyConfig::default(),
                     session_llm: session_llm_config(provider.clone()),
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                     reply: reply_tx,
                 })
                 .await
@@ -8180,6 +8705,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
                 history: vec![
                     Message::user("seed session memory"),
@@ -8202,6 +8728,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     memory_diagnostics: None,
                 }),
                 permission_state: None,
+                status_report: None,
             }],
             crate::persistence::PersistedSessionTree {
                 parents: std::collections::HashMap::new(),
@@ -8299,6 +8826,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -8358,6 +8886,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -8423,6 +8952,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -8446,6 +8976,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -8482,6 +9013,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -8597,6 +9129,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -8731,6 +9264,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
             &provider,
         )
@@ -8874,6 +9408,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -8995,6 +9530,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -9110,6 +9646,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -9227,6 +9764,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -9309,6 +9847,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await
@@ -9347,6 +9886,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     memory_policy: MemoryPolicyConfig::default(),
                     session_llm: session_llm_config(provider.clone()),
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                     reply: reply_tx,
                 })
                 .await
@@ -9490,6 +10030,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await

@@ -11,6 +11,7 @@ use crate::permission::{PermissionPromptBehavior, PermissionRuleSet};
 use crate::persistence::CoreCheckpoint;
 use crate::session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 use crate::skill::Skill;
+use crate::status_report::SessionStatusReport;
 use crate::tool;
 
 #[derive(Clone)]
@@ -60,6 +61,8 @@ pub enum CoreInput {
         session_llm: SessionLlmConfig,
         /// Auto-compaction threshold as a percentage of the model context window.
         auto_compact_threshold_percent: u8,
+        /// Minimum number of tool rounds before status reporting begins.
+        status_report_min_tool_rounds: u32,
         /// Acknowledges session creation.
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -276,6 +279,12 @@ pub enum CoreOutput {
         total: usize,
     },
 
+    /// Updated status report for a multi-turn tool loop.
+    SessionStatusReport {
+        session_id: SessionId,
+        report: Option<SessionStatusReport>,
+    },
+
     /// A child session was successfully spawned.
     ChildSpawned {
         parent_id: SessionId,
@@ -465,6 +474,7 @@ mod tests {
                 session_llm: test_session_llm_config(),
                 auto_compact_threshold_percent:
                     crate::compaction::DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: crate::default_status_report_min_tool_rounds(),
                 reply: reply_tx,
             })
             .await

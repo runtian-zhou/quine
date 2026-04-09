@@ -215,6 +215,14 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
                 "total": total,
             }),
         ),
+        quine_core::CoreOutput::SessionStatusReport { session_id, report } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "session_status_report",
+            serde_json::json!({ "report": report }),
+        ),
         quine_core::CoreOutput::ToolResult {
             session_id,
             tool_use_id,
@@ -444,6 +452,13 @@ async fn handle_request(
                 .and_then(|v| v.as_u64())
                 .and_then(|value| u8::try_from(value).ok())
                 .unwrap_or_else(crate::config::auto_compact_threshold_percent_from_env);
+            let status_report_min_tool_rounds = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("status_report_min_tool_rounds"))
+                .and_then(|v| v.as_u64())
+                .and_then(|value| u32::try_from(value).ok())
+                .unwrap_or_else(quine_core::default_status_report_min_tool_rounds);
 
             let config = crate::config::SessionConfig {
                 system_prompt,
@@ -457,6 +472,7 @@ async fn handle_request(
                 memory_policy,
                 model_profile: model_profile.clone(),
                 auto_compact_threshold_percent,
+                status_report_min_tool_rounds,
             };
 
             match service.create_session(config).await {
@@ -1391,6 +1407,15 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
                 "total": total,
             })),
         ),
+        quine_core::CoreOutput::SessionStatusReport { session_id, report } => {
+            JsonRpcNotification::new(
+                notifications::SESSION_STATUS_REPORT,
+                Some(serde_json::json!({
+                    "session_id": session_id,
+                    "report": report,
+                })),
+            )
+        }
         quine_core::CoreOutput::ToolResult {
             session_id,
             tool_use_id,

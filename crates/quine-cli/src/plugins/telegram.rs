@@ -2981,6 +2981,7 @@ mod tests {
             compact_memory_summary_markdown: None,
             memory_diagnostics: None,
             permission_diagnostics: None,
+            status_report: None,
             history: Vec::new(),
         };
 

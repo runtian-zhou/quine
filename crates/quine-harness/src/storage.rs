@@ -6,7 +6,7 @@ use quine_core::{
     built_in_tool_definitions,
     planner::{ActionPlan, ActionStatus},
     skill, CoreCheckpoint, MemoryTurnDiagnostics, PermissionRuntimeSnapshot,
-    PersistedPromptMemoryState, PersistedSession, SessionId,
+    PersistedPromptMemoryState, PersistedSession, SessionId, SessionStatusReport,
 };
 use quine_llm::{Message, MessageContent, Role, ToolDefinition};
 use serde::{Deserialize, Serialize};
@@ -75,6 +75,7 @@ pub struct SessionContextSnapshot {
     pub compact_memory_summary_markdown: Option<String>,
     pub memory_diagnostics: Option<MemoryTurnDiagnostics>,
     pub permission_diagnostics: Option<PermissionRuntimeSnapshot>,
+    pub status_report: Option<SessionStatusReport>,
     pub history: Vec<HistoryEntry>,
 }
 
@@ -155,6 +156,7 @@ fn snapshot_from_persisted(
             .as_ref()
             .and_then(|state| state.memory_diagnostics.clone()),
         permission_diagnostics: session.permission_state.clone(),
+        status_report: session.status_report.clone(),
         history: session
             .history
             .iter()
@@ -479,6 +481,8 @@ mod tests {
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
                     auto_compact_threshold_percent: 60,
+                    status_report_min_tool_rounds:
+                        quine_core::default_status_report_min_tool_rounds(),
                 },
                 history: vec![quine_llm::Message::user("hello")],
                 plan_store: PersistedPlanStore::default(),
@@ -538,6 +542,7 @@ mod tests {
                     last_decision: None,
                     pending_approval: None,
                 }),
+                status_report: None,
             }],
             PersistedSessionTree {
                 parents: Default::default(),
@@ -669,11 +674,14 @@ mod tests {
                         memory_policy: MemoryPolicyConfig::default(),
                         model_profile: None,
                         auto_compact_threshold_percent: 60,
+                        status_report_min_tool_rounds:
+                            quine_core::default_status_report_min_tool_rounds(),
                     },
                     history: Vec::new(),
                     plan_store: PersistedPlanStore::default(),
                     memory_state: None,
                     permission_state: None,
+                    status_report: None,
                 },
             ],
             PersistedSessionTree {

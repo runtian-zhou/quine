@@ -12,6 +12,7 @@ mod scheduler;
 pub mod session;
 pub mod session_tree;
 pub mod skill;
+pub mod status_report;
 pub mod tool;
 
 pub use channel::{
@@ -51,6 +52,10 @@ pub use session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, Sessio
 pub use skill::{
     default_skill_service, list_available_skills, load_skill, load_skills, DefaultSkillService,
     FileSystemSkillLoader, Skill, SkillLoader, SkillMeta, SkillService, SkillToolDef,
+};
+pub use status_report::{
+    default_status_report_min_tool_rounds, SessionStatusReport,
+    DEFAULT_STATUS_REPORT_MIN_TOOL_ROUNDS,
 };
 pub use tool::{
     built_in_tool_definitions, CancellationChannel, ExecutionContext, InteractionChannel,

@@ -519,6 +519,11 @@ impl HarnessService for LocalHarness {
         } else {
             config.auto_compact_threshold_percent.clamp(1, 100)
         };
+        let status_report_min_tool_rounds = if config.status_report_min_tool_rounds == 0 {
+            quine_core::default_status_report_min_tool_rounds()
+        } else {
+            config.status_report_min_tool_rounds
+        };
 
         self.core_input
             .send(CoreInput::CreateSession {
@@ -535,6 +540,7 @@ impl HarnessService for LocalHarness {
                 memory_policy: config.memory_policy,
                 session_llm: session_llm.clone(),
                 auto_compact_threshold_percent,
+                status_report_min_tool_rounds,
                 reply: reply_tx,
             })
             .await
@@ -997,6 +1003,7 @@ mod tests {
                 memory_policy: quine_core::MemoryPolicyConfig::default(),
                 model_profile: None,
                 auto_compact_threshold_percent: 60,
+                status_report_min_tool_rounds: quine_core::default_status_report_min_tool_rounds(),
             },
             history: Vec::new(),
             plan_store: quine_core::PersistedPlanStore::default(),
@@ -1014,6 +1021,7 @@ mod tests {
                 memory_diagnostics: None,
             }),
             permission_state: None,
+            status_report: None,
         };
 
         assert_eq!(
@@ -1773,11 +1781,14 @@ mod tests {
                         memory_policy: quine_core::MemoryPolicyConfig::default(),
                         model_profile: Some("missing-profile".into()),
                         auto_compact_threshold_percent: 60,
+                        status_report_min_tool_rounds:
+                            quine_core::default_status_report_min_tool_rounds(),
                     },
                     history: Vec::new(),
                     plan_store: quine_core::PersistedPlanStore::default(),
                     memory_state: None,
                     permission_state: None,
+                    status_report: None,
                 }],
                 quine_core::PersistedSessionTree {
                     parents: HashMap::new(),
