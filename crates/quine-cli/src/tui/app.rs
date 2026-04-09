@@ -877,23 +877,17 @@ impl App {
             }
         };
 
-        match self.backend_activity_text() {
-            Some(activity) => {
-                let mut status = format!("{base} · {activity}");
-                if let Some(notice) = self.status_notice_text() {
-                    status.push_str(" · ");
-                    status.push_str(&notice);
-                }
-                status
-            }
-            None => {
-                if let Some(notice) = self.status_notice_text() {
-                    format!("{base} · {notice}")
-                } else {
-                    base
-                }
-            }
+        let mut parts = vec![base];
+        if let Some(activity) = self.backend_activity_text() {
+            parts.push(activity);
         }
+        if let Some(status_report) = self.status_report_summary_text() {
+            parts.push(status_report);
+        }
+        if let Some(notice) = self.status_notice_text() {
+            parts.push(notice);
+        }
+        parts.join(" · ")
     }
 
     fn note_backend_event(&mut self, label: &'static str) {
@@ -917,6 +911,16 @@ impl App {
         };
 
         Some(format!("{prefix}: {label} {age_secs}s ago"))
+    }
+
+    fn status_report_summary_text(&self) -> Option<String> {
+        let report = self.status_report.as_ref()?;
+        let done = report.completed_summary.trim();
+        let todo = report.remaining_summary.trim();
+
+        let done = if done.is_empty() { "-" } else { done };
+        let todo = if todo.is_empty() { "-" } else { todo };
+        Some(format!("done: {done} | todo: {todo}"))
     }
 
     fn status_notice_text(&self) -> Option<String> {
@@ -2544,6 +2548,24 @@ mod tests {
         app.set_status_notice("copied 12 chars");
 
         assert!(app.phase_status_text().contains("copied 12 chars"));
+    }
+
+    #[test]
+    fn phase_status_text_includes_status_report_done_and_todo() {
+        let mut app = App::new("session".into(), false, None);
+        app.status_report = Some(SessionStatusReportSnapshot {
+            active: true,
+            progress_percent: 40,
+            confidence_percent: 75,
+            completed_summary: "wired prompt commands".into(),
+            remaining_summary: "add notification bar summary".into(),
+            tool_rounds_observed: 3,
+        });
+
+        let status = app.phase_status_text();
+
+        assert!(status.contains("done: wired prompt commands"));
+        assert!(status.contains("todo: add notification bar summary"));
     }
 
     #[test]
