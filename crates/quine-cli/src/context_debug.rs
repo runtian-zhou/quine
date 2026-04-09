@@ -399,10 +399,16 @@ pub(crate) struct SessionLineageSnapshot {
     pub child_ids: Vec<String>,
 }
 
+const fn default_status_report_confidence_percent() -> u8 {
+    50
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct SessionStatusReportSnapshot {
     pub active: bool,
     pub progress_percent: u8,
+    #[serde(default = "default_status_report_confidence_percent")]
+    pub confidence_percent: u8,
     pub completed_summary: String,
     pub remaining_summary: String,
     pub tool_rounds_observed: u32,

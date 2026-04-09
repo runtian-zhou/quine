@@ -140,6 +140,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     if let Some(explorer) = app.context_explorer.as_ref() {
         draw_context_explorer(frame, chunks[conversation_index], explorer);
     }
+    draw_status_notice_overlay(frame, app);
 }
 
 fn wrapped_rows(width: usize, area_width: u16) -> u16 {
@@ -739,14 +740,139 @@ fn build_conversation_lines(app: &App, area_width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn conversation_content_height(lines: &[Line<'static>], area_width: u16) -> u32 {
+fn wrap_plain_line(text: &str, area_width: u16) -> Vec<String> {
     if area_width == 0 {
-        return 0;
+        return Vec::new();
     }
 
-    Paragraph::new(Text::from(lines.to_vec()))
-        .wrap(Wrap { trim: false })
-        .line_count(area_width) as u32
+    let max_width = usize::from(area_width);
+    if text.is_empty() {
+        return vec![String::new()];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for ch in text.chars() {
+        let ch_width = ch.width().unwrap_or(0).max(1);
+        if current_width + ch_width > max_width && !current.is_empty() {
+            wrapped.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += ch_width;
+    }
+
+    if current.is_empty() {
+        wrapped.push(String::new());
+    } else {
+        wrapped.push(current);
+    }
+
+    wrapped
+}
+
+fn wrap_styled_line(line: &Line<'static>, area_width: u16) -> Vec<Line<'static>> {
+    if area_width == 0 {
+        return Vec::new();
+    }
+
+    let max_width = usize::from(area_width);
+    if line.spans.is_empty() {
+        return vec![Line::from("")];
+    }
+
+    let mut wrapped = Vec::new();
+    let mut current_line_spans: Vec<Span<'static>> = Vec::new();
+    let mut current_segment = String::new();
+    let mut current_style = Style::default();
+    let mut has_segment = false;
+    let mut current_width = 0usize;
+
+    let flush_segment =
+        |current_line_spans: &mut Vec<Span<'static>>,
+         current_segment: &mut String,
+         current_style: Style,
+         has_segment: &mut bool| {
+            if !current_segment.is_empty() {
+                current_line_spans.push(Span::styled(std::mem::take(current_segment), current_style));
+            }
+            *has_segment = false;
+        };
+
+    let flush_line = |wrapped: &mut Vec<Line<'static>>, current_line_spans: &mut Vec<Span<'static>>| {
+        if current_line_spans.is_empty() {
+            wrapped.push(Line::from(""));
+        } else {
+            wrapped.push(Line::from(std::mem::take(current_line_spans)));
+        }
+    };
+
+    for span in &line.spans {
+        let style = span.style;
+        for ch in span.content.chars() {
+            let ch_width = ch.width().unwrap_or(0).max(1);
+            if current_width + ch_width > max_width && current_width > 0 {
+                flush_segment(
+                    &mut current_line_spans,
+                    &mut current_segment,
+                    current_style,
+                    &mut has_segment,
+                );
+                flush_line(&mut wrapped, &mut current_line_spans);
+                current_width = 0;
+            }
+
+            if !has_segment {
+                current_style = style;
+                has_segment = true;
+            } else if current_style != style {
+                flush_segment(
+                    &mut current_line_spans,
+                    &mut current_segment,
+                    current_style,
+                    &mut has_segment,
+                );
+                current_style = style;
+                has_segment = true;
+            }
+
+            current_segment.push(ch);
+            current_width += ch_width;
+        }
+    }
+
+    flush_segment(
+        &mut current_line_spans,
+        &mut current_segment,
+        current_style,
+        &mut has_segment,
+    );
+    flush_line(&mut wrapped, &mut current_line_spans);
+    wrapped
+}
+
+fn build_conversation_wrapped_lines(lines: &[Line<'static>], area_width: u16) -> Vec<Line<'static>> {
+    let mut wrapped = Vec::new();
+    for line in lines {
+        wrapped.extend(wrap_styled_line(line, area_width));
+    }
+    if wrapped.is_empty() {
+        wrapped.push(Line::from(""));
+    }
+    wrapped
+}
+
+fn build_conversation_visual_lines(lines: &[Line<'static>], area_width: u16) -> Vec<String> {
+    let mut visual_lines = Vec::new();
+    for line in lines {
+        visual_lines.extend(wrap_plain_line(&line.to_string(), area_width));
+    }
+    if visual_lines.is_empty() {
+        visual_lines.push(String::new());
+    }
+    visual_lines
 }
 
 fn ensure_conversation_cache(app: &mut App, area_width: u16) -> &ConversationRenderCache {
@@ -757,12 +883,15 @@ fn ensure_conversation_cache(app: &mut App, area_width: u16) -> &ConversationRen
         .is_none_or(|cache| cache.width != area_width || cache.revision != revision);
 
     if should_rebuild {
-        let lines = build_conversation_lines(app, area_width);
-        let content_height = conversation_content_height(&lines, area_width);
+        let logical_lines = build_conversation_lines(app, area_width);
+        let lines = build_conversation_wrapped_lines(&logical_lines, area_width);
+        let visual_lines = build_conversation_visual_lines(&lines, area_width);
+        let content_height = visual_lines.len() as u32;
         app.conversation_cache = Some(ConversationRenderCache {
             width: area_width,
             revision,
             lines,
+            visual_lines,
             content_height,
         });
     }
@@ -806,13 +935,13 @@ fn draw_status_report_panel(frame: &mut Frame, app: &App, area: Rect) {
     let progress = status_report_bar(report.progress_percent, inner_width.min(24));
     let heading = if report.active {
         format!(
-            "Status report · {}% · {} rounds",
-            report.progress_percent, report.tool_rounds_observed
+            "Status report · {}% progress · {}% confidence · {} rounds",
+            report.progress_percent, report.confidence_percent, report.tool_rounds_observed
         )
     } else {
         format!(
-            "Last status report · {}% · {} rounds",
-            report.progress_percent, report.tool_rounds_observed
+            "Last status report · {}% progress · {}% confidence · {} rounds",
+            report.progress_percent, report.confidence_percent, report.tool_rounds_observed
         )
     };
     let text = Text::from(vec![
@@ -825,6 +954,18 @@ fn draw_status_report_panel(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled(progress, Style::default().fg(Color::Green)),
             Span::raw(format!(" {}%", report.progress_percent)),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                "Confidence: ",
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(
+                "{}% chance of fully completing the current request",
+                report.confidence_percent
+            )),
         ]),
         Line::from(vec![
             Span::styled(
@@ -851,13 +992,50 @@ fn draw_status_report_panel(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(widget, area);
 }
 
+fn draw_status_notice_overlay(frame: &mut Frame, app: &App) {
+    let Some(notice) = app.current_status_notice() else {
+        return;
+    };
+    let width = (notice.width() as u16 + 4).min(frame.area().width.saturating_sub(2));
+    if width < 8 {
+        return;
+    }
+    let area = Rect {
+        x: frame
+            .area()
+            .width
+            .saturating_sub(width)
+            .saturating_sub(1),
+        y: 1,
+        width,
+        height: 3,
+    };
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(notice)
+            .style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::ALL).title(" Notice ")),
+        area,
+    );
+}
+
 /// Render the scrollable conversation view.
 fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(Clear, area);
 
-    let (content_height, lines) = {
+    let (content_height, lines, visual_lines) = {
         let cache = ensure_conversation_cache(app, area.width);
-        (cache.content_height, cache.lines.clone())
+        (
+            cache.content_height,
+            cache.lines.clone(),
+            cache.visual_lines.clone(),
+        )
     };
     let view_height = area.height as u32;
     app.last_view_height = view_height;
@@ -867,10 +1045,60 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     } else {
         max_scroll
     };
+    app.set_conversation_viewport(area.x, area.y, area.width, area.height, scroll);
 
-    let text = Text::from(lines);
+    let text = if app.has_conversation_selection() {
+        let mut selected_lines = Vec::with_capacity(lines.len());
+        for (row, (base_line, line_text)) in lines.iter().zip(visual_lines.iter()).enumerate() {
+            if let Some((start_col, end_col)) =
+                app.conversation_selection_columns_for_visual_row(row as u32, line_text)
+            {
+                let mut spans = Vec::new();
+                let mut display_col = 0usize;
+                for span in &base_line.spans {
+                    let mut segment = String::new();
+                    let mut segment_selected = None;
+                    for ch in span.content.chars() {
+                        let ch_width = ch.width().unwrap_or(0).max(1);
+                        let ch_start = display_col;
+                        let ch_end = display_col + ch_width;
+                        let selected = !(ch_end <= start_col || ch_start >= end_col);
+                        if segment_selected != Some(selected) && !segment.is_empty() {
+                            let style = if segment_selected == Some(true) {
+                                span.style.bg(Color::Blue).fg(Color::Black)
+                            } else {
+                                span.style
+                            };
+                            spans.push(Span::styled(std::mem::take(&mut segment), style));
+                        }
+                        segment_selected = Some(selected);
+                        segment.push(ch);
+                        display_col = ch_end;
+                    }
+                    if !segment.is_empty() {
+                        let style = if segment_selected == Some(true) {
+                            span.style.bg(Color::Blue).fg(Color::Black)
+                        } else {
+                            span.style
+                        };
+                        spans.push(Span::styled(segment, style));
+                    }
+                }
+                selected_lines.push(if spans.is_empty() {
+                    base_line.clone()
+                } else {
+                    Line::from(spans)
+                });
+            } else {
+                selected_lines.push(base_line.clone());
+            }
+        }
+        Text::from(selected_lines)
+    } else {
+        Text::from(lines)
+    };
+
     let conversation = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
         .scroll((scroll.min(u16::MAX as u32) as u16, 0));
 
     frame.render_widget(conversation, area);
