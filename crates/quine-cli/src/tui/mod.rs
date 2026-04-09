@@ -2,11 +2,17 @@ mod app;
 mod ui;
 
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use base64::Engine;
 use crossterm::cursor::MoveTo;
-use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyModifiers};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
@@ -313,6 +319,7 @@ pub async fn run_tui_chat(
     auto_approve: bool,
     resume_checkpoint: Option<&str>,
     model_profile: Option<&str>,
+    capture_mouse: bool,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let available_skills = fetch_available_skills(&mut client).await?;
@@ -333,6 +340,9 @@ pub async fn run_tui_chat(
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     stdout.execute(EnterAlternateScreen)?;
+    if capture_mouse {
+        stdout.execute(EnableMouseCapture)?;
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
@@ -342,6 +352,9 @@ pub async fn run_tui_chat(
     std::panic::set_hook(Box::new(move |info| {
         let mut stdout = std::io::stdout();
         let _ = disable_raw_mode();
+        if capture_mouse {
+            let _ = stdout.execute(DisableMouseCapture);
+        }
         let _ = stdout.execute(LeaveAlternateScreen);
         let _ = stdout.execute(Clear(ClearType::All));
         let _ = stdout.execute(MoveTo(0, 0));
@@ -392,6 +405,9 @@ pub async fn run_tui_chat(
 
     // Restore terminal.
     disable_raw_mode()?;
+    if capture_mouse {
+        terminal.backend_mut().execute(DisableMouseCapture)?;
+    }
     terminal.backend_mut().execute(LeaveAlternateScreen)?;
     terminal.backend_mut().execute(Clear(ClearType::All))?;
     terminal.backend_mut().execute(MoveTo(0, 0))?;
@@ -497,6 +513,176 @@ fn request_plan_exit_confirmation_after_turn_complete(app: &mut app::App) {
             });
     if let Some(pending_exit) = pending_plan_exit {
         app.request_plan_exit_confirmation(pending_exit);
+    }
+}
+
+fn mouse_scroll_step(view_height: u32) -> u32 {
+    if view_height > 6 {
+        (view_height / 3).max(3)
+    } else {
+        3
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn try_arboard_copy(text: &str) -> Result<&'static str, String> {
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("arboard init failed: {error}"))?;
+    clipboard
+        .set_text(text.to_string())
+        .map_err(|error| format!("arboard copy failed: {error}"))?;
+    Ok("arboard")
+}
+
+#[cfg(target_os = "macos")]
+fn try_pbcopy(text: &str) -> Result<&'static str, String> {
+    let mut child = Command::new("/usr/bin/pbcopy")
+        .stdin(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to launch pbcopy: {error}"))?;
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| "pbcopy stdin unavailable".to_string())?;
+    stdin
+        .write_all(text.as_bytes())
+        .map_err(|error| format!("failed to write to pbcopy: {error}"))?;
+    drop(stdin);
+    let status = child
+        .wait()
+        .map_err(|error| format!("failed waiting for pbcopy: {error}"))?;
+    if status.success() {
+        Ok("pbcopy")
+    } else {
+        Err(format!("pbcopy exited with status {status}"))
+    }
+}
+
+fn try_osc52(text: &str) -> Result<&'static str, String> {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut stdout = std::io::stdout();
+    stdout
+        .write_all(format!("\u{1b}]52;c;{encoded}\u{07}").as_bytes())
+        .map_err(|error| format!("failed to write OSC 52 clipboard sequence: {error}"))?;
+    stdout
+        .flush()
+        .map_err(|error| format!("failed to flush OSC 52 clipboard sequence: {error}"))?;
+    Ok("osc52")
+}
+
+fn copy_selection_to_pasteboard(text: &str) -> Result<String, String> {
+    let mut errors = Vec::new();
+
+    #[cfg(target_os = "macos")]
+    {
+        match try_pbcopy(text) {
+            Ok(backend) => return Ok(backend.to_string()),
+            Err(error) => errors.push(error),
+        }
+
+        match try_osc52(text) {
+            Ok(backend) => Ok(format!("{backend} ({})", errors.join(" | "))),
+            Err(error) => {
+                errors.push(error);
+                Err(errors.join(" | "))
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    match try_arboard_copy(text) {
+        Ok(backend) => return Ok(backend.to_string()),
+        Err(error) => errors.push(error),
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    match try_osc52(text) {
+        Ok(backend) => {
+            if errors.is_empty() {
+                Ok(backend.to_string())
+            } else {
+                Ok(format!("{backend} ({})", errors.join(" | ")))
+            }
+        }
+        Err(error) => {
+            errors.push(error);
+            Err(errors.join(" | "))
+        }
+    }
+}
+
+fn copy_current_conversation_selection(app: &mut app::App) {
+    let Some(text) = app.selected_conversation_text() else {
+        return;
+    };
+    match copy_selection_to_pasteboard(&text) {
+        Ok(backend) => {
+            app.set_status_notice(format!(
+                "copied {} chars via {backend}",
+                text.chars().count()
+            ));
+        }
+        Err(error) => {
+            app.set_status_notice(format!("copy failed: {error}"));
+        }
+    }
+}
+
+fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction> {
+    let step = mouse_scroll_step(app.last_view_height);
+    match event.kind {
+        MouseEventKind::ScrollUp => {
+            if app.context_explorer_active() {
+                app.context_explorer_scroll_up(step.min(u16::MAX as u32) as u16);
+            } else {
+                app.scroll_up(step);
+            }
+            None
+        }
+        MouseEventKind::ScrollDown => {
+            if app.context_explorer_active() {
+                app.context_explorer_scroll_down(step.min(u16::MAX as u32) as u16);
+            } else {
+                app.scroll_down(step);
+            }
+            None
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if !app.context_explorer_active()
+                && app.begin_conversation_drag_at_mouse(event.column, event.row)
+            {
+                app.set_status_notice("selection started");
+            }
+            None
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if !app.context_explorer_active()
+                && app.update_conversation_drag_at_mouse(event.column, event.row)
+            {
+                if let Some(text) = app.selected_conversation_text() {
+                    app.set_status_notice(format!("selecting {} chars", text.chars().count()));
+                } else {
+                    app.set_status_notice("drag received");
+                }
+                copy_current_conversation_selection(app);
+            }
+            None
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            if !app.context_explorer_active() {
+                if app
+                    .finish_conversation_drag_at_mouse(event.column, event.row)
+                    .is_some()
+                {
+                    app.set_status_notice("selection released");
+                    copy_current_conversation_selection(app);
+                } else {
+                    app.set_status_notice("mouse up received");
+                }
+            }
+            None
+        }
+        _ => None,
     }
 }
 
@@ -755,7 +941,7 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 _ => None,
             }
         }
-        Event::Mouse(_) => None,
+        Event::Mouse(event) => handle_mouse_event(app, event),
         Event::Resize(_, _) => None, // ratatui redraws on next frame.
         _ => None,
     }
@@ -1225,6 +1411,131 @@ mod tests {
         assert!(action.is_none());
         assert_eq!(app.input.content(), "/model local-qwen-coder");
         assert!(!app.model_select_active);
+    }
+
+    #[test]
+    fn mouse_scroll_up_moves_conversation_scroll() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.last_view_height = 12;
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(app.scroll_offset, 4);
+        assert!(app.user_scrolled);
+    }
+
+    #[test]
+    fn mouse_scroll_down_moves_conversation_toward_bottom() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.last_view_height = 12;
+        app.scroll_up(10);
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(app.scroll_offset, 6);
+        assert!(app.user_scrolled);
+    }
+
+    #[test]
+    fn mouse_scroll_targets_context_explorer_when_open() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.last_view_height = 15;
+        app.open_context_explorer(crate::context_debug::SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: Vec::new(),
+            working_directory: std::path::PathBuf::from("."),
+            plan_mode: false,
+            available_tools: Vec::new(),
+            loaded_skills: Vec::new(),
+            plans: Vec::new(),
+            lineage: crate::context_debug::SessionLineageSnapshot {
+                parent_id: None,
+                root_id: "session-1".into(),
+                depth: 0,
+                child_ids: Vec::new(),
+            },
+            prompt_memory: None,
+            compact_memory_summary_markdown: None,
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            status_report: None,
+            history: Vec::new(),
+        });
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(
+            app.context_explorer
+                .as_ref()
+                .map(|explorer| explorer.scroll_offset),
+            Some(5)
+        );
+        assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn mouse_drag_updates_conversation_selection() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.set_conversation_viewport(0, 0, 40, 10, 0);
+
+        let down = handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 2,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+        let drag = handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::Drag(MouseButton::Left),
+                column: 6,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+
+        assert!(down.is_none());
+        assert!(drag.is_none());
+        assert_eq!(
+            app.conversation_selection,
+            Some(app::ConversationSelection {
+                anchor: app::ConversationSelectionPoint { row: 1, col: 2 },
+                focus: app::ConversationSelectionPoint { row: 1, col: 6 },
+            })
+        );
     }
 
     #[test]

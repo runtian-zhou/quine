@@ -2291,11 +2291,19 @@ fn status_report_progress(
     u8::try_from(bounded).unwrap_or(100)
 }
 
+fn status_report_confidence(stage: StatusReportStage, prior_confidence: Option<u8>) -> u8 {
+    match stage {
+        StatusReportStage::Completed => prior_confidence.unwrap_or(85).clamp(1, 100),
+        StatusReportStage::ReviewingResults => prior_confidence.unwrap_or(60).clamp(1, 95),
+    }
+}
+
 fn build_status_report(
     tool_rounds_observed: u32,
     threshold: u32,
     current_round_tool_calls: usize,
     stage: StatusReportStage,
+    prior_confidence: Option<u8>,
 ) -> SessionStatusReport {
     let tool_calls = tool_call_count_label(current_round_tool_calls);
     let completed_summary = match stage {
@@ -2316,6 +2324,7 @@ fn build_status_report(
     SessionStatusReport::new(
         !matches!(stage, StatusReportStage::Completed),
         status_report_progress(tool_rounds_observed, threshold, stage),
+        status_report_confidence(stage, prior_confidence),
         completed_summary,
         remaining_summary,
         tool_rounds_observed,
@@ -2344,6 +2353,7 @@ async fn set_session_status_report(
 #[derive(Deserialize)]
 struct ModelStatusReportPayload {
     progress_percent: u8,
+    confidence_percent: u8,
     completed_summary: String,
     remaining_summary: String,
 }
@@ -2352,6 +2362,21 @@ fn current_turn_messages(history: &[Message]) -> &[Message] {
     latest_user_message_index(history)
         .map(|index| &history[index..])
         .unwrap_or(history)
+}
+
+fn latest_user_request_text(history: &[Message]) -> Option<&str> {
+    current_turn_messages(history).iter().find_map(|message| {
+        if message.role != quine_llm::Role::User {
+            return None;
+        }
+        match &message.content {
+            MessageContent::Text(text) => {
+                let trimmed = text.trim();
+                (!trimmed.is_empty()).then_some(trimmed)
+            }
+            MessageContent::ToolUse { .. } | MessageContent::ToolResult { .. } => None,
+        }
+    })
 }
 
 fn truncate_status_report_text(text: &str, max_chars: usize) -> String {
@@ -2438,6 +2463,8 @@ async fn generate_status_report_with_model(
     stage: StatusReportStage,
 ) -> SessionStatusReport {
     let transcript = render_status_report_transcript(&session.history);
+    let latest_user_request =
+        latest_user_request_text(&session.history).unwrap_or("No explicit user request captured.");
     let tool_rounds_observed = session.current_turn_tool_rounds;
     let threshold = session
         .persisted_config
@@ -2451,13 +2478,17 @@ async fn generate_status_report_with_model(
     };
     let messages = [
         Message::system(
-            "You generate internal status reports for a coding-agent UI. Return JSON only with keys progress_percent, completed_summary, and remaining_summary. completed_summary and remaining_summary must each be exactly one sentence. Do not include markdown fences or extra commentary.",
+            "You generate internal status reports for a coding-agent UI. Return JSON only with keys progress_percent, confidence_percent, completed_summary, and remaining_summary. completed_summary and remaining_summary must each be exactly one sentence. Evaluate progress_percent against the full amount of work required by the latest user request, not against tool counts, elapsed time, or transcript length. Set confidence_percent to your confidence that the agent can fully complete the latest user request from the current trajectory and evidence. Do not include markdown fences or extra commentary.",
         ),
         Message::user(format!(
             "Generate a concise status report for this in-progress coding turn.\n\
+             Latest user request:\n{latest_user_request}\n\n\
              Tool rounds observed in this turn: {tool_rounds_observed}\n\
              Reporting threshold: {threshold}\n\
              Current round tool calls: {current_round_tool_calls}\n\
+             Estimate confidence_percent as your confidence that the agent can fully complete the latest user request from the current trajectory and evidence.\n\
+             Do not use tool rounds, tool calls, or transcript length as a proxy for progress.\n\
+             Use tool activity only as evidence for what is done and what still needs work.\n\
              {completion_hint}\n\n\
              Current user-turn transcript:\n{transcript}"
         )),
@@ -2474,9 +2505,11 @@ async fn generate_status_report_with_model(
                     StatusReportStage::Completed => 100,
                     _ => payload.progress_percent.clamp(1, 95),
                 };
+                let confidence_percent = payload.confidence_percent.clamp(1, 100);
                 SessionStatusReport::new(
                     !matches!(stage, StatusReportStage::Completed),
                     progress_percent,
+                    confidence_percent,
                     payload
                         .completed_summary
                         .split_whitespace()
@@ -2495,6 +2528,10 @@ async fn generate_status_report_with_model(
                     threshold,
                     current_round_tool_calls,
                     stage,
+                    session
+                        .status_report
+                        .as_ref()
+                        .map(|report| report.confidence_percent),
                 )
             }
         }
@@ -2503,6 +2540,10 @@ async fn generate_status_report_with_model(
             threshold,
             current_round_tool_calls,
             stage,
+            session
+                .status_report
+                .as_ref()
+                .map(|report| report.confidence_percent),
         ),
     }
 }

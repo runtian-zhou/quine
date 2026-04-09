@@ -16,10 +16,16 @@ mod usage;
 
 use std::io::IsTerminal;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use quine_harness::default_socket_path;
 
 const GIT_HASH: &str = env!("QUINE_GIT_HASH");
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum TuiMouseMode {
+    Capture,
+    Passthrough,
+}
 
 #[derive(Parser)]
 #[command(name = "quine", about = "Quine AI coding agent CLI")]
@@ -50,6 +56,9 @@ enum Commands {
         /// Named model profile for this session.
         #[arg(long)]
         model_profile: Option<String>,
+        /// TUI mouse handling mode.
+        #[arg(long, value_enum, default_value_t = TuiMouseMode::Passthrough)]
+        tui_mouse_mode: TuiMouseMode,
     },
     /// Send a one-shot message to the agent and exit.
     Run {
@@ -289,6 +298,7 @@ async fn main() -> anyhow::Result<()> {
             auto_approve,
             resume,
             model_profile,
+            tui_mouse_mode,
         } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
@@ -301,6 +311,7 @@ async fn main() -> anyhow::Result<()> {
                     auto_approve,
                     resume.as_deref(),
                     model_profile.as_deref(),
+                    matches!(tui_mouse_mode, TuiMouseMode::Capture),
                 )
                 .await?;
             } else {
@@ -511,4 +522,34 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chat_command_defaults_tui_mouse_mode_to_passthrough() {
+        let cli = Cli::try_parse_from(["quine", "chat"]).expect("parse chat command");
+
+        match cli.command {
+            Commands::Chat { tui_mouse_mode, .. } => {
+                assert_eq!(tui_mouse_mode, TuiMouseMode::Passthrough);
+            }
+            _ => panic!("expected chat command"),
+        }
+    }
+
+    #[test]
+    fn chat_command_accepts_passthrough_tui_mouse_mode() {
+        let cli = Cli::try_parse_from(["quine", "chat", "--tui-mouse-mode", "passthrough"])
+            .expect("parse chat command with mouse mode");
+
+        match cli.command {
+            Commands::Chat { tui_mouse_mode, .. } => {
+                assert_eq!(tui_mouse_mode, TuiMouseMode::Passthrough);
+            }
+            _ => panic!("expected chat command"),
+        }
+    }
 }

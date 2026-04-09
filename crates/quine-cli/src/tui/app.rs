@@ -7,7 +7,7 @@ use crate::context_debug::{HistoryEntry, SessionContextSnapshot, SessionStatusRe
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{notifications, JsonRpcNotification};
 use ratatui::text::Line;
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 /// Spinner braille frames for the waiting animation.
 const SPINNER_FRAMES: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -496,6 +496,7 @@ pub struct App {
     pub status_report: Option<SessionStatusReportSnapshot>,
     last_backend_event_at: Option<Instant>,
     last_backend_event_label: Option<&'static str>,
+    status_notice: Option<(String, Instant)>,
     pub scroll_offset: u32,
     pub user_scrolled: bool,
     pub input: InputBuffer,
@@ -528,6 +529,9 @@ pub struct App {
     pub pending_plan_exit: Option<PendingPlanExit>,
     /// Last known conversation view height (set during rendering for scroll step sizing).
     pub last_view_height: u32,
+    pub conversation_viewport: Option<ConversationViewport>,
+    pub conversation_selection: Option<ConversationSelection>,
+    conversation_drag_anchor: Option<ConversationSelectionPoint>,
     /// Interactive explorer for large `/context` snapshots in the TUI.
     pub context_explorer: Option<ContextExplorerState>,
     /// Monotonic revision for conversation-affecting state.
@@ -540,7 +544,29 @@ pub struct ConversationRenderCache {
     pub width: u16,
     pub revision: u64,
     pub lines: Vec<Line<'static>>,
+    pub visual_lines: Vec<String>,
     pub content_height: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversationViewport {
+    pub x: u16,
+    pub y: u16,
+    pub width: u16,
+    pub height: u16,
+    pub top_row: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversationSelectionPoint {
+    pub row: u32,
+    pub col: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConversationSelection {
+    pub anchor: ConversationSelectionPoint,
+    pub focus: ConversationSelectionPoint,
 }
 
 struct LoopCommand {
@@ -652,6 +678,7 @@ impl App {
             status_report: None,
             last_backend_event_at: None,
             last_backend_event_label: None,
+            status_notice: None,
             scroll_offset: 0,
             user_scrolled: false,
             input: InputBuffer::new(),
@@ -675,6 +702,9 @@ impl App {
             plan_mode,
             pending_plan_exit: None,
             last_view_height: 0,
+            conversation_viewport: None,
+            conversation_selection: None,
+            conversation_drag_anchor: None,
             context_explorer: None,
             conversation_revision: 0,
             conversation_cache: None,
@@ -684,6 +714,8 @@ impl App {
     fn invalidate_conversation_cache(&mut self) {
         self.conversation_revision = self.conversation_revision.wrapping_add(1);
         self.conversation_cache = None;
+        self.conversation_selection = None;
+        self.conversation_drag_anchor = None;
     }
 
     pub fn conversation_revision(&self) -> u64 {
@@ -712,12 +744,15 @@ impl App {
         }
         self.current_turn_assistant_text = None;
         self.status_report = None;
+        self.status_notice = None;
         self.interaction_queue.clear();
         self.option_select = None;
         self.slash_select_active = false;
         self.model_select_active = false;
         self.switch_select_active = false;
         self.pending_plan_exit = None;
+        self.conversation_selection = None;
+        self.conversation_drag_anchor = None;
         self.context_explorer = None;
         self.auto_scroll();
     }
@@ -736,6 +771,7 @@ impl App {
         self.status_report = None;
         self.last_backend_event_at = None;
         self.last_backend_event_label = None;
+        self.status_notice = None;
         self.scroll_offset = 0;
         self.user_scrolled = false;
         self.interaction_queue.clear();
@@ -753,6 +789,9 @@ impl App {
         self.switch_session_candidates.clear();
         self.plan_mode = plan_mode;
         self.pending_plan_exit = None;
+        self.conversation_viewport = None;
+        self.conversation_selection = None;
+        self.conversation_drag_anchor = None;
         self.context_explorer = None;
         self.invalidate_conversation_cache();
         self.auto_scroll();
@@ -839,8 +878,21 @@ impl App {
         };
 
         match self.backend_activity_text() {
-            Some(activity) => format!("{base} · {activity}"),
-            None => base,
+            Some(activity) => {
+                let mut status = format!("{base} · {activity}");
+                if let Some(notice) = self.status_notice_text() {
+                    status.push_str(" · ");
+                    status.push_str(&notice);
+                }
+                status
+            }
+            None => {
+                if let Some(notice) = self.status_notice_text() {
+                    format!("{base} · {notice}")
+                } else {
+                    base
+                }
+            }
         }
     }
 
@@ -865,6 +917,25 @@ impl App {
         };
 
         Some(format!("{prefix}: {label} {age_secs}s ago"))
+    }
+
+    fn status_notice_text(&self) -> Option<String> {
+        const NOTICE_TTL_SECS: u64 = 3;
+
+        let (message, created_at) = self.status_notice.as_ref()?;
+        (Instant::now()
+            .saturating_duration_since(*created_at)
+            .as_secs()
+            < NOTICE_TTL_SECS)
+            .then(|| message.clone())
+    }
+
+    pub fn current_status_notice(&self) -> Option<String> {
+        self.status_notice_text()
+    }
+
+    pub fn set_status_notice(&mut self, message: impl Into<String>) {
+        self.status_notice = Some((message.into(), Instant::now()));
     }
 
     /// Get the label for the input box.
@@ -1761,6 +1832,191 @@ impl App {
         }
     }
 
+    pub fn set_conversation_viewport(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        height: u16,
+        top_row: u32,
+    ) {
+        self.conversation_viewport = Some(ConversationViewport {
+            x,
+            y,
+            width,
+            height,
+            top_row,
+        });
+    }
+
+    fn conversation_point_at_mouse(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<ConversationSelectionPoint> {
+        let viewport = self.conversation_viewport?;
+        let max_x = viewport.x.saturating_add(viewport.width);
+        let max_y = viewport.y.saturating_add(viewport.height);
+        if column < viewport.x || column >= max_x || row < viewport.y || row >= max_y {
+            return None;
+        }
+
+        Some(ConversationSelectionPoint {
+            row: viewport.top_row + u32::from(row.saturating_sub(viewport.y)),
+            col: column.saturating_sub(viewport.x),
+        })
+    }
+
+    fn conversation_point_at_mouse_clamped(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<ConversationSelectionPoint> {
+        let viewport = self.conversation_viewport?;
+        if viewport.width == 0 || viewport.height == 0 {
+            return None;
+        }
+
+        let max_x = viewport.x + viewport.width.saturating_sub(1);
+        let max_y = viewport.y + viewport.height.saturating_sub(1);
+        let clamped_x = column.clamp(viewport.x, max_x);
+        let clamped_y = row.clamp(viewport.y, max_y);
+
+        Some(ConversationSelectionPoint {
+            row: viewport.top_row + u32::from(clamped_y.saturating_sub(viewport.y)),
+            col: clamped_x.saturating_sub(viewport.x),
+        })
+    }
+
+    pub fn begin_conversation_drag_at_mouse(&mut self, column: u16, row: u16) -> bool {
+        let Some(point) = self.conversation_point_at_mouse(column, row) else {
+            self.clear_conversation_selection();
+            return false;
+        };
+        self.conversation_drag_anchor = Some(point);
+        self.conversation_selection = None;
+        true
+    }
+
+    pub fn update_conversation_drag_at_mouse(&mut self, column: u16, row: u16) -> bool {
+        let Some(anchor) = self.conversation_drag_anchor else {
+            return false;
+        };
+        let Some(focus) = self.conversation_point_at_mouse_clamped(column, row) else {
+            return false;
+        };
+        self.conversation_selection = Some(ConversationSelection { anchor, focus });
+        true
+    }
+
+    pub fn finish_conversation_drag_at_mouse(&mut self, column: u16, row: u16) -> Option<String> {
+        let anchor = self.conversation_drag_anchor.take()?;
+        let focus = self.conversation_point_at_mouse_clamped(column, row)?;
+        if anchor == focus {
+            self.conversation_selection = None;
+            return None;
+        }
+
+        self.conversation_selection = Some(ConversationSelection { anchor, focus });
+        self.selected_conversation_text()
+    }
+
+    pub fn clear_conversation_selection(&mut self) {
+        self.conversation_selection = None;
+        self.conversation_drag_anchor = None;
+    }
+
+    pub fn has_conversation_selection(&self) -> bool {
+        self.conversation_selection.is_some()
+    }
+
+    fn ordered_conversation_selection(
+        &self,
+    ) -> Option<(ConversationSelectionPoint, ConversationSelectionPoint)> {
+        let selection = self.conversation_selection?;
+        if (selection.anchor.row, selection.anchor.col)
+            <= (selection.focus.row, selection.focus.col)
+        {
+            Some((
+                selection.anchor,
+                ConversationSelectionPoint {
+                    row: selection.focus.row,
+                    col: selection.focus.col.saturating_add(1),
+                },
+            ))
+        } else {
+            Some((
+                selection.focus,
+                ConversationSelectionPoint {
+                    row: selection.anchor.row,
+                    col: selection.anchor.col.saturating_add(1),
+                },
+            ))
+        }
+    }
+
+    pub fn conversation_selection_columns_for_visual_row(
+        &self,
+        row: u32,
+        line: &str,
+    ) -> Option<(usize, usize)> {
+        let (start, end) = self.ordered_conversation_selection()?;
+        if row < start.row || row > end.row {
+            return None;
+        }
+
+        let line_width = line.width();
+        let start_col = if row == start.row {
+            usize::from(start.col).min(line_width)
+        } else {
+            0
+        };
+        let end_col = if row == end.row {
+            usize::from(end.col).min(line_width)
+        } else {
+            line_width
+        };
+
+        (start_col < end_col).then_some((start_col, end_col))
+    }
+
+    pub fn selected_conversation_text(&self) -> Option<String> {
+        let visual_lines = &self.conversation_cache.as_ref()?.visual_lines;
+        let (start, end) = self.ordered_conversation_selection()?;
+        let end_row = end.row.min(visual_lines.len().saturating_sub(1) as u32);
+        let mut chunks = Vec::new();
+
+        for row in start.row..=end_row {
+            let line = visual_lines.get(row as usize)?;
+            let Some((start_col, end_col)) =
+                self.conversation_selection_columns_for_visual_row(row, line)
+            else {
+                continue;
+            };
+
+            let mut segment = String::new();
+            let mut display_col = 0usize;
+            for ch in line.chars() {
+                let ch_width = ch.width().unwrap_or(0).max(1);
+                let ch_start = display_col;
+                let ch_end = display_col + ch_width;
+                if ch_end <= start_col {
+                    display_col = ch_end;
+                    continue;
+                }
+                if ch_start >= end_col {
+                    break;
+                }
+                segment.push(ch);
+                display_col = ch_end;
+            }
+            chunks.push(segment);
+        }
+
+        let text = chunks.join("\n");
+        (!text.is_empty()).then_some(text)
+    }
+
     /// Apply an incoming notification from the daemon to app state.
     pub fn apply_notification(&mut self, notif: &JsonRpcNotification) {
         if notification_session_id(notif).is_some_and(|session_id| session_id != self.session_id) {
@@ -2241,6 +2497,53 @@ mod tests {
         assert_eq!(explorer.active_tab, ContextExplorerTab::Skills);
         assert_eq!(explorer.selected_index, 0);
         assert_eq!(explorer.scroll_offset, 0);
+    }
+
+    #[test]
+    fn selected_conversation_text_uses_visual_line_ranges() {
+        let mut app = App::new("session".into(), false, None);
+        app.conversation_cache = Some(ConversationRenderCache {
+            width: 40,
+            revision: 0,
+            lines: Vec::new(),
+            visual_lines: vec!["alpha beta".into(), "gamma delta".into(), "omega".into()],
+            content_height: 3,
+        });
+        app.conversation_selection = Some(ConversationSelection {
+            anchor: ConversationSelectionPoint { row: 0, col: 6 },
+            focus: ConversationSelectionPoint { row: 1, col: 4 },
+        });
+
+        assert_eq!(
+            app.selected_conversation_text().as_deref(),
+            Some("beta\ngamma")
+        );
+    }
+
+    #[test]
+    fn selected_conversation_text_handles_reverse_drag() {
+        let mut app = App::new("session".into(), false, None);
+        app.conversation_cache = Some(ConversationRenderCache {
+            width: 40,
+            revision: 0,
+            lines: Vec::new(),
+            visual_lines: vec!["0123456789".into()],
+            content_height: 1,
+        });
+        app.conversation_selection = Some(ConversationSelection {
+            anchor: ConversationSelectionPoint { row: 0, col: 7 },
+            focus: ConversationSelectionPoint { row: 0, col: 3 },
+        });
+
+        assert_eq!(app.selected_conversation_text().as_deref(), Some("34567"));
+    }
+
+    #[test]
+    fn phase_status_text_includes_recent_status_notice() {
+        let mut app = App::new("session".into(), false, None);
+        app.set_status_notice("copied 12 chars");
+
+        assert!(app.phase_status_text().contains("copied 12 chars"));
     }
 
     #[test]
