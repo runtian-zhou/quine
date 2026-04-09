@@ -923,7 +923,10 @@ impl App {
         const NOTICE_TTL_SECS: u64 = 3;
 
         let (message, created_at) = self.status_notice.as_ref()?;
-        (Instant::now().saturating_duration_since(*created_at).as_secs() < NOTICE_TTL_SECS)
+        (Instant::now()
+            .saturating_duration_since(*created_at)
+            .as_secs()
+            < NOTICE_TTL_SECS)
             .then(|| message.clone())
     }
 
@@ -1906,11 +1909,7 @@ impl App {
         true
     }
 
-    pub fn finish_conversation_drag_at_mouse(
-        &mut self,
-        column: u16,
-        row: u16,
-    ) -> Option<String> {
+    pub fn finish_conversation_drag_at_mouse(&mut self, column: u16, row: u16) -> Option<String> {
         let anchor = self.conversation_drag_anchor.take()?;
         let focus = self.conversation_point_at_mouse_clamped(column, row)?;
         if anchor == focus {
@@ -1935,7 +1934,8 @@ impl App {
         &self,
     ) -> Option<(ConversationSelectionPoint, ConversationSelectionPoint)> {
         let selection = self.conversation_selection?;
-        if (selection.anchor.row, selection.anchor.col) <= (selection.focus.row, selection.focus.col)
+        if (selection.anchor.row, selection.anchor.col)
+            <= (selection.focus.row, selection.focus.col)
         {
             Some((
                 selection.anchor,
@@ -2506,11 +2506,7 @@ mod tests {
             width: 40,
             revision: 0,
             lines: Vec::new(),
-            visual_lines: vec![
-                "alpha beta".into(),
-                "gamma delta".into(),
-                "omega".into(),
-            ],
+            visual_lines: vec!["alpha beta".into(), "gamma delta".into(), "omega".into()],
             content_height: 3,
         });
         app.conversation_selection = Some(ConversationSelection {

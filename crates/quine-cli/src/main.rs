@@ -542,13 +542,8 @@ mod tests {
 
     #[test]
     fn chat_command_accepts_passthrough_tui_mouse_mode() {
-        let cli = Cli::try_parse_from([
-            "quine",
-            "chat",
-            "--tui-mouse-mode",
-            "passthrough",
-        ])
-        .expect("parse chat command with mouse mode");
+        let cli = Cli::try_parse_from(["quine", "chat", "--tui-mouse-mode", "passthrough"])
+            .expect("parse chat command with mouse mode");
 
         match cli.command {
             Commands::Chat { tui_mouse_mode, .. } => {

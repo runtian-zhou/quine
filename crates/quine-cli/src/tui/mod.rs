@@ -4,6 +4,7 @@ mod ui;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use base64::Engine;
@@ -525,8 +526,8 @@ fn mouse_scroll_step(view_height: u32) -> u32 {
 
 #[cfg(not(target_os = "macos"))]
 fn try_arboard_copy(text: &str) -> Result<&'static str, String> {
-    let mut clipboard = arboard::Clipboard::new()
-        .map_err(|error| format!("arboard init failed: {error}"))?;
+    let mut clipboard =
+        arboard::Clipboard::new().map_err(|error| format!("arboard init failed: {error}"))?;
     clipboard
         .set_text(text.to_string())
         .map_err(|error| format!("arboard copy failed: {error}"))?;
@@ -579,13 +580,13 @@ fn copy_selection_to_pasteboard(text: &str) -> Result<String, String> {
             Err(error) => errors.push(error),
         }
 
-        return match try_osc52(text) {
+        match try_osc52(text) {
             Ok(backend) => Ok(format!("{backend} ({})", errors.join(" | "))),
             Err(error) => {
                 errors.push(error);
                 Err(errors.join(" | "))
             }
-        };
+        }
     }
 
     #[cfg(not(target_os = "macos"))]
@@ -647,23 +648,23 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
             None
         }
         MouseEventKind::Down(MouseButton::Left) => {
-            if !app.context_explorer_active() {
-                if app.begin_conversation_drag_at_mouse(event.column, event.row) {
-                    app.set_status_notice("selection started");
-                }
+            if !app.context_explorer_active()
+                && app.begin_conversation_drag_at_mouse(event.column, event.row)
+            {
+                app.set_status_notice("selection started");
             }
             None
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            if !app.context_explorer_active() {
-                if app.update_conversation_drag_at_mouse(event.column, event.row) {
-                    if let Some(text) = app.selected_conversation_text() {
-                        app.set_status_notice(format!("selecting {} chars", text.chars().count()));
-                    } else {
-                        app.set_status_notice("drag received");
-                    }
-                    copy_current_conversation_selection(app);
+            if !app.context_explorer_active()
+                && app.update_conversation_drag_at_mouse(event.column, event.row)
+            {
+                if let Some(text) = app.selected_conversation_text() {
+                    app.set_status_notice(format!("selecting {} chars", text.chars().count()));
+                } else {
+                    app.set_status_notice("drag received");
                 }
+                copy_current_conversation_selection(app);
             }
             None
         }
@@ -1494,7 +1495,9 @@ mod tests {
 
         assert!(action.is_none());
         assert_eq!(
-            app.context_explorer.as_ref().map(|explorer| explorer.scroll_offset),
+            app.context_explorer
+                .as_ref()
+                .map(|explorer| explorer.scroll_offset),
             Some(5)
         );
         assert_eq!(app.scroll_offset, 0);

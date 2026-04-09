@@ -790,18 +790,18 @@ fn wrap_styled_line(line: &Line<'static>, area_width: u16) -> Vec<Line<'static>>
     let mut has_segment = false;
     let mut current_width = 0usize;
 
-    let flush_segment =
-        |current_line_spans: &mut Vec<Span<'static>>,
-         current_segment: &mut String,
-         current_style: Style,
-         has_segment: &mut bool| {
-            if !current_segment.is_empty() {
-                current_line_spans.push(Span::styled(std::mem::take(current_segment), current_style));
-            }
-            *has_segment = false;
-        };
+    let flush_segment = |current_line_spans: &mut Vec<Span<'static>>,
+                         current_segment: &mut String,
+                         current_style: Style,
+                         has_segment: &mut bool| {
+        if !current_segment.is_empty() {
+            current_line_spans.push(Span::styled(std::mem::take(current_segment), current_style));
+        }
+        *has_segment = false;
+    };
 
-    let flush_line = |wrapped: &mut Vec<Line<'static>>, current_line_spans: &mut Vec<Span<'static>>| {
+    let flush_line = |wrapped: &mut Vec<Line<'static>>,
+                      current_line_spans: &mut Vec<Span<'static>>| {
         if current_line_spans.is_empty() {
             wrapped.push(Line::from(""));
         } else {
@@ -853,7 +853,10 @@ fn wrap_styled_line(line: &Line<'static>, area_width: u16) -> Vec<Line<'static>>
     wrapped
 }
 
-fn build_conversation_wrapped_lines(lines: &[Line<'static>], area_width: u16) -> Vec<Line<'static>> {
+fn build_conversation_wrapped_lines(
+    lines: &[Line<'static>],
+    area_width: u16,
+) -> Vec<Line<'static>> {
     let mut wrapped = Vec::new();
     for line in lines {
         wrapped.extend(wrap_styled_line(line, area_width));
@@ -1001,11 +1004,7 @@ fn draw_status_notice_overlay(frame: &mut Frame, app: &App) {
         return;
     }
     let area = Rect {
-        x: frame
-            .area()
-            .width
-            .saturating_sub(width)
-            .saturating_sub(1),
+        x: frame.area().width.saturating_sub(width).saturating_sub(1),
         y: 1,
         width,
         height: 3,
@@ -1098,8 +1097,7 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
         Text::from(lines)
     };
 
-    let conversation = Paragraph::new(text)
-        .scroll((scroll.min(u16::MAX as u32) as u16, 0));
+    let conversation = Paragraph::new(text).scroll((scroll.min(u16::MAX as u32) as u16, 0));
 
     frame.render_widget(conversation, area);
 }

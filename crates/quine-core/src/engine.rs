@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -9,7 +10,7 @@ use quine_llm::{
     ToolDefinition, WebProvider,
 };
 use serde::Deserialize;
-use tokio::sync::{mpsc, oneshot, Notify};
+use tokio::sync::{mpsc, oneshot, Notify, RwLock};
 
 use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
@@ -61,6 +62,7 @@ using the tools available to you. Each message from the user is a new request â€
 respond to it directly. Use tools when needed to read files, run commands, or \
 write code. Be concise and accurate.";
 
+#[cfg_attr(not(test), allow(dead_code))]
 const CONCURRENT_TOOL_BATCH_ALLOWLIST: &[&str] = &["find", "read_file"];
 
 fn debug_enabled() -> bool {
@@ -306,6 +308,7 @@ struct SessionContext {
     current_turn_tool_rounds: u32,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Clone)]
 enum SuspendedWait {
     Mailbox {
@@ -320,6 +323,7 @@ enum SuspendedWait {
     },
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 impl SuspendedWait {
     fn depends_on(&self) -> Option<SessionId> {
         match self {
@@ -952,6 +956,65 @@ impl SessionContext {
     }
 }
 
+#[derive(Clone)]
+struct SessionHandle {
+    command_tx: mpsc::Sender<SessionCommand>,
+    provider: Arc<dyn LlmProvider>,
+    max_context_window: Option<u64>,
+    model_profile: Option<String>,
+}
+
+enum SessionCommand {
+    UserMessage(String),
+    ExitPlanMode {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    UpdateSessionLlm {
+        session_llm: crate::channel::SessionLlmConfig,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    CompactSession {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    ToolResult {
+        tool_use_id: String,
+        result: ToolOutcome,
+    },
+    InteractionResponse(InteractionResponse),
+    Cancel,
+    Signal(SessionSignal),
+    MailboxMessage(MailboxMessage),
+    Snapshot {
+        reply: oneshot::Sender<Option<PersistedSession>>,
+    },
+    SessionMemoryRefreshFinished {
+        last_summarized_message_index: Option<usize>,
+        refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
+        listing_summary: Option<String>,
+    },
+    QueryMailbox {
+        source: MessageSource,
+        reply: oneshot::Sender<Option<MailboxMessage>>,
+    },
+    ChildExited {
+        child_id: SessionId,
+        status: ExitStatus,
+    },
+    Shutdown,
+}
+
+enum RuntimeEvent {
+    ChildSessionFinished {
+        session_id: SessionId,
+        parent_id: SessionId,
+        status: ExitStatus,
+    },
+    CheckpointHint,
+}
+
+type SessionRegistry = Arc<RwLock<HashMap<SessionId, SessionHandle>>>;
+type SharedSessionTree = Arc<RwLock<SessionTree>>;
+
 fn mailbox_matches_source(message: &MailboxMessage, source: &MessageSource) -> bool {
     match source {
         MessageSource::Any => true,
@@ -969,6 +1032,7 @@ fn pop_mailbox_message(
     mailbox.remove(index)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn waiting_on_session(session: &SessionContext) -> Option<SessionId> {
     session
         .suspended_wait
@@ -976,6 +1040,7 @@ fn waiting_on_session(session: &SessionContext) -> Option<SessionId> {
         .and_then(SuspendedWait::depends_on)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn waiting_would_cycle(
     sessions: &HashMap<SessionId, SessionContext>,
     waiter: SessionId,
@@ -995,6 +1060,7 @@ fn waiting_would_cycle(
     false
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn waiting_would_cycle_including_session_tree(
     sessions: &HashMap<SessionId, SessionContext>,
     session_tree: &SessionTree,
@@ -1005,6 +1071,7 @@ fn waiting_would_cycle_including_session_tree(
         || session_tree.wait_would_cycle(waiter, dependency)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn emit_session_waiting(
     sessions: &HashMap<SessionId, SessionContext>,
     session_id: SessionId,
@@ -1020,6 +1087,7 @@ async fn emit_session_waiting(
     emit_checkpoint_request(sessions, session_tree, output).await;
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn resume_session_from_wait(
     sessions: &mut HashMap<SessionId, SessionContext>,
     session_id: SessionId,
@@ -1111,6 +1179,7 @@ async fn resume_session_from_wait(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn next_wait_deadline(sessions: &HashMap<SessionId, SessionContext>) -> Option<Instant> {
     sessions
         .values()
@@ -1123,6 +1192,7 @@ fn next_wait_deadline(sessions: &HashMap<SessionId, SessionContext>) -> Option<I
         .min()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn drain_wait_timeouts(
     sessions: &mut HashMap<SessionId, SessionContext>,
     io: &mut CoreIo<'_>,
@@ -1152,6 +1222,7 @@ async fn drain_wait_timeouts(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn handle_send_message_input(
     sessions: &mut HashMap<SessionId, SessionContext>,
     output: &mpsc::Sender<CoreOutput>,
@@ -1359,6 +1430,7 @@ async fn call_llm_with_messages(
     Ok(LlmCallResult { turn, usage })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn call_llm_interruptible(
     provider: &dyn LlmProvider,
     history: Vec<Message>,
@@ -1583,6 +1655,7 @@ enum LlmTurnResult {
     },
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct CoreIo<'a> {
     output: &'a mpsc::Sender<CoreOutput>,
     input: &'a mut mpsc::Receiver<CoreInput>,
@@ -1590,6 +1663,7 @@ struct CoreIo<'a> {
     deferred_inputs: &'a mut VecDeque<CoreInput>,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct EngineState<'a> {
     provider: &'a Arc<dyn LlmProvider>,
     session_tree: &'a mut SessionTree,
@@ -1602,11 +1676,13 @@ enum TurnOutcome {
     Suspended,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 enum SessionControlFlow {
     Continue,
     Interrupted,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 struct PreparedConcurrentToolCall {
     index: usize,
     tool_use_id: String,
@@ -1827,6 +1903,7 @@ fn session_output(session: &SessionContext) -> Option<String> {
     })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn interrupt_session(
     sessions: &mut HashMap<SessionId, SessionContext>,
     deferred_inputs: &mut VecDeque<CoreInput>,
@@ -1855,6 +1932,7 @@ fn interrupt_session(
     });
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn handle_session_control_input(
     input: CoreInput,
     session_id: SessionId,
@@ -1890,6 +1968,7 @@ fn handle_session_control_input(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn tool_call_is_concurrency_eligible(session: &SessionContext, call: &PendingToolCall) -> bool {
     CONCURRENT_TOOL_BATCH_ALLOWLIST.contains(&call.tool_name.as_str())
         && session
@@ -1900,6 +1979,7 @@ fn tool_call_is_concurrency_eligible(session: &SessionContext, call: &PendingToo
             })
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn tool_batch_is_concurrency_eligible(session: &SessionContext, calls: &[PendingToolCall]) -> bool {
     calls.len() > 1
         && calls
@@ -1907,6 +1987,7 @@ fn tool_batch_is_concurrency_eligible(session: &SessionContext, calls: &[Pending
             .all(|call| tool_call_is_concurrency_eligible(session, call))
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn partition_tool_calls_by_concurrency<'a>(
     session: &SessionContext,
     calls: &'a [PendingToolCall],
@@ -1929,6 +2010,7 @@ fn partition_tool_calls_by_concurrency<'a>(
     partitions
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn prepare_concurrent_tool_calls(
     session: &SessionContext,
     calls: &[PendingToolCall],
@@ -1952,6 +2034,7 @@ fn prepare_concurrent_tool_calls(
         .collect()
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn execute_concurrent_tool_batch(
     calls: Vec<PreparedConcurrentToolCall>,
     sessions: &mut HashMap<SessionId, SessionContext>,
@@ -2045,8 +2128,8 @@ async fn execute_concurrent_tool_batch(
                         interrupt_session(sessions, io.deferred_inputs, session_id);
                         let _ = cancel_tx.send(true);
                     }
-                    Some(input) => {
-                        io.deferred_inputs.push_back(input);
+                    Some(other) => {
+                        io.deferred_inputs.push_back(other);
                     }
                     None => {
                         debug_log_session(
@@ -2132,6 +2215,7 @@ async fn compact_session_history(
     Ok(true)
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn clear_suspended_wait(
     sessions: &mut HashMap<SessionId, SessionContext>,
     session_tree: &mut SessionTree,
@@ -2169,7 +2253,7 @@ fn tool_call_count_label(count: usize) -> String {
 
 fn should_emit_periodic_status_report(tool_rounds_observed: u32, threshold: u32) -> bool {
     let threshold = threshold.max(1);
-    tool_rounds_observed >= threshold && tool_rounds_observed % threshold == 0
+    tool_rounds_observed >= threshold && tool_rounds_observed.is_multiple_of(threshold)
 }
 
 fn should_emit_completed_status_report(
@@ -2180,14 +2264,34 @@ fn should_emit_completed_status_report(
     prior_report_exists || should_emit_periodic_status_report(tool_rounds_observed, threshold)
 }
 
-fn fallback_status_report_progress(stage: StatusReportStage, prior_progress: Option<u8>) -> u8 {
-    match stage {
-        StatusReportStage::Completed => 100,
-        StatusReportStage::ReviewingResults => prior_progress.unwrap_or(50).clamp(10, 95),
+fn status_report_progress(
+    tool_rounds_observed: u32,
+    threshold: u32,
+    stage: StatusReportStage,
+) -> u8 {
+    if matches!(stage, StatusReportStage::Completed) {
+        return 100;
     }
+
+    let threshold = threshold.max(1);
+    let estimated_total_rounds = tool_rounds_observed
+        .saturating_add((threshold / 2).max(2))
+        .max(tool_rounds_observed);
+    let total_units = estimated_total_rounds.saturating_mul(2).max(1);
+    let completed_units = match stage {
+        StatusReportStage::ReviewingResults | StatusReportStage::Completed => {
+            tool_rounds_observed.saturating_mul(2)
+        }
+    };
+    let raw_percent = completed_units.saturating_mul(100) / total_units;
+    let bounded = match stage {
+        StatusReportStage::ReviewingResults => raw_percent.clamp(10, 95),
+        StatusReportStage::Completed => 100,
+    };
+    u8::try_from(bounded).unwrap_or(100)
 }
 
-fn fallback_status_report_confidence(stage: StatusReportStage, prior_confidence: Option<u8>) -> u8 {
+fn status_report_confidence(stage: StatusReportStage, prior_confidence: Option<u8>) -> u8 {
     match stage {
         StatusReportStage::Completed => prior_confidence.unwrap_or(85).clamp(1, 100),
         StatusReportStage::ReviewingResults => prior_confidence.unwrap_or(60).clamp(1, 95),
@@ -2196,24 +2300,22 @@ fn fallback_status_report_confidence(stage: StatusReportStage, prior_confidence:
 
 fn build_status_report(
     tool_rounds_observed: u32,
+    threshold: u32,
     current_round_tool_calls: usize,
     stage: StatusReportStage,
-    prior_progress: Option<u8>,
     prior_confidence: Option<u8>,
 ) -> SessionStatusReport {
     let tool_calls = tool_call_count_label(current_round_tool_calls);
     let completed_summary = match stage {
-        StatusReportStage::ReviewingResults => {
-            format!("Completed another work step for the current request; the latest round finished {tool_calls}.")
-        }
-        StatusReportStage::Completed => {
-            "Finished the work needed for the current request and completed the response for this turn.".to_string()
-        }
+        StatusReportStage::ReviewingResults => format!(
+            "Completed {tool_rounds_observed} tool rounds so far; the latest round finished {tool_calls}."
+        ),
+        StatusReportStage::Completed => format!(
+            "Completed {tool_rounds_observed} tool rounds and finished the response for this turn."
+        ),
     };
     let remaining_summary = match stage {
-        StatusReportStage::ReviewingResults => {
-            "Compare the latest results against the user's request, finish any remaining work, and then produce the final response.".to_string()
-        }
+        StatusReportStage::ReviewingResults => "Review the latest tool results, decide whether another tool round is needed, and then produce the final response.".to_string(),
         StatusReportStage::Completed => {
             "Nothing remains in this turn; wait for the next user request.".to_string()
         }
@@ -2221,14 +2323,15 @@ fn build_status_report(
 
     SessionStatusReport::new(
         !matches!(stage, StatusReportStage::Completed),
-        fallback_status_report_progress(stage, prior_progress),
-        fallback_status_report_confidence(stage, prior_confidence),
+        status_report_progress(tool_rounds_observed, threshold, stage),
+        status_report_confidence(stage, prior_confidence),
         completed_summary,
         remaining_summary,
         tool_rounds_observed,
     )
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn set_session_status_report(
     sessions: &mut HashMap<SessionId, SessionContext>,
     session_id: SessionId,
@@ -2353,34 +2456,6 @@ fn parse_status_report_payload(raw: &str) -> Option<ModelStatusReportPayload> {
         .flatten()
 }
 
-fn build_status_report_request_prompt(
-    latest_user_request: &str,
-    transcript: &str,
-    tool_rounds_observed: u32,
-    current_round_tool_calls: usize,
-    stage: StatusReportStage,
-) -> String {
-    let completion_hint = match stage {
-        StatusReportStage::Completed => "The turn has completed. Set progress_percent to 100.",
-        StatusReportStage::ReviewingResults => {
-            "The turn is still active after a tool round. Set progress_percent between 1 and 95."
-        }
-    };
-    format!(
-        "Generate a concise status report for this coding turn.\n\
-         Latest user request:\n{latest_user_request}\n\n\
-         Evaluate progress_percent against the entire scope of that latest user request.\n\
-         Also estimate confidence_percent as your confidence that the agent can fully complete that latest user request from the current trajectory and evidence.\n\
-         Estimate how much of the requested work is actually complete and how much remains.\n\
-         Do not use tool rounds, tool calls, or transcript length as a proxy for progress.\n\
-         Use tool activity only as evidence for what is done and what still needs work.\n\
-         Tool rounds observed in this turn (context only): {tool_rounds_observed}\n\
-         Current round tool calls (context only): {current_round_tool_calls}\n\
-         {completion_hint}\n\n\
-         Current user-turn transcript:\n{transcript}"
-    )
-}
-
 async fn generate_status_report_with_model(
     session: &SessionContext,
     session_id: SessionId,
@@ -2391,16 +2466,31 @@ async fn generate_status_report_with_model(
     let latest_user_request =
         latest_user_request_text(&session.history).unwrap_or("No explicit user request captured.");
     let tool_rounds_observed = session.current_turn_tool_rounds;
+    let threshold = session
+        .persisted_config
+        .status_report_min_tool_rounds
+        .max(1);
+    let completion_hint = match stage {
+        StatusReportStage::Completed => "The turn has completed. Set progress_percent to 100.",
+        StatusReportStage::ReviewingResults => {
+            "The turn is still active after a tool round. Set progress_percent between 1 and 95."
+        }
+    };
     let messages = [
         Message::system(
             "You generate internal status reports for a coding-agent UI. Return JSON only with keys progress_percent, confidence_percent, completed_summary, and remaining_summary. completed_summary and remaining_summary must each be exactly one sentence. Evaluate progress_percent against the full amount of work required by the latest user request, not against tool counts, elapsed time, or transcript length. Set confidence_percent to your confidence that the agent can fully complete the latest user request from the current trajectory and evidence. Do not include markdown fences or extra commentary.",
         ),
-        Message::user(build_status_report_request_prompt(
-            latest_user_request,
-            &transcript,
-            tool_rounds_observed,
-            current_round_tool_calls,
-            stage,
+        Message::user(format!(
+            "Generate a concise status report for this in-progress coding turn.\n\
+             Latest user request:\n{latest_user_request}\n\n\
+             Tool rounds observed in this turn: {tool_rounds_observed}\n\
+             Reporting threshold: {threshold}\n\
+             Current round tool calls: {current_round_tool_calls}\n\
+             Estimate confidence_percent as your confidence that the agent can fully complete the latest user request from the current trajectory and evidence.\n\
+             Do not use tool rounds, tool calls, or transcript length as a proxy for progress.\n\
+             Use tool activity only as evidence for what is done and what still needs work.\n\
+             {completion_hint}\n\n\
+             Current user-turn transcript:\n{transcript}"
         )),
     ];
 
@@ -2435,9 +2525,9 @@ async fn generate_status_report_with_model(
             } else {
                 build_status_report(
                     tool_rounds_observed,
+                    threshold,
                     current_round_tool_calls,
                     stage,
-                    session.status_report.as_ref().map(|report| report.progress_percent),
                     session
                         .status_report
                         .as_ref()
@@ -2447,9 +2537,9 @@ async fn generate_status_report_with_model(
         }
         _ => build_status_report(
             tool_rounds_observed,
+            threshold,
             current_round_tool_calls,
             stage,
-            session.status_report.as_ref().map(|report| report.progress_percent),
             session
                 .status_report
                 .as_ref()
@@ -2515,6 +2605,7 @@ async fn archive_old_tool_results_in_history(
     Ok(())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn snapshot_sessions(
     sessions: &HashMap<SessionId, SessionContext>,
     session_tree: &SessionTree,
@@ -2528,6 +2619,7 @@ async fn snapshot_sessions(
     CoreCheckpoint::new(persisted_sessions, session_tree.snapshot())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn emit_checkpoint_request(
     sessions: &HashMap<SessionId, SessionContext>,
     session_tree: &SessionTree,
@@ -2539,6 +2631,7 @@ async fn emit_checkpoint_request(
         .await;
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 async fn finalize_child_session(
     sessions: &mut HashMap<SessionId, SessionContext>,
     session_tree: &mut SessionTree,
@@ -2607,6 +2700,7 @@ async fn finalize_child_session(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(test), allow(dead_code))]
 async fn start_child_session(
     sessions: &mut HashMap<SessionId, SessionContext>,
     io: &mut CoreIo<'_>,
@@ -2704,6 +2798,7 @@ async fn start_child_session(
 ///
 /// For interactive tools, sets up a channel and emits `InteractionNeeded`.
 /// Returns the tool result as a `ToolOutcome`.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn execute_tool_call(
     call: &PendingToolCall,
     sessions: &mut HashMap<SessionId, SessionContext>,
@@ -2851,9 +2946,11 @@ async fn execute_tool_call(
                         interrupt_session(sessions, io.deferred_inputs, session_id);
                         return ToolOutcome::Cancelled;
                     }
-                    Some(input) => {
-                        io.deferred_inputs.push_back(input);
+                    Some(CoreInput::RequestCheckpoint { reply }) => {
+                        emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
+                        let _ = reply.send(());
                     }
+                    Some(other) => io.deferred_inputs.push_back(other),
                     None => {
                         if let Some(session) = sessions.get_mut(&session_id) {
                             session.state = SessionState::Streaming;
@@ -3278,8 +3375,8 @@ async fn execute_tool_call(
                                     drop(reply_tx);
                                     break 'tool_loop ToolOutcome::Cancelled;
                                 }
-                                Some(input) => {
-                                    io.deferred_inputs.push_back(input);
+                                Some(other) => {
+                                    io.deferred_inputs.push_back(other);
                                     continue;
                                 }
                                 None => {
@@ -3377,8 +3474,8 @@ async fn execute_tool_call(
                             interrupt_session(sessions, io.deferred_inputs, session_id);
                             break ToolOutcome::Cancelled;
                         }
-                        Some(input) => {
-                            io.deferred_inputs.push_back(input);
+                        Some(other) => {
+                            io.deferred_inputs.push_back(other);
                             continue;
                         }
                         None => {
@@ -3411,6 +3508,7 @@ async fn execute_tool_call(
 /// Handle plan progress after an `update_plan` tool call.
 ///
 /// Emits `PlanProgress` events and injects a prompt for newly ready actions.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn handle_plan_progress(
     session: &mut SessionContext,
     session_id: SessionId,
@@ -3488,6 +3586,7 @@ async fn handle_plan_progress(
 ///
 /// This function handles the tool execution loop: when the LLM requests tools,
 /// it executes them and calls the LLM again until the LLM produces text.
+#[cfg_attr(not(test), allow(dead_code))]
 async fn handle_llm_turn(
     sessions: &mut HashMap<SessionId, SessionContext>,
     session_id: SessionId,
@@ -3675,11 +3774,7 @@ async fn handle_llm_turn(
                         .persisted_config
                         .status_report_min_tool_rounds
                         .max(1);
-                    if should_emit_completed_status_report(
-                        session.current_turn_tool_rounds,
-                        threshold,
-                        session.status_report.is_some(),
-                    ) {
+                    if session.current_turn_tool_rounds >= threshold {
                         Some(
                             generate_status_report_with_model(
                                 session,
@@ -4213,10 +4308,7 @@ async fn handle_llm_turn(
                         .persisted_config
                         .status_report_min_tool_rounds
                         .max(1);
-                    if should_emit_periodic_status_report(
-                        session.current_turn_tool_rounds,
-                        threshold,
-                    ) {
+                    if session.current_turn_tool_rounds >= threshold {
                         Some(
                             generate_status_report_with_model(
                                 session,
@@ -4259,6 +4351,1589 @@ async fn handle_llm_turn(
             }
         }
     }
+}
+
+struct SessionActor {
+    session_id: SessionId,
+    parent_id: Option<SessionId>,
+    session: SessionContext,
+    command_rx: mpsc::Receiver<SessionCommand>,
+    deferred_commands: VecDeque<SessionCommand>,
+    output: mpsc::Sender<CoreOutput>,
+    core_input_tx: mpsc::Sender<CoreInput>,
+    runtime_event_tx: mpsc::Sender<RuntimeEvent>,
+    session_tree: SharedSessionTree,
+    web_provider: Arc<dyn WebProvider>,
+}
+
+impl SessionActor {
+    async fn run(mut self) {
+        while let Some(command) = self.next_command().await {
+            if !self.handle_command(command).await {
+                break;
+            }
+        }
+    }
+
+    async fn next_command(&mut self) -> Option<SessionCommand> {
+        if let Some(command) = self.deferred_commands.pop_front() {
+            return Some(command);
+        }
+        self.command_rx.recv().await
+    }
+
+    async fn handle_command(&mut self, command: SessionCommand) -> bool {
+        match command {
+            SessionCommand::UserMessage(content) => self.handle_user_message(content).await,
+            SessionCommand::ExitPlanMode { reply } => {
+                let result = if !matches!(
+                    self.session.state,
+                    SessionState::Idle | SessionState::Paused
+                ) {
+                    Err(format!(
+                        "cannot exit plan mode while session is {:?}",
+                        self.session.state
+                    ))
+                } else {
+                    self.session
+                        .exit_plan_mode_with_web_provider(&self.web_provider)
+                        .await
+                        .map_err(|error| format!("failed to exit plan mode: {error}"))
+                };
+                let is_ok = result.is_ok();
+                let _ = reply.send(result);
+                if is_ok {
+                    self.emit_checkpoint_hint().await;
+                }
+                true
+            }
+            SessionCommand::UpdateSessionLlm { session_llm, reply } => {
+                let result = if !matches!(
+                    self.session.state,
+                    SessionState::Idle | SessionState::Paused
+                ) {
+                    Err(format!(
+                        "cannot switch model while session is {:?}",
+                        self.session.state
+                    ))
+                } else {
+                    self.session
+                        .update_llm_provider_with_web_provider(
+                            Arc::clone(&session_llm.provider),
+                            session_llm.model_profile.clone(),
+                            session_llm.max_context_window,
+                            &self.web_provider,
+                        )
+                        .await
+                        .map_err(|error| format!("failed to update session model: {error}"))
+                };
+                let is_ok = result.is_ok();
+                let _ = reply.send(result);
+                if is_ok {
+                    self.emit_checkpoint_hint().await;
+                }
+                true
+            }
+            SessionCommand::CompactSession { reply } => {
+                let provider = Arc::clone(&self.session.provider);
+                let result = compact_session_history(
+                    provider.as_ref(),
+                    &mut self.session,
+                    self.session_id,
+                    CompactionTrigger::Manual,
+                )
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string());
+                let _ = reply.send(result);
+                true
+            }
+            SessionCommand::ToolResult {
+                tool_use_id,
+                result,
+            } => {
+                self.handle_external_tool_result(tool_use_id, result).await;
+                true
+            }
+            SessionCommand::InteractionResponse(_) => {
+                debug_log_session(
+                    self.session_id,
+                    "received unexpected InteractionResponse while session was idle",
+                );
+                true
+            }
+            SessionCommand::Cancel => {
+                self.interrupt().await;
+                true
+            }
+            SessionCommand::Signal(signal) => {
+                self.handle_signal(signal).await;
+                true
+            }
+            SessionCommand::MailboxMessage(message) => {
+                self.handle_mailbox_message(message).await;
+                true
+            }
+            SessionCommand::Snapshot { reply } => {
+                let _ = reply.send(self.session.snapshot(self.session_id).await);
+                true
+            }
+            SessionCommand::SessionMemoryRefreshFinished {
+                last_summarized_message_index,
+                refreshed_at,
+                listing_summary,
+            } => {
+                self.session.session_memory.refresh_in_flight = false;
+                if let Some(index) = last_summarized_message_index {
+                    self.session.session_memory.last_summarized_message_index = Some(index);
+                }
+                if let Some(timestamp) = refreshed_at {
+                    self.session.session_memory.last_refresh_at = Some(timestamp);
+                }
+                if let Some(summary) = listing_summary {
+                    self.session.session_memory.listing_summary = Some(summary);
+                }
+                let diagnostics = ensure_turn_diagnostics(&mut self.session);
+                diagnostics.session_memory.refresh.attempted = true;
+                if let Some(index) = last_summarized_message_index {
+                    diagnostics.session_memory.refresh.status = MemoryStatus::Succeeded;
+                    diagnostics.session_memory.refresh.reason = None;
+                    diagnostics
+                        .session_memory
+                        .refresh
+                        .last_summarized_message_index = Some(index);
+                } else {
+                    diagnostics.session_memory.refresh.status = MemoryStatus::FailedBestEffort;
+                    diagnostics.session_memory.refresh.reason =
+                        Some(MemoryDecisionReason::MissingSummary);
+                }
+                if let Some(timestamp) = refreshed_at {
+                    diagnostics.session_memory.refresh.refreshed_at = Some(timestamp.to_rfc3339());
+                }
+                self.emit_checkpoint_hint().await;
+                true
+            }
+            SessionCommand::QueryMailbox { source, reply } => {
+                let message = pop_mailbox_message(&mut self.session.mailbox, &source);
+                let _ = reply.send(message);
+                true
+            }
+            SessionCommand::ChildExited { child_id, status } => {
+                self.handle_child_exited(child_id, status).await;
+                true
+            }
+            SessionCommand::Shutdown => false,
+        }
+    }
+
+    async fn handle_user_message(&mut self, content: String) -> bool {
+        debug_log_session(
+            self.session_id,
+            format!("received UserMessage ({} chars)", content.len()),
+        );
+        self.session.interrupted = false;
+        self.clear_active_wait().await;
+        self.session.suspended_wait = None;
+        self.session.state = SessionState::Streaming;
+        self.session.current_turn_tool_rounds = 0;
+        self.session.history.push(Message::user(&content));
+        self.session.last_memory_diagnostics =
+            Some(default_turn_diagnostics_for_session(&self.session));
+        self.set_status_report(None).await;
+        self.emit_state(SessionState::Streaming).await;
+
+        let outcome = self.handle_turn().await;
+        self.finish_turn(outcome).await
+    }
+
+    async fn handle_signal(&mut self, signal: SessionSignal) {
+        debug_log_session(self.session_id, format!("received Signal::{signal:?}"));
+        match signal {
+            SessionSignal::Continue => {
+                self.session.interrupted = false;
+                if self.session.state == SessionState::Paused {
+                    self.session.state = SessionState::Idle;
+                }
+                self.emit_state(self.session.state).await;
+            }
+            SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill => {
+                self.interrupt().await;
+            }
+        }
+    }
+
+    async fn interrupt(&mut self) {
+        self.clear_active_wait().await;
+        self.session.state = SessionState::Idle;
+        self.session.interrupted = true;
+        if let Some(cancel_tx) = &self.session.cancel_tx {
+            let _ = cancel_tx.send(true);
+        }
+        self.session.cancel_tx = None;
+        self.session.pending_interaction.take();
+        self.session.pending_permission_approval = None;
+        self.emit_state(SessionState::Idle).await;
+        self.emit_checkpoint_hint().await;
+    }
+
+    async fn clear_active_wait(&self) {
+        self.session_tree
+            .write()
+            .await
+            .clear_active_wait(self.session_id);
+    }
+
+    async fn emit_state(&self, state: SessionState) {
+        let _ = self
+            .output
+            .send(CoreOutput::SessionStateChanged {
+                session_id: self.session_id,
+                state,
+            })
+            .await;
+    }
+
+    async fn set_status_report(&mut self, report: Option<SessionStatusReport>) {
+        if self.session.status_report == report {
+            return;
+        }
+        self.session.status_report = report.clone();
+        let _ = self
+            .output
+            .send(CoreOutput::SessionStatusReport {
+                session_id: self.session_id,
+                report,
+            })
+            .await;
+    }
+
+    async fn emit_checkpoint_hint(&self) {
+        let _ = self
+            .runtime_event_tx
+            .send(RuntimeEvent::CheckpointHint)
+            .await;
+    }
+
+    async fn handle_mailbox_message(&mut self, message: MailboxMessage) {
+        let should_resume = matches!(
+            self.session.suspended_wait.as_ref(),
+            Some(SuspendedWait::Mailbox { source, .. }) if mailbox_matches_source(&message, source)
+        );
+        self.session.mailbox.push_back(message);
+        if should_resume {
+            let _ = self.resume_from_wait(None).await;
+        }
+    }
+
+    async fn handle_child_exited(&mut self, child_id: SessionId, _status: ExitStatus) {
+        let should_resume = matches!(
+            self.session.suspended_wait.as_ref(),
+            Some(SuspendedWait::ChildExit { child_id: waiting_child, .. }) if *waiting_child == child_id
+        );
+        if should_resume {
+            let _ = self.resume_from_wait(None).await;
+        }
+    }
+
+    async fn finish_turn(&mut self, outcome: TurnOutcome) -> bool {
+        if let Some(parent_id) = self.parent_id {
+            let status = match outcome {
+                TurnOutcome::Completed(text) => ExitStatus::Success {
+                    output: text
+                        .or_else(|| session_output(&self.session))
+                        .unwrap_or_default(),
+                },
+                TurnOutcome::Failed(error) => ExitStatus::Failed { error },
+                TurnOutcome::Cancelled => ExitStatus::Cancelled,
+                TurnOutcome::Suspended => return true,
+            };
+            self.session.state = SessionState::Destroyed;
+            let _ = self
+                .runtime_event_tx
+                .send(RuntimeEvent::ChildSessionFinished {
+                    session_id: self.session_id,
+                    parent_id,
+                    status,
+                })
+                .await;
+            false
+        } else {
+            true
+        }
+    }
+
+    async fn handle_external_tool_result(&mut self, tool_use_id: String, result: ToolOutcome) {
+        debug_log_session(
+            self.session_id,
+            format!("received external ToolResult for tool_use_id={tool_use_id}"),
+        );
+        if self.session.suspended_wait.is_some() {
+            let _ = self.resume_from_wait(Some(result)).await;
+            return;
+        }
+
+        if self.session.state != SessionState::AwaitingToolResult {
+            debug_log_session(
+                self.session_id,
+                format!(
+                    "ignoring stale external ToolResult for tool_use_id={tool_use_id} while session is {:?}",
+                    self.session.state
+                ),
+            );
+            return;
+        }
+
+        let (output_text, is_error) = match &result {
+            ToolOutcome::Success { output } => (output.clone(), false),
+            ToolOutcome::Error { message } => (message.clone(), true),
+            ToolOutcome::Cancelled => ("Tool execution was cancelled".to_string(), true),
+        };
+        let history_output = match prepare_tool_result_for_history(
+            &self.session,
+            self.session_id,
+            &tool_use_id,
+            "external",
+            &output_text,
+            is_error,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = self
+                    .output
+                    .send(CoreOutput::SessionError {
+                        session_id: self.session_id,
+                        error,
+                    })
+                    .await;
+                return;
+            }
+        };
+        self.session.history.push(Message::tool_result(
+            &tool_use_id,
+            &history_output,
+            is_error,
+        ));
+        self.session.state = SessionState::Streaming;
+        self.emit_state(SessionState::Streaming).await;
+        let outcome = self.handle_turn().await;
+        let _ = self.finish_turn(outcome).await;
+    }
+
+    async fn resume_from_wait(&mut self, explicit_result: Option<ToolOutcome>) -> Result<(), ()> {
+        let Some(wait) = self.session.suspended_wait.clone() else {
+            return Ok(());
+        };
+        let tool_use_id = wait.tool_use_id().to_string();
+        let result = if let Some(result) = explicit_result {
+            result
+        } else {
+            match wait {
+                SuspendedWait::Mailbox { source, .. } => {
+                    match pop_mailbox_message(&mut self.session.mailbox, &source) {
+                        Some(MailboxMessage { from, content }) => ToolOutcome::Success {
+                            output: serde_json::json!({
+                                "from": from,
+                                "content": content,
+                            })
+                            .to_string(),
+                        },
+                        None => ToolOutcome::Error {
+                            message: "recv_message resumed without a matching message".into(),
+                        },
+                    }
+                }
+                SuspendedWait::ChildExit { child_id, .. } => {
+                    match self
+                        .session_tree
+                        .read()
+                        .await
+                        .exit_status(child_id)
+                        .cloned()
+                    {
+                        Some(status) => ToolOutcome::Success {
+                            output: serde_json::to_string(&status)
+                                .unwrap_or_else(|_| "unknown".into()),
+                        },
+                        None => ToolOutcome::Error {
+                            message: "wait_child resumed before child exit was recorded".into(),
+                        },
+                    }
+                }
+            }
+        };
+
+        let (output_text, is_error) = match &result {
+            ToolOutcome::Success { output } => (output.clone(), false),
+            ToolOutcome::Error { message } => (message.clone(), true),
+            ToolOutcome::Cancelled => ("Tool execution was cancelled".to_string(), true),
+        };
+        let history_output = match prepare_tool_result_for_history(
+            &self.session,
+            self.session_id,
+            &tool_use_id,
+            "suspended_wait",
+            &output_text,
+            is_error,
+        )
+        .await
+        {
+            Ok(output) => output,
+            Err(error) => {
+                let _ = self
+                    .output
+                    .send(CoreOutput::SessionError {
+                        session_id: self.session_id,
+                        error,
+                    })
+                    .await;
+                return Err(());
+            }
+        };
+
+        self.session.suspended_wait = None;
+        self.clear_active_wait().await;
+        self.session.history.push(Message::tool_result(
+            &tool_use_id,
+            &history_output,
+            is_error,
+        ));
+        self.session.state = SessionState::Streaming;
+        let _ = self
+            .output
+            .send(CoreOutput::ToolResult {
+                session_id: self.session_id,
+                tool_use_id,
+                tool_name: "suspended_wait".into(),
+                content: output_text,
+                is_error,
+                duration_us: 0,
+            })
+            .await;
+        self.emit_state(SessionState::Streaming).await;
+        let outcome = self.handle_turn().await;
+        let _ = self.finish_turn(outcome).await;
+        Ok(())
+    }
+
+    async fn handle_turn(&mut self) -> TurnOutcome {
+        let turn_start = std::time::Instant::now();
+        let mut accumulated_usage: Option<quine_llm::TokenUsage> = None;
+        let mut accumulated_cache_usage: Option<PromptCacheUsage> = None;
+        debug_log_session(
+            self.session_id,
+            format!(
+                "starting LLM turn with {} history messages",
+                self.session.history.len()
+            ),
+        );
+
+        loop {
+            if let Err(error) =
+                archive_old_tool_results_in_history(&mut self.session, self.session_id).await
+            {
+                let _ = self
+                    .output
+                    .send(CoreOutput::SessionError {
+                        session_id: self.session_id,
+                        error,
+                    })
+                    .await;
+                self.session.state = SessionState::Idle;
+                return TurnOutcome::Failed("session error".into());
+            }
+
+            let should_auto_compact = compaction::should_auto_compact(
+                self.session.max_context_window,
+                self.session.last_input_tokens,
+                self.session.auto_compact_threshold_percent,
+            );
+            if should_auto_compact {
+                let provider = Arc::clone(&self.session.provider);
+                if let Err(error) = compact_session_history(
+                    provider.as_ref(),
+                    &mut self.session,
+                    self.session_id,
+                    CompactionTrigger::Auto,
+                )
+                .await
+                {
+                    let _ = self
+                        .output
+                        .send(CoreOutput::SessionError {
+                            session_id: self.session_id,
+                            error,
+                        })
+                        .await;
+                    self.session.state = SessionState::Idle;
+                    return TurnOutcome::Failed("session error".into());
+                }
+            }
+
+            if self.session.interrupted {
+                debug_log_session(
+                    self.session_id,
+                    "aborting LLM turn because session is interrupted",
+                );
+                let duration_us = turn_start.elapsed().as_micros() as u64;
+                let _ = self
+                    .output
+                    .send(CoreOutput::TurnComplete {
+                        session_id: self.session_id,
+                        duration_us,
+                        usage: accumulated_usage.clone(),
+                        cache_usage: accumulated_cache_usage.clone(),
+                    })
+                    .await;
+                return TurnOutcome::Cancelled;
+            }
+
+            let history = match build_provider_messages(&mut self.session).await {
+                Ok(history) => history,
+                Err(error) => {
+                    let _ = self
+                        .output
+                        .send(CoreOutput::SessionError {
+                            session_id: self.session_id,
+                            error,
+                        })
+                        .await;
+                    return TurnOutcome::Failed("session error".into());
+                }
+            };
+            let tools = self.session.tools.clone();
+            let prompt_cache_tokens = canonicalize_prompt_cache_tokens(&history, &tools);
+            let cache_usage = estimate_prompt_cache_usage(
+                self.session.last_prompt_cache_tokens.as_deref(),
+                &prompt_cache_tokens,
+            );
+            let provider = Arc::clone(&self.session.provider);
+
+            match self
+                .call_llm_interruptible(provider.as_ref(), history, tools)
+                .await
+            {
+                Ok(None) => {
+                    debug_log_session(self.session_id, "LLM turn interrupted");
+                    self.set_status_report(None).await;
+                    let duration_us = turn_start.elapsed().as_micros() as u64;
+                    self.emit_state(SessionState::Idle).await;
+                    let _ = self
+                        .output
+                        .send(CoreOutput::TurnComplete {
+                            session_id: self.session_id,
+                            duration_us,
+                            usage: accumulated_usage.clone(),
+                            cache_usage: accumulated_cache_usage.clone(),
+                        })
+                        .await;
+                    return TurnOutcome::Cancelled;
+                }
+                Ok(Some(LlmCallResult {
+                    turn: LlmTurnResult::Text(full_text),
+                    usage,
+                    ..
+                })) => {
+                    let acc = accumulated_cache_usage.get_or_insert_with(PromptCacheUsage::default);
+                    acc.estimated_hit_tokens += cache_usage.estimated_hit_tokens;
+                    acc.estimated_miss_tokens += cache_usage.estimated_miss_tokens;
+
+                    if let Some(u) = usage {
+                        let acc = accumulated_usage.get_or_insert(quine_llm::TokenUsage::default());
+                        acc.input_tokens += u.input_tokens;
+                        acc.output_tokens += u.output_tokens;
+                        self.session.last_input_tokens = Some(u.input_tokens);
+                    } else {
+                        self.session.last_input_tokens = None;
+                    }
+                    self.session.last_prompt_cache_tokens = Some(prompt_cache_tokens);
+                    self.session.history.push(Message::assistant(&full_text));
+
+                    let status_report_update = {
+                        let threshold = self
+                            .session
+                            .persisted_config
+                            .status_report_min_tool_rounds
+                            .max(1);
+                        if should_emit_completed_status_report(
+                            self.session.current_turn_tool_rounds,
+                            threshold,
+                            self.session.status_report.is_some(),
+                        ) {
+                            Some(
+                                generate_status_report_with_model(
+                                    &self.session,
+                                    self.session_id,
+                                    0,
+                                    StatusReportStage::Completed,
+                                )
+                                .await,
+                            )
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(report) = status_report_update {
+                        self.set_status_report(Some(report)).await;
+                    }
+
+                    let _ = self
+                        .output
+                        .send(CoreOutput::TextComplete {
+                            session_id: self.session_id,
+                            full_text: full_text.clone(),
+                        })
+                        .await;
+                    self.session.state = SessionState::Idle;
+                    let duration_us = turn_start.elapsed().as_micros() as u64;
+                    let _ = self
+                        .output
+                        .send(CoreOutput::TurnComplete {
+                            session_id: self.session_id,
+                            duration_us,
+                            usage: accumulated_usage,
+                            cache_usage: accumulated_cache_usage,
+                        })
+                        .await;
+                    self.emit_state(SessionState::Idle).await;
+                    let provider = Arc::clone(&self.session.provider);
+                    schedule_session_memory_refresh(
+                        &mut self.session,
+                        self.session_id,
+                        provider,
+                        self.core_input_tx.clone(),
+                    );
+                    self.emit_checkpoint_hint().await;
+                    return TurnOutcome::Completed(Some(full_text));
+                }
+                Ok(Some(LlmCallResult {
+                    turn:
+                        LlmTurnResult::ToolCalls {
+                            text_before,
+                            mut calls,
+                        },
+                    usage,
+                    ..
+                })) => {
+                    let acc = accumulated_cache_usage.get_or_insert_with(PromptCacheUsage::default);
+                    acc.estimated_hit_tokens += cache_usage.estimated_hit_tokens;
+                    acc.estimated_miss_tokens += cache_usage.estimated_miss_tokens;
+
+                    if let Some(u) = usage {
+                        let acc = accumulated_usage.get_or_insert(quine_llm::TokenUsage::default());
+                        acc.input_tokens += u.input_tokens;
+                        acc.output_tokens += u.output_tokens;
+                        self.session.last_input_tokens = Some(u.input_tokens);
+                    } else {
+                        self.session.last_input_tokens = None;
+                    }
+                    self.session.last_prompt_cache_tokens = Some(prompt_cache_tokens);
+
+                    if let Some(ref text) = text_before {
+                        let _ = self
+                            .output
+                            .send(CoreOutput::TextComplete {
+                                session_id: self.session_id,
+                                full_text: text.clone(),
+                            })
+                            .await;
+                    }
+
+                    let tool_use_requests: Vec<quine_llm::ToolUseRequest> = calls
+                        .iter()
+                        .map(|c| quine_llm::ToolUseRequest {
+                            tool_use_id: c.tool_use_id.clone(),
+                            tool_name: c.tool_name.clone(),
+                            arguments: c.arguments.clone(),
+                        })
+                        .collect();
+                    self.session.history.push(Message::assistant_tool_use(
+                        text_before.clone(),
+                        tool_use_requests,
+                    ));
+                    self.session.current_turn_tool_rounds =
+                        self.session.current_turn_tool_rounds.saturating_add(1);
+                    calls = calls
+                        .iter()
+                        .map(|call| normalize_plan_tool_arguments(&self.session, call))
+                        .collect();
+
+                    let mut completed_calls = Vec::with_capacity(calls.len());
+                    for call in &calls {
+                        if self.session.interrupted {
+                            let duration_us = turn_start.elapsed().as_micros() as u64;
+                            self.emit_state(SessionState::Idle).await;
+                            let _ = self
+                                .output
+                                .send(CoreOutput::TurnComplete {
+                                    session_id: self.session_id,
+                                    duration_us,
+                                    usage: accumulated_usage.clone(),
+                                    cache_usage: accumulated_cache_usage.clone(),
+                                })
+                                .await;
+                            return TurnOutcome::Cancelled;
+                        }
+                        let _ = self
+                            .output
+                            .send(CoreOutput::ToolRequest {
+                                session_id: self.session_id,
+                                tool_use_id: call.tool_use_id.clone(),
+                                tool_name: call.tool_name.clone(),
+                                arguments: call.arguments.clone(),
+                            })
+                            .await;
+                        let tool_start = std::time::Instant::now();
+                        let result = self.execute_tool_call(call).await;
+                        completed_calls.push(CompletedConcurrentToolCall {
+                            index: completed_calls.len(),
+                            tool_use_id: call.tool_use_id.clone(),
+                            tool_name: call.tool_name.clone(),
+                            arguments: call.arguments.clone(),
+                            result,
+                            duration_us: tool_start.elapsed().as_micros() as u64,
+                        });
+                    }
+
+                    let mut saw_cancelled_tool = false;
+                    for completed_call in &completed_calls {
+                        let (tool_output, is_error) = match &completed_call.result {
+                            ToolOutcome::Success { output } => (output.clone(), false),
+                            ToolOutcome::Error { message } => (message.clone(), true),
+                            ToolOutcome::Cancelled => {
+                                ("Tool execution was cancelled".to_string(), true)
+                            }
+                        };
+                        let _ = self
+                            .output
+                            .send(CoreOutput::ToolResult {
+                                session_id: self.session_id,
+                                tool_use_id: completed_call.tool_use_id.clone(),
+                                tool_name: completed_call.tool_name.clone(),
+                                content: tool_output.clone(),
+                                is_error,
+                                duration_us: completed_call.duration_us,
+                            })
+                            .await;
+
+                        let history_output = match prepare_tool_result_for_history(
+                            &self.session,
+                            self.session_id,
+                            &completed_call.tool_use_id,
+                            &completed_call.tool_name,
+                            &tool_output,
+                            is_error,
+                        )
+                        .await
+                        {
+                            Ok(output) => output,
+                            Err(error) => {
+                                self.session.cancel_tx = None;
+                                self.session.state = SessionState::Idle;
+                                let duration_us = turn_start.elapsed().as_micros() as u64;
+                                self.emit_state(SessionState::Idle).await;
+                                let _ = self
+                                    .output
+                                    .send(CoreOutput::SessionError {
+                                        session_id: self.session_id,
+                                        error: error.clone(),
+                                    })
+                                    .await;
+                                let _ = self
+                                    .output
+                                    .send(CoreOutput::TurnComplete {
+                                        session_id: self.session_id,
+                                        duration_us,
+                                        usage: accumulated_usage.clone(),
+                                        cache_usage: accumulated_cache_usage.clone(),
+                                    })
+                                    .await;
+                                return TurnOutcome::Failed(error.to_string());
+                            }
+                        };
+                        self.session.history.push(Message::tool_result(
+                            &completed_call.tool_use_id,
+                            &history_output,
+                            is_error,
+                        ));
+
+                        let should_suspend =
+                            matches!(completed_call.result, ToolOutcome::Cancelled)
+                                && self.session.suspended_wait.is_some();
+                        if should_suspend {
+                            return TurnOutcome::Suspended;
+                        }
+
+                        if matches!(completed_call.result, ToolOutcome::Cancelled) {
+                            saw_cancelled_tool = true;
+                        }
+
+                        if completed_call.tool_name == "plan" {
+                            let is_update = completed_call
+                                .arguments
+                                .get("operation")
+                                .and_then(|v| v.as_str())
+                                == Some("update_plan");
+                            if is_update {
+                                if let Some(plan_id_str) = completed_call
+                                    .arguments
+                                    .get("plan_id")
+                                    .and_then(|v| v.as_str())
+                                {
+                                    if let Some(action_id_str) = completed_call
+                                        .arguments
+                                        .get("action_id")
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        self.handle_plan_progress(plan_id_str, action_id_str).await;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if saw_cancelled_tool {
+                        self.set_status_report(None).await;
+                        self.session.cancel_tx = None;
+                        self.session.state = SessionState::Idle;
+                        let duration_us = turn_start.elapsed().as_micros() as u64;
+                        self.emit_state(SessionState::Idle).await;
+                        let _ = self
+                            .output
+                            .send(CoreOutput::TurnComplete {
+                                session_id: self.session_id,
+                                duration_us,
+                                usage: accumulated_usage.clone(),
+                                cache_usage: accumulated_cache_usage.clone(),
+                            })
+                            .await;
+                        let provider = Arc::clone(&self.session.provider);
+                        schedule_session_memory_refresh(
+                            &mut self.session,
+                            self.session_id,
+                            provider,
+                            self.core_input_tx.clone(),
+                        );
+                        self.emit_checkpoint_hint().await;
+                        return TurnOutcome::Cancelled;
+                    }
+
+                    let status_report_update = {
+                        let threshold = self
+                            .session
+                            .persisted_config
+                            .status_report_min_tool_rounds
+                            .max(1);
+                        if should_emit_periodic_status_report(
+                            self.session.current_turn_tool_rounds,
+                            threshold,
+                        ) {
+                            Some(
+                                generate_status_report_with_model(
+                                    &self.session,
+                                    self.session_id,
+                                    completed_calls.len(),
+                                    StatusReportStage::ReviewingResults,
+                                )
+                                .await,
+                            )
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some(report) = status_report_update {
+                        self.set_status_report(Some(report)).await;
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    debug_log_session(self.session_id, format!("LLM turn failed: {error}"));
+                    self.set_status_report(None).await;
+                    self.session.state = SessionState::Idle;
+                    self.emit_state(SessionState::Idle).await;
+                    let _ = self
+                        .output
+                        .send(CoreOutput::SessionError {
+                            session_id: self.session_id,
+                            error,
+                        })
+                        .await;
+                    return TurnOutcome::Failed("session error".into());
+                }
+            }
+        }
+    }
+
+    async fn call_llm_interruptible(
+        &mut self,
+        provider: &dyn LlmProvider,
+        history: Vec<Message>,
+        tools: Vec<ToolDefinition>,
+    ) -> Result<Option<LlmCallResult>, CoreError> {
+        let send_future = provider.send(&history, &tools);
+        tokio::pin!(send_future);
+
+        let mut stream = loop {
+            if let Some(command) = self.deferred_commands.pop_front() {
+                if self.handle_control_command(command).await {
+                    return Ok(None);
+                }
+                continue;
+            }
+            tokio::select! {
+                stream_result = &mut send_future => {
+                    break stream_result.map_err(|e| CoreError::LlmError {
+                        message: e.to_string(),
+                    })?;
+                }
+                maybe_command = self.command_rx.recv() => {
+                    match maybe_command {
+                        Some(command) => {
+                            if self.handle_control_command(command).await {
+                                debug_log_session(self.session_id, "LLM request interrupted before stream opened");
+                                return Ok(None);
+                            }
+                        }
+                        None => {
+                            return Err(CoreError::Internal {
+                                message: "input channel closed while awaiting LLM response".into(),
+                            });
+                        }
+                    }
+                }
+            }
+        };
+
+        let mut full_text = String::new();
+        let mut tool_calls = Vec::new();
+        let mut usage = None;
+
+        loop {
+            if let Some(command) = self.deferred_commands.pop_front() {
+                if self.handle_control_command(command).await {
+                    debug_log_session(self.session_id, "LLM stream interrupted");
+                    return Ok(None);
+                }
+                continue;
+            }
+            tokio::select! {
+                event_result = stream.next() => {
+                    let Some(event_result) = event_result else {
+                        break;
+                    };
+                    match event_result {
+                        Ok(LlmEvent::ReasoningDelta { text }) => {
+                            let _ = self
+                                .output
+                                .send(CoreOutput::ReasoningDelta {
+                                    session_id: self.session_id,
+                                    delta: text,
+                                })
+                                .await;
+                        }
+                        Ok(LlmEvent::TextDelta { text }) => {
+                            full_text.push_str(&text);
+                            let _ = self
+                                .output
+                                .send(CoreOutput::StreamDelta {
+                                    session_id: self.session_id,
+                                    delta: text,
+                                })
+                                .await;
+                        }
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id,
+                            tool_name,
+                            arguments,
+                        }) => {
+                            tool_calls.push(PendingToolCall {
+                                tool_use_id,
+                                tool_name,
+                                arguments,
+                            });
+                        }
+                        Ok(LlmEvent::Done { usage: u }) => {
+                            usage = u;
+                            break;
+                        }
+                        Err(e) => {
+                            return Err(CoreError::LlmError {
+                                message: e.to_string(),
+                            });
+                        }
+                    }
+                }
+                maybe_command = self.command_rx.recv() => {
+                    match maybe_command {
+                        Some(command) => {
+                            if self.handle_control_command(command).await {
+                                debug_log_session(self.session_id, "LLM stream interrupted");
+                                return Ok(None);
+                            }
+                        }
+                        None => {
+                            return Err(CoreError::Internal {
+                                message: "input channel closed while streaming LLM response".into(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        let turn = if tool_calls.is_empty() {
+            LlmTurnResult::Text(full_text)
+        } else {
+            LlmTurnResult::ToolCalls {
+                text_before: if full_text.is_empty() {
+                    None
+                } else {
+                    Some(full_text)
+                },
+                calls: tool_calls,
+            }
+        };
+        Ok(Some(LlmCallResult { turn, usage }))
+    }
+
+    async fn handle_control_command(&mut self, command: SessionCommand) -> bool {
+        match command {
+            SessionCommand::Cancel => {
+                self.clear_active_wait().await;
+                self.session.state = SessionState::Idle;
+                self.session.interrupted = true;
+                if let Some(cancel_tx) = &self.session.cancel_tx {
+                    let _ = cancel_tx.send(true);
+                }
+                self.session.cancel_tx = None;
+                self.session.pending_interaction.take();
+                self.session.pending_permission_approval = None;
+                true
+            }
+            SessionCommand::Signal(
+                SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill,
+            ) => {
+                self.clear_active_wait().await;
+                self.session.state = SessionState::Idle;
+                self.session.interrupted = true;
+                if let Some(cancel_tx) = &self.session.cancel_tx {
+                    let _ = cancel_tx.send(true);
+                }
+                self.session.cancel_tx = None;
+                self.session.pending_interaction.take();
+                self.session.pending_permission_approval = None;
+                true
+            }
+            SessionCommand::MailboxMessage(message) => {
+                self.session.mailbox.push_back(message);
+                false
+            }
+            SessionCommand::ChildExited { .. } => false,
+            SessionCommand::Snapshot { reply } => {
+                let _ = reply.send(self.session.snapshot(self.session_id).await);
+                false
+            }
+            SessionCommand::SessionMemoryRefreshFinished {
+                last_summarized_message_index,
+                refreshed_at,
+                listing_summary,
+            } => {
+                self.deferred_commands
+                    .push_back(SessionCommand::SessionMemoryRefreshFinished {
+                        last_summarized_message_index,
+                        refreshed_at,
+                        listing_summary,
+                    });
+                false
+            }
+            SessionCommand::QueryMailbox { source, reply } => {
+                let message = pop_mailbox_message(&mut self.session.mailbox, &source);
+                let _ = reply.send(message);
+                false
+            }
+            SessionCommand::InteractionResponse(_)
+            | SessionCommand::ExitPlanMode { .. }
+            | SessionCommand::UpdateSessionLlm { .. }
+            | SessionCommand::CompactSession { .. }
+            | SessionCommand::ToolResult { .. }
+            | SessionCommand::UserMessage(_)
+            | SessionCommand::Shutdown => {
+                self.deferred_commands.push_back(command);
+                false
+            }
+            SessionCommand::Signal(_) => false,
+        }
+    }
+
+    async fn execute_tool_call(&mut self, call: &PendingToolCall) -> ToolOutcome {
+        let (cancel_tx, cancellation) = CancellationChannel::new_pair();
+        if self.session.interrupted {
+            return ToolOutcome::Cancelled;
+        }
+        self.session.cancel_tx = Some(cancel_tx.clone());
+
+        let tool = match self.session.tool_registry.get(&call.tool_name) {
+            Some(tool) => Arc::clone(tool),
+            None => {
+                return ToolOutcome::Error {
+                    message: format!("unknown tool: {}", call.tool_name),
+                };
+            }
+        };
+
+        let (request, local) = build_permission_request(&self.session, call, tool.as_ref());
+        let permission_outcome =
+            evaluate_permission(&self.session.permission_context, request, local);
+        self.session.last_permission_outcome = Some(permission_outcome.clone());
+
+        if !permission_outcome.is_allowed() {
+            if permission_outcome.kind
+                == crate::permission::outcome::PermissionOutcomeKind::RequiresApproval
+            {
+                let (pending, request) = build_permission_approval_request(&permission_outcome);
+                self.session.state = SessionState::Paused;
+                self.session.pending_permission_approval = Some(pending);
+                let _ = self
+                    .output
+                    .send(CoreOutput::InteractionNeeded {
+                        session_id: self.session_id,
+                        request,
+                    })
+                    .await;
+                self.emit_state(SessionState::Paused).await;
+                loop {
+                    match self.next_command().await {
+                        Some(SessionCommand::InteractionResponse(response)) => {
+                            let Some(parsed) = parse_permission_approval_response(&response) else {
+                                continue;
+                            };
+                            match parsed {
+                                PermissionApprovalChoice::ApproveOnce => {
+                                    self.session.pending_permission_approval = None;
+                                    self.session.state = SessionState::Streaming;
+                                    self.emit_state(SessionState::Streaming).await;
+                                    break;
+                                }
+                                PermissionApprovalChoice::DenyOnce => {
+                                    self.session.pending_permission_approval = None;
+                                    self.session.state = SessionState::Streaming;
+                                    self.emit_state(SessionState::Streaming).await;
+                                    self.session.cancel_tx = None;
+                                    return ToolOutcome::Error {
+                                        message: format!(
+                                            "permission denied: {}",
+                                            permission_outcome.reason
+                                        ),
+                                    };
+                                }
+                            }
+                        }
+                        Some(command) => {
+                            if self.handle_control_command(command).await {
+                                self.session.cancel_tx = None;
+                                return ToolOutcome::Cancelled;
+                            }
+                        }
+                        None => {
+                            self.session.cancel_tx = None;
+                            return ToolOutcome::Error {
+                                message: "input channel closed".into(),
+                            };
+                        }
+                    }
+                }
+            } else {
+                self.session.cancel_tx = None;
+                return ToolOutcome::Error {
+                    message: format!("permission denied: {}", permission_outcome.reason),
+                };
+            }
+        }
+
+        if call.tool_name == "wait_child" {
+            let child_id_str = match call.arguments.get("child_id").and_then(|v| v.as_str()) {
+                Some(child_id) => child_id,
+                None => {
+                    self.session.cancel_tx = None;
+                    return ToolOutcome::Error {
+                        message: "invalid arguments: missing required parameter: child_id".into(),
+                    };
+                }
+            };
+            let child_id = match crate::tool::wait_child::parse_session_id(child_id_str) {
+                Some(child_id) => child_id,
+                None => {
+                    self.session.cancel_tx = None;
+                    return ToolOutcome::Error {
+                        message: format!("invalid arguments: invalid child_id: {child_id_str}"),
+                    };
+                }
+            };
+            let non_blocking = call
+                .arguments
+                .get("non_blocking")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let timeout = call
+                .arguments
+                .get("timeout_ms")
+                .and_then(|v| v.as_u64())
+                .map(Duration::from_millis);
+
+            let tree = self.session_tree.read().await;
+            let result = if tree.parent_of(child_id) == Some(self.session_id) {
+                tree.exit_status(child_id).cloned()
+            } else {
+                None
+            };
+            drop(tree);
+
+            self.session.cancel_tx = None;
+            if let Some(status) = result {
+                return ToolOutcome::Success {
+                    output: serde_json::to_string(&status).unwrap_or_else(|_| "unknown".into()),
+                };
+            }
+            if non_blocking {
+                return ToolOutcome::Success {
+                    output: "null".into(),
+                };
+            }
+            if let Err(error) = self
+                .session_tree
+                .write()
+                .await
+                .register_active_wait(self.session_id, child_id)
+            {
+                return ToolOutcome::Error { message: error };
+            }
+            self.session.state = SessionState::Waiting;
+            self.session.suspended_wait = Some(SuspendedWait::ChildExit {
+                tool_use_id: call.tool_use_id.clone(),
+                child_id,
+                timeout_at: timeout.map(|value| Instant::now() + value),
+            });
+            self.emit_state(SessionState::Waiting).await;
+            self.emit_checkpoint_hint().await;
+            return ToolOutcome::Cancelled;
+        }
+
+        if call.tool_name == "recv_message" {
+            let source_str = match call.arguments.get("source").and_then(|v| v.as_str()) {
+                Some(source) => source,
+                None => {
+                    self.session.cancel_tx = None;
+                    return ToolOutcome::Error {
+                        message: "invalid arguments: missing required parameter: source".into(),
+                    };
+                }
+            };
+            let non_blocking = call
+                .arguments
+                .get("non_blocking")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let timeout = call
+                .arguments
+                .get("timeout_ms")
+                .and_then(|v| v.as_u64())
+                .map(Duration::from_millis);
+            let source = if source_str == "any" {
+                MessageSource::Any
+            } else {
+                match crate::tool::wait_child::parse_session_id(source_str) {
+                    Some(source_id) => MessageSource::Session(source_id),
+                    None => {
+                        self.session.cancel_tx = None;
+                        return ToolOutcome::Error {
+                            message: format!(
+                                "invalid arguments: invalid source session_id: {source_str}"
+                            ),
+                        };
+                    }
+                }
+            };
+
+            if let Some(message) = pop_mailbox_message(&mut self.session.mailbox, &source) {
+                self.session.cancel_tx = None;
+                return ToolOutcome::Success {
+                    output: serde_json::json!({
+                        "from": message.from,
+                        "content": message.content,
+                    })
+                    .to_string(),
+                };
+            }
+
+            self.session.cancel_tx = None;
+            if non_blocking {
+                return ToolOutcome::Success {
+                    output: "null".into(),
+                };
+            }
+
+            if let MessageSource::Session(source_session) = source {
+                if let Err(error) = self
+                    .session_tree
+                    .write()
+                    .await
+                    .register_active_wait(self.session_id, source_session)
+                {
+                    return ToolOutcome::Error { message: error };
+                }
+            }
+
+            self.session.state = SessionState::Waiting;
+            self.session.suspended_wait = Some(SuspendedWait::Mailbox {
+                tool_use_id: call.tool_use_id.clone(),
+                source,
+                timeout_at: timeout.map(|value| Instant::now() + value),
+            });
+            self.emit_state(SessionState::Waiting).await;
+            self.emit_checkpoint_hint().await;
+            return ToolOutcome::Cancelled;
+        }
+
+        let filesystem = Arc::clone(&self.session.filesystem);
+        let working_directory = self.session.working_directory.clone();
+        let plan_store = self.session.plan_store.clone();
+
+        if tool.is_interactive() {
+            let (req_tx, mut req_rx) =
+                mpsc::channel::<(InteractionRequest, oneshot::Sender<InteractionResponse>)>(1);
+            let channel = InteractionChannel { request_tx: req_tx };
+            let ctx = ExecutionContext {
+                session_id: self.session_id,
+                filesystem,
+                working_directory,
+                interaction_channel: Some(channel),
+                plan_store,
+                core_input: Some(self.core_input_tx.clone()),
+                cancellation: cancellation.clone(),
+            };
+            let args = call.arguments.clone();
+            let mut tool_handle = tokio::spawn(async move { tool.execute(args, &ctx).await });
+
+            let outcome = 'tool_loop: loop {
+                tokio::select! {
+                    result = &mut tool_handle => {
+                        break 'tool_loop match result {
+                            Ok(Ok(tool_output)) if tool_output.is_error => ToolOutcome::Error { message: tool_output.content },
+                            Ok(Ok(tool_output)) => ToolOutcome::Success { output: tool_output.content },
+                            Ok(Err(ToolError::Cancelled)) => ToolOutcome::Cancelled,
+                            Ok(Err(tool_err)) => ToolOutcome::Error { message: tool_err.to_string() },
+                            Err(join_err) => ToolOutcome::Error { message: format!("tool task panicked: {join_err}") },
+                        };
+                    }
+                    interaction = req_rx.recv() => {
+                        if let Some((request, reply_tx)) = interaction {
+                            let _ = self.output.send(CoreOutput::InteractionNeeded {
+                                session_id: self.session_id,
+                                request,
+                            }).await;
+                            loop {
+                                match self.next_command().await {
+                                    Some(SessionCommand::InteractionResponse(response)) => {
+                                        let _ = reply_tx.send(response);
+                                        break;
+                                    }
+                                    Some(command) => {
+                                        if self.handle_control_command(command).await {
+                                            drop(reply_tx);
+                                            break 'tool_loop ToolOutcome::Cancelled;
+                                        }
+                                    }
+                                    None => {
+                                        break 'tool_loop ToolOutcome::Error {
+                                            message: "input channel closed".into(),
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(cancel_tx) = self.session.cancel_tx.as_ref() {
+                let _ = cancel_tx.send(true);
+            }
+            self.session.cancel_tx = None;
+            outcome
+        } else {
+            let ctx = ExecutionContext {
+                session_id: self.session_id,
+                filesystem,
+                working_directory,
+                interaction_channel: None,
+                plan_store,
+                core_input: Some(self.core_input_tx.clone()),
+                cancellation: cancellation.clone(),
+            };
+            let tool_future = tool.execute(call.arguments.clone(), &ctx);
+            tokio::pin!(tool_future);
+            let result = loop {
+                if let Some(command) = self.deferred_commands.pop_front() {
+                    if self.handle_control_command(command).await {
+                        break ToolOutcome::Cancelled;
+                    }
+                    continue;
+                }
+                tokio::select! {
+                    result = &mut tool_future => {
+                        break match result {
+                            Ok(tool_output) if tool_output.is_error => ToolOutcome::Error { message: tool_output.content },
+                            Ok(tool_output) => ToolOutcome::Success { output: tool_output.content },
+                            Err(ToolError::Cancelled) => ToolOutcome::Cancelled,
+                            Err(tool_err) => ToolOutcome::Error { message: tool_err.to_string() },
+                        };
+                    }
+                    maybe_command = self.command_rx.recv() => {
+                        match maybe_command {
+                            Some(command) => {
+                                if self.handle_control_command(command).await {
+                                    break ToolOutcome::Cancelled;
+                                }
+                            }
+                            None => {
+                                break ToolOutcome::Error { message: "input channel closed during execution".into() };
+                            }
+                        }
+                    }
+                }
+            };
+            if let Some(cancel_tx) = self.session.cancel_tx.as_ref() {
+                let _ = cancel_tx.send(true);
+            }
+            self.session.cancel_tx = None;
+            result
+        }
+    }
+
+    async fn handle_plan_progress(&mut self, plan_id_str: &str, action_id_str: &str) {
+        let plan_id = match crate::planner::PlanId::from_str(plan_id_str) {
+            Ok(plan_id) => plan_id,
+            Err(_) => return,
+        };
+        let store = self.session.plan_store.lock().await;
+        let Some(plan) = store.get(&plan_id) else {
+            return;
+        };
+        let Some(action_id) = plan
+            .actions
+            .iter()
+            .find(|candidate| candidate.action_id.to_string() == action_id_str)
+            .map(|candidate| candidate.action_id.clone())
+        else {
+            return;
+        };
+        let remaining = get_ready_actions(plan)
+            .into_iter()
+            .filter(|candidate| candidate.action_id != action_id)
+            .count();
+        let total = plan.actions.len();
+        let status = plan
+            .actions
+            .iter()
+            .find(|action| action.action_id == action_id)
+            .map(|action| action.status.label().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        drop(store);
+        let _ = self
+            .output
+            .send(CoreOutput::PlanProgress {
+                session_id: self.session_id,
+                plan_id: plan_id_str.to_string(),
+                action_id: action_id_str.to_string(),
+                status,
+                remaining,
+                total,
+            })
+            .await;
+    }
+}
+
+async fn snapshot_registry_sessions(
+    registry: &SessionRegistry,
+    session_tree: &SharedSessionTree,
+) -> CoreCheckpoint {
+    let handles: Vec<SessionHandle> = registry.read().await.values().cloned().collect();
+    let mut persisted_sessions = Vec::new();
+    for handle in handles {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if handle
+            .command_tx
+            .send(SessionCommand::Snapshot { reply: reply_tx })
+            .await
+            .is_ok()
+        {
+            if let Ok(Some(snapshot)) = reply_rx.await {
+                persisted_sessions.push(snapshot);
+            }
+        }
+    }
+    let tree = session_tree.read().await.snapshot();
+    CoreCheckpoint::new(persisted_sessions, tree)
+}
+
+async fn emit_checkpoint_request_for_registry(
+    registry: &SessionRegistry,
+    session_tree: &SharedSessionTree,
+    output: &mpsc::Sender<CoreOutput>,
+) {
+    let checkpoint = snapshot_registry_sessions(registry, session_tree).await;
+    let _ = output
+        .send(CoreOutput::CheckpointRequested { checkpoint })
+        .await;
+}
+
+#[derive(Clone)]
+struct SessionActorSpawner {
+    registry: SessionRegistry,
+    session_tree: SharedSessionTree,
+    output: mpsc::Sender<CoreOutput>,
+    core_input_tx: mpsc::Sender<CoreInput>,
+    runtime_event_tx: mpsc::Sender<RuntimeEvent>,
+    web_provider: Arc<dyn WebProvider>,
+}
+
+async fn spawn_session_actor(
+    spawner: &SessionActorSpawner,
+    session_id: SessionId,
+    session: SessionContext,
+    parent_id: Option<SessionId>,
+) -> Result<(), String> {
+    let (command_tx, command_rx) = mpsc::channel(256);
+    {
+        let mut guard = spawner.registry.write().await;
+        if guard.contains_key(&session_id) {
+            return Err("session already exists".into());
+        }
+        guard.insert(
+            session_id,
+            SessionHandle {
+                command_tx: command_tx.clone(),
+                provider: Arc::clone(&session.provider),
+                max_context_window: session.max_context_window,
+                model_profile: session.persisted_config.model_profile.clone(),
+            },
+        );
+    }
+
+    let actor = SessionActor {
+        session_id,
+        parent_id,
+        session,
+        command_rx,
+        deferred_commands: VecDeque::new(),
+        output: spawner.output.clone(),
+        core_input_tx: spawner.core_input_tx.clone(),
+        runtime_event_tx: spawner.runtime_event_tx.clone(),
+        session_tree: Arc::clone(&spawner.session_tree),
+        web_provider: Arc::clone(&spawner.web_provider),
+    };
+    tokio::spawn(actor.run());
+    Ok(())
 }
 
 /// Run the core event loop, processing inputs and emitting outputs.
@@ -4327,16 +6002,27 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
     restored_checkpoint: Option<CoreCheckpoint>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
-    wake_waits: Arc<Notify>,
+    _wake_waits: Arc<Notify>,
 ) {
-    let mut sessions: HashMap<SessionId, SessionContext> = HashMap::new();
-    let mut session_tree = SessionTree::new();
-    let mut deferred_inputs = VecDeque::new();
+    let restored_tree = restored_checkpoint
+        .as_ref()
+        .map(|checkpoint| SessionTree::restore(checkpoint.session_tree.clone()))
+        .unwrap_or_default();
+    let registry: SessionRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let session_tree: SharedSessionTree = Arc::new(RwLock::new(restored_tree));
+    let (runtime_event_tx, mut runtime_event_rx) = mpsc::channel(256);
+    let spawner = SessionActorSpawner {
+        registry: Arc::clone(&registry),
+        session_tree: Arc::clone(&session_tree),
+        output: handle.output.clone(),
+        core_input_tx: handle.input_tx.clone(),
+        runtime_event_tx: runtime_event_tx.clone(),
+        web_provider: Arc::clone(&web_provider),
+    };
     let (scheduler_handle, scheduler_task) = spawn_scheduler(handle.input_tx.clone());
     debug_log("core event loop started");
 
     if let Some(checkpoint) = restored_checkpoint {
-        session_tree = SessionTree::restore(checkpoint.session_tree);
         for persisted_session in checkpoint.sessions {
             match SessionContext::from_persisted_with_web_provider(
                 persisted_session,
@@ -4349,11 +6035,16 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
             {
                 Ok((session_id, session)) => {
                     let state = session.state;
-                    sessions.insert(session_id, session);
-                    let _ = handle
-                        .output
-                        .send(CoreOutput::SessionStateChanged { session_id, state })
-                        .await;
+                    let parent_id = session_tree.read().await.parent_of(session_id);
+                    if spawn_session_actor(&spawner, session_id, session, parent_id)
+                        .await
+                        .is_ok()
+                    {
+                        let _ = handle
+                            .output
+                            .send(CoreOutput::SessionStateChanged { session_id, state })
+                            .await;
+                    }
                 }
                 Err(error) => {
                     debug_log(format!(
@@ -4365,751 +6056,371 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
     }
 
     loop {
-        let mut io = CoreIo {
-            output: &handle.output,
-            input: &mut handle.input,
-            input_tx: &handle.input_tx,
-            deferred_inputs: &mut deferred_inputs,
-        };
-        let mut engine = EngineState {
-            provider: &provider,
-            session_tree: &mut session_tree,
-        };
-        drain_wait_timeouts(&mut sessions, &mut io, &mut engine).await;
-
-        let input = match deferred_inputs.pop_front() {
-            Some(input) => input,
-            None => {
-                if let Some(deadline) = next_wait_deadline(&sessions) {
-                    tokio::select! {
-                        _ = wake_waits.notified() => {
-                            continue;
+        tokio::select! {
+            maybe_event = runtime_event_rx.recv() => {
+                match maybe_event {
+                    Some(RuntimeEvent::ChildSessionFinished { session_id, parent_id, status }) => {
+                        registry.write().await.remove(&session_id);
+                        session_tree.write().await.record_exit(session_id, status.clone());
+                        let _ = handle.output.send(CoreOutput::SessionStateChanged {
+                            session_id,
+                            state: SessionState::Destroyed,
+                        }).await;
+                        let _ = handle.output.send(CoreOutput::ChildExited {
+                            parent_id,
+                            child_id: session_id,
+                            status: status.clone(),
+                        }).await;
+                        let handles: Vec<SessionHandle> = registry.read().await.values().cloned().collect();
+                        for session_handle in handles {
+                            let _ = session_handle.command_tx.send(SessionCommand::ChildExited {
+                                child_id: session_id,
+                                status: status.clone(),
+                            }).await;
                         }
-                        _ = tokio::time::sleep_until(deadline) => {
-                            continue;
-                        }
-                        maybe_input = handle.input.recv() => {
-                            match maybe_input {
-                                Some(input) => input,
-                                None => break,
-                            }
-                        }
+                        emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
                     }
-                } else {
-                    match handle.input.recv().await {
-                        Some(input) => input,
-                        None => break,
+                    Some(RuntimeEvent::CheckpointHint) => {
+                        emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
                     }
+                    None => {}
                 }
             }
-        };
-        match input {
-            CoreInput::CreateSession {
-                session_id,
-                system_prompt,
-                working_directory,
-                skills,
-                plan_mode,
-                prompt_behavior,
-                initial_messages,
-                agent_key,
-                team_key,
-                memory_policy,
-                session_llm,
-                auto_compact_threshold_percent,
-                status_report_min_tool_rounds,
-                permission_rules,
-                reply,
-            } => {
-                debug_log_session(
-                    session_id,
-                    format!(
-                        "received CreateSession (plan_mode={}, skills={})",
-                        plan_mode,
-                        skills.len()
-                    ),
-                );
-                if sessions.contains_key(&session_id) {
-                    let _ = reply.send(Err("session already exists".into()));
-                    continue;
-                }
-
-                let work_dir = working_directory
-                    .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
-                let work_dir_display = work_dir.display().to_string();
-
-                match SessionContext::new_with_web_provider(
-                    session_id,
-                    SessionInit {
+            maybe_input = handle.input.recv() => {
+                let Some(input) = maybe_input else {
+                    break;
+                };
+                match input {
+                    CoreInput::CreateSession {
+                        session_id,
                         system_prompt,
+                        working_directory,
                         skills,
-                        working_directory: work_dir,
                         plan_mode,
                         prompt_behavior,
                         initial_messages,
-                        archive_root: archive_root.clone(),
-                        max_context_window: session_llm.max_context_window,
-                        prompt_memory_mode: prompt_memory_mode_from_env(),
                         agent_key,
                         team_key,
                         memory_policy,
-                        model_profile: session_llm.model_profile.clone(),
+                        session_llm,
                         auto_compact_threshold_percent,
                         status_report_min_tool_rounds,
-                    },
-                    &session_llm.provider,
-                    &web_provider,
-                )
-                .await
-                {
-                    Ok(mut ctx) => {
-                        ctx.permission_context.set_rules(permission_rules);
-                        debug_log_session(
+                        permission_rules,
+                        reply,
+                    } => {
+                        if registry.read().await.contains_key(&session_id) {
+                            let _ = reply.send(Err("session already exists".into()));
+                            continue;
+                        }
+                        let work_dir = working_directory
+                            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+                        match SessionContext::new_with_web_provider(
                             session_id,
-                            format!(
-                                "session created with working_directory={}",
-                                work_dir_display
-                            ),
-                        );
-                        sessions.insert(session_id, ctx);
-                        let _ = handle
-                            .output
-                            .send(CoreOutput::SessionStateChanged {
-                                session_id,
-                                state: SessionState::Idle,
-                            })
-                            .await;
-                        emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(e) => {
-                        debug_log_session(session_id, format!("session creation failed: {e}"));
-                        let _ = reply.send(Err(format!("failed to create session: {e}")));
-                    }
-                }
-            }
-
-            CoreInput::ExitPlanMode { session_id, reply } => {
-                let Some(session) = sessions.get_mut(&session_id) else {
-                    let _ = reply.send(Err("unknown session".into()));
-                    continue;
-                };
-
-                if !matches!(session.state, SessionState::Idle | SessionState::Paused) {
-                    let _ = reply.send(Err(format!(
-                        "cannot exit plan mode while session is {:?}",
-                        session.state
-                    )));
-                    continue;
-                }
-
-                match session
-                    .exit_plan_mode_with_web_provider(&web_provider)
-                    .await
-                {
-                    Ok(()) => {
-                        emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(error) => {
-                        let _ = reply.send(Err(format!("failed to exit plan mode: {error}")));
-                    }
-                }
-            }
-
-            CoreInput::UpdateSessionLlm {
-                session_id,
-                session_llm,
-                reply,
-            } => {
-                let Some(session) = sessions.get_mut(&session_id) else {
-                    let _ = reply.send(Err("unknown session".into()));
-                    continue;
-                };
-
-                if !matches!(session.state, SessionState::Idle | SessionState::Paused) {
-                    let _ = reply.send(Err(format!(
-                        "cannot switch model while session is {:?}",
-                        session.state
-                    )));
-                    continue;
-                }
-
-                match session
-                    .update_llm_provider_with_web_provider(
-                        Arc::clone(&session_llm.provider),
-                        session_llm.model_profile.clone(),
-                        session_llm.max_context_window,
-                        &web_provider,
-                    )
-                    .await
-                {
-                    Ok(()) => {
-                        emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(error) => {
-                        let _ = reply.send(Err(format!("failed to update session model: {error}")));
-                    }
-                }
-            }
-
-            CoreInput::UserMessage {
-                session_id,
-                content,
-            } => {
-                debug_log_session(
-                    session_id,
-                    format!("received UserMessage ({} chars)", content.len()),
-                );
-                if sessions.contains_key(&session_id) {
-                    {
-                        let session = sessions.get_mut(&session_id).unwrap();
-                        session.interrupted = false;
-                        session_tree.clear_active_wait(session_id);
-                        session.suspended_wait = None;
-                        session.state = SessionState::Streaming;
-                        session.current_turn_tool_rounds = 0;
-                        session.history.push(Message::user(&content));
-                        session.last_memory_diagnostics =
-                            Some(default_turn_diagnostics_for_session(session));
-                    }
-                    set_session_status_report(&mut sessions, session_id, &handle.output, None)
-                        .await;
-                    let _ = handle
-                        .output
-                        .send(CoreOutput::SessionStateChanged {
-                            session_id,
-                            state: SessionState::Streaming,
-                        })
-                        .await;
-                    let mut io = CoreIo {
-                        output: &handle.output,
-                        input: &mut handle.input,
-                        input_tx: &handle.input_tx,
-                        deferred_inputs: &mut deferred_inputs,
-                    };
-                    let mut engine = EngineState {
-                        provider: &provider,
-                        session_tree: &mut session_tree,
-                    };
-                    let turn_outcome =
-                        handle_llm_turn(&mut sessions, session_id, &mut io, &mut engine).await;
-                    if session_tree.parent_of(session_id).is_some() {
-                        finalize_child_session(
-                            &mut sessions,
-                            &mut session_tree,
-                            session_id,
-                            turn_outcome,
-                            &handle.output,
-                            &mut deferred_inputs,
-                        )
-                        .await;
-                    }
-                } else {
-                    debug_log_session(session_id, "user message targeted unknown session");
-                    let _ = handle
-                        .output
-                        .send(CoreOutput::SessionError {
-                            session_id,
-                            error: CoreError::SessionNotFound,
-                        })
-                        .await;
-                }
-            }
-
-            CoreInput::ScheduleUserMessage {
-                session_id,
-                content,
-                delay,
-            } => {
-                debug_log_session(
-                    session_id,
-                    format!("received ScheduleUserMessage (delay={}s)", delay.as_secs()),
-                );
-                if scheduler_handle
-                    .schedule_user_message(session_id, content, delay)
-                    .await
-                    .is_err()
-                {
-                    let _ = handle
-                        .output
-                        .send(CoreOutput::SessionError {
-                            session_id,
-                            error: CoreError::Internal {
-                                message: "scheduler unavailable".into(),
+                            SessionInit {
+                                system_prompt,
+                                skills,
+                                working_directory: work_dir,
+                                plan_mode,
+                                prompt_behavior,
+                                initial_messages,
+                                archive_root: archive_root.clone(),
+                                max_context_window: session_llm.max_context_window,
+                                prompt_memory_mode: prompt_memory_mode_from_env(),
+                                agent_key,
+                                team_key,
+                                memory_policy,
+                                model_profile: session_llm.model_profile.clone(),
+                                auto_compact_threshold_percent,
+                                status_report_min_tool_rounds,
                             },
-                        })
-                        .await;
-                }
-            }
-
-            CoreInput::CompactSession { session_id, reply } => {
-                debug_log_session(session_id, "received CompactSession request");
-                let result = if let Some(session) = sessions.get_mut(&session_id) {
-                    compact_session_history(
-                        provider.as_ref(),
-                        session,
-                        session_id,
-                        CompactionTrigger::Manual,
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())
-                } else {
-                    Err("session not found".into())
-                };
-                let _ = reply.send(result);
-            }
-
-            CoreInput::ToolResult {
-                session_id,
-                tool_use_id,
-                result,
-            } => {
-                debug_log_session(
-                    session_id,
-                    format!("received external ToolResult for tool_use_id={tool_use_id}"),
-                );
-                // Legacy path: the harness sent a tool result.
-                // With the new architecture, tools are executed in-core,
-                // but we still accept external tool results for backward compat.
-                if let Some(wait) = sessions
-                    .get(&session_id)
-                    .and_then(|session| session.suspended_wait.clone())
-                {
-                    let resume_result = match wait {
-                        SuspendedWait::Mailbox { source, .. } => {
-                            let message = sessions.get_mut(&session_id).and_then(|session| {
-                                pop_mailbox_message(&mut session.mailbox, &source)
-                            });
-                            match message {
-                                Some(MailboxMessage { from, content }) => ToolOutcome::Success {
-                                    output: serde_json::json!({
-                                        "from": from,
-                                        "content": content,
-                                    })
-                                    .to_string(),
-                                },
-                                None => ToolOutcome::Error {
-                                    message: "recv_message resumed without a matching message"
-                                        .into(),
-                                },
-                            }
-                        }
-                        SuspendedWait::ChildExit { child_id, .. } => {
-                            match session_tree.exit_status(child_id).cloned() {
-                                Some(status) => ToolOutcome::Success {
-                                    output: serde_json::to_string(&status)
-                                        .unwrap_or_else(|_| "unknown".into()),
-                                },
-                                None => ToolOutcome::Error {
-                                    message: "wait_child resumed before child exit was recorded"
-                                        .into(),
-                                },
-                            }
-                        }
-                    };
-
-                    let mut io = CoreIo {
-                        output: &handle.output,
-                        input: &mut handle.input,
-                        input_tx: &handle.input_tx,
-                        deferred_inputs: &mut deferred_inputs,
-                    };
-                    let mut engine = EngineState {
-                        provider: &provider,
-                        session_tree: &mut session_tree,
-                    };
-                    resume_session_from_wait(
-                        &mut sessions,
-                        session_id,
-                        resume_result,
-                        &mut io,
-                        &mut engine,
-                    )
-                    .await;
-                    continue;
-                }
-
-                if let Some(actual_state) = sessions.get(&session_id).map(|s| s.state) {
-                    if actual_state != SessionState::AwaitingToolResult {
-                        debug_log_session(
-                            session_id,
-                            format!(
-                                "ignoring stale external ToolResult for tool_use_id={tool_use_id} while session is {actual_state:?}"
-                            ),
-                        );
-                    } else {
-                        let (output_text, is_error) = match &result {
-                            ToolOutcome::Success { output } => (output.clone(), false),
-                            ToolOutcome::Error { message } => (message.clone(), true),
-                            ToolOutcome::Cancelled => {
-                                ("Tool execution was cancelled".to_string(), true)
-                            }
-                        };
-                        let history_output = {
-                            let session = sessions.get(&session_id).unwrap();
-                            match prepare_tool_result_for_history(
-                                session,
-                                session_id,
-                                &tool_use_id,
-                                "external",
-                                &output_text,
-                                is_error,
-                            )
-                            .await
-                            {
-                                Ok(output) => output,
-                                Err(error) => {
-                                    let _ = handle
-                                        .output
-                                        .send(CoreOutput::SessionError { session_id, error })
-                                        .await;
-                                    continue;
+                            &session_llm.provider,
+                            &web_provider,
+                        )
+                        .await
+                        {
+                            Ok(mut ctx) => {
+                                ctx.permission_context.set_rules(permission_rules);
+                                match spawn_session_actor(
+                                    &spawner,
+                                    session_id,
+                                    ctx,
+                                    None,
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        let _ = handle.output.send(CoreOutput::SessionStateChanged {
+                                            session_id,
+                                            state: SessionState::Idle,
+                                        }).await;
+                                        emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
+                                        let _ = reply.send(Ok(()));
+                                    }
+                                    Err(error) => {
+                                        let _ = reply.send(Err(error));
+                                    }
                                 }
                             }
-                        };
-                        {
-                            let session = sessions.get_mut(&session_id).unwrap();
-                            session.history.push(Message::tool_result(
-                                &tool_use_id,
-                                &history_output,
-                                is_error,
-                            ));
-                            session.state = SessionState::Streaming;
-                        }
-                        let _ = handle
-                            .output
-                            .send(CoreOutput::SessionStateChanged {
-                                session_id,
-                                state: SessionState::Streaming,
-                            })
-                            .await;
-
-                        let mut io = CoreIo {
-                            output: &handle.output,
-                            input: &mut handle.input,
-                            input_tx: &handle.input_tx,
-                            deferred_inputs: &mut deferred_inputs,
-                        };
-                        let mut engine = EngineState {
-                            provider: &provider,
-                            session_tree: &mut session_tree,
-                        };
-                        let turn_outcome =
-                            handle_llm_turn(&mut sessions, session_id, &mut io, &mut engine).await;
-                        if session_tree.parent_of(session_id).is_some() {
-                            finalize_child_session(
-                                &mut sessions,
-                                &mut session_tree,
-                                session_id,
-                                turn_outcome,
-                                &handle.output,
-                                &mut deferred_inputs,
-                            )
-                            .await;
-                        }
-                    }
-                } else {
-                    let _ = handle
-                        .output
-                        .send(CoreOutput::SessionError {
-                            session_id,
-                            error: CoreError::SessionNotFound,
-                        })
-                        .await;
-                }
-            }
-
-            CoreInput::InteractionResponse { .. } => {
-                debug_log("received unhandled InteractionResponse at top-level core loop");
-                // Interaction responses are handled within execute_tool_call.
-                // If we get one here, it means no tool is waiting for it.
-            }
-
-            CoreInput::Cancel { session_id } => {
-                debug_log_session(session_id, "received Cancel");
-                if sessions.contains_key(&session_id) {
-                    interrupt_session(&mut sessions, &mut deferred_inputs, session_id);
-                    let _ = handle
-                        .output
-                        .send(CoreOutput::SessionStateChanged {
-                            session_id,
-                            state: SessionState::Idle,
-                        })
-                        .await;
-                    emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
-                }
-            }
-
-            CoreInput::SessionMemoryRefreshFinished {
-                session_id,
-                last_summarized_message_index,
-                refreshed_at,
-                listing_summary,
-            } => {
-                if let Some(session) = sessions.get_mut(&session_id) {
-                    session.session_memory.refresh_in_flight = false;
-                    if let Some(index) = last_summarized_message_index {
-                        session.session_memory.last_summarized_message_index = Some(index);
-                    }
-                    if let Some(timestamp) = refreshed_at {
-                        session.session_memory.last_refresh_at = Some(timestamp);
-                    }
-                    if let Some(summary) = listing_summary {
-                        session.session_memory.listing_summary = Some(summary);
-                    }
-                    let diagnostics = ensure_turn_diagnostics(session);
-                    diagnostics.session_memory.refresh.attempted = true;
-                    if let Some(index) = last_summarized_message_index {
-                        diagnostics.session_memory.refresh.status = MemoryStatus::Succeeded;
-                        diagnostics.session_memory.refresh.reason = None;
-                        diagnostics
-                            .session_memory
-                            .refresh
-                            .last_summarized_message_index = Some(index);
-                    } else {
-                        diagnostics.session_memory.refresh.status = MemoryStatus::FailedBestEffort;
-                        diagnostics.session_memory.refresh.reason =
-                            Some(MemoryDecisionReason::MissingSummary);
-                    }
-                    if let Some(timestamp) = refreshed_at {
-                        diagnostics.session_memory.refresh.refreshed_at =
-                            Some(timestamp.to_rfc3339());
-                    }
-                    emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
-                }
-            }
-
-            CoreInput::Shutdown => {
-                debug_log("received Shutdown; exiting core event loop");
-                break;
-            }
-
-            CoreInput::SpawnSession {
-                parent_id,
-                child_id,
-                task,
-                system_prompt,
-                prompt_behavior,
-                permission_rules,
-                inheritance,
-                reply,
-            } => {
-                debug_log_session(
-                    parent_id,
-                    format!(
-                        "received SpawnSession for child={child_id:?} (task_len={}, inherit_history={}, inherit_filesystem={}, has_system_prompt={})",
-                        task.len(),
-                        inheritance.history,
-                        inheritance.filesystem,
-                        system_prompt.is_some()
-                    ),
-                );
-                debug_log_session(
-                    child_id,
-                    format!("received SpawnSession for task ({} chars)", task.len()),
-                );
-                if sessions.contains_key(&child_id) {
-                    let _ = reply.send(Err("session already exists".into()));
-                    continue;
-                }
-
-                let mut io = CoreIo {
-                    output: &handle.output,
-                    input: &mut handle.input,
-                    input_tx: &handle.input_tx,
-                    deferred_inputs: &mut deferred_inputs,
-                };
-                let mut engine = EngineState {
-                    provider: &provider,
-                    session_tree: &mut session_tree,
-                };
-                let result = start_child_session(
-                    &mut sessions,
-                    &mut io,
-                    &mut engine,
-                    parent_id,
-                    child_id,
-                    task,
-                    system_prompt,
-                    prompt_behavior,
-                    permission_rules,
-                    archive_root.clone(),
-                    max_context_window,
-                )
-                .await;
-                match result {
-                    Ok(()) => {
-                        let _ = reply.send(Ok(()));
-                    }
-                    Err(error) => {
-                        debug_log_session(
-                            parent_id,
-                            format!(
-                                "child session creation failed for child={child_id:?}: {error}"
-                            ),
-                        );
-                        debug_log_session(
-                            child_id,
-                            format!("child session creation failed: {error}"),
-                        );
-                        let _ = reply.send(Err(error));
-                    }
-                }
-            }
-            CoreInput::ScheduleSpawnSession {
-                parent_id,
-                task,
-                system_prompt,
-                delay,
-                cadence,
-            } => {
-                debug_log_session(
-                    parent_id,
-                    format!(
-                        "received ScheduleSpawnSession (delay={}s cadence={:?})",
-                        delay.as_secs(),
-                        cadence.map(|value| value.as_secs())
-                    ),
-                );
-                if scheduler_handle
-                    .schedule_spawn_session(parent_id, task, system_prompt, delay, cadence)
-                    .await
-                    .is_err()
-                {
-                    let _ = handle
-                        .output
-                        .send(CoreOutput::SessionError {
-                            session_id: parent_id,
-                            error: CoreError::Internal {
-                                message: "scheduler unavailable".into(),
-                            },
-                        })
-                        .await;
-                }
-            }
-            CoreInput::Signal { session_id, signal } => {
-                debug_log_session(session_id, format!("received Signal::{signal:?}"));
-                match signal {
-                    SessionSignal::Continue => {
-                        if let Some(session) = sessions.get_mut(&session_id) {
-                            session.interrupted = false;
-                            if session.state == SessionState::Paused {
-                                session.state = SessionState::Idle;
+                            Err(error) => {
+                                let _ = reply.send(Err(format!("failed to create session: {error}")));
                             }
-                            let _ = handle
-                                .output
-                                .send(CoreOutput::SessionStateChanged {
-                                    session_id,
-                                    state: session.state,
-                                })
-                                .await;
                         }
                     }
-                    SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill => {
-                        if sessions.contains_key(&session_id) {
-                            interrupt_session(&mut sessions, &mut deferred_inputs, session_id);
-                            clear_suspended_wait(&mut sessions, &mut session_tree, session_id);
-                            let _ = handle
-                                .output
-                                .send(CoreOutput::SessionStateChanged {
-                                    session_id,
-                                    state: SessionState::Idle,
-                                })
-                                .await;
+                    CoreInput::ExitPlanMode { session_id, reply } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::ExitPlanMode { reply }).await;
+                        } else {
+                            let _ = reply.send(Err("unknown session".into()));
                         }
                     }
-                }
-            }
-            CoreInput::SendMessage { from, to, content } => {
-                handle_send_message_input(
-                    &mut sessions,
-                    &handle.output,
-                    from,
-                    to,
-                    content,
-                    &mut deferred_inputs,
-                    wake_waits.as_ref(),
-                )
-                .await;
-            }
-            CoreInput::RecvMessage {
-                session_id,
-                source,
-                non_blocking,
-                timeout: _,
-                reply,
-            } => {
-                debug_log_session(session_id, "received RecvMessage");
-                match sessions.get_mut(&session_id) {
-                    Some(session) => {
-                        if let Some(message) = pop_mailbox_message(&mut session.mailbox, &source) {
-                            let _ = reply.send(Some(message));
+                    CoreInput::UpdateSessionLlm { session_id, session_llm, reply } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::UpdateSessionLlm {
+                                session_llm,
+                                reply,
+                            }).await;
+                        } else {
+                            let _ = reply.send(Err("unknown session".into()));
+                        }
+                    }
+                    CoreInput::UserMessage { session_id, content } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::UserMessage(content)).await;
+                        } else {
+                            let _ = handle.output.send(CoreOutput::SessionError {
+                                session_id,
+                                error: CoreError::SessionNotFound,
+                            }).await;
+                        }
+                    }
+                    CoreInput::ScheduleUserMessage { session_id, content, delay } => {
+                        if scheduler_handle.schedule_user_message(session_id, content, delay).await.is_err() {
+                            let _ = handle.output.send(CoreOutput::SessionError {
+                                session_id,
+                                error: CoreError::Internal {
+                                    message: "scheduler unavailable".into(),
+                                },
+                            }).await;
+                        }
+                    }
+                    CoreInput::CompactSession { session_id, reply } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::CompactSession { reply }).await;
+                        } else {
+                            let _ = reply.send(Err("session not found".into()));
+                        }
+                    }
+                    CoreInput::ToolResult { session_id, tool_use_id, result } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::ToolResult {
+                                tool_use_id,
+                                result,
+                            }).await;
+                        } else {
+                            let _ = handle.output.send(CoreOutput::SessionError {
+                                session_id,
+                                error: CoreError::SessionNotFound,
+                            }).await;
+                        }
+                    }
+                    CoreInput::InteractionResponse { session_id, response } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::InteractionResponse(response)).await;
+                        }
+                    }
+                    CoreInput::Cancel { session_id } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::Cancel).await;
+                        }
+                    }
+                    CoreInput::SessionMemoryRefreshFinished {
+                        session_id,
+                        last_summarized_message_index,
+                        refreshed_at,
+                        listing_summary,
+                    } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::SessionMemoryRefreshFinished {
+                                last_summarized_message_index,
+                                refreshed_at,
+                                listing_summary,
+                            }).await;
+                        }
+                    }
+                    CoreInput::Shutdown => {
+                        let handles: Vec<SessionHandle> = registry.read().await.values().cloned().collect();
+                        for session_handle in handles {
+                            let _ = session_handle.command_tx.send(SessionCommand::Shutdown).await;
+                        }
+                        break;
+                    }
+                    CoreInput::SpawnSession {
+                        parent_id,
+                        child_id,
+                        task,
+                        system_prompt,
+                        prompt_behavior,
+                        permission_rules,
+                        inheritance: _inheritance,
+                        reply,
+                    } => {
+                        if registry.read().await.contains_key(&child_id) {
+                            let _ = reply.send(Err("session already exists".into()));
+                            continue;
+                        }
+                        let parent_handle = registry.read().await.get(&parent_id).cloned();
+                        let inherited_provider = parent_handle
+                            .as_ref()
+                            .map(|handle| Arc::clone(&handle.provider))
+                            .unwrap_or_else(|| Arc::clone(&provider));
+                        let inherited_model_profile = parent_handle
+                            .as_ref()
+                            .and_then(|handle| handle.model_profile.clone());
+                        let inherited_max_context_window = parent_handle
+                            .as_ref()
+                            .and_then(|handle| handle.max_context_window)
+                            .or(max_context_window);
+                        match SessionContext::new(
+                            child_id,
+                            SessionInit {
+                                system_prompt,
+                                skills: Vec::new(),
+                                working_directory: std::env::current_dir().unwrap_or_default(),
+                                plan_mode: false,
+                                prompt_behavior,
+                                initial_messages: Vec::new(),
+                                archive_root: archive_root.clone(),
+                                max_context_window: inherited_max_context_window,
+                                prompt_memory_mode: PromptMemoryMode::Disabled,
+                                agent_key: None,
+                                team_key: None,
+                                memory_policy: MemoryPolicyConfig::default(),
+                                model_profile: inherited_model_profile,
+                                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+                            },
+                            &inherited_provider,
+                        )
+                        .await
+                        {
+                            Ok(mut ctx) => {
+                                ctx.permission_context.set_rules(permission_rules);
+                                session_tree.write().await.add_child(parent_id, child_id);
+                                match spawn_session_actor(
+                                    &spawner,
+                                    child_id,
+                                    ctx,
+                                    Some(parent_id),
+                                )
+                                .await
+                                {
+                                    Ok(()) => {
+                                        let _ = handle.output.send(CoreOutput::ChildSpawned { parent_id, child_id }).await;
+                                        let _ = handle.output.send(CoreOutput::SessionStateChanged {
+                                            session_id: child_id,
+                                            state: SessionState::Idle,
+                                        }).await;
+                                        if let Some(child_handle) = registry.read().await.get(&child_id).cloned() {
+                                            let _ = child_handle.command_tx.send(SessionCommand::UserMessage(task)).await;
+                                        }
+                                        emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
+                                        let _ = reply.send(Ok(()));
+                                    }
+                                    Err(error) => {
+                                        let _ = reply.send(Err(error));
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                let _ = reply.send(Err(error.to_string()));
+                            }
+                        }
+                    }
+                    CoreInput::ScheduleSpawnSession { parent_id, task, system_prompt, delay, cadence } => {
+                        if scheduler_handle.schedule_spawn_session(parent_id, task, system_prompt, delay, cadence).await.is_err() {
+                            let _ = handle.output.send(CoreOutput::SessionError {
+                                session_id: parent_id,
+                                error: CoreError::Internal {
+                                    message: "scheduler unavailable".into(),
+                                },
+                            }).await;
+                        }
+                    }
+                    CoreInput::Signal { session_id, signal } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::Signal(signal)).await;
+                        }
+                    }
+                    CoreInput::SendMessage { from, to, content } => {
+                        if let Some(session_handle) = registry.read().await.get(&to).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::MailboxMessage(
+                                MailboxMessage { from, content: content.clone() }
+                            )).await;
+                            let _ = handle.output.send(CoreOutput::MessageReceived {
+                                session_id: to,
+                                from,
+                                content,
+                            }).await;
+                        }
+                    }
+                    CoreInput::RecvMessage { session_id, source, non_blocking: _, timeout: _, reply } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::QueryMailbox {
+                                source,
+                                reply,
+                            }).await;
                         } else {
                             let _ = reply.send(None);
-                            if !non_blocking {
-                                debug_log_session(
-                                    session_id,
-                                    "legacy RecvMessage request could not block in core loop",
-                                );
+                        }
+                    }
+                    CoreInput::SendHarnessIpcMessage { target, content, reply } => {
+                        let result = scheduler_handle
+                            .send_ipc_message(target, content)
+                            .await
+                            .map_err(|error| error.to_string());
+                        let _ = reply.send(result);
+                    }
+                    CoreInput::RecvHarnessIpcMessage { source, non_blocking, reply } => {
+                        let result = scheduler_handle
+                            .recv_ipc_message(source, non_blocking)
+                            .await
+                            .ok()
+                            .flatten();
+                        let _ = reply.send(result);
+                    }
+                    CoreInput::RequestCheckpoint { reply } => {
+                        emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
+                        let _ = reply.send(());
+                    }
+                    CoreInput::WaitSession { parent_id, child_id, reply, non_blocking, timeout: _ } => {
+                        let tree = session_tree.read().await;
+                        let result = if tree.parent_of(child_id) == Some(parent_id) {
+                            tree.exit_status(child_id).cloned()
+                        } else {
+                            None
+                        };
+                        drop(tree);
+                        if let Some(status) = result {
+                            let _ = reply.send(Ok(Some(status)));
+                        } else if non_blocking {
+                            let _ = reply.send(Ok(None));
+                        } else {
+                            let (wait_tx, wait_rx) = oneshot::channel();
+                            let already_exited = session_tree.write().await.register_waiter(child_id, wait_tx);
+                            if already_exited {
+                                let status = session_tree.read().await.exit_status(child_id).cloned();
+                                let _ = reply.send(Ok(status));
+                            } else {
+                                tokio::spawn(async move {
+                                    let response = wait_rx.await
+                                        .map(Some)
+                                        .map_err(|_| "wait reply channel dropped".to_string());
+                                    let _ = reply.send(response);
+                                });
                             }
                         }
                     }
-                    None => {
-                        let _ = reply.send(None);
-                    }
                 }
-            }
-            CoreInput::SendHarnessIpcMessage {
-                target,
-                content,
-                reply,
-            } => {
-                let result = scheduler_handle
-                    .send_ipc_message(target, content)
-                    .await
-                    .map_err(|error| error.to_string());
-                let _ = reply.send(result);
-            }
-            CoreInput::RecvHarnessIpcMessage {
-                source,
-                non_blocking,
-                reply,
-            } => {
-                let result = scheduler_handle
-                    .recv_ipc_message(source, non_blocking)
-                    .await
-                    .ok()
-                    .flatten();
-                let _ = reply.send(result);
-            }
-            CoreInput::RequestCheckpoint { reply } => {
-                emit_checkpoint_request(&sessions, &session_tree, &handle.output).await;
-                let _ = reply.send(());
-            }
-            CoreInput::WaitSession {
-                parent_id,
-                child_id,
-                reply,
-                non_blocking,
-                timeout: _,
-            } => {
-                let result = if session_tree.parent_of(child_id) == Some(parent_id) {
-                    session_tree.exit_status(child_id).cloned()
-                } else {
-                    None
-                };
-                let response = if result.is_some() || non_blocking {
-                    Ok(result)
-                } else {
-                    match session_tree.register_active_wait(parent_id, child_id) {
-                        Ok(()) => Ok(None),
-                        Err(error) => Err(error),
-                    }
-                };
-                let _ = reply.send(response);
             }
         }
     }
@@ -5131,7 +6442,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::TempDir;
-    use tokio::sync::{oneshot, Barrier};
+    use tokio::sync::{oneshot, Barrier, Notify};
     use tokio::time::Duration as TokioDuration;
 
     use crate::memory::load_summary_metadata;
@@ -5241,6 +6552,81 @@ mod tests {
                 .unwrap()
                 .pop_front()
                 .unwrap_or_default();
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LlmEvent::TextDelta { text }),
+                Ok(LlmEvent::Done { usage: None }),
+            ])))
+        }
+    }
+
+    struct ConcurrentSessionProvider {
+        response_text: String,
+        started: AtomicUsize,
+        started_notify: Notify,
+        released: AtomicBool,
+        release_notify: Notify,
+    }
+
+    impl ConcurrentSessionProvider {
+        fn new(text: impl Into<String>) -> Self {
+            Self {
+                response_text: text.into(),
+                started: AtomicUsize::new(0),
+                started_notify: Notify::new(),
+                released: AtomicBool::new(false),
+                release_notify: Notify::new(),
+            }
+        }
+
+        async fn wait_until_started(&self, expected: usize) {
+            tokio::time::timeout(TokioDuration::from_secs(1), async {
+                loop {
+                    if self.started.load(Ordering::SeqCst) >= expected {
+                        break;
+                    }
+                    self.started_notify.notified().await;
+                }
+            })
+            .await
+            .expect("sessions never entered the provider concurrently");
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release_notify.notify_waiters();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ConcurrentSessionProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.started_notify.notify_waiters();
+
+            tokio::time::timeout(TokioDuration::from_secs(1), async {
+                loop {
+                    if self.started.load(Ordering::SeqCst) >= 2 {
+                        break;
+                    }
+                    self.started_notify.notified().await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("second session never reached the provider"))?;
+
+            loop {
+                if self.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                self.release_notify.notified().await;
+            }
+
+            let text = self.response_text.clone();
             Ok(Box::pin(futures::stream::iter([
                 Ok(LlmEvent::TextDelta { text }),
                 Ok(LlmEvent::Done { usage: None }),
@@ -6956,84 +8342,6 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             ),
             Some("22222222-2222-2222-2222-222222222222".into())
         );
-    }
-
-    #[test]
-    fn periodic_status_reports_fire_only_on_threshold_multiples() {
-        assert!(!should_emit_periodic_status_report(9, 10));
-        assert!(should_emit_periodic_status_report(10, 10));
-        assert!(!should_emit_periodic_status_report(11, 10));
-        assert!(should_emit_periodic_status_report(20, 10));
-    }
-
-    #[test]
-    fn completed_status_report_closes_out_existing_periodic_report() {
-        assert!(!should_emit_completed_status_report(9, 10, false));
-        assert!(should_emit_completed_status_report(10, 10, false));
-        assert!(!should_emit_completed_status_report(11, 10, false));
-        assert!(should_emit_completed_status_report(11, 10, true));
-    }
-
-    #[test]
-    fn fallback_status_report_progress_is_not_round_count_based() {
-        assert_eq!(
-            fallback_status_report_progress(StatusReportStage::ReviewingResults, None),
-            50
-        );
-        assert_eq!(
-            fallback_status_report_progress(StatusReportStage::ReviewingResults, Some(72)),
-            72
-        );
-        assert_eq!(
-            fallback_status_report_progress(StatusReportStage::ReviewingResults, Some(100)),
-            95
-        );
-        assert_eq!(
-            fallback_status_report_progress(StatusReportStage::Completed, Some(72)),
-            100
-        );
-    }
-
-    #[test]
-    fn fallback_status_report_confidence_is_present_and_clamped() {
-        assert_eq!(
-            fallback_status_report_confidence(StatusReportStage::ReviewingResults, None),
-            60
-        );
-        assert_eq!(
-            fallback_status_report_confidence(StatusReportStage::ReviewingResults, Some(99)),
-            95
-        );
-        assert_eq!(
-            fallback_status_report_confidence(StatusReportStage::Completed, None),
-            85
-        );
-        assert_eq!(
-            fallback_status_report_confidence(StatusReportStage::Completed, Some(120)),
-            100
-        );
-    }
-
-    #[test]
-    fn status_report_prompt_anchors_progress_to_latest_user_request_scope() {
-        let prompt = build_status_report_request_prompt(
-            "fix the session status report progress calculation",
-            "user: fix the session status report progress calculation\ntool: ok result",
-            12,
-            3,
-            StatusReportStage::ReviewingResults,
-        );
-
-        assert!(prompt.contains("Latest user request:\nfix the session status report progress calculation"));
-        assert!(prompt.contains(
-            "Evaluate progress_percent against the entire scope of that latest user request."
-        ));
-        assert!(prompt.contains(
-            "Also estimate confidence_percent as your confidence that the agent can fully complete that latest user request from the current trajectory and evidence."
-        ));
-        assert!(prompt.contains(
-            "Do not use tool rounds, tool calls, or transcript length as a proxy for progress."
-        ));
     }
 
     #[test]
@@ -9059,6 +10367,82 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         let event = output.recv().await.unwrap();
         assert!(matches!(event, CoreOutput::TurnComplete { .. }));
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn different_sessions_can_enter_provider_concurrently() {
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+
+        let provider = Arc::new(ConcurrentSessionProvider::new("parallel reply"));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
+
+        let session_a = SessionId::new();
+        let session_b = SessionId::new();
+        for session_id in [session_a, session_b] {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            harness
+                .input
+                .send(CoreInput::CreateSession {
+                    session_id,
+                    system_prompt: None,
+                    working_directory: None,
+                    skills: Vec::new(),
+                    plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
+                    initial_messages: Vec::new(),
+                    agent_key: None,
+                    team_key: None,
+                    permission_rules: PermissionRuleSet::default(),
+                    memory_policy: MemoryPolicyConfig::default(),
+                    session_llm: session_llm_config(provider.clone()),
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+                    reply: reply_tx,
+                })
+                .await
+                .unwrap();
+            reply_rx.await.unwrap().unwrap();
+        }
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id: session_a,
+                content: "first".into(),
+            })
+            .await
+            .unwrap();
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id: session_b,
+                content: "second".into(),
+            })
+            .await
+            .unwrap();
+
+        provider.wait_until_started(2).await;
+        provider.release();
+
+        let mut completed = Vec::new();
+        while completed.len() < 2 {
+            match tokio::time::timeout(TokioDuration::from_secs(5), output.recv()).await {
+                Ok(Some(CoreOutput::TurnComplete { session_id, .. })) => {
+                    if !completed.contains(&session_id) {
+                        completed.push(session_id);
+                    }
+                }
+                Ok(Some(_)) => {}
+                other => panic!("unexpected output while waiting for turns to complete: {other:?}"),
+            }
+        }
+
+        assert!(completed.contains(&session_a));
+        assert!(completed.contains(&session_b));
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();

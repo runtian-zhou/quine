@@ -335,10 +335,19 @@ impl LocalHarness {
                 })
                 .await
                 .map_err(|_| HarnessError::CoreChannelClosed)?;
-            reply_rx
+            let update_result = reply_rx
                 .await
-                .map_err(|_| HarnessError::CoreChannelClosed)?
-                .map_err(|reason| HarnessError::SessionCreationFailed { reason })?;
+                .map_err(|_| HarnessError::CoreChannelClosed)?;
+            if let Err(reason) = update_result {
+                if reason == "unknown session" {
+                    harness.sessions.lock().await.remove(&session_id);
+                    eprintln!(
+                        "[daemon] skipping model-profile restore for missing session {session_id}"
+                    );
+                    continue;
+                }
+                return Err(HarnessError::SessionCreationFailed { reason });
+            }
             let mut sessions = harness.sessions.lock().await;
             if let Some(session) = sessions.get_mut(&session_id) {
                 session.model_profile = restored_model_profile;
@@ -928,9 +937,10 @@ mod tests {
     use std::fs;
     use std::path::PathBuf;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::LazyLock;
     use tokio::fs as async_fs;
-    use tokio::sync::Mutex;
+    use tokio::sync::{Mutex, Notify};
 
     static PROMPT_MEMORY_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -957,6 +967,81 @@ mod tests {
                 Ok(LlmEvent::Done { usage: None }),
             ];
             Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    struct ConcurrentSessionProvider {
+        response_text: String,
+        started: AtomicUsize,
+        started_notify: Notify,
+        released: AtomicBool,
+        release_notify: Notify,
+    }
+
+    impl ConcurrentSessionProvider {
+        fn new(text: impl Into<String>) -> Self {
+            Self {
+                response_text: text.into(),
+                started: AtomicUsize::new(0),
+                started_notify: Notify::new(),
+                released: AtomicBool::new(false),
+                release_notify: Notify::new(),
+            }
+        }
+
+        async fn wait_until_started(&self, expected: usize) {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if self.started.load(Ordering::SeqCst) >= expected {
+                        break;
+                    }
+                    self.started_notify.notified().await;
+                }
+            })
+            .await
+            .expect("sessions never entered the provider concurrently");
+        }
+
+        fn release(&self) {
+            self.released.store(true, Ordering::SeqCst);
+            self.release_notify.notify_waiters();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for ConcurrentSessionProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            self.started.fetch_add(1, Ordering::SeqCst);
+            self.started_notify.notify_waiters();
+
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if self.started.load(Ordering::SeqCst) >= 2 {
+                        break;
+                    }
+                    self.started_notify.notified().await;
+                }
+            })
+            .await
+            .map_err(|_| anyhow::anyhow!("second session never reached the provider"))?;
+
+            loop {
+                if self.released.load(Ordering::SeqCst) {
+                    break;
+                }
+                self.release_notify.notified().await;
+            }
+
+            let text = self.response_text.clone();
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LlmEvent::TextDelta { text }),
+                Ok(LlmEvent::Done { usage: None }),
+            ])))
         }
     }
 
@@ -1064,6 +1149,55 @@ mod tests {
 
         assert!(got_delta);
         assert!(got_complete);
+
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_harness_handles_two_sessions_concurrently() {
+        let provider = Arc::new(ConcurrentSessionProvider::new("parallel reply"));
+        let harness = LocalHarness::new(provider.clone(), Some(temp_storage()))
+            .await
+            .unwrap();
+        let mut rx = harness.subscribe();
+
+        let session_a = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+        let session_b = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+
+        harness
+            .send_message(session_a, "first".into())
+            .await
+            .unwrap();
+        harness
+            .send_message(session_b, "second".into())
+            .await
+            .unwrap();
+
+        provider.wait_until_started(2).await;
+        provider.release();
+
+        let mut completed = Vec::new();
+        while completed.len() < 2 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(CoreOutput::TurnComplete { session_id, .. })) => {
+                    if !completed.contains(&session_id) {
+                        completed.push(session_id);
+                    }
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => panic!("event stream closed unexpectedly: {error}"),
+                Err(_) => panic!("timeout waiting for concurrent session completions"),
+            }
+        }
+
+        assert!(completed.contains(&session_a));
+        assert!(completed.contains(&session_b));
 
         harness.shutdown().await.unwrap();
     }
