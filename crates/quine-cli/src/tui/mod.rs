@@ -4,6 +4,8 @@ mod ui;
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
+#[cfg(target_os = "macos")]
+use std::process::{Command, Stdio};
 use std::time::Duration;
 
 use base64::Engine;
