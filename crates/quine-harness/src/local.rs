@@ -7,7 +7,8 @@ use std::collections::HashMap;
 
 use quine_core::{
     create_channels, load_skills, ChannelConfig, CoreCheckpoint, CoreInput, CoreOutput,
-    HarnessHandle, InheritanceFlags, InteractionResponse, SessionId, SessionSignal, Skill,
+    HarnessHandle, InheritanceFlags, InteractionResponse, PythonExecRequest, PythonRuntime,
+    SessionId, SessionSignal, Skill,
 };
 use quine_llm::{LlmProvider, NoopWebProvider, WebProvider};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
@@ -41,6 +42,7 @@ pub struct LocalHarness {
     /// Mirrored live/restored session states.
     sessions: Arc<Mutex<HashMap<SessionId, SessionListing>>>,
     provider_manager: ProviderManager,
+    python_runtime: Arc<PythonRuntime>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +55,7 @@ struct SessionListing {
     plan_mode: bool,
     parent_id: Option<SessionId>,
     model_profile: Option<String>,
+    session_group: String,
 }
 
 #[derive(Clone)]
@@ -148,6 +151,12 @@ fn serialize_session_id(session_id: SessionId) -> String {
         .unwrap_or_default()
 }
 
+fn effective_group_for_listing(session_id: SessionId, session_group: Option<&str>) -> String {
+    session_group
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| serialize_session_id(session_id))
+}
+
 fn session_lineage(
     sessions: &HashMap<SessionId, SessionListing>,
 ) -> HashMap<String, (String, usize)> {
@@ -171,6 +180,43 @@ fn session_lineage(
 }
 
 impl LocalHarness {
+    async fn request_checkpoint(&self) -> Result<(), HarnessError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.core_input
+            .send(CoreInput::RequestCheckpoint { reply: reply_tx })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+        reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+        Ok(())
+    }
+
+    async fn resolve_python_group(
+        &self,
+        session_id: Option<SessionId>,
+        session_group: Option<String>,
+    ) -> Result<String, HarnessError> {
+        match (session_id, session_group) {
+            (Some(_), Some(_)) => Err(HarnessError::Internal {
+                message: "provide either session_id or session_group, not both".into(),
+            }),
+            (None, None) => Err(HarnessError::Internal {
+                message: "missing session_id or session_group".into(),
+            }),
+            (None, Some(group)) => Ok(group),
+            (Some(session_id), None) => self
+                .sessions
+                .lock()
+                .await
+                .get(&session_id)
+                .map(|session| session.session_group.clone())
+                .ok_or_else(|| HarnessError::SessionNotFound {
+                    session_id: serialize_session_id(session_id),
+                }),
+        }
+    }
+
     /// Create a new `LocalHarness` that spawns the core event loop with the
     /// given LLM provider.
     pub async fn new(
@@ -264,6 +310,10 @@ impl LocalHarness {
                                     .get(&session.session_id)
                                     .copied(),
                                 model_profile: session.config.model_profile.clone(),
+                                session_group: effective_group_for_listing(
+                                    session.session_id,
+                                    session.config.session_group.as_deref(),
+                                ),
                             },
                         )
                     })
@@ -274,6 +324,7 @@ impl LocalHarness {
 
         let max_context_window = max_context_window_from_env();
         let provider_manager = ProviderManager::new(Arc::clone(&provider), max_context_window);
+        let python_runtime = PythonRuntime::new();
         let restored_profile_updates = restored_checkpoint
             .as_ref()
             .map(|checkpoint| {
@@ -292,14 +343,17 @@ impl LocalHarness {
             .unwrap_or_default();
 
         // Spawn the core event loop.
-        let core_task = tokio::spawn(quine_core::run_core_loop_with_compaction_and_web_provider(
-            core_handle,
-            Arc::clone(&provider),
-            web_provider,
-            restored_checkpoint,
-            archive_root,
-            max_context_window,
-        ));
+        let core_task = tokio::spawn(
+            quine_core::run_core_loop_with_compaction_and_web_provider_and_python_runtime(
+                core_handle,
+                Arc::clone(&provider),
+                web_provider,
+                restored_checkpoint,
+                archive_root,
+                max_context_window,
+                Arc::clone(&python_runtime),
+            ),
+        );
 
         // Spawn a fan-out task that reads from the core output channel and
         // broadcasts events. The core now handles tool execution directly,
@@ -320,6 +374,7 @@ impl LocalHarness {
             _storage: storage,
             sessions,
             provider_manager,
+            python_runtime,
         };
 
         for (session_id, profile) in restored_profile_updates {
@@ -468,6 +523,7 @@ impl LocalHarness {
                                 plan_mode: false,
                                 parent_id: None,
                                 model_profile: None,
+                                session_group: serialize_session_id(*session_id),
                             });
                     }
                 }
@@ -546,6 +602,7 @@ impl HarnessService for LocalHarness {
                 initial_messages: config.initial_messages,
                 agent_key: config.agent_key,
                 team_key: config.team_key,
+                session_group: config.session_group.clone(),
                 memory_policy: config.memory_policy,
                 session_llm: session_llm.clone(),
                 auto_compact_threshold_percent,
@@ -571,6 +628,10 @@ impl HarnessService for LocalHarness {
                 plan_mode: config.plan_mode,
                 parent_id: None,
                 model_profile: session_llm.model_profile,
+                session_group: effective_group_for_listing(
+                    session_id,
+                    config.session_group.as_deref(),
+                ),
             },
         );
 
@@ -724,6 +785,7 @@ impl HarnessService for LocalHarness {
                     "plan_mode": session.plan_mode,
                     "parent_id": session.parent_id.map(serialize_session_id),
                     "model_profile": session.model_profile,
+                    "session_group": session.session_group,
                     "root_id": root_id,
                     "depth": depth,
                 })
@@ -753,14 +815,7 @@ impl HarnessService for LocalHarness {
         }
         drop(sessions);
 
-        let (reply_tx, reply_rx) = oneshot::channel();
-        self.core_input
-            .send(CoreInput::RequestCheckpoint { reply: reply_tx })
-            .await
-            .map_err(|_| HarnessError::CoreChannelClosed)?;
-        reply_rx
-            .await
-            .map_err(|_| HarnessError::CoreChannelClosed)?;
+        self.request_checkpoint().await?;
 
         let checkpoint = self
             ._storage
@@ -834,7 +889,7 @@ impl HarnessService for LocalHarness {
                 .lock()
                 .await
                 .get(&id)
-                .and_then(|session| session.model_profile.clone())
+                .map(|session| (session.model_profile.clone(), session.session_group.clone()))
         } else {
             None
         };
@@ -849,7 +904,12 @@ impl HarnessService for LocalHarness {
                 summary: None,
                 plan_mode: false,
                 parent_id,
-                model_profile: inherited_model_profile,
+                model_profile: inherited_model_profile
+                    .as_ref()
+                    .and_then(|(model_profile, _)| model_profile.clone()),
+                session_group: inherited_model_profile
+                    .map(|(_, session_group)| session_group)
+                    .unwrap_or_else(|| serialize_session_id(child_id)),
             },
         );
 
@@ -900,6 +960,61 @@ impl HarnessService for LocalHarness {
         Ok(reply_rx
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)?)
+    }
+
+    async fn python_exec(
+        &self,
+        session_id: Option<SessionId>,
+        session_group: Option<String>,
+        request: PythonExecRequest,
+    ) -> Result<quine_core::PythonExecResult, HarnessError> {
+        let group = self.resolve_python_group(session_id, session_group).await?;
+        let result = self
+            .python_runtime
+            .exec(&group, &request)
+            .await
+            .map_err(|error| HarnessError::Internal {
+                message: error.to_string(),
+            })?;
+        let should_checkpoint = self
+            .sessions
+            .lock()
+            .await
+            .values()
+            .any(|session| session.session_group == group);
+        if should_checkpoint {
+            self.request_checkpoint().await?;
+        }
+        Ok(result)
+    }
+
+    async fn python_list_globals(
+        &self,
+        session_id: Option<SessionId>,
+        session_group: Option<String>,
+    ) -> Result<quine_core::PythonListGlobalsResult, HarnessError> {
+        let group = self.resolve_python_group(session_id, session_group).await?;
+        self.python_runtime
+            .list_globals(&group)
+            .await
+            .map_err(|error| HarnessError::Internal {
+                message: error.to_string(),
+            })
+    }
+
+    async fn python_inspect_global(
+        &self,
+        session_id: Option<SessionId>,
+        session_group: Option<String>,
+        name: String,
+    ) -> Result<quine_core::PythonInspectResult, HarnessError> {
+        let group = self.resolve_python_group(session_id, session_group).await?;
+        self.python_runtime
+            .inspect(&group, &name)
+            .await
+            .map_err(|error| HarnessError::Internal {
+                message: error.to_string(),
+            })
     }
 
     async fn schedule_agent(
@@ -1087,6 +1202,7 @@ mod tests {
                 team_key: None,
                 memory_policy: quine_core::MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: 60,
                 status_report_min_tool_rounds: quine_core::default_status_report_min_tool_rounds(),
             },
@@ -1107,6 +1223,7 @@ mod tests {
             }),
             permission_state: None,
             status_report: None,
+            python_state: None,
         };
 
         assert_eq!(
@@ -1914,6 +2031,7 @@ mod tests {
                         team_key: None,
                         memory_policy: quine_core::MemoryPolicyConfig::default(),
                         model_profile: Some("missing-profile".into()),
+                        session_group: None,
                         auto_compact_threshold_percent: 60,
                         status_report_min_tool_rounds:
                             quine_core::default_status_report_min_tool_rounds(),
@@ -1923,6 +2041,7 @@ mod tests {
                     memory_state: None,
                     permission_state: None,
                     status_report: None,
+                    python_state: None,
                 }],
                 quine_core::PersistedSessionTree {
                     parents: HashMap::new(),

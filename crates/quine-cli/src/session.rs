@@ -22,6 +22,7 @@ fn build_session_params(
     initial_messages: &[Message],
     system_prompt: Option<String>,
     model_profile: Option<&str>,
+    session_group: Option<&str>,
 ) -> Option<serde_json::Value> {
     let mut session_params = serde_json::json!({});
     if !skills.is_empty() {
@@ -44,6 +45,9 @@ fn build_session_params(
     if let Some(model_profile) = model_profile {
         session_params["model_profile"] = serde_json::json!(model_profile);
     }
+    if let Some(session_group) = session_group {
+        session_params["session_group"] = serde_json::json!(session_group);
+    }
 
     (!session_params.as_object().unwrap().is_empty()).then_some(session_params)
 }
@@ -54,6 +58,7 @@ pub(crate) fn build_create_session_params(
     prompt_behavior: PermissionPromptBehavior,
     initial_messages: &[Message],
     model_profile: Option<&str>,
+    session_group: Option<&str>,
 ) -> Option<serde_json::Value> {
     build_session_params(
         skills,
@@ -62,6 +67,7 @@ pub(crate) fn build_create_session_params(
         initial_messages,
         None,
         model_profile,
+        session_group,
     )
 }
 
@@ -130,6 +136,7 @@ pub(crate) async fn create_session(
     skills: &[String],
     plan_mode: bool,
     model_profile: Option<&str>,
+    session_group: Option<&str>,
 ) -> anyhow::Result<CreatedSession> {
     create_session_with_initial_messages(
         client,
@@ -138,6 +145,7 @@ pub(crate) async fn create_session(
         PermissionPromptBehavior::Interactive,
         &[],
         model_profile,
+        session_group,
     )
     .await
 }
@@ -157,6 +165,7 @@ pub(crate) async fn create_slash_skill_session(
                 PermissionPromptBehavior::Interactive,
                 &[],
                 slash_skill_arguments_overlay(request),
+                None,
                 None,
             ),
         )
@@ -193,6 +202,7 @@ pub(crate) async fn create_session_with_initial_messages(
     prompt_behavior: PermissionPromptBehavior,
     initial_messages: &[Message],
     model_profile: Option<&str>,
+    session_group: Option<&str>,
 ) -> anyhow::Result<CreatedSession> {
     let result = client
         .call(
@@ -203,6 +213,7 @@ pub(crate) async fn create_session_with_initial_messages(
                 prompt_behavior,
                 initial_messages,
                 model_profile,
+                session_group,
             ),
         )
         .await?;
@@ -279,6 +290,7 @@ mod tests {
             PermissionPromptBehavior::Interactive,
             &[],
             None,
+            None,
         )
         .unwrap();
 
@@ -300,6 +312,7 @@ mod tests {
                 PermissionPromptBehavior::Interactive,
                 &[],
                 None,
+                None,
             ),
             None
         );
@@ -307,9 +320,15 @@ mod tests {
 
     #[test]
     fn build_create_session_params_includes_noninteractive_prompt_behavior() {
-        let params =
-            build_create_session_params(&[], false, PermissionPromptBehavior::Headless, &[], None)
-                .unwrap();
+        let params = build_create_session_params(
+            &[],
+            false,
+            PermissionPromptBehavior::Headless,
+            &[],
+            None,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(
             params,
@@ -327,6 +346,7 @@ mod tests {
             PermissionPromptBehavior::Interactive,
             &[],
             Some("claude-sonnet"),
+            None,
         )
         .unwrap();
 

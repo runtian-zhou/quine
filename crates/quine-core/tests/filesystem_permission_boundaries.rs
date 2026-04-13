@@ -92,6 +92,7 @@ async fn run_tool_turn(
             initial_messages: Vec::new(),
             agent_key: None,
             team_key: None,
+            session_group: None,
             memory_policy: MemoryPolicyConfig::default(),
             session_llm: session_llm_config(provider),
             auto_compact_threshold_percent: 60,

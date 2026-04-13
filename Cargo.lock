@@ -1540,6 +1540,7 @@ dependencies = [
  "futures",
  "hex",
  "libc",
+ "once_cell",
  "quine-llm",
  "regex",
  "serde",

@@ -156,6 +156,8 @@ mod tests {
             working_directory: base.path().to_path_buf(),
             interaction_channel: Some(channel),
             plan_store: crate::tool::plan::new_plan_store(),
+            session_group: String::new(),
+            python_runtime: crate::python::PythonRuntime::new(),
             core_input: None,
             cancellation: crate::tool::CancellationChannel::never(),
         };
@@ -270,6 +272,8 @@ mod tests {
             working_directory: base.path().to_path_buf(),
             interaction_channel: Some(channel),
             plan_store: crate::tool::plan::new_plan_store(),
+            session_group: String::new(),
+            python_runtime: crate::python::PythonRuntime::new(),
             core_input: None,
             cancellation,
         };

@@ -8,6 +8,7 @@ pub mod memory;
 pub mod permission;
 pub mod persistence;
 pub mod planner;
+pub mod python;
 mod scheduler;
 pub mod session;
 pub mod session_tree;
@@ -21,6 +22,7 @@ pub use channel::{
 };
 pub use engine::{
     run_core_loop, run_core_loop_with_compaction, run_core_loop_with_compaction_and_web_provider,
+    run_core_loop_with_compaction_and_web_provider_and_python_runtime,
 };
 pub use error::CoreError;
 pub use filesystem::{DirEntry, FsError, NullFilesystem, OverlayFilesystem, SessionFilesystem};
@@ -47,6 +49,11 @@ pub use persistence::{
     PersistedPromptMemoryState, PersistedSession, PersistedSessionConfig,
     PersistedSessionMemoryState, PersistedSessionState, PersistedSessionTree, PromptMemoryMode,
     CORE_CHECKPOINT_FORMAT_VERSION,
+};
+pub use python::{
+    PersistedPythonState, PythonExecRequest, PythonExecResult, PythonInspectResult,
+    PythonListGlobalsResult, PythonMethodSummary, PythonRuntime, PythonRuntimeError,
+    PythonSymbolSummary,
 };
 pub use session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 pub use skill::{

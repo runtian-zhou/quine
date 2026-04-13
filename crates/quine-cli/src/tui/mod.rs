@@ -320,6 +320,7 @@ pub async fn run_tui_chat(
     auto_approve: bool,
     resume_checkpoint: Option<&str>,
     model_profile: Option<&str>,
+    session_group: Option<&str>,
     capture_mouse: bool,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
@@ -334,7 +335,9 @@ pub async fn run_tui_chat(
             session_id: target.session_id,
             max_context_window: None,
         },
-        None => create_session(&mut client, skills, plan_mode, model_profile).await?,
+        None => {
+            create_session(&mut client, skills, plan_mode, model_profile, session_group).await?
+        }
     };
 
     // Setup terminal.
@@ -1029,7 +1032,7 @@ async fn execute_action(
             app.auto_scroll();
         }
         AppAction::ClearSession => {
-            let created = create_session(client, available_skills, false, None).await?;
+            let created = create_session(client, available_skills, false, None, None).await?;
             let new_session_id = created.session_id;
             app.reset_for_new_session(new_session_id.clone(), false, None);
             app.push_message(app::ConversationEntry::AssistantText(format!(
@@ -1141,7 +1144,7 @@ async fn execute_action(
         AppAction::EnterPlanMode {
             request,
             was_plan_mode,
-        } => match create_session(client, skills, true, None).await {
+        } => match create_session(client, skills, true, None, None).await {
             Ok(session) => {
                 app.reset_for_new_session(session.session_id, true, session.max_context_window);
                 if let Ok(snapshot) = fetch_session_context(client, &app.session_id).await {

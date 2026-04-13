@@ -6,6 +6,7 @@ mod interaction;
 mod log;
 mod plugins;
 mod ps;
+mod python;
 mod render;
 mod run;
 mod session;
@@ -56,6 +57,9 @@ enum Commands {
         /// Named model profile for this session.
         #[arg(long)]
         model_profile: Option<String>,
+        /// Share Python globals with other sessions in the same group.
+        #[arg(long)]
+        session_group: Option<String>,
         /// TUI mouse handling mode.
         #[arg(long, value_enum, default_value_t = TuiMouseMode::Passthrough)]
         tui_mouse_mode: TuiMouseMode,
@@ -85,6 +89,44 @@ enum Commands {
         /// Named model profile for a newly created session.
         #[arg(long)]
         model_profile: Option<String>,
+        /// Share Python globals with other sessions in the same group.
+        #[arg(long)]
+        session_group: Option<String>,
+    },
+    /// Execute or inspect Python in a shared session/group environment.
+    Py {
+        /// Existing session whose Python group should be used.
+        #[arg(long)]
+        session: Option<String>,
+        /// Explicit Python session group.
+        #[arg(long)]
+        group: Option<String>,
+        /// Inline Python code to execute.
+        code: Option<String>,
+        /// Execute Python code from a file.
+        #[arg(long)]
+        file: Option<String>,
+        /// Call a Python function by name.
+        #[arg(long)]
+        call: Option<String>,
+        /// Positional JSON argument for --call. Repeatable.
+        #[arg(long = "arg")]
+        arg: Vec<String>,
+        /// Keyword JSON argument in key=<json> form. Repeatable.
+        #[arg(long = "kw")]
+        kw: Vec<String>,
+        /// List globals in the target Python environment.
+        #[arg(long)]
+        list_globals: bool,
+        /// Inspect a global by name.
+        #[arg(long)]
+        inspect: Option<String>,
+        /// Output structured JSON.
+        #[arg(long)]
+        json: bool,
+        /// Socket path to connect to the harness daemon.
+        #[arg(long)]
+        socket: Option<String>,
     },
     /// Respond to an interaction request (e.g., ask_user prompt) on an existing session.
     Respond {
@@ -298,6 +340,7 @@ async fn main() -> anyhow::Result<()> {
             auto_approve,
             resume,
             model_profile,
+            session_group,
             tui_mouse_mode,
         } => {
             let socket_path = socket
@@ -311,6 +354,7 @@ async fn main() -> anyhow::Result<()> {
                     auto_approve,
                     resume.as_deref(),
                     model_profile.as_deref(),
+                    session_group.as_deref(),
                     matches!(tui_mouse_mode, TuiMouseMode::Capture),
                 )
                 .await?;
@@ -322,6 +366,7 @@ async fn main() -> anyhow::Result<()> {
                     auto_approve,
                     resume.as_deref(),
                     model_profile.as_deref(),
+                    session_group.as_deref(),
                 )
                 .await?;
             }
@@ -335,6 +380,7 @@ async fn main() -> anyhow::Result<()> {
             skill,
             auto_approve,
             model_profile,
+            session_group,
         } => {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
@@ -349,6 +395,40 @@ async fn main() -> anyhow::Result<()> {
                     skills: &skill,
                     auto_approve,
                     model_profile: model_profile.as_deref(),
+                    session_group: session_group.as_deref(),
+                },
+            )
+            .await?;
+        }
+        Commands::Py {
+            session,
+            group,
+            code,
+            file,
+            call,
+            arg,
+            kw,
+            list_globals,
+            inspect,
+            json,
+            socket,
+        } => {
+            let socket_path = socket
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(default_socket_path);
+            python::handle_py(
+                &socket_path,
+                python::PythonCliOptions {
+                    session_id: session.as_deref(),
+                    session_group: group.as_deref(),
+                    code: code.as_deref(),
+                    file: file.as_deref(),
+                    function: call.as_deref(),
+                    args: &arg,
+                    kwargs: &kw,
+                    list_globals,
+                    inspect: inspect.as_deref(),
+                    json_output: json,
                 },
             )
             .await?;

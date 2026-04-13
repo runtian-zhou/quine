@@ -96,6 +96,7 @@ pub struct RunOneshotOptions<'a> {
     pub skills: &'a [String],
     pub auto_approve: bool,
     pub model_profile: Option<&'a str>,
+    pub session_group: Option<&'a str>,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +133,7 @@ where
         skills,
         auto_approve,
         model_profile,
+        session_group,
     } = options;
     let (mut client, _daemon_spawned) = if allow_daemon_launch {
         IpcClient::connect_or_launch(socket_path).await?
@@ -151,6 +153,9 @@ where
             }
             if let Some(model_profile) = model_profile {
                 session_params["model_profile"] = serde_json::json!(model_profile);
+            }
+            if let Some(session_group) = session_group {
+                session_params["session_group"] = serde_json::json!(session_group);
             }
             session_params["prompt_behavior"] = serde_json::json!(if auto_approve {
                 PermissionPromptBehavior::Interactive

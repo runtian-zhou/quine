@@ -47,6 +47,9 @@ pub struct SessionConfig {
     /// Optional named model profile for this session.
     #[serde(default)]
     pub model_profile: Option<String>,
+    /// Optional python session group for shared Python state.
+    #[serde(default)]
+    pub session_group: Option<String>,
     /// Auto-compaction threshold as a percentage of the model context window.
     #[serde(default = "default_auto_compact_threshold_percent")]
     pub auto_compact_threshold_percent: u8,
@@ -68,6 +71,7 @@ impl Default for SessionConfig {
             team_key: None,
             memory_policy: MemoryPolicyConfig::default(),
             model_profile: None,
+            session_group: None,
             auto_compact_threshold_percent: default_auto_compact_threshold_percent(),
             status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
         }
@@ -354,6 +358,7 @@ mod tests {
             team_key: None,
             memory_policy: MemoryPolicyConfig::default(),
             model_profile: None,
+            session_group: None,
             auto_compact_threshold_percent: default_auto_compact_threshold_percent(),
             status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
         };
