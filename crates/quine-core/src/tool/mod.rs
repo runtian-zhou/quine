@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::filesystem::SessionFilesystem;
+use crate::python::PythonRuntime;
 use crate::session::SessionId;
 
 /// Errors from tool execution.
@@ -231,6 +232,10 @@ pub struct ExecutionContext {
     pub interaction_channel: Option<InteractionChannel>,
     /// Shared plan store for this session.
     pub plan_store: crate::tool::plan::PlanStore,
+    /// The effective python session group for this session.
+    pub session_group: String,
+    /// Shared python runtime for session-scoped execution.
+    pub python_runtime: Arc<PythonRuntime>,
     /// Sender for sending messages back to the core event loop (for spawn, signal, etc.).
     pub core_input: Option<mpsc::Sender<crate::channel::CoreInput>>,
     /// Per-execution cancellation channel for immediate tool aborts.

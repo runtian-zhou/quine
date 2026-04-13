@@ -444,6 +444,12 @@ async fn handle_request(
                 .and_then(|p| p.get("model_profile"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let session_group = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("session_group"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
 
             let auto_compact_threshold_percent = request
                 .params
@@ -471,6 +477,7 @@ async fn handle_request(
                 team_key,
                 memory_policy,
                 model_profile: model_profile.clone(),
+                session_group,
                 auto_compact_threshold_percent,
                 status_report_min_tool_rounds,
             };
@@ -1164,6 +1171,157 @@ async fn handle_request(
                         error_codes::INVALID_PARAMS,
                         "missing source",
                     );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::PYTHON_EXEC => {
+            let params = request.params.as_ref();
+            let session_id = params
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(|sid| serde_json::from_value(serde_json::Value::String(sid.to_string())))
+                .transpose();
+            let session_group = params
+                .and_then(|p| p.get("session_group"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let request_payload = params
+                .cloned()
+                .map(serde_json::from_value::<quine_core::PythonExecRequest>)
+                .transpose();
+
+            match (session_id, request_payload) {
+                (Ok(session_id), Ok(Some(request_payload))) => {
+                    match service
+                        .python_exec(session_id, session_group, request_payload)
+                        .await
+                    {
+                        Ok(result) => {
+                            let resp = JsonRpcResponse::success(id, result);
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                (Err(error), _) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid session_id: {error}"),
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+                (_, Err(error)) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid python_exec payload: {error}"),
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+                _ => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing python_exec payload",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::PYTHON_LIST_GLOBALS => {
+            let params = request.params.as_ref();
+            let session_id = params
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(|sid| serde_json::from_value(serde_json::Value::String(sid.to_string())))
+                .transpose();
+            let session_group = params
+                .and_then(|p| p.get("session_group"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            match session_id {
+                Ok(session_id) => {
+                    match service.python_list_globals(session_id, session_group).await {
+                        Ok(result) => {
+                            let resp = JsonRpcResponse::success(id, result);
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                Err(error) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid session_id: {error}"),
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
+        methods::PYTHON_INSPECT_GLOBAL => {
+            let params = request.params.as_ref();
+            let session_id = params
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(|sid| serde_json::from_value(serde_json::Value::String(sid.to_string())))
+                .transpose();
+            let session_group = params
+                .and_then(|p| p.get("session_group"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let name = params
+                .and_then(|p| p.get("name"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            match (session_id, name) {
+                (Ok(session_id), Some(name)) => match service
+                    .python_inspect_global(session_id, session_group, name)
+                    .await
+                {
+                    Ok(result) => {
+                        let resp = JsonRpcResponse::success(id, result);
+                        Some(serde_json::to_string(&resp).unwrap_or_default())
+                    }
+                    Err(e) => {
+                        let resp = JsonRpcErrorResponse::new(
+                            id,
+                            error_codes::INTERNAL_ERROR,
+                            e.to_string(),
+                        );
+                        Some(serde_json::to_string(&resp).unwrap_or_default())
+                    }
+                },
+                (Err(error), _) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        format!("invalid session_id: {error}"),
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+                (_, None) => {
+                    let resp =
+                        JsonRpcErrorResponse::new(id, error_codes::INVALID_PARAMS, "missing name");
                     Some(serde_json::to_string(&resp).unwrap_or_default())
                 }
             }

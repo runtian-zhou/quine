@@ -1,5 +1,8 @@
 use async_trait::async_trait;
-use quine_core::{CoreCheckpoint, CoreOutput, InteractionResponse, SessionId, SessionSignal};
+use quine_core::{
+    CoreCheckpoint, CoreOutput, InteractionResponse, PythonExecRequest, PythonExecResult,
+    PythonInspectResult, PythonListGlobalsResult, SessionId, SessionSignal,
+};
 use std::path::PathBuf;
 use tokio::sync::broadcast;
 use tokio::time::Duration;
@@ -151,6 +154,38 @@ pub trait HarnessService: Send + Sync {
     /// Return the harness state root when snapshots need access to persisted artifacts.
     fn state_root(&self) -> Option<PathBuf> {
         None
+    }
+
+    async fn python_exec(
+        &self,
+        _session_id: Option<SessionId>,
+        _session_group: Option<String>,
+        _request: PythonExecRequest,
+    ) -> Result<PythonExecResult, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    async fn python_list_globals(
+        &self,
+        _session_id: Option<SessionId>,
+        _session_group: Option<String>,
+    ) -> Result<PythonListGlobalsResult, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
+    async fn python_inspect_global(
+        &self,
+        _session_id: Option<SessionId>,
+        _session_group: Option<String>,
+        _name: String,
+    ) -> Result<PythonInspectResult, HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
     }
 }
 

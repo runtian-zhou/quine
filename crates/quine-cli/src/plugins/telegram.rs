@@ -677,6 +677,7 @@ impl TelegramBot {
             &self.skills,
             plan_mode,
             self.default_model_profile.as_deref(),
+            None,
         )
         .await?;
         self.chat_state.lock().await.insert(
@@ -725,6 +726,7 @@ impl TelegramBot {
                 skills: &self.skills,
                 auto_approve: self.auto_approve,
                 model_profile: self.default_model_profile.as_deref(),
+                session_group: None,
             },
             false,
             |event| Self::apply_progress_event(&progress, event),
@@ -776,6 +778,7 @@ impl TelegramBot {
                 &self.skills,
                 true,
                 self.default_model_profile.as_deref(),
+                None,
             )
             .await?;
             self.chat_state.lock().await.insert(
@@ -816,6 +819,7 @@ impl TelegramBot {
                 skills: &self.skills,
                 auto_approve: self.auto_approve,
                 model_profile: self.default_model_profile.as_deref(),
+                session_group: None,
             },
             false,
             |event| Self::apply_progress_event(&progress, event),
@@ -888,6 +892,7 @@ impl TelegramBot {
                 skills: &self.skills,
                 auto_approve: self.auto_approve,
                 model_profile: self.default_model_profile.as_deref(),
+                session_group: None,
             },
             false,
             |event| Self::apply_progress_event(&progress, event),
@@ -1394,6 +1399,7 @@ impl TelegramBot {
                     &self.skills,
                     false,
                     self.default_model_profile.as_deref(),
+                    None,
                 )
                 .await?;
                 self.chat_state.lock().await.insert(

@@ -41,6 +41,9 @@ use crate::persistence::{
     PersistedSessionState, PromptMemoryMode,
 };
 use crate::planner::scheduler::{get_ready_actions, render_plan};
+use crate::python::{
+    PythonExecTool, PythonInspectGlobalTool, PythonListGlobalsTool, PythonRuntime,
+};
 use crate::scheduler::spawn_scheduler;
 use crate::session::{ExitStatus, SessionId, SessionSignal, SessionState};
 use crate::session_tree::SessionTree;
@@ -255,6 +258,10 @@ struct SessionContext {
     filesystem: Arc<dyn crate::filesystem::SessionFilesystem>,
     /// Working directory for this session.
     working_directory: PathBuf,
+    /// Effective python session-group key for this session.
+    python_group: String,
+    /// Shared runtime for session-group python execution.
+    python_runtime: Arc<PythonRuntime>,
     /// Sender for pending interaction responses (tool_use_id -> sender).
     pending_interaction: Option<oneshot::Sender<InteractionResponse>>,
     /// Shared plan store for this session.
@@ -373,6 +380,7 @@ struct SessionInit {
     team_key: Option<String>,
     memory_policy: MemoryPolicyConfig,
     model_profile: Option<String>,
+    session_group: Option<String>,
     auto_compact_threshold_percent: u8,
     status_report_min_tool_rounds: u32,
 }
@@ -394,10 +402,17 @@ impl SessionInit {
             team_key: self.team_key.clone(),
             memory_policy: self.memory_policy.clone(),
             model_profile: self.model_profile.clone(),
+            session_group: self.session_group.clone(),
             auto_compact_threshold_percent: self.auto_compact_threshold_percent.clamp(1, 100),
             status_report_min_tool_rounds: self.status_report_min_tool_rounds.max(1),
         }
     }
+}
+
+fn effective_session_group(session_id: SessionId, session_group: Option<&str>) -> String {
+    session_group
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| session_id.to_string())
 }
 
 fn build_tool_registry_for_session(
@@ -415,6 +430,9 @@ fn build_tool_registry_for_session(
     tool_registry.register(Arc::new(PlanTool::new(plan_store)));
     tool_registry.register(Arc::new(WebSearchTool::new(Arc::clone(web_provider))));
     tool_registry.register(Arc::new(WebOpenTool::new(Arc::clone(web_provider))));
+    tool_registry.register(Arc::new(PythonExecTool));
+    tool_registry.register(Arc::new(PythonListGlobalsTool));
+    tool_registry.register(Arc::new(PythonInspectGlobalTool));
 
     if !persisted_config.plan_mode {
         tool_registry.register(Arc::new(WriteTool));
@@ -602,7 +620,14 @@ impl SessionContext {
         provider: &Arc<dyn LlmProvider>,
     ) -> Result<Self, CoreError> {
         let web_provider: Arc<dyn WebProvider> = Arc::new(NoopWebProvider);
-        Self::new_with_web_provider(session_id, init, provider, &web_provider).await
+        Self::new_with_web_provider(
+            session_id,
+            init,
+            provider,
+            &web_provider,
+            PythonRuntime::new(),
+        )
+        .await
     }
 
     async fn new_with_web_provider(
@@ -610,8 +635,11 @@ impl SessionContext {
         init: SessionInit,
         provider: &Arc<dyn LlmProvider>,
         web_provider: &Arc<dyn WebProvider>,
+        python_runtime: Arc<PythonRuntime>,
     ) -> Result<Self, CoreError> {
         let persisted_config = init.to_persisted_config();
+        let python_group =
+            effective_session_group(session_id, persisted_config.session_group.as_deref());
         let SessionInit {
             system_prompt: _,
             skills,
@@ -686,6 +714,8 @@ impl SessionContext {
             tool_registry,
             filesystem,
             working_directory,
+            python_group,
+            python_runtime,
             pending_interaction: None,
             plan_store,
             cancel_tx: None,
@@ -731,6 +761,7 @@ impl SessionContext {
         web_provider: &Arc<dyn WebProvider>,
         archive_root: PathBuf,
         max_context_window: Option<u64>,
+        python_runtime: Arc<PythonRuntime>,
     ) -> Result<(SessionId, Self), CoreError> {
         let PersistedSession {
             session_id,
@@ -742,6 +773,7 @@ impl SessionContext {
             memory_state,
             permission_state,
             status_report,
+            python_state,
         } = persisted;
         let skills =
             crate::skill::load_skills(&config.working_directory, &config.skill_names).await;
@@ -761,50 +793,38 @@ impl SessionContext {
                 team_key: config.team_key.clone(),
                 memory_policy: config.memory_policy.clone(),
                 model_profile: config.model_profile.clone(),
+                session_group: config.session_group.clone(),
                 auto_compact_threshold_percent: config.auto_compact_threshold_percent,
                 status_report_min_tool_rounds: config.status_report_min_tool_rounds,
             },
             provider,
             web_provider,
+            Arc::clone(&python_runtime),
         )
         .await?;
+        if let Some(python_state) = python_state.as_ref() {
+            python_runtime
+                .restore_group(&session.python_group, python_state)
+                .await
+                .map_err(|error| CoreError::Internal {
+                    message: format!("failed to restore python group: {error}"),
+                })?;
+        }
         session.state = state.into();
         session.history = history;
         session.auto_compact_threshold_percent = config.auto_compact_threshold_percent;
         session.plan_store = crate::tool::plan::restore_plan_store(plan_store).await;
-        session.tool_registry = {
-            let mut registry = ToolRegistry::new();
-            registry.register(Arc::new(ReadTool));
-            registry.register(Arc::new(BashTool));
-            registry.register(Arc::new(FindTool));
-            registry.register(Arc::new(AskUserTool));
-            registry.register(Arc::new(PlanTool::new(session.plan_store.clone())));
-            registry.register(Arc::new(WebSearchTool::new(Arc::clone(web_provider))));
-            registry.register(Arc::new(WebOpenTool::new(Arc::clone(web_provider))));
-            if !session.persisted_config.plan_mode {
-                registry.register(Arc::new(WriteTool));
-                registry.register(Arc::new(SubagentTool::new(
-                    Arc::clone(provider),
-                    Arc::clone(web_provider),
-                )));
-                registry.register(Arc::new(SpawnTool));
-                registry.register(Arc::new(WaitChildTool));
-                registry.register(Arc::new(SignalTool));
-                registry.register(Arc::new(SendMessageTool));
-                registry.register(Arc::new(RecvMessageTool));
-            }
-            for skill in &crate::skill::load_skills(
+        session.tool_registry = build_tool_registry_for_session(
+            provider,
+            web_provider,
+            session.plan_store.clone(),
+            &session.persisted_config,
+            &crate::skill::load_skills(
                 &session.persisted_config.working_directory,
                 &session.persisted_config.skill_names,
             )
-            .await
-            {
-                for tool_def in &skill.tool_definitions {
-                    registry.register(Arc::new(SkillTemplateTool::new(tool_def.clone())));
-                }
-            }
-            registry
-        };
+            .await,
+        );
         session.tools = session.tool_registry.tool_definitions();
         session.persisted_config = config;
         session.created_at = created_at;
@@ -840,6 +860,11 @@ impl SessionContext {
 
     async fn snapshot(&self, session_id: SessionId) -> Option<PersistedSession> {
         let state = PersistedSessionState::from_runtime(self.state)?;
+        let python_state = self
+            .python_runtime
+            .snapshot_group(&self.python_group)
+            .await
+            .ok();
         Some(PersistedSession {
             session_id,
             created_at: self.created_at,
@@ -861,6 +886,7 @@ impl SessionContext {
                 self.pending_permission_approval.clone(),
             )),
             status_report: self.status_report.clone(),
+            python_state,
         })
     }
 
@@ -962,6 +988,7 @@ struct SessionHandle {
     provider: Arc<dyn LlmProvider>,
     max_context_window: Option<u64>,
     model_profile: Option<String>,
+    session_group: Option<String>,
 }
 
 enum SessionCommand {
@@ -1692,6 +1719,8 @@ struct PreparedConcurrentToolCall {
     filesystem: Arc<dyn crate::filesystem::SessionFilesystem>,
     working_directory: PathBuf,
     plan_store: crate::tool::plan::PlanStore,
+    session_group: String,
+    python_runtime: Arc<PythonRuntime>,
 }
 
 struct CompletedConcurrentToolCall {
@@ -2029,6 +2058,8 @@ fn prepare_concurrent_tool_calls(
                 filesystem: Arc::clone(&session.filesystem),
                 working_directory: session.working_directory.clone(),
                 plan_store: session.plan_store.clone(),
+                session_group: session.python_group.clone(),
+                python_runtime: Arc::clone(&session.python_runtime),
             })
         })
         .collect()
@@ -2063,6 +2094,8 @@ async fn execute_concurrent_tool_batch(
                 working_directory: call.working_directory,
                 interaction_channel: None,
                 plan_store: call.plan_store,
+                session_group: call.session_group,
+                python_runtime: call.python_runtime,
                 core_input: Some(input_tx),
                 cancellation,
             };
@@ -2731,6 +2764,13 @@ async fn start_child_session(
         .get(&parent_id)
         .and_then(|parent| parent.max_context_window)
         .or(max_context_window);
+    let inherited_session_group = sessions
+        .get(&parent_id)
+        .and_then(|parent| parent.persisted_config.session_group.clone());
+    let inherited_python_runtime = sessions
+        .get(&parent_id)
+        .map(|parent| Arc::clone(&parent.python_runtime))
+        .unwrap_or_else(PythonRuntime::new);
 
     let ctx = SessionContext::new(
         child_id,
@@ -2748,6 +2788,7 @@ async fn start_child_session(
             team_key: None,
             memory_policy: MemoryPolicyConfig::default(),
             model_profile: inherited_model_profile,
+            session_group: inherited_session_group.clone(),
             auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
             status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
         },
@@ -2756,6 +2797,9 @@ async fn start_child_session(
     .await
     .map_err(|e| e.to_string())?;
     let mut ctx = ctx;
+    ctx.python_runtime = inherited_python_runtime;
+    ctx.python_group = effective_session_group(child_id, inherited_session_group.as_deref());
+    ctx.persisted_config.session_group = inherited_session_group;
     ctx.permission_context.set_rules(permission_rules);
 
     debug_log_session(
@@ -3236,7 +3280,15 @@ async fn execute_tool_call(
         return ToolOutcome::Cancelled;
     }
 
-    let (tool, filesystem, working_directory, plan_store, cancellation) = {
+    let (
+        tool,
+        filesystem,
+        working_directory,
+        plan_store,
+        cancellation,
+        python_group,
+        python_runtime,
+    ) = {
         let Some(session) = sessions.get(&session_id) else {
             return ToolOutcome::Error {
                 message: "session not found".into(),
@@ -3253,6 +3305,8 @@ async fn execute_tool_call(
             session.working_directory.clone(),
             session.plan_store.clone(),
             cancellation.clone(),
+            session.python_group.clone(),
+            Arc::clone(&session.python_runtime),
         )
     };
 
@@ -3271,6 +3325,8 @@ async fn execute_tool_call(
             working_directory,
             interaction_channel: Some(channel),
             plan_store,
+            session_group: python_group.clone(),
+            python_runtime: Arc::clone(&python_runtime),
             core_input: Some(io.input_tx.clone()),
             cancellation: cancellation.clone(),
         };
@@ -3410,6 +3466,8 @@ async fn execute_tool_call(
             working_directory,
             interaction_channel: None,
             plan_store,
+            session_group: python_group,
+            python_runtime,
             core_input: Some(io.input_tx.clone()),
             cancellation: cancellation.clone(),
         };
@@ -5698,6 +5756,8 @@ impl SessionActor {
         let filesystem = Arc::clone(&self.session.filesystem);
         let working_directory = self.session.working_directory.clone();
         let plan_store = self.session.plan_store.clone();
+        let session_group = self.session.python_group.clone();
+        let python_runtime = Arc::clone(&self.session.python_runtime);
 
         if tool.is_interactive() {
             let (req_tx, mut req_rx) =
@@ -5709,6 +5769,8 @@ impl SessionActor {
                 working_directory,
                 interaction_channel: Some(channel),
                 plan_store,
+                session_group: session_group.clone(),
+                python_runtime: Arc::clone(&python_runtime),
                 core_input: Some(self.core_input_tx.clone()),
                 cancellation: cancellation.clone(),
             };
@@ -5767,6 +5829,8 @@ impl SessionActor {
                 working_directory,
                 interaction_channel: None,
                 plan_store,
+                session_group,
+                python_runtime,
                 core_input: Some(self.core_input_tx.clone()),
                 cancellation: cancellation.clone(),
             };
@@ -5916,6 +5980,7 @@ async fn spawn_session_actor(
                 provider: Arc::clone(&session.provider),
                 max_context_window: session.max_context_window,
                 model_profile: session.persisted_config.model_profile.clone(),
+                session_group: session.persisted_config.session_group.clone(),
             },
         );
     }
@@ -5945,13 +6010,14 @@ pub async fn run_core_loop(
     provider: Arc<dyn LlmProvider>,
     restored_checkpoint: Option<CoreCheckpoint>,
 ) {
-    run_core_loop_with_compaction_and_web_provider(
+    run_core_loop_with_compaction_and_web_provider_and_python_runtime(
         handle,
         provider,
         Arc::new(NoopWebProvider),
         restored_checkpoint,
         std::env::temp_dir().join("quine-core-compactions"),
         None,
+        PythonRuntime::new(),
     )
     .await;
 }
@@ -5963,24 +6029,46 @@ pub async fn run_core_loop_with_compaction(
     archive_root: PathBuf,
     max_context_window: Option<u64>,
 ) {
-    run_core_loop_with_compaction_and_web_provider(
+    run_core_loop_with_compaction_and_web_provider_and_python_runtime(
         handle,
         provider,
         Arc::new(NoopWebProvider),
         restored_checkpoint,
         archive_root,
         max_context_window,
+        PythonRuntime::new(),
     )
     .await;
 }
 
 pub async fn run_core_loop_with_compaction_and_web_provider(
+    handle: CoreHandle,
+    provider: Arc<dyn LlmProvider>,
+    web_provider: Arc<dyn WebProvider>,
+    restored_checkpoint: Option<CoreCheckpoint>,
+    archive_root: PathBuf,
+    max_context_window: Option<u64>,
+) {
+    run_core_loop_with_compaction_and_web_provider_and_python_runtime(
+        handle,
+        provider,
+        web_provider,
+        restored_checkpoint,
+        archive_root,
+        max_context_window,
+        PythonRuntime::new(),
+    )
+    .await;
+}
+
+pub async fn run_core_loop_with_compaction_and_web_provider_and_python_runtime(
     mut handle: CoreHandle,
     provider: Arc<dyn LlmProvider>,
     web_provider: Arc<dyn WebProvider>,
     restored_checkpoint: Option<CoreCheckpoint>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
+    python_runtime: Arc<PythonRuntime>,
 ) {
     let wake_waits = Arc::new(Notify::new());
     run_core_loop_with_compaction_and_wait_notifier(
@@ -5991,6 +6079,7 @@ pub async fn run_core_loop_with_compaction_and_web_provider(
         archive_root,
         max_context_window,
         wake_waits,
+        python_runtime,
     )
     .await;
 }
@@ -6003,6 +6092,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
     archive_root: PathBuf,
     max_context_window: Option<u64>,
     _wake_waits: Arc<Notify>,
+    python_runtime: Arc<PythonRuntime>,
 ) {
     let restored_tree = restored_checkpoint
         .as_ref()
@@ -6030,6 +6120,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 &web_provider,
                 archive_root.clone(),
                 max_context_window,
+                Arc::clone(&python_runtime),
             )
             .await
             {
@@ -6101,6 +6192,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         initial_messages,
                         agent_key,
                         team_key,
+                        session_group,
                         memory_policy,
                         session_llm,
                         auto_compact_threshold_percent,
@@ -6132,9 +6224,11 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                 model_profile: session_llm.model_profile.clone(),
                                 auto_compact_threshold_percent,
                                 status_report_min_tool_rounds,
+                                session_group,
                             },
                             &session_llm.provider,
                             &web_provider,
+                            Arc::clone(&python_runtime),
                         )
                         .await
                         {
@@ -6276,6 +6370,9 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         let inherited_model_profile = parent_handle
                             .as_ref()
                             .and_then(|handle| handle.model_profile.clone());
+                        let inherited_session_group = parent_handle
+                            .as_ref()
+                            .and_then(|handle| handle.session_group.clone());
                         let inherited_max_context_window = parent_handle
                             .as_ref()
                             .and_then(|handle| handle.max_context_window)
@@ -6296,6 +6393,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                 team_key: None,
                                 memory_policy: MemoryPolicyConfig::default(),
                                 model_profile: inherited_model_profile,
+                                session_group: inherited_session_group.clone(),
                                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                             },
@@ -6304,6 +6402,10 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         .await
                         {
                             Ok(mut ctx) => {
+                                ctx.python_runtime = Arc::clone(&python_runtime);
+                                ctx.python_group =
+                                    effective_session_group(child_id, inherited_session_group.as_deref());
+                                ctx.persisted_config.session_group = inherited_session_group;
                                 ctx.permission_context.set_rules(permission_rules);
                                 session_tree.write().await.add_child(parent_id, child_id);
                                 match spawn_session_actor(
@@ -6663,6 +6765,7 @@ mod tests {
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -6706,6 +6809,7 @@ mod tests {
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -6741,6 +6845,7 @@ mod tests {
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -6788,6 +6893,7 @@ mod tests {
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -6905,6 +7011,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -6974,6 +7081,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -7488,6 +7596,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    session_group: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
@@ -7511,6 +7620,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    session_group: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
@@ -7534,6 +7644,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    session_group: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
@@ -7597,6 +7708,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    session_group: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
@@ -7620,6 +7732,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    session_group: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
@@ -7676,6 +7789,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    session_group: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
@@ -7699,6 +7813,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    session_group: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
@@ -7743,6 +7858,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -7820,6 +7936,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -7895,6 +8012,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -7972,6 +8090,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -8064,6 +8183,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -8172,6 +8292,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -8267,6 +8388,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -8368,6 +8490,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    session_group: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
@@ -8660,6 +8783,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -8710,6 +8834,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -8762,6 +8887,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -8805,6 +8931,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -8876,6 +9003,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -8960,6 +9088,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -9060,6 +9189,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -9148,6 +9278,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -9234,6 +9365,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -9312,6 +9444,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -9375,6 +9508,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -9448,6 +9582,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -9494,6 +9629,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -9563,6 +9699,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -9647,6 +9784,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -9690,6 +9828,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -9780,6 +9919,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -9880,6 +10020,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -9953,6 +10094,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     initial_messages: Vec::new(),
                     agent_key: None,
                     team_key: None,
+                    session_group: None,
                     permission_rules: PermissionRuleSet::default(),
                     memory_policy: MemoryPolicyConfig::default(),
                     session_llm: session_llm_config(provider.clone()),
@@ -10012,6 +10154,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    session_group: None,
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                     status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
                 },
@@ -10037,6 +10180,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 }),
                 permission_state: None,
                 status_report: None,
+                python_state: None,
             }],
             crate::persistence::PersistedSessionTree {
                 parents: std::collections::HashMap::new(),
@@ -10131,6 +10275,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -10191,6 +10336,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -10257,6 +10403,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -10281,6 +10428,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -10317,6 +10465,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
@@ -10396,6 +10545,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     initial_messages: Vec::new(),
                     agent_key: None,
                     team_key: None,
+                    session_group: None,
                     permission_rules: PermissionRuleSet::default(),
                     memory_policy: MemoryPolicyConfig::default(),
                     session_llm: session_llm_config(provider.clone()),
@@ -10509,6 +10659,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
@@ -10647,6 +10798,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 team_key: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 model_profile: None,
+                session_group: None,
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
                 status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
             },
@@ -10788,6 +10940,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
@@ -10910,6 +11063,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 permission_rules: PermissionRuleSet::default(),
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
@@ -11027,6 +11181,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -11145,6 +11300,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -11228,6 +11384,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: vec![seeded_message.clone()],
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -11267,6 +11424,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     initial_messages: Vec::new(),
                     agent_key: None,
                     team_key: None,
+                    session_group: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     session_llm: session_llm_config(provider.clone()),
                     auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
@@ -11411,6 +11569,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: MemoryPolicyConfig::default(),
                 session_llm: session_llm_config(provider.clone()),
                 auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,

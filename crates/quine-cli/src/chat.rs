@@ -161,6 +161,7 @@ pub async fn run_chat(
     auto_approve: bool,
     resume_checkpoint: Option<&str>,
     model_profile: Option<&str>,
+    session_group: Option<&str>,
 ) -> anyhow::Result<()> {
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
     let mut renderer = TerminalRenderer::new();
@@ -176,7 +177,9 @@ pub async fn run_chat(
             session_id: target.session_id,
             max_context_window: None,
         },
-        None => create_session(&mut client, skills, plan_mode, model_profile).await?,
+        None => {
+            create_session(&mut client, skills, plan_mode, model_profile, session_group).await?
+        }
     };
     let mut session_in_plan_mode = session_plan_mode.unwrap_or(plan_mode);
 
@@ -238,7 +241,13 @@ pub async fn run_chat(
                             ChatCommandAction::SendMessage(content) => content,
                             ChatCommandAction::EnterPlanModeAndSend(content) => {
                                 session =
-                                    create_session(&mut client, skills, true, model_profile)
+                                    create_session(
+                                        &mut client,
+                                        skills,
+                                        true,
+                                        model_profile,
+                                        session_group,
+                                    )
                                         .await?;
                                 session_in_plan_mode = true;
                                 eprintln!("Switched to plan mode: {}", session.session_id);

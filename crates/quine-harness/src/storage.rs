@@ -480,6 +480,7 @@ mod tests {
                     team_key: None,
                     memory_policy: MemoryPolicyConfig::default(),
                     model_profile: None,
+                    session_group: None,
                     auto_compact_threshold_percent: 60,
                     status_report_min_tool_rounds:
                         quine_core::default_status_report_min_tool_rounds(),
@@ -543,6 +544,7 @@ mod tests {
                     pending_approval: None,
                 }),
                 status_report: None,
+                python_state: None,
             }],
             PersistedSessionTree {
                 parents: Default::default(),
@@ -673,6 +675,7 @@ mod tests {
                         team_key: None,
                         memory_policy: MemoryPolicyConfig::default(),
                         model_profile: None,
+                        session_group: None,
                         auto_compact_threshold_percent: 60,
                         status_report_min_tool_rounds:
                             quine_core::default_status_report_min_tool_rounds(),
@@ -682,6 +685,7 @@ mod tests {
                     memory_state: None,
                     permission_state: None,
                     status_report: None,
+                    python_state: None,
                 },
             ],
             PersistedSessionTree {

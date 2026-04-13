@@ -307,6 +307,8 @@ mod tests {
             working_directory: PathBuf::from("/tmp"),
             interaction_channel: None,
             plan_store: new_plan_store(),
+            session_group: String::new(),
+            python_runtime: crate::python::PythonRuntime::new(),
             core_input: None,
             cancellation: crate::tool::CancellationChannel::never(),
         }

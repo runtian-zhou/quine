@@ -55,6 +55,8 @@ pub enum CoreInput {
         agent_key: Option<String>,
         /// Optional team durable memory key.
         team_key: Option<String>,
+        /// Optional shared python session-group key.
+        session_group: Option<String>,
         /// Session memory scope and policy configuration.
         memory_policy: crate::memory::MemoryPolicyConfig,
         /// Selected LLM provider/runtime config for this session.
@@ -470,6 +472,7 @@ mod tests {
                 initial_messages: Vec::new(),
                 agent_key: None,
                 team_key: None,
+                session_group: None,
                 memory_policy: crate::memory::MemoryPolicyConfig::default(),
                 session_llm: test_session_llm_config(),
                 auto_compact_threshold_percent:
