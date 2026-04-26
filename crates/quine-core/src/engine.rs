@@ -4516,6 +4516,11 @@ struct SessionActor {
     parent_id: Option<SessionId>,
     session: SessionContext,
     command_rx: mpsc::Receiver<SessionCommand>,
+    /// Commands accepted while a turn is in flight and replayed between turns.
+    ///
+    /// User messages live here when a client sends another prompt to a busy
+    /// session. Active LLM/tool loops must not drain this queue, otherwise a
+    /// queued user message can be re-deferred forever and starve the stream.
     deferred_commands: VecDeque<SessionCommand>,
     output: mpsc::Sender<CoreOutput>,
     core_input_tx: mpsc::Sender<CoreInput>,
@@ -5433,12 +5438,6 @@ impl SessionActor {
         tokio::pin!(send_future);
 
         let mut stream = loop {
-            if let Some(command) = self.deferred_commands.pop_front() {
-                if self.handle_control_command(command).await {
-                    return Ok(None);
-                }
-                continue;
-            }
             tokio::select! {
                 stream_result = &mut send_future => {
                     break stream_result.map_err(|e| CoreError::LlmError {
@@ -5468,13 +5467,6 @@ impl SessionActor {
         let mut usage = None;
 
         loop {
-            if let Some(command) = self.deferred_commands.pop_front() {
-                if self.handle_control_command(command).await {
-                    debug_log_session(self.session_id, "LLM stream interrupted");
-                    return Ok(None);
-                }
-                continue;
-            }
             tokio::select! {
                 event_result = stream.next() => {
                     let Some(event_result) = event_result else {
@@ -5661,7 +5653,7 @@ impl SessionActor {
                     .await;
                 self.emit_state(SessionState::Paused).await;
                 loop {
-                    match self.next_command().await {
+                    match self.command_rx.recv().await {
                         Some(SessionCommand::InteractionResponse(response)) => {
                             let Some(parsed) = parse_permission_approval_response(&response) else {
                                 continue;
@@ -5895,7 +5887,7 @@ impl SessionActor {
                                 request,
                             }).await;
                             loop {
-                                match self.next_command().await {
+                                match self.command_rx.recv().await {
                                     Some(SessionCommand::InteractionResponse(response)) => {
                                         let _ = reply_tx.send(response);
                                         break;
@@ -5937,12 +5929,6 @@ impl SessionActor {
             let tool_future = tool.execute(call.arguments.clone(), &ctx);
             tokio::pin!(tool_future);
             let result = loop {
-                if let Some(command) = self.deferred_commands.pop_front() {
-                    if self.handle_control_command(command).await {
-                        break ToolOutcome::Cancelled;
-                    }
-                    continue;
-                }
                 tokio::select! {
                     result = &mut tool_future => {
                         break match result {
@@ -6861,6 +6847,75 @@ mod tests {
                 Ok(LlmEvent::TextDelta { text }),
                 Ok(LlmEvent::Done { usage: None }),
             ])))
+        }
+    }
+
+    struct QueuedUserMessageProvider {
+        first_turn_released: Arc<AtomicBool>,
+        first_turn_release_notify: Arc<Notify>,
+    }
+
+    impl QueuedUserMessageProvider {
+        fn new() -> Self {
+            Self {
+                first_turn_released: Arc::new(AtomicBool::new(false)),
+                first_turn_release_notify: Arc::new(Notify::new()),
+            }
+        }
+
+        fn release_first_turn(&self) {
+            self.first_turn_released.store(true, Ordering::SeqCst);
+            self.first_turn_release_notify.notify_waiters();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for QueuedUserMessageProvider {
+        async fn send(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            match latest_user_request_text(messages) {
+                Some("first") => {
+                    let released = Arc::clone(&self.first_turn_released);
+                    let release_notify = Arc::clone(&self.first_turn_release_notify);
+                    Ok(Box::pin(futures::stream::unfold(0_u8, move |step| {
+                        let released = Arc::clone(&released);
+                        let release_notify = Arc::clone(&release_notify);
+                        async move {
+                            match step {
+                                0 => Some((
+                                    Ok(LlmEvent::TextDelta {
+                                        text: "first reply".into(),
+                                    }),
+                                    1,
+                                )),
+                                1 => {
+                                    loop {
+                                        if released.load(Ordering::SeqCst) {
+                                            break;
+                                        }
+                                        release_notify.notified().await;
+                                    }
+                                    Some((Ok(LlmEvent::Done { usage: None }), 2))
+                                }
+                                _ => None,
+                            }
+                        }
+                    })))
+                }
+                Some("second") => Ok(Box::pin(futures::stream::iter([
+                    Ok(LlmEvent::TextDelta {
+                        text: "second reply".into(),
+                    }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ]))),
+                _ => Ok(Box::pin(futures::stream::iter([Ok(LlmEvent::Done {
+                    usage: None,
+                })]))),
+            }
         }
     }
 
@@ -10842,6 +10897,116 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         assert!(completed.contains(&session_a));
         assert!(completed.contains(&session_b));
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn busy_session_buffers_user_messages_until_current_turn_finishes() {
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+
+        let provider = Arc::new(QueuedUserMessageProvider::new());
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                session_group: None,
+                permission_rules: PermissionRuleSet::default(),
+                memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        let _ = output.recv().await.unwrap();
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "first".into(),
+            })
+            .await
+            .unwrap();
+
+        loop {
+            match tokio::time::timeout(TokioDuration::from_secs(5), output.recv()).await {
+                Ok(Some(CoreOutput::StreamDelta { delta, .. })) if delta == "first reply" => {
+                    break;
+                }
+                Ok(Some(CoreOutput::SessionError { error, .. })) => {
+                    panic!("session error before first stream blocked: {error:?}");
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("output channel closed before first stream blocked"),
+                Err(_) => panic!("timed out waiting for first stream delta"),
+            }
+        }
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "second".into(),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::sleep(TokioDuration::from_millis(100)).await;
+        provider.release_first_turn();
+
+        let mut completed_turns = 0;
+        let mut first_turn_complete = false;
+        let mut completed_text = Vec::new();
+
+        while completed_turns < 2 {
+            match tokio::time::timeout(TokioDuration::from_secs(5), output.recv()).await {
+                Ok(Some(CoreOutput::TextComplete { full_text, .. })) => {
+                    if full_text == "second reply" {
+                        assert!(
+                            first_turn_complete,
+                            "queued user message completed before the active turn completed"
+                        );
+                    }
+                    completed_text.push(full_text);
+                }
+                Ok(Some(CoreOutput::TurnComplete {
+                    session_id: observed,
+                    ..
+                })) if observed == session_id => {
+                    completed_turns += 1;
+                    if completed_turns == 1 {
+                        first_turn_complete = true;
+                    }
+                }
+                Ok(Some(CoreOutput::SessionError { error, .. })) => {
+                    panic!("session error while draining queued user messages: {error:?}");
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => panic!("output channel closed while draining queued user messages"),
+                Err(_) => panic!("timed out waiting for queued user message to complete"),
+            }
+        }
+
+        assert_eq!(completed_text, vec!["first reply", "second reply"]);
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();
