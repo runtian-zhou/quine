@@ -54,6 +54,10 @@ pub(crate) struct SkillSnapshot {
     pub description: String,
     pub version: String,
     pub system_prompt: Option<String>,
+    #[serde(default)]
+    pub system_prompt_char_count: usize,
+    #[serde(default)]
+    pub system_prompt_truncated: bool,
     pub source_path: PathBuf,
     pub tool_names: Vec<String>,
 }

@@ -368,18 +368,25 @@ async fn handle_request(
     let id = request.id.clone();
 
     match request.method.as_str() {
-        methods::PING => {
-            let cwd = std::env::current_dir().unwrap_or_default();
-            let resp = JsonRpcResponse::success(
-                id,
-                serde_json::json!({
-                    "status": "ok",
-                    "pid": std::process::id(),
-                    "cwd": cwd,
-                }),
-            );
-            Some(serde_json::to_string(&resp).unwrap_or_default())
-        }
+        methods::PING => match service.health_check().await {
+            Ok(()) => {
+                let cwd = std::env::current_dir().unwrap_or_default();
+                let resp = JsonRpcResponse::success(
+                    id,
+                    serde_json::json!({
+                        "status": "ok",
+                        "pid": std::process::id(),
+                        "cwd": cwd,
+                    }),
+                );
+                Some(serde_json::to_string(&resp).unwrap_or_default())
+            }
+            Err(error) => {
+                let resp =
+                    JsonRpcErrorResponse::new(id, error_codes::INTERNAL_ERROR, error.to_string());
+                Some(serde_json::to_string(&resp).unwrap_or_default())
+            }
+        },
         methods::CREATE_SESSION => {
             let system_prompt = request
                 .params
@@ -1018,36 +1025,21 @@ async fn handle_request(
                 .and_then(|v| v.as_str())
                 .map(String::from);
 
-            match task {
-                Some(task) => {
-                    let parent_id: Option<quine_core::SessionId> = parent_id_str.and_then(|s| {
-                        serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
-                    });
+            let parent_id: Option<quine_core::SessionId> = parent_id_str.and_then(|s| {
+                serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+            });
 
-                    match service
-                        .spawn_child_session(parent_id, task, system_prompt)
-                        .await
-                    {
-                        Ok(session_id) => {
-                            let resp = JsonRpcResponse::success(id, session_id);
-                            Some(serde_json::to_string(&resp).unwrap_or_default())
-                        }
-                        Err(e) => {
-                            let resp = JsonRpcErrorResponse::new(
-                                id,
-                                error_codes::INTERNAL_ERROR,
-                                e.to_string(),
-                            );
-                            Some(serde_json::to_string(&resp).unwrap_or_default())
-                        }
-                    }
+            match service
+                .spawn_child_session(parent_id, task, system_prompt)
+                .await
+            {
+                Ok(session_id) => {
+                    let resp = JsonRpcResponse::success(id, session_id);
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
                 }
-                None => {
-                    let resp = JsonRpcErrorResponse::new(
-                        id,
-                        error_codes::INVALID_PARAMS,
-                        "missing task parameter",
-                    );
+                Err(e) => {
+                    let resp =
+                        JsonRpcErrorResponse::new(id, error_codes::INTERNAL_ERROR, e.to_string());
                     Some(serde_json::to_string(&resp).unwrap_or_default())
                 }
             }
@@ -1689,6 +1681,93 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::HarnessError;
+    use crate::service::HarnessService;
+    use crate::SessionConfig;
+    use async_trait::async_trait;
+    use tokio::sync::{broadcast, Notify};
+
+    struct MockHarnessService {
+        healthy: bool,
+    }
+
+    #[async_trait]
+    impl HarnessService for MockHarnessService {
+        async fn health_check(&self) -> Result<(), HarnessError> {
+            if self.healthy {
+                Ok(())
+            } else {
+                Err(HarnessError::Internal {
+                    message: "core channel closed".into(),
+                })
+            }
+        }
+
+        async fn create_session(
+            &self,
+            _config: SessionConfig,
+        ) -> Result<quine_core::SessionId, HarnessError> {
+            Err(HarnessError::Internal {
+                message: "not used in test".into(),
+            })
+        }
+
+        async fn send_message(
+            &self,
+            _session_id: quine_core::SessionId,
+            _content: String,
+        ) -> Result<(), HarnessError> {
+            Err(HarnessError::Internal {
+                message: "not used in test".into(),
+            })
+        }
+
+        async fn compact_session(
+            &self,
+            _session_id: quine_core::SessionId,
+        ) -> Result<(), HarnessError> {
+            Err(HarnessError::Internal {
+                message: "not used in test".into(),
+            })
+        }
+
+        async fn submit_tool_result(
+            &self,
+            _session_id: quine_core::SessionId,
+            _tool_use_id: String,
+            _output: String,
+            _is_error: bool,
+        ) -> Result<(), HarnessError> {
+            Err(HarnessError::Internal {
+                message: "not used in test".into(),
+            })
+        }
+
+        async fn submit_interaction_response(
+            &self,
+            _session_id: quine_core::SessionId,
+            _response: quine_core::InteractionResponse,
+        ) -> Result<(), HarnessError> {
+            Err(HarnessError::Internal {
+                message: "not used in test".into(),
+            })
+        }
+
+        async fn cancel(&self, _session_id: quine_core::SessionId) -> Result<(), HarnessError> {
+            Err(HarnessError::Internal {
+                message: "not used in test".into(),
+            })
+        }
+
+        async fn shutdown(&self) -> Result<(), HarnessError> {
+            Ok(())
+        }
+
+        fn subscribe(&self) -> broadcast::Receiver<quine_core::CoreOutput> {
+            let (_tx, rx) = broadcast::channel(1);
+            rx
+        }
+    }
 
     #[test]
     fn interaction_needed_notification_includes_options() {
@@ -1733,5 +1812,28 @@ mod tests {
             .get("allow_freeform")
             .expect("allow_freeform field missing");
         assert_eq!(allow_freeform, true);
+    }
+
+    #[tokio::test]
+    async fn ping_probes_service_health() {
+        let request = serde_json::to_string(&JsonRpcRequest::new(1, methods::PING, None)).unwrap();
+        let shutdown = Notify::new();
+
+        let healthy = MockHarnessService { healthy: true };
+        let response = handle_request(&request, &healthy, &shutdown)
+            .await
+            .expect("ping should return a response");
+        let parsed: JsonRpcResponse =
+            serde_json::from_str(&response).expect("healthy ping should succeed");
+        assert_eq!(parsed.result["status"], "ok");
+
+        let unhealthy = MockHarnessService { healthy: false };
+        let response = handle_request(&request, &unhealthy, &shutdown)
+            .await
+            .expect("ping should return an error response");
+        let parsed: JsonRpcErrorResponse =
+            serde_json::from_str(&response).expect("unhealthy ping should fail");
+        assert_eq!(parsed.error.code, error_codes::INTERNAL_ERROR);
+        assert!(parsed.error.message.contains("core channel closed"));
     }
 }

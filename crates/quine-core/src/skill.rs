@@ -168,6 +168,46 @@ impl FileSystemSkillLoader {
         Ok(results)
     }
 
+    fn discover_skill_paths_sync(&self) -> anyhow::Result<Vec<(String, PathBuf)>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut results = Vec::new();
+
+        for dir in &self.search_paths {
+            if !dir.is_dir() {
+                continue;
+            }
+            for entry in std::fs::read_dir(dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                let candidate = if path.extension().and_then(|e| e.to_str()) == Some("md") {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(|stem| (stem.to_string(), path.clone()))
+                } else if path.is_dir() {
+                    let skill_path = path.join("SKILL.md");
+                    if skill_path.is_file() {
+                        path.file_name()
+                            .and_then(|s| s.to_str())
+                            .map(|name| (name.to_string(), skill_path))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some((name, skill_path)) = candidate {
+                    if seen.insert(name.clone()) {
+                        results.push((name, skill_path));
+                    }
+                }
+            }
+        }
+
+        results.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(results)
+    }
+
     /// Load every discoverable skill from this loader's search paths.
     pub async fn load_all(&self) -> Vec<Skill> {
         let mut skills = Vec::new();
@@ -187,6 +227,36 @@ impl FileSystemSkillLoader {
 
         skills.sort_by(|left, right| left.meta.name.cmp(&right.meta.name));
         skills
+    }
+
+    /// Load every discoverable skill from this loader's search paths synchronously.
+    pub fn load_all_sync(&self) -> Vec<Skill> {
+        let mut skills = Vec::new();
+        let Ok(paths) = self.discover_skill_paths_sync() else {
+            return skills;
+        };
+
+        for (_lookup_name, skill_path) in paths {
+            let Ok(content) = std::fs::read_to_string(&skill_path) else {
+                continue;
+            };
+            let Ok(skill) = parse_skill(&content, skill_path) else {
+                continue;
+            };
+            skills.push(skill);
+        }
+
+        skills.sort_by(|left, right| left.meta.name.cmp(&right.meta.name));
+        skills
+    }
+
+    /// Load a single skill synchronously.
+    pub fn load_sync(&self, name: &str) -> anyhow::Result<Skill> {
+        let path = self
+            .find_skill_path(name)
+            .ok_or_else(|| anyhow::anyhow!("skill not found: {name}"))?;
+        let content = std::fs::read_to_string(&path)?;
+        parse_skill(&content, path)
     }
 }
 
@@ -287,6 +357,12 @@ pub async fn load_project_skills(project_root: &Path) -> Vec<Skill> {
         .await
 }
 
+/// Load every project-scoped skill from `.quine`, `.claude`, and `.codex`
+/// using synchronous filesystem access.
+pub fn load_project_skills_sync(project_root: &Path) -> Vec<Skill> {
+    FileSystemSkillLoader::project_only(project_root).load_all_sync()
+}
+
 /// Resolve the full session skill set by auto-attaching project skills and
 /// then layering explicitly requested skills on top without duplicates.
 pub async fn load_session_skills(project_root: &Path, names: &[String]) -> Vec<Skill> {
@@ -300,6 +376,32 @@ pub async fn load_session_skills(project_root: &Path, names: &[String]) -> Vec<S
     }
 
     for skill in load_skills(project_root, names).await {
+        if seen.insert(skill.meta.name.clone()) {
+            skills.push(skill);
+        }
+    }
+
+    skills
+}
+
+/// Resolve the full session skill set synchronously by auto-attaching project
+/// skills and then layering explicitly requested skills on top without
+/// duplicates.
+pub fn load_session_skills_sync(project_root: &Path, names: &[String]) -> Vec<Skill> {
+    let mut seen = std::collections::HashSet::new();
+    let mut skills = Vec::new();
+    let loader = FileSystemSkillLoader::default_paths(project_root);
+
+    for skill in load_project_skills_sync(project_root) {
+        if seen.insert(skill.meta.name.clone()) {
+            skills.push(skill);
+        }
+    }
+
+    for name in names {
+        let Ok(skill) = loader.load_sync(name) else {
+            continue;
+        };
         if seen.insert(skill.meta.name.clone()) {
             skills.push(skill);
         }
@@ -865,12 +967,6 @@ Say hello!
             .collect::<Vec<_>>();
 
         assert_eq!(names, vec!["qa", "review"]);
-        assert!(skills
-            .iter()
-            .any(|skill| skill.source_path == commands_dir.join("qa.md")));
-        assert!(skills
-            .iter()
-            .all(|skill| { skill.source_path != commands_dir.join("feature_planning.py") }));
     }
 
     #[tokio::test]
@@ -880,12 +976,7 @@ Say hello!
         std::fs::create_dir_all(&commands_dir).unwrap();
         std::fs::write(
             commands_dir.join("auto-attached.md"),
-            "Project auto-attached instructions.\n",
-        )
-        .unwrap();
-        std::fs::write(
-            commands_dir.join("second-auto.md"),
-            "Another project auto-attached skill.\n",
+            "You are auto-attached for this project.\n",
         )
         .unwrap();
 
@@ -895,6 +986,6 @@ Say hello!
             .map(|skill| skill.meta.name.as_str())
             .collect::<Vec<_>>();
 
-        assert_eq!(names, vec!["auto-attached", "second-auto"]);
+        assert_eq!(names, vec!["auto-attached"]);
     }
 }

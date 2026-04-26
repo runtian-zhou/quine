@@ -1195,6 +1195,18 @@ fn format_skill_label(index: usize, explorer: &ContextExplorerState) -> String {
     }
 }
 
+fn format_skill_prompt_preview(skill: &crate::context_debug::SkillSnapshot) -> String {
+    match skill.system_prompt.as_deref() {
+        Some(system_prompt) if skill.system_prompt_truncated => format!(
+            "{system_prompt}\n\n[preview truncated to {} chars; full prompt has {} chars]",
+            system_prompt.chars().count(),
+            skill.system_prompt_char_count
+        ),
+        Some(system_prompt) => system_prompt.to_string(),
+        None => "<none>".to_string(),
+    }
+}
+
 fn format_skill_detail(explorer: &ContextExplorerState) -> String {
     match explorer.selected_skill() {
         Some(skill) => {
@@ -1203,14 +1215,16 @@ fn format_skill_detail(explorer: &ContextExplorerState) -> String {
             } else {
                 skill.tool_names.join(", ")
             };
-            let system_prompt = skill.system_prompt.as_deref().unwrap_or("<none>");
+            let system_prompt = format_skill_prompt_preview(skill);
             format!(
-                "name: {}\nversion: {}\nsource: {}\n\ndescription:\n{}\n\nsystem_prompt:\n{}\n\ntools:\n{}",
+                "name: {}\nversion: {}\nsource: {}\n\ndescription:\n{}\n\nsystem_prompt:\n{}\n\nprompt_chars: {}\nprompt_truncated: {}\n\ntools:\n{}",
                 skill.name,
                 skill.version,
                 skill.source_path.display(),
                 skill.description,
                 system_prompt,
+                skill.system_prompt_char_count,
+                skill.system_prompt_truncated,
                 tool_names
             )
         }
@@ -2290,6 +2304,8 @@ mod tests {
                 description: "Review changes".into(),
                 version: "1.0".into(),
                 system_prompt: Some("Review carefully".into()),
+                system_prompt_char_count: 16,
+                system_prompt_truncated: false,
                 source_path: std::path::PathBuf::from("/tmp/project/.quine/skills/review.md"),
                 tool_names: vec!["read_file".into(), "bash".into()],
             }],
@@ -2315,6 +2331,49 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("Skill Detail")));
         assert!(lines.iter().any(|line| line.contains("review")));
         assert!(lines.iter().any(|line| line.contains("Review changes")));
+    }
+
+    #[test]
+    fn format_skill_detail_marks_truncated_prompt_previews() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec!["feature-planning".into()],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            available_tools: vec![],
+            loaded_skills: vec![crate::context_debug::SkillSnapshot {
+                name: "feature-planning".into(),
+                description: "Plan features".into(),
+                version: "1.0".into(),
+                system_prompt: Some("preview body".into()),
+                system_prompt_char_count: 2_048,
+                system_prompt_truncated: true,
+                source_path: std::path::PathBuf::from(
+                    "/tmp/project/.claude/commands/feature-planning.md",
+                ),
+                tool_names: vec![],
+            }],
+            plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
+            prompt_memory: None,
+            compact_memory_summary_markdown: None,
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            status_report: None,
+            history: vec![],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+        let explorer = app.context_explorer.as_ref().expect("explorer open");
+        let detail = format_skill_detail(explorer);
+
+        assert!(detail.contains("preview body"));
+        assert!(detail.contains("prompt_chars: 2048"));
+        assert!(detail.contains("prompt_truncated: true"));
+        assert!(detail.contains("[preview truncated"));
     }
 
     #[test]

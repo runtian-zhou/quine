@@ -46,6 +46,8 @@ pub struct SkillSnapshot {
     pub description: String,
     pub version: String,
     pub system_prompt: Option<String>,
+    pub system_prompt_char_count: usize,
+    pub system_prompt_truncated: bool,
     pub source_path: PathBuf,
     pub tool_names: Vec<String>,
 }
@@ -106,6 +108,8 @@ pub struct ToolCallEntry {
     pub arguments: serde_json::Value,
 }
 
+const SKILL_SYSTEM_PROMPT_PREVIEW_CHARS: usize = 1_200;
+
 pub fn session_context_from_checkpoint(
     checkpoint: &CoreCheckpoint,
     session_id: SessionId,
@@ -125,6 +129,14 @@ fn snapshot_from_persisted(
     live_states: &HashMap<SessionId, String>,
     state_root: Option<&Path>,
 ) -> SessionContextSnapshot {
+    let resolved_skills = load_snapshot_skills(session);
+    let loaded_skills = build_loaded_skills(&resolved_skills);
+    let skills = loaded_skills
+        .iter()
+        .map(|skill| skill.name.clone())
+        .collect();
+    let available_tools = build_available_tools(session.config.plan_mode, &resolved_skills);
+
     SessionContextSnapshot {
         session_id: serialize_session_id(session.session_id),
         created_at: session.created_at,
@@ -133,11 +145,11 @@ fn snapshot_from_persisted(
             .cloned()
             .unwrap_or_else(|| format!("{:?}", session.state).to_lowercase()),
         system_prompt: session.config.system_prompt.clone(),
-        skills: session.config.skill_names.clone(),
+        skills,
         working_directory: session.config.working_directory.clone(),
         plan_mode: session.config.plan_mode,
-        available_tools: build_available_tools(session),
-        loaded_skills: build_loaded_skills(session),
+        available_tools,
+        loaded_skills,
         plans: session
             .plan_store
             .plans
@@ -239,46 +251,70 @@ fn plan_status_snapshot(status: &ActionStatus) -> PlanActionStatusSnapshot {
     }
 }
 
-fn build_loaded_skills(session: &PersistedSession) -> Vec<SkillSnapshot> {
-    futures::executor::block_on(skill::load_skills(
+fn load_snapshot_skills(session: &PersistedSession) -> Vec<skill::Skill> {
+    skill::load_session_skills_sync(
         &session.config.working_directory,
         &session.config.skill_names,
-    ))
-    .into_iter()
-    .map(|skill| SkillSnapshot {
-        name: skill.meta.name,
-        description: skill.meta.description,
-        version: skill.meta.version,
-        system_prompt: skill.system_prompt,
-        source_path: skill.source_path,
-        tool_names: skill
-            .tool_definitions
-            .into_iter()
-            .map(|tool| tool.name)
-            .collect(),
-    })
-    .collect()
+    )
 }
 
-fn build_available_tools(session: &PersistedSession) -> Vec<ToolDefinition> {
-    let mut tools = built_in_tool_definitions(session.config.plan_mode);
+fn skill_prompt_preview(system_prompt: Option<&str>) -> (Option<String>, usize, bool) {
+    let Some(system_prompt) = system_prompt
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (None, 0, false);
+    };
 
-    for skill in futures::executor::block_on(skill::load_skills(
-        &session.config.working_directory,
-        &session.config.skill_names,
-    )) {
-        tools.extend(
-            skill
-                .tool_definitions
-                .into_iter()
-                .map(|tool| ToolDefinition {
-                    name: tool.name,
-                    description: tool.description,
-                    parameters: tool.parameters,
-                    read_only: false,
-                    idempotent: false,
-                }),
-        );
+    let char_count = system_prompt.chars().count();
+    if char_count <= SKILL_SYSTEM_PROMPT_PREVIEW_CHARS {
+        return (Some(system_prompt.to_string()), char_count, false);
+    }
+
+    let preview = system_prompt
+        .chars()
+        .take(SKILL_SYSTEM_PROMPT_PREVIEW_CHARS)
+        .collect::<String>()
+        .trim_end()
+        .to_string();
+    (Some(preview), char_count, true)
+}
+
+fn build_loaded_skills(skills: &[skill::Skill]) -> Vec<SkillSnapshot> {
+    skills
+        .iter()
+        .map(|skill| {
+            let (system_prompt, system_prompt_char_count, system_prompt_truncated) =
+                skill_prompt_preview(skill.system_prompt.as_deref());
+            SkillSnapshot {
+                name: skill.meta.name.clone(),
+                description: skill.meta.description.clone(),
+                version: skill.meta.version.clone(),
+                system_prompt,
+                system_prompt_char_count,
+                system_prompt_truncated,
+                source_path: skill.source_path.clone(),
+                tool_names: skill
+                    .tool_definitions
+                    .iter()
+                    .map(|tool| tool.name.clone())
+                    .collect(),
+            }
+        })
+        .collect()
+}
+
+fn build_available_tools(plan_mode: bool, skills: &[skill::Skill]) -> Vec<ToolDefinition> {
+    let mut tools = built_in_tool_definitions(plan_mode);
+
+    for skill in skills {
+        tools.extend(skill.tool_definitions.iter().map(|tool| ToolDefinition {
+            name: tool.name.clone(),
+            description: tool.description.clone(),
+            parameters: tool.parameters.clone(),
+            read_only: false,
+            idempotent: false,
+        }));
     }
 
     tools.sort_by(|left, right| left.name.cmp(&right.name));
@@ -726,6 +762,79 @@ mod tests {
             snapshot.compact_memory_summary_markdown.as_deref(),
             Some("# Session Summary\n\nCompact context body.\n")
         );
+    }
+
+    #[tokio::test]
+    async fn session_context_snapshot_loads_project_skills_and_truncates_prompt_preview() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let commands_dir = project_dir.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        let prompt = format!(
+            "You are creating feature planning docs for the quine project.\n\n{}\nTAIL MARKER",
+            "plan carefully ".repeat(200)
+        );
+        std::fs::write(commands_dir.join("feature-planning.md"), &prompt).unwrap();
+
+        let session_id = SessionId::new();
+        let checkpoint = CoreCheckpoint::new(
+            vec![PersistedSession {
+                session_id,
+                created_at: Utc::now(),
+                state: PersistedSessionState::Idle,
+                config: PersistedSessionConfig {
+                    system_prompt: None,
+                    skill_names: Vec::new(),
+                    working_directory: project_dir.path().to_path_buf(),
+                    plan_mode: false,
+                    prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
+                    prompt_memory_mode: quine_core::PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
+                    session_group: None,
+                    auto_compact_threshold_percent: 60,
+                    status_report_min_tool_rounds:
+                        quine_core::default_status_report_min_tool_rounds(),
+                },
+                history: Vec::new(),
+                plan_store: PersistedPlanStore::default(),
+                memory_state: None,
+                permission_state: None,
+                status_report: None,
+                python_state: None,
+            }],
+            PersistedSessionTree {
+                parents: HashMap::new(),
+                children: HashMap::new(),
+                exit_statuses: HashMap::new(),
+            },
+        );
+
+        let snapshot =
+            super::session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new(), None)
+                .expect("session context should project from checkpoint");
+
+        assert_eq!(snapshot.skills, vec!["feature-planning".to_string()]);
+        assert_eq!(snapshot.loaded_skills.len(), 1);
+        let skill = &snapshot.loaded_skills[0];
+        assert_eq!(skill.name, "feature-planning");
+        assert!(skill.system_prompt_truncated);
+        assert!(skill.system_prompt_char_count > SKILL_SYSTEM_PROMPT_PREVIEW_CHARS);
+        assert_eq!(
+            skill
+                .system_prompt
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count(),
+            SKILL_SYSTEM_PROMPT_PREVIEW_CHARS
+        );
+        assert!(!skill
+            .system_prompt
+            .as_deref()
+            .unwrap_or_default()
+            .contains("TAIL MARKER"));
     }
 
     #[tokio::test]
