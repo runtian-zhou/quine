@@ -406,22 +406,17 @@ impl LlmProvider for AnthropicProvider {
                             "content_block_delta" => {
                                 if let Ok(sse) = serde_json::from_str::<SseEvent>(&data) {
                                     match sse.delta {
-                                        Some(DeltaPayload::TextDelta { text }) => {
-                                            if !text.is_empty() {
-                                                return Some((
-                                                    stream::iter(vec![Ok(LlmEvent::TextDelta {
-                                                        text,
-                                                    })]),
-                                                    (
-                                                        byte_stream,
-                                                        buffer,
-                                                        tool_tracker,
-                                                        done,
-                                                        usage,
-                                                    ),
-                                                ));
-                                            }
+                                        Some(DeltaPayload::TextDelta { text })
+                                            if !text.is_empty() =>
+                                        {
+                                            return Some((
+                                                stream::iter(vec![Ok(LlmEvent::TextDelta {
+                                                    text,
+                                                })]),
+                                                (byte_stream, buffer, tool_tracker, done, usage),
+                                            ));
                                         }
+                                        Some(DeltaPayload::TextDelta { .. }) => {}
                                         Some(DeltaPayload::InputJsonDelta { partial_json }) => {
                                             if let Some(block_index) = sse.index {
                                                 tool_tracker

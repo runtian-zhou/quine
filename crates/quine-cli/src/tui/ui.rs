@@ -55,11 +55,10 @@ fn format_running_timer(started_at: Instant, timeout: Option<Duration>) -> Strin
 /// Format token usage in a compact, TUI-friendly form.
 fn format_token_usage(usage: &quine_llm::TokenUsage, max_context_window: u64) -> String {
     let current = usage.input_tokens + usage.output_tokens;
-    let percent = if max_context_window == 0 {
-        0
-    } else {
-        current.saturating_mul(100) / max_context_window
-    };
+    let percent = current
+        .saturating_mul(100)
+        .checked_div(max_context_window)
+        .unwrap_or(0);
     format!("ctx {percent}%", percent = percent.min(100),)
 }
 

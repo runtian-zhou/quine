@@ -315,6 +315,7 @@ fn print_resume_command(socket_path: &Path, session_id: &str) {
 ///
 /// Sets up the terminal in raw/alternate-screen mode, runs the main event loop,
 /// and restores the terminal on exit (including panics).
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tui_chat(
     socket_path: &Path,
     skills: &[String],

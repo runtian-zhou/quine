@@ -6,7 +6,7 @@ use chrono::Utc;
 use std::collections::HashMap;
 
 use quine_core::{
-    create_channels, load_skills, ChannelConfig, CoreCheckpoint, CoreInput, CoreOutput,
+    create_channels, load_session_skills, ChannelConfig, CoreCheckpoint, CoreInput, CoreOutput,
     HarnessHandle, InheritanceFlags, InteractionResponse, PythonExecRequest, PythonRuntime,
     SessionId, SessionSignal, Skill,
 };
@@ -535,14 +535,12 @@ impl LocalHarness {
     }
 }
 
-/// Load skills by name using `quine-core` default skill support.
-async fn load_skills_from_config(skill_names: &[String]) -> Vec<Skill> {
-    if skill_names.is_empty() {
-        return Vec::new();
-    }
-
-    let project_root = std::env::current_dir().unwrap_or_default();
-    load_skills(&project_root, skill_names).await
+/// Resolve auto-attached project skills plus any explicit requested skills.
+async fn load_skills_from_config(
+    working_directory: &std::path::Path,
+    skill_names: &[String],
+) -> Vec<Skill> {
+    load_session_skills(working_directory, skill_names).await
 }
 
 impl LocalHarness {
@@ -565,11 +563,11 @@ impl HarnessService for LocalHarness {
     async fn create_session(&self, config: SessionConfig) -> Result<SessionId, HarnessError> {
         let session_id = SessionId::new();
         let (reply_tx, reply_rx) = oneshot::channel();
-        let skills = load_skills_from_config(&config.skills).await;
         let working_directory = config
             .working_directory
             .clone()
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+        let skills = load_skills_from_config(&working_directory, &config.skills).await;
         let permission_rules =
             load_persisted_permission_rules(&working_directory).map_err(|error| {
                 HarnessError::SessionCreationFailed {
@@ -1181,6 +1179,102 @@ mod tests {
         assert_eq!(snapshot.working_directory, projected.working_directory);
         assert!(!snapshot.plan_mode);
         assert!(!projected.plan_mode);
+
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_session_auto_attaches_project_claude_command_skills() {
+        let storage = temp_storage();
+        let project_dir =
+            std::env::temp_dir().join(format!("quine-project-{}", uuid::Uuid::new_v4()));
+        let commands_dir = project_dir.join(".claude").join("commands");
+        async_fs::create_dir_all(&commands_dir).await.unwrap();
+        async_fs::write(
+            commands_dir.join("auto-attached.md"),
+            "Always mention that this skill was auto-attached.\n",
+        )
+        .await
+        .unwrap();
+        async_fs::write(commands_dir.join("helper.py"), "print('not a skill')\n")
+            .await
+            .unwrap();
+
+        let harness = LocalHarness::new(Arc::new(MockProvider), Some(storage))
+            .await
+            .unwrap();
+
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(project_dir.clone()),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot
+                .loaded_skills
+                .iter()
+                .any(|skill| skill.name == "auto-attached")
+        })
+        .await;
+
+        assert_eq!(snapshot.skills, vec!["auto-attached"]);
+        assert_eq!(snapshot.loaded_skills.len(), 1);
+        assert_eq!(snapshot.loaded_skills[0].name, "auto-attached");
+        assert_eq!(
+            snapshot.loaded_skills[0].source_path,
+            commands_dir.join("auto-attached.md")
+        );
+
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn create_session_keeps_project_auto_skills_when_explicit_skill_names_overlap() {
+        let storage = temp_storage();
+        let project_dir =
+            std::env::temp_dir().join(format!("quine-project-{}", uuid::Uuid::new_v4()));
+        let commands_dir = project_dir.join(".claude").join("commands");
+        async_fs::create_dir_all(&commands_dir).await.unwrap();
+        async_fs::write(
+            commands_dir.join("project-only.md"),
+            "Project-specific auto-attached instructions.\n",
+        )
+        .await
+        .unwrap();
+        async_fs::write(
+            commands_dir.join("second-auto.md"),
+            "A second project skill that should stay attached.\n",
+        )
+        .await
+        .unwrap();
+
+        let harness = LocalHarness::new(Arc::new(MockProvider), Some(storage))
+            .await
+            .unwrap();
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(project_dir),
+                skills: vec!["project-only".into()],
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+
+        let snapshot = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot.loaded_skills.len() == 2
+        })
+        .await;
+
+        assert_eq!(snapshot.skills, vec!["project-only", "second-auto"]);
+        let loaded_names = snapshot
+            .loaded_skills
+            .iter()
+            .map(|skill| skill.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(loaded_names, vec!["project-only", "second-auto"]);
 
         harness.shutdown().await.unwrap();
     }

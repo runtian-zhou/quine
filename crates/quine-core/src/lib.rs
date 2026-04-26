@@ -57,8 +57,9 @@ pub use python::{
 };
 pub use session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 pub use skill::{
-    default_skill_service, list_available_skills, load_skill, load_skills, DefaultSkillService,
-    FileSystemSkillLoader, Skill, SkillLoader, SkillMeta, SkillService, SkillToolDef,
+    default_skill_service, list_available_skills, load_project_skills, load_session_skills,
+    load_skill, load_skills, DefaultSkillService, FileSystemSkillLoader, Skill, SkillLoader,
+    SkillMeta, SkillService, SkillToolDef,
 };
 pub use status_report::{
     default_status_report_min_tool_rounds, SessionStatusReport,

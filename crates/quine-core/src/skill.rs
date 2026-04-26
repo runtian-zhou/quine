@@ -78,14 +78,23 @@ impl FileSystemSkillLoader {
         &self.search_paths
     }
 
-    /// Default search paths include native Quine skills plus legacy Claude/Codex locations.
-    pub fn default_paths(project_root: &Path) -> Self {
-        let mut paths = vec![
+    fn project_paths(project_root: &Path) -> Vec<PathBuf> {
+        vec![
             project_root.join(".quine").join("skills"),
             project_root.join(".claude").join("commands"),
             project_root.join(".codex").join("skills"),
             project_root.join(".codex").join("skills").join(".system"),
-        ];
+        ]
+    }
+
+    /// Project-scoped search paths only.
+    pub fn project_only(project_root: &Path) -> Self {
+        Self::new(Self::project_paths(project_root))
+    }
+
+    /// Default search paths include native Quine skills plus legacy Claude/Codex locations.
+    pub fn default_paths(project_root: &Path) -> Self {
+        let mut paths = Self::project_paths(project_root);
         if let Some(home) = dirs_home() {
             paths.push(home.join(".quine").join("skills"));
             paths.push(home.join(".claude").join("commands"));
@@ -118,16 +127,8 @@ impl FileSystemSkillLoader {
         }
         None
     }
-}
 
-/// Get the user's home directory.
-fn dirs_home() -> Option<PathBuf> {
-    std::env::var("HOME").ok().map(PathBuf::from)
-}
-
-#[async_trait::async_trait]
-impl SkillLoader for FileSystemSkillLoader {
-    async fn list(&self) -> anyhow::Result<Vec<SkillMeta>> {
+    async fn discover_skill_paths(&self) -> anyhow::Result<Vec<(String, PathBuf)>> {
         let mut seen = std::collections::HashSet::new();
         let mut results = Vec::new();
 
@@ -157,12 +158,52 @@ impl SkillLoader for FileSystemSkillLoader {
 
                 if let Some((name, skill_path)) = candidate {
                     if seen.insert(name.clone()) {
-                        let content = tokio::fs::read_to_string(&skill_path).await?;
-                        if let Ok(meta) = parse_skill_meta(&content, &skill_path, &name) {
-                            results.push(meta);
-                        }
+                        results.push((name, skill_path));
                     }
                 }
+            }
+        }
+
+        results.sort_by(|left, right| left.0.cmp(&right.0));
+        Ok(results)
+    }
+
+    /// Load every discoverable skill from this loader's search paths.
+    pub async fn load_all(&self) -> Vec<Skill> {
+        let mut skills = Vec::new();
+        let Ok(paths) = self.discover_skill_paths().await else {
+            return skills;
+        };
+
+        for (_lookup_name, skill_path) in paths {
+            let Ok(content) = tokio::fs::read_to_string(&skill_path).await else {
+                continue;
+            };
+            let Ok(skill) = parse_skill(&content, skill_path) else {
+                continue;
+            };
+            skills.push(skill);
+        }
+
+        skills.sort_by(|left, right| left.meta.name.cmp(&right.meta.name));
+        skills
+    }
+}
+
+/// Get the user's home directory.
+fn dirs_home() -> Option<PathBuf> {
+    std::env::var("HOME").ok().map(PathBuf::from)
+}
+
+#[async_trait::async_trait]
+impl SkillLoader for FileSystemSkillLoader {
+    async fn list(&self) -> anyhow::Result<Vec<SkillMeta>> {
+        let mut results = Vec::new();
+
+        for (name, skill_path) in self.discover_skill_paths().await? {
+            let content = tokio::fs::read_to_string(&skill_path).await?;
+            if let Ok(meta) = parse_skill_meta(&content, &skill_path, &name) {
+                results.push(meta);
             }
         }
 
@@ -237,6 +278,34 @@ pub async fn load_skill(project_root: &Path, name: &str) -> anyhow::Result<Skill
 /// Load multiple skills using the standard default skill search paths.
 pub async fn load_skills(project_root: &Path, names: &[String]) -> Vec<Skill> {
     default_skill_service(project_root).load_skills(names).await
+}
+
+/// Load every project-scoped skill from `.quine`, `.claude`, and `.codex`.
+pub async fn load_project_skills(project_root: &Path) -> Vec<Skill> {
+    FileSystemSkillLoader::project_only(project_root)
+        .load_all()
+        .await
+}
+
+/// Resolve the full session skill set by auto-attaching project skills and
+/// then layering explicitly requested skills on top without duplicates.
+pub async fn load_session_skills(project_root: &Path, names: &[String]) -> Vec<Skill> {
+    let mut seen = std::collections::HashSet::new();
+    let mut skills = Vec::new();
+
+    for skill in load_project_skills(project_root).await {
+        if seen.insert(skill.meta.name.clone()) {
+            skills.push(skill);
+        }
+    }
+
+    for skill in load_skills(project_root, names).await {
+        if seen.insert(skill.meta.name.clone()) {
+            skills.push(skill);
+        }
+    }
+
+    skills
 }
 
 fn parse_skill_meta(
@@ -760,5 +829,72 @@ Say hello!
             .unwrap()
             .contains("Follow this workflow exactly."));
         assert!(skill.tool_definitions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn load_project_skills_loads_markdown_commands_and_ignores_python_helpers() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let commands_dir = project_dir.path().join(".claude").join("commands");
+        let codex_skill_dir = project_dir
+            .path()
+            .join(".codex")
+            .join("skills")
+            .join("review");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::create_dir_all(&codex_skill_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("qa.md"),
+            "You are running QA tests for the quine project.\n\nFollow this workflow exactly.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            commands_dir.join("feature_planning.py"),
+            "print('helper')\n",
+        )
+        .unwrap();
+        std::fs::write(
+            codex_skill_dir.join("SKILL.md"),
+            "---\nname: review\ndescription: Review project changes\n---\n\n## System Prompt\n\nReview carefully.\n",
+        )
+        .unwrap();
+
+        let skills = load_project_skills(project_dir.path()).await;
+        let names = skills
+            .iter()
+            .map(|skill| skill.meta.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["qa", "review"]);
+        assert!(skills
+            .iter()
+            .any(|skill| skill.source_path == commands_dir.join("qa.md")));
+        assert!(skills
+            .iter()
+            .all(|skill| { skill.source_path != commands_dir.join("feature_planning.py") }));
+    }
+
+    #[tokio::test]
+    async fn load_session_skills_keeps_project_auto_skills_without_duplicates() {
+        let project_dir = tempfile::tempdir().unwrap();
+        let commands_dir = project_dir.path().join(".claude").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("auto-attached.md"),
+            "Project auto-attached instructions.\n",
+        )
+        .unwrap();
+        std::fs::write(
+            commands_dir.join("second-auto.md"),
+            "Another project auto-attached skill.\n",
+        )
+        .unwrap();
+
+        let skills = load_session_skills(project_dir.path(), &["auto-attached".into()]).await;
+        let names = skills
+            .iter()
+            .map(|skill| skill.meta.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(names, vec!["auto-attached", "second-auto"]);
     }
 }

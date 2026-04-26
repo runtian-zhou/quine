@@ -409,6 +409,105 @@ impl SessionInit {
     }
 }
 
+fn sanitize_restored_history(session_id: SessionId, history: Vec<Message>) -> Vec<Message> {
+    let mut tool_use_positions = HashMap::new();
+    let mut tool_result_positions = HashMap::new();
+
+    for (index, message) in history.iter().enumerate() {
+        match &message.content {
+            MessageContent::ToolUse { tool_calls, .. } => {
+                for call in tool_calls {
+                    tool_use_positions
+                        .entry(call.tool_use_id.clone())
+                        .or_insert(index);
+                }
+            }
+            MessageContent::ToolResult { tool_use_id, .. } => {
+                tool_result_positions.insert(tool_use_id.clone(), index);
+            }
+            MessageContent::Text(_) => {}
+        }
+    }
+
+    let valid_tool_use_ids = tool_use_positions
+        .iter()
+        .filter_map(|(tool_use_id, tool_use_index)| {
+            tool_result_positions
+                .get(tool_use_id)
+                .filter(|tool_result_index| **tool_result_index > *tool_use_index)
+                .map(|_| tool_use_id.clone())
+        })
+        .collect::<HashSet<_>>();
+
+    let mut removed_tool_calls = 0usize;
+    let mut removed_tool_results = 0usize;
+    let mut sanitized = Vec::with_capacity(history.len());
+
+    for message in history {
+        let role = message.role.clone();
+        match message.content {
+            MessageContent::ToolUse { text, tool_calls } => {
+                let original_count = tool_calls.len();
+                let retained_tool_calls = tool_calls
+                    .into_iter()
+                    .filter(|call| valid_tool_use_ids.contains(&call.tool_use_id))
+                    .collect::<Vec<_>>();
+                removed_tool_calls += original_count.saturating_sub(retained_tool_calls.len());
+
+                if retained_tool_calls.is_empty() {
+                    if let Some(text) = text.filter(|text| !text.trim().is_empty()) {
+                        sanitized.push(Message {
+                            role,
+                            content: MessageContent::Text(text),
+                        });
+                    }
+                } else {
+                    sanitized.push(Message {
+                        role,
+                        content: MessageContent::ToolUse {
+                            text,
+                            tool_calls: retained_tool_calls,
+                        },
+                    });
+                }
+            }
+            MessageContent::ToolResult {
+                tool_use_id,
+                output,
+                is_error,
+            } => {
+                if valid_tool_use_ids.contains(&tool_use_id) {
+                    sanitized.push(Message {
+                        role,
+                        content: MessageContent::ToolResult {
+                            tool_use_id,
+                            output,
+                            is_error,
+                        },
+                    });
+                } else {
+                    removed_tool_results += 1;
+                }
+            }
+            MessageContent::Text(text) => sanitized.push(Message {
+                role,
+                content: MessageContent::Text(text),
+            }),
+        }
+    }
+
+    if removed_tool_calls > 0 || removed_tool_results > 0 {
+        debug_log_session(
+            session_id,
+            format!(
+                "sanitized restored history: removed {removed_tool_calls} zombie tool calls and {removed_tool_results} orphan tool results"
+            ),
+        );
+    }
+
+    sanitized
+}
+
 fn effective_session_group(session_id: SessionId, session_group: Option<&str>) -> String {
     session_group
         .map(ToOwned::to_owned)
@@ -776,12 +875,16 @@ impl SessionContext {
             python_state,
         } = persisted;
         let skills =
-            crate::skill::load_skills(&config.working_directory, &config.skill_names).await;
+            crate::skill::load_session_skills(&config.working_directory, &config.skill_names).await;
+        let restored_skill_names = skills
+            .iter()
+            .map(|skill| skill.meta.name.clone())
+            .collect::<Vec<_>>();
         let mut session = Self::new_with_web_provider(
             session_id,
             SessionInit {
                 system_prompt: config.system_prompt.clone(),
-                skills,
+                skills: skills.clone(),
                 working_directory: config.working_directory.clone(),
                 plan_mode: config.plan_mode,
                 prompt_behavior: config.prompt_behavior,
@@ -811,7 +914,7 @@ impl SessionContext {
                 })?;
         }
         session.state = state.into();
-        session.history = history;
+        session.history = sanitize_restored_history(session_id, history);
         session.auto_compact_threshold_percent = config.auto_compact_threshold_percent;
         session.plan_store = crate::tool::plan::restore_plan_store(plan_store).await;
         session.tool_registry = build_tool_registry_for_session(
@@ -819,14 +922,11 @@ impl SessionContext {
             web_provider,
             session.plan_store.clone(),
             &session.persisted_config,
-            &crate::skill::load_skills(
-                &session.persisted_config.working_directory,
-                &session.persisted_config.skill_names,
-            )
-            .await,
+            &skills,
         );
         session.tools = session.tool_registry.tool_definitions();
         session.persisted_config = config;
+        session.persisted_config.skill_names = restored_skill_names;
         session.created_at = created_at;
         session.session_memory =
             restore_memory_state(&session.archive_root, session_id, memory_state.as_ref());
@@ -2770,7 +2870,7 @@ async fn start_child_session(
     let inherited_python_runtime = sessions
         .get(&parent_id)
         .map(|parent| Arc::clone(&parent.python_runtime))
-        .unwrap_or_else(PythonRuntime::new);
+        .unwrap_or_default();
 
     let ctx = SessionContext::new(
         child_id,
@@ -6070,7 +6170,6 @@ pub async fn run_core_loop_with_compaction_and_web_provider_and_python_runtime(
     max_context_window: Option<u64>,
     python_runtime: Arc<PythonRuntime>,
 ) {
-    let wake_waits = Arc::new(Notify::new());
     run_core_loop_with_compaction_and_wait_notifier(
         &mut handle,
         provider,
@@ -6078,7 +6177,6 @@ pub async fn run_core_loop_with_compaction_and_web_provider_and_python_runtime(
         restored_checkpoint,
         archive_root,
         max_context_window,
-        wake_waits,
         python_runtime,
     )
     .await;
@@ -6091,7 +6189,6 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
     restored_checkpoint: Option<CoreCheckpoint>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
-    _wake_waits: Arc<Notify>,
     python_runtime: Arc<PythonRuntime>,
 ) {
     let restored_tree = restored_checkpoint
@@ -6623,6 +6720,38 @@ mod tests {
         }
     }
 
+    struct RejectZombieToolUseProvider {
+        forbidden_tool_use_id: String,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for RejectZombieToolUseProvider {
+        async fn send(
+            &self,
+            messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            for message in messages {
+                if let MessageContent::ToolUse { tool_calls, .. } = &message.content {
+                    if tool_calls
+                        .iter()
+                        .any(|call| call.tool_use_id == self.forbidden_tool_use_id)
+                    {
+                        anyhow::bail!("zombie tool call survived restore sanitation");
+                    }
+                }
+            }
+
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LlmEvent::TextDelta {
+                    text: "restored reply".into(),
+                }),
+                Ok(LlmEvent::Done { usage: None }),
+            ])))
+        }
+    }
+
     struct SequenceProvider {
         responses: Mutex<VecDeque<String>>,
     }
@@ -7102,6 +7231,32 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[test]
+    fn sanitize_restored_history_removes_zombie_tool_calls_and_orphan_results() {
+        let sanitized = sanitize_restored_history(
+            SessionId::new(),
+            vec![
+                Message::system("system"),
+                Message::user("before"),
+                Message::assistant_tool_use(
+                    Some("trying tool".into()),
+                    vec![quine_llm::ToolUseRequest {
+                        tool_use_id: "call_zombie".into(),
+                        tool_name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "Cargo.toml"}),
+                    }],
+                ),
+                Message::tool_result("call_orphan", "never requested", false),
+            ],
+        );
+
+        assert_eq!(sanitized.len(), 3);
+        match &sanitized[2].content {
+            MessageContent::Text(text) => assert_eq!(text, "trying tool"),
+            other => panic!("expected assistant text after zombie tool cleanup, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn estimate_prompt_cache_usage_uses_shared_prefix() {
         let previous = vec![
             "system".into(),
@@ -7241,8 +7396,10 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let paths = session.session_memory.paths.clone();
         let template_version = session.session_memory.template_version;
         let refresh_handle = session.session_memory.refresh_handle.clone();
+        let (lock_ready_tx, lock_ready_rx) = tokio::sync::oneshot::channel();
         let writer = tokio::spawn(async move {
             let _guard = refresh_handle.lock.lock().await;
+            let _ = lock_ready_tx.send(());
             tokio::time::sleep(TokioDuration::from_millis(20)).await;
             std::fs::create_dir_all(&paths.directory).unwrap();
             std::fs::write(
@@ -7261,6 +7418,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             )
             .unwrap();
         });
+        lock_ready_rx.await.unwrap();
 
         compact_session_history(
             provider_dyn.as_ref(),
@@ -10217,6 +10375,98 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         assert!(summary_path.exists(), "summary file should be recreated");
         assert!(metadata_path.exists(), "metadata file should be recreated");
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn restore_session_sanitizes_zombie_tool_calls_before_next_provider_request() {
+        let temp = TempDir::new().unwrap();
+        let session_id = SessionId::new();
+        let zombie_tool_use_id = "call_zombie";
+        let provider = Arc::new(RejectZombieToolUseProvider {
+            forbidden_tool_use_id: zombie_tool_use_id.into(),
+        });
+        let checkpoint = crate::persistence::CoreCheckpoint::new(
+            vec![crate::persistence::PersistedSession {
+                session_id,
+                created_at: Utc::now(),
+                state: crate::persistence::PersistedSessionState::Idle,
+                config: crate::persistence::PersistedSessionConfig {
+                    system_prompt: None,
+                    skill_names: Vec::new(),
+                    working_directory: std::env::current_dir().unwrap_or_default(),
+                    plan_mode: false,
+                    prompt_behavior: PermissionPromptBehavior::Interactive,
+                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                    agent_key: None,
+                    team_key: None,
+                    memory_policy: MemoryPolicyConfig::default(),
+                    model_profile: None,
+                    session_group: None,
+                    auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                    status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+                },
+                history: vec![
+                    Message::user("run a tool"),
+                    Message::assistant_tool_use(
+                        Some("calling read_file".into()),
+                        vec![quine_llm::ToolUseRequest {
+                            tool_use_id: zombie_tool_use_id.into(),
+                            tool_name: "read_file".into(),
+                            arguments: serde_json::json!({"path": "Cargo.toml"}),
+                        }],
+                    ),
+                ],
+                plan_store: crate::persistence::PersistedPlanStore::default(),
+                memory_state: None,
+                permission_state: None,
+                status_report: None,
+                python_state: None,
+            }],
+            crate::persistence::PersistedSessionTree {
+                parents: std::collections::HashMap::new(),
+                children: std::collections::HashMap::new(),
+                exit_statuses: std::collections::HashMap::new(),
+            },
+        );
+
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let loop_handle = tokio::spawn(run_core_loop_with_compaction(
+            core,
+            provider,
+            Some(checkpoint),
+            temp.path().to_path_buf(),
+            None,
+        ));
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "resume".into(),
+            })
+            .await
+            .unwrap();
+
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), output.recv()).await {
+                Ok(Some(CoreOutput::TurnComplete {
+                    session_id: event_session_id,
+                    ..
+                })) if event_session_id == session_id => break,
+                Ok(Some(CoreOutput::SessionError {
+                    session_id: event_session_id,
+                    error,
+                })) if event_session_id == session_id => {
+                    panic!("restored session should not surface an LLM error: {error:?}");
+                }
+                Ok(Some(_)) => {}
+                other => panic!("unexpected event while waiting for restored turn: {other:?}"),
+            }
+        }
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();
