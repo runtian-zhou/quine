@@ -6384,8 +6384,17 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                             }).await;
                         }
                     }
-                    CoreInput::ScheduleUserMessage { session_id, content, delay } => {
-                        if scheduler_handle.schedule_user_message(session_id, content, delay).await.is_err() {
+                    CoreInput::ScheduleUserMessage {
+                        session_id,
+                        content,
+                        delay,
+                        cadence,
+                    } => {
+                        if scheduler_handle
+                            .schedule_user_message(session_id, content, delay, cadence)
+                            .await
+                            .is_err()
+                        {
                             let _ = handle.output.send(CoreOutput::SessionError {
                                 session_id,
                                 error: CoreError::Internal {
@@ -6533,16 +6542,6 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                             Err(error) => {
                                 let _ = reply.send(Err(error.to_string()));
                             }
-                        }
-                    }
-                    CoreInput::ScheduleSpawnSession { parent_id, task, system_prompt, delay, cadence } => {
-                        if scheduler_handle.schedule_spawn_session(parent_id, task, system_prompt, delay, cadence).await.is_err() {
-                            let _ = handle.output.send(CoreOutput::SessionError {
-                                session_id: parent_id,
-                                error: CoreError::Internal {
-                                    message: "scheduler unavailable".into(),
-                                },
-                            }).await;
                         }
                     }
                     CoreInput::Signal { session_id, signal } => {

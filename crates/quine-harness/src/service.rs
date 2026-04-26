@@ -140,11 +140,11 @@ pub trait HarnessService: Send + Sync {
         })
     }
 
-    /// Schedule a future or recurring child-agent spawn.
+    /// Schedule a future or recurring user message for an existing session.
     async fn schedule_agent(
         &self,
-        _parent_id: Option<SessionId>,
-        _task: String,
+        _session_id: SessionId,
+        _content: String,
         _system_prompt: Option<String>,
         _delay: Duration,
         _cadence: Option<Duration>,

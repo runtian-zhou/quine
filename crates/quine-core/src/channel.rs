@@ -93,6 +93,7 @@ pub enum CoreInput {
         session_id: SessionId,
         content: String,
         delay: Duration,
+        cadence: Option<Duration>,
     },
 
     /// Compact a session's stored context without sending a new user message.
@@ -128,15 +129,6 @@ pub enum CoreInput {
         permission_rules: PermissionRuleSet,
         inheritance: InheritanceFlags,
         reply: oneshot::Sender<Result<(), String>>,
-    },
-
-    /// Schedule a future or recurring child-session spawn.
-    ScheduleSpawnSession {
-        parent_id: SessionId,
-        task: String,
-        system_prompt: Option<String>,
-        delay: Duration,
-        cadence: Option<Duration>,
     },
 
     /// Send a signal to a session.

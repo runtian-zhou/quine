@@ -1139,8 +1139,8 @@ async fn execute_action(
             cadence,
         } => {
             let params = serde_json::json!({
-                "parent_id": app.session_id,
-                "task": request,
+                "session_id": app.session_id,
+                "content": request,
                 "delay_secs": delay.as_secs(),
                 "cadence_secs": cadence.map(|value| value.as_secs()),
             });

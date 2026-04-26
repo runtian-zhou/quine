@@ -1339,19 +1339,31 @@ async fn handle_request(
 
         methods::SCHEDULE_AGENT => {
             let params = request.params.as_ref();
-            let task = params
-                .and_then(|p| p.get("task"))
+            let content = params
+                .and_then(|p| p.get("content"))
                 .and_then(|v| v.as_str())
-                .map(String::from);
+                .map(String::from)
+                .or_else(|| {
+                    params
+                        .and_then(|p| p.get("task"))
+                        .and_then(|v| v.as_str())
+                        .map(String::from)
+                });
             let system_prompt = params
                 .and_then(|p| p.get("system_prompt"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            let parent_id = params
-                .and_then(|p| p.get("parent_id"))
+            let session_id = params
+                .and_then(|p| p.get("session_id"))
                 .and_then(|v| v.as_str())
-                .and_then(|s| {
-                    serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+                .and_then(|s| serde_json::from_value(serde_json::Value::String(s.to_string())).ok())
+                .or_else(|| {
+                    params
+                        .and_then(|p| p.get("parent_id"))
+                        .and_then(|v| v.as_str())
+                        .and_then(|s| {
+                            serde_json::from_value(serde_json::Value::String(s.to_string())).ok()
+                        })
                 });
             let delay_secs = params
                 .and_then(|p| p.get("delay_secs"))
@@ -1360,12 +1372,12 @@ async fn handle_request(
                 .and_then(|p| p.get("cadence_secs"))
                 .and_then(|v| v.as_u64());
 
-            match (task, delay_secs) {
-                (Some(task), Some(delay_secs)) => {
+            match (session_id, content, delay_secs) {
+                (Some(session_id), Some(content), Some(delay_secs)) => {
                     match service
                         .schedule_agent(
-                            parent_id,
-                            task,
+                            session_id,
+                            content,
                             system_prompt,
                             tokio::time::Duration::from_secs(delay_secs),
                             cadence_secs.map(tokio::time::Duration::from_secs),
@@ -1386,11 +1398,27 @@ async fn handle_request(
                         }
                     }
                 }
-                _ => {
+                (None, _, _) => {
                     let resp = JsonRpcErrorResponse::new(
                         id,
                         error_codes::INVALID_PARAMS,
-                        "missing task or delay_secs",
+                        "missing session_id",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+                (_, None, _) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing content",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+                (_, _, None) => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing delay_secs",
                     );
                     Some(serde_json::to_string(&resp).unwrap_or_default())
                 }

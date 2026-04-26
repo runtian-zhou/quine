@@ -2,6 +2,7 @@ mod agent_ctl;
 mod chat;
 mod client;
 mod context_debug;
+mod duration;
 mod interaction;
 mod log;
 mod plugins;

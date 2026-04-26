@@ -4,6 +4,7 @@ use std::fmt;
 use std::time::{Duration, Instant};
 
 use crate::context_debug::{HistoryEntry, SessionContextSnapshot, SessionStatusReportSnapshot};
+use crate::duration::parse_duration_literal;
 use crate::slash_command::{parse_slash_command, SlashCommand};
 use quine_harness::protocol::{notifications, JsonRpcNotification};
 use ratatui::text::Line;
@@ -599,7 +600,7 @@ fn parse_loop_arguments(arguments: &str) -> Result<LoopCommand, String> {
             "Usage: /loop every <duration> <message> | /loop in <duration> <message>".into(),
         );
     }
-    let duration = parse_duration(duration_text)?;
+    let duration = parse_duration_literal(duration_text)?;
     match mode {
         "every" => Ok(LoopCommand {
             request,
@@ -612,26 +613,6 @@ fn parse_loop_arguments(arguments: &str) -> Result<LoopCommand, String> {
             cadence: None,
         }),
         _ => Err("Usage: /loop every <duration> <message> | /loop in <duration> <message>".into()),
-    }
-}
-
-fn parse_duration(input: &str) -> Result<Duration, String> {
-    if input.is_empty() {
-        return Err("Duration cannot be empty".into());
-    }
-    let split_at = input
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| "Duration must include a unit like s, m, h, or d".to_string())?;
-    let (value, unit) = input.split_at(split_at);
-    let amount = value
-        .parse::<u64>()
-        .map_err(|_| format!("Invalid duration value: {input}"))?;
-    match unit {
-        "s" => Ok(Duration::from_secs(amount)),
-        "m" => Ok(Duration::from_secs(amount * 60)),
-        "h" => Ok(Duration::from_secs(amount * 60 * 60)),
-        "d" => Ok(Duration::from_secs(amount * 60 * 60 * 24)),
-        _ => Err(format!("Unsupported duration unit: {unit}")),
     }
 }
 
@@ -3262,6 +3243,22 @@ mod tests {
     fn submit_input_loop_every_schedules_immediate_first_run() {
         let mut app = App::new("test".into(), false, None);
         app.input.set_from_string("/loop every 5m check logs");
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::ScheduleLoop { request, delay, cadence })
+                if request == "check logs"
+                    && delay == Duration::ZERO
+                    && cadence == Some(Duration::from_secs(300))
+        ));
+    }
+
+    #[test]
+    fn submit_input_loop_every_accepts_minute_alias() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/loop every 5min check logs");
 
         let action = app.submit_input();
 

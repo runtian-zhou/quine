@@ -416,11 +416,24 @@ impl LocalHarness {
         content: String,
         delay: Duration,
     ) -> Result<(), HarnessError> {
+        self.schedule_loop_message(session_id, content, delay, None)
+            .await
+    }
+
+    /// Queue a user message to be delivered after `delay`, optionally recurring on `cadence`.
+    pub async fn schedule_loop_message(
+        &self,
+        session_id: SessionId,
+        content: String,
+        delay: Duration,
+        cadence: Option<Duration>,
+    ) -> Result<(), HarnessError> {
         self.core_input
             .send(CoreInput::ScheduleUserMessage {
                 session_id,
                 content,
                 delay,
+                cadence,
             })
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)
@@ -1021,22 +1034,14 @@ impl HarnessService for LocalHarness {
 
     async fn schedule_agent(
         &self,
-        parent_id: Option<SessionId>,
-        task: String,
-        system_prompt: Option<String>,
+        session_id: SessionId,
+        content: String,
+        _system_prompt: Option<String>,
         delay: Duration,
         cadence: Option<Duration>,
     ) -> Result<(), HarnessError> {
-        self.core_input
-            .send(CoreInput::ScheduleSpawnSession {
-                parent_id: parent_id.unwrap_or_default(),
-                task,
-                system_prompt,
-                delay,
-                cadence,
-            })
+        self.schedule_loop_message(session_id, content, delay, cadence)
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)
     }
 
     fn state_root(&self) -> Option<std::path::PathBuf> {
@@ -2714,15 +2719,116 @@ mod tests {
         let _ = fs::remove_dir_all(project_dir);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn local_harness_schedule_agent_one_shot() {
-        let harness = LocalHarness::new(Arc::new(MockProvider), Some(temp_storage()))
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(temp_storage()))
             .await
             .unwrap();
+        let mut rx = harness.subscribe();
+        let session_id = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoreOutput::SessionStateChanged {
+                session_id: event_session_id,
+                state: SessionState::Idle,
+            } if event_session_id == session_id
+        ));
+
         harness
-            .schedule_agent(None, "do work".into(), None, Duration::from_secs(1), None)
+            .schedule_agent(
+                session_id,
+                "do work".into(),
+                None,
+                Duration::from_secs(1),
+                None,
+            )
             .await
             .unwrap();
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        let mut saw_completion = false;
+        while !saw_completion {
+            if let CoreOutput::TextComplete {
+                session_id: event_session_id,
+                full_text,
+            } = rx.recv().await.unwrap()
+            {
+                if event_session_id == session_id && full_text == "do work" {
+                    saw_completion = true;
+                }
+            }
+        }
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_harness_schedule_agent_recurs_in_same_session() {
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(temp_storage()))
+            .await
+            .unwrap();
+        let mut rx = harness.subscribe();
+        let session_id = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            CoreOutput::SessionStateChanged {
+                session_id: event_session_id,
+                state: SessionState::Idle,
+            } if event_session_id == session_id
+        ));
+
+        harness
+            .schedule_agent(
+                session_id,
+                "tick".into(),
+                None,
+                Duration::ZERO,
+                Some(Duration::from_secs(30)),
+            )
+            .await
+            .unwrap();
+
+        tokio::task::yield_now().await;
+
+        let mut completions = Vec::new();
+        while completions.is_empty() {
+            if let CoreOutput::TextComplete {
+                session_id: event_session_id,
+                full_text,
+            } = rx.recv().await.unwrap()
+            {
+                if event_session_id == session_id {
+                    completions.push(full_text);
+                }
+            }
+        }
+        assert_eq!(completions, vec!["tick"]);
+
+        tokio::time::advance(Duration::from_secs(30)).await;
+        tokio::task::yield_now().await;
+
+        while completions.len() < 2 {
+            if let CoreOutput::TextComplete {
+                session_id: event_session_id,
+                full_text,
+            } = rx.recv().await.unwrap()
+            {
+                if event_session_id == session_id {
+                    completions.push(full_text);
+                }
+            }
+        }
+
+        assert_eq!(completions, vec!["tick", "tick"]);
         harness.shutdown().await.unwrap();
     }
 
