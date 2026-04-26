@@ -652,26 +652,6 @@ impl TelegramBot {
         }
 
         let mut client = self.connect_client().await?;
-        let sessions = self.fetch_sessions(&mut client).await?;
-        if let Some(session) = sessions.first() {
-            let session_id = session.session_id.clone();
-            eprintln!(
-                "[telegram] load_or_create_session chat_id={chat_id} reusing latest session_id={session_id}"
-            );
-            self.chat_state.lock().await.insert(
-                chat_id,
-                TelegramChatState {
-                    session_id: Some(session_id.clone()),
-                    plan_mode: session.plan_mode,
-                    model_profile: self.default_model_profile.clone(),
-                    state_tab: SessionStateTab::Overview,
-                    session_picker_page: 0,
-                    pending_interaction: None,
-                },
-            );
-            return Ok(session_id);
-        }
-
         let created = create_session(
             &mut client,
             &self.skills,

@@ -105,6 +105,7 @@ pub mod error_codes {
 
 /// Well-known RPC method names for the harness protocol.
 pub mod methods {
+    pub const PING: &str = "ping";
     pub const CREATE_SESSION: &str = "create_session";
     pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
     pub const SET_SESSION_MODEL_PROFILE: &str = "set_session_model_profile";

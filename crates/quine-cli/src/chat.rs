@@ -5,7 +5,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use crate::client::IpcClient;
 use crate::context_debug::render_session_context;
 use crate::interaction::{
-    maybe_auto_approve, options as interaction_options, prompt as interaction_prompt, source_label,
+    maybe_auto_approve, options as interaction_options, prompt as interaction_prompt,
+    session_id as interaction_session_id, source_label,
 };
 use crate::render::{Renderer, TerminalRenderer};
 use crate::run::fetch_available_skills;
@@ -18,6 +19,13 @@ use quine_harness::protocol::{methods, notifications};
 
 const PLAN_EXIT_PROMPT: &str =
     "Leave plan mode and start a normal session with this final plan? (y/n)";
+const DEBUG_INIT_ENV: &str = "QUINE_DEBUG_INIT";
+
+fn debug_init(message: impl AsRef<str>) {
+    if std::env::var_os(DEBUG_INIT_ENV).is_some() {
+        eprintln!("[chat init] {}", message.as_ref());
+    }
+}
 
 /// Shut down the daemon if we spawned it.
 async fn shutdown_if_spawned(client: &mut IpcClient, daemon_spawned: bool) {
@@ -163,15 +171,28 @@ pub async fn run_chat(
     model_profile: Option<&str>,
     session_group: Option<&str>,
 ) -> anyhow::Result<()> {
+    debug_init(format!("connecting to daemon at {}", socket_path.display()));
     let (mut client, daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
+    debug_init("daemon connection established");
     let mut renderer = TerminalRenderer::new();
+    debug_init("fetching available skills");
     let available_skills = fetch_available_skills(&mut client).await?;
+    debug_init(format!(
+        "loaded {} available skills",
+        available_skills.len()
+    ));
 
+    debug_init("resolving resume target");
     let resumed = resolve_resume_target(&mut client, resume_checkpoint).await?;
 
     let session_plan_mode = resumed.as_ref().map(|target| target.plan_mode);
 
     // Create or resume a session.
+    debug_init(if resumed.is_some() {
+        "resuming existing session"
+    } else {
+        "creating new session"
+    });
     let mut session = match resumed {
         Some(target) => crate::session::CreatedSession {
             session_id: target.session_id,
@@ -182,6 +203,7 @@ pub async fn run_chat(
         }
     };
     let mut session_in_plan_mode = session_plan_mode.unwrap_or(plan_mode);
+    debug_init(format!("session ready: {}", session.session_id));
 
     eprintln!("Session created: {}", session.session_id);
     eprintln!("Type /quit or Ctrl-D to exit.\n");
@@ -310,6 +332,11 @@ pub async fn run_chat(
                                 notif = client.recv_notification() => {
                                     match notif {
                                         Some(notif) => {
+                                            if interaction_session_id(&notif)
+                                                .is_some_and(|id| id != session.session_id.as_str())
+                                            {
+                                                continue;
+                                            }
                                             if notif.method == notifications::INTERACTION_NEEDED {
                                                 handle_interaction(
                                                     &notif,

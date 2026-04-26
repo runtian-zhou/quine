@@ -368,6 +368,18 @@ async fn handle_request(
     let id = request.id.clone();
 
     match request.method.as_str() {
+        methods::PING => {
+            let cwd = std::env::current_dir().unwrap_or_default();
+            let resp = JsonRpcResponse::success(
+                id,
+                serde_json::json!({
+                    "status": "ok",
+                    "pid": std::process::id(),
+                    "cwd": cwd,
+                }),
+            );
+            Some(serde_json::to_string(&resp).unwrap_or_default())
+        }
         methods::CREATE_SESSION => {
             let system_prompt = request
                 .params
@@ -375,6 +387,12 @@ async fn handle_request(
                 .and_then(|p| p.get("system_prompt"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let working_directory = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("working_directory"))
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from);
 
             let skills: Vec<String> = request
                 .params
@@ -468,7 +486,7 @@ async fn handle_request(
 
             let config = crate::config::SessionConfig {
                 system_prompt,
-                working_directory: None,
+                working_directory,
                 skills,
                 plan_mode,
                 prompt_behavior,
@@ -1388,7 +1406,13 @@ async fn handle_request(
         }
 
         methods::LIST_SKILLS => {
-            let project_root = std::env::current_dir().unwrap_or_default();
+            let project_root = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("working_directory"))
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
             match quine_core::list_available_skills(&project_root).await {
                 Ok(skills) => {
                     let result = skills
@@ -1418,40 +1442,44 @@ async fn handle_request(
                 .as_ref()
                 .and_then(|p| p.get("name"))
                 .and_then(|v| v.as_str());
+            let project_root = request
+                .params
+                .as_ref()
+                .and_then(|p| p.get("working_directory"))
+                .and_then(|v| v.as_str())
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
 
             match skill_name {
-                Some(name) => {
-                    let project_root = std::env::current_dir().unwrap_or_default();
-                    match quine_core::load_skill(&project_root, name).await {
-                        Ok(skill) => {
-                            let result = serde_json::json!({
-                                "name": skill.meta.name,
-                                "description": skill.meta.description,
-                                "version": skill.meta.version,
-                                "source_path": skill.source_path.to_string_lossy(),
-                                "system_prompt": skill.system_prompt,
-                                "tools": skill.tool_definitions.iter().map(|t| {
-                                    serde_json::json!({
-                                        "name": t.name,
-                                        "description": t.description,
-                                        "handler": t.handler,
-                                        "parameters": t.parameters,
-                                    })
-                                }).collect::<Vec<_>>(),
-                            });
-                            let resp = JsonRpcResponse::success(id, result);
-                            Some(serde_json::to_string(&resp).unwrap_or_default())
-                        }
-                        Err(e) => {
-                            let resp = JsonRpcErrorResponse::new(
-                                id,
-                                error_codes::INTERNAL_ERROR,
-                                e.to_string(),
-                            );
-                            Some(serde_json::to_string(&resp).unwrap_or_default())
-                        }
+                Some(name) => match quine_core::load_skill(&project_root, name).await {
+                    Ok(skill) => {
+                        let result = serde_json::json!({
+                            "name": skill.meta.name,
+                            "description": skill.meta.description,
+                            "version": skill.meta.version,
+                            "source_path": skill.source_path.to_string_lossy(),
+                            "system_prompt": skill.system_prompt,
+                            "tools": skill.tool_definitions.iter().map(|t| {
+                                serde_json::json!({
+                                    "name": t.name,
+                                    "description": t.description,
+                                    "handler": t.handler,
+                                    "parameters": t.parameters,
+                                })
+                            }).collect::<Vec<_>>(),
+                        });
+                        let resp = JsonRpcResponse::success(id, result);
+                        Some(serde_json::to_string(&resp).unwrap_or_default())
                     }
-                }
+                    Err(e) => {
+                        let resp = JsonRpcErrorResponse::new(
+                            id,
+                            error_codes::INTERNAL_ERROR,
+                            e.to_string(),
+                        );
+                        Some(serde_json::to_string(&resp).unwrap_or_default())
+                    }
+                },
                 None => {
                     let resp = JsonRpcErrorResponse::new(
                         id,

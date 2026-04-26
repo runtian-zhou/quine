@@ -265,8 +265,11 @@ pub fn resolve_session_llm_config(model_profile: Option<&str>) -> anyhow::Result
 }
 
 fn web_config_from_env() -> WebProviderConfig {
-    let provider = std::env::var("WEB_PROVIDER")
-        .or_else(|_| std::env::var("LLM_PROVIDER"))
+    let explicit_provider = std::env::var("WEB_PROVIDER").ok();
+    let provider = explicit_provider
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(|| std::env::var("LLM_PROVIDER"))
         .unwrap_or_else(|_| "openai".into());
     if provider.eq_ignore_ascii_case("none") || provider.eq_ignore_ascii_case("disabled") {
         return WebProviderConfig::None;
@@ -279,7 +282,16 @@ fn web_config_from_env() -> WebProviderConfig {
     let api_key = std::env::var("WEB_API_KEY")
         .or_else(|_| std::env::var("LLM_API_KEY"))
         .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .expect("WEB_API_KEY, OPENAI_API_KEY, or LLM_API_KEY must be set for web provider");
+        .ok();
+
+    let Some(api_key) = api_key else {
+        if explicit_provider.is_some() {
+            eprintln!(
+                "[daemon] web provider `{provider}` disabled because WEB_API_KEY, OPENAI_API_KEY, or LLM_API_KEY is not set"
+            );
+        }
+        return WebProviderConfig::None;
+    };
 
     WebProviderConfig::OpenAi(OpenAiWebConfig {
         base_url: std::env::var("WEB_BASE_URL")
@@ -567,5 +579,94 @@ rules:
         let error = load_persisted_permission_rules(project.path()).unwrap_err();
         assert!(error.to_string().contains("permissions.yaml"));
         assert!(error.to_string().contains("definitely_not_valid"));
+    }
+
+    #[test]
+    fn web_config_defaults_to_none_when_no_key_is_available() {
+        with_env_lock(|| {
+            let previous_web_provider = std::env::var_os("WEB_PROVIDER");
+            let previous_llm_provider = std::env::var_os("LLM_PROVIDER");
+            let previous_web_api_key = std::env::var_os("WEB_API_KEY");
+            let previous_llm_api_key = std::env::var_os("LLM_API_KEY");
+            let previous_openai_api_key = std::env::var_os("OPENAI_API_KEY");
+            unsafe {
+                std::env::remove_var("WEB_PROVIDER");
+                std::env::remove_var("LLM_PROVIDER");
+                std::env::remove_var("WEB_API_KEY");
+                std::env::remove_var("LLM_API_KEY");
+                std::env::remove_var("OPENAI_API_KEY");
+            }
+
+            assert!(matches!(web_config_from_env(), WebProviderConfig::None));
+
+            match previous_web_provider {
+                Some(value) => unsafe { std::env::set_var("WEB_PROVIDER", value) },
+                None => unsafe { std::env::remove_var("WEB_PROVIDER") },
+            }
+            match previous_llm_provider {
+                Some(value) => unsafe { std::env::set_var("LLM_PROVIDER", value) },
+                None => unsafe { std::env::remove_var("LLM_PROVIDER") },
+            }
+            match previous_web_api_key {
+                Some(value) => unsafe { std::env::set_var("WEB_API_KEY", value) },
+                None => unsafe { std::env::remove_var("WEB_API_KEY") },
+            }
+            match previous_llm_api_key {
+                Some(value) => unsafe { std::env::set_var("LLM_API_KEY", value) },
+                None => unsafe { std::env::remove_var("LLM_API_KEY") },
+            }
+            match previous_openai_api_key {
+                Some(value) => unsafe { std::env::set_var("OPENAI_API_KEY", value) },
+                None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
+            }
+        });
+    }
+
+    #[test]
+    fn web_config_uses_openai_when_key_is_available() {
+        with_env_lock(|| {
+            let previous_web_provider = std::env::var_os("WEB_PROVIDER");
+            let previous_llm_provider = std::env::var_os("LLM_PROVIDER");
+            let previous_web_api_key = std::env::var_os("WEB_API_KEY");
+            let previous_web_base_url = std::env::var_os("WEB_BASE_URL");
+            let previous_web_model = std::env::var_os("WEB_MODEL");
+            unsafe {
+                std::env::set_var("WEB_PROVIDER", "openai");
+                std::env::remove_var("LLM_PROVIDER");
+                std::env::set_var("WEB_API_KEY", "test-key");
+                std::env::set_var("WEB_BASE_URL", "https://example.test/v1");
+                std::env::set_var("WEB_MODEL", "gpt-test");
+            }
+
+            match web_config_from_env() {
+                WebProviderConfig::OpenAi(config) => {
+                    assert_eq!(config.api_key, "test-key");
+                    assert_eq!(config.base_url, "https://example.test/v1");
+                    assert_eq!(config.model, "gpt-test");
+                }
+                WebProviderConfig::None => panic!("expected OpenAI web config"),
+            }
+
+            match previous_web_provider {
+                Some(value) => unsafe { std::env::set_var("WEB_PROVIDER", value) },
+                None => unsafe { std::env::remove_var("WEB_PROVIDER") },
+            }
+            match previous_llm_provider {
+                Some(value) => unsafe { std::env::set_var("LLM_PROVIDER", value) },
+                None => unsafe { std::env::remove_var("LLM_PROVIDER") },
+            }
+            match previous_web_api_key {
+                Some(value) => unsafe { std::env::set_var("WEB_API_KEY", value) },
+                None => unsafe { std::env::remove_var("WEB_API_KEY") },
+            }
+            match previous_web_base_url {
+                Some(value) => unsafe { std::env::set_var("WEB_BASE_URL", value) },
+                None => unsafe { std::env::remove_var("WEB_BASE_URL") },
+            }
+            match previous_web_model {
+                Some(value) => unsafe { std::env::set_var("WEB_MODEL", value) },
+                None => unsafe { std::env::remove_var("WEB_MODEL") },
+            }
+        });
     }
 }

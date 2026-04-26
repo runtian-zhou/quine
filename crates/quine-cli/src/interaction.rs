@@ -58,6 +58,14 @@ pub(crate) fn source_label(notif: &JsonRpcNotification) -> Option<&str> {
         .and_then(|value| value.as_str())
 }
 
+pub(crate) fn session_id(notif: &JsonRpcNotification) -> Option<&str> {
+    notif
+        .params
+        .as_ref()
+        .and_then(|params| params.get("session_id"))
+        .and_then(|value| value.as_str())
+}
+
 pub(crate) fn is_permission_interaction(notif: &JsonRpcNotification) -> bool {
     source_label(notif).is_some_and(|label| label.starts_with(PERMISSION_SOURCE_PREFIX))
 }
@@ -129,6 +137,7 @@ mod tests {
         assert_eq!(kind(&notif), "SingleSelect");
         assert!(!allow_freeform(&notif));
         assert_eq!(source_label(&notif), Some("permission:1234"));
+        assert_eq!(session_id(&notif), None);
         assert_eq!(
             options(&notif),
             vec!["approve once".to_string(), "deny once".to_string()]

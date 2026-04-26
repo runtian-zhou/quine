@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use crate::client::IpcClient;
 use crate::interaction::{
     allow_freeform as interaction_allow_freeform, kind as interaction_kind, maybe_auto_approve,
-    options as interaction_options, prompt as interaction_prompt, source_label,
+    options as interaction_options, prompt as interaction_prompt,
+    session_id as interaction_session_id, source_label,
 };
-use crate::session::resolve_resume_target;
+use crate::session::{build_create_session_params, resolve_resume_target};
 use quine_harness::{
     protocol::{methods, notifications},
     PermissionPromptBehavior,
@@ -28,6 +29,14 @@ pub(crate) async fn connect_existing_client(socket_path: &Path) -> anyhow::Resul
             Err(error) => return Err(error),
         }
     }
+}
+
+fn working_directory_params() -> Option<serde_json::Value> {
+    std::env::current_dir().ok().map(|working_directory| {
+        serde_json::json!({
+            "working_directory": working_directory.to_string_lossy().to_string(),
+        })
+    })
 }
 
 fn print_resume_command(socket_path: &Path, session_id: &str) {
@@ -147,26 +156,20 @@ where
         (Some(sid), _) => sid.to_string(),
         (None, Some(target)) => target.session_id,
         (None, None) => {
-            let mut session_params = serde_json::json!({});
-            if !skills.is_empty() {
-                session_params["skills"] = serde_json::json!(skills);
-            }
-            if let Some(model_profile) = model_profile {
-                session_params["model_profile"] = serde_json::json!(model_profile);
-            }
-            if let Some(session_group) = session_group {
-                session_params["session_group"] = serde_json::json!(session_group);
-            }
-            session_params["prompt_behavior"] = serde_json::json!(if auto_approve {
-                PermissionPromptBehavior::Interactive
-            } else {
-                PermissionPromptBehavior::Headless
-            });
-            let params = if session_params.as_object().unwrap().is_empty() {
-                None
-            } else {
-                Some(session_params)
-            };
+            let working_directory = std::env::current_dir().ok();
+            let params = build_create_session_params(
+                skills,
+                false,
+                if auto_approve {
+                    PermissionPromptBehavior::Interactive
+                } else {
+                    PermissionPromptBehavior::Headless
+                },
+                &[],
+                working_directory.as_deref(),
+                model_profile,
+                session_group,
+            );
             let result = client.call(methods::CREATE_SESSION, params).await?;
             match result {
                 Ok(value) => {
@@ -206,108 +209,117 @@ where
 
     loop {
         match client.recv_notification().await {
-            Some(notif) => match notif.method.as_str() {
-                notifications::STREAM_DELTA => {
-                    if let Some(params) = &notif.params {
-                        if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
-                            if !saw_stream_delta {
-                                saw_stream_delta = true;
-                                on_progress(OneshotProgressEvent::Streaming);
-                            }
-                            delta_buffer.push_str(delta);
-                        }
-                    }
+            Some(notif) => {
+                if interaction_session_id(&notif).is_some_and(|id| id != session_id.as_str()) {
+                    continue;
                 }
-                notifications::TEXT_COMPLETE => {
-                    if let Some(params) = &notif.params {
-                        if let Some(full_text) = params.get("full_text").and_then(|v| v.as_str()) {
-                            if !full_text.trim().is_empty() {
-                                if !completed_text.is_empty() {
-                                    completed_text.push('\n');
+                match notif.method.as_str() {
+                    notifications::STREAM_DELTA => {
+                        if let Some(params) = &notif.params {
+                            if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
+                                if !saw_stream_delta {
+                                    saw_stream_delta = true;
+                                    on_progress(OneshotProgressEvent::Streaming);
                                 }
-                                completed_text.push_str(full_text);
+                                delta_buffer.push_str(delta);
                             }
                         }
                     }
-                    delta_buffer.clear();
-                }
-                notifications::TOOL_REQUEST => {
-                    if let Some(params) = &notif.params {
-                        let tool_name = params
-                            .get("tool_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let tool_use_id = params
-                            .get("tool_use_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        on_progress(OneshotProgressEvent::ToolRequested {
-                            tool_name: tool_name.clone(),
-                        });
-                        tool_calls.push(ToolCallRecord {
-                            tool_name,
-                            tool_use_id,
-                        });
+                    notifications::TEXT_COMPLETE => {
+                        if let Some(params) = &notif.params {
+                            if let Some(full_text) =
+                                params.get("full_text").and_then(|v| v.as_str())
+                            {
+                                if !full_text.trim().is_empty() {
+                                    if !completed_text.is_empty() {
+                                        completed_text.push('\n');
+                                    }
+                                    completed_text.push_str(full_text);
+                                }
+                            }
+                        }
+                        delta_buffer.clear();
                     }
-                }
-                notifications::INTERACTION_NEEDED => {
-                    on_progress(OneshotProgressEvent::InteractionNeeded);
-                    if maybe_auto_approve(&mut client, &session_id, &notif, auto_approve).await? {
-                        continue;
-                    }
-
-                    let prompt = interaction_prompt(&notif).to_string();
-                    let source_label = source_label(&notif).map(ToString::to_string);
-                    let kind = interaction_kind(&notif).to_string();
-                    let options = interaction_options(&notif);
-                    let allow_freeform = interaction_allow_freeform(&notif);
-                    let partial = if !completed_text.is_empty() {
-                        completed_text.clone()
-                    } else {
-                        delta_buffer.clone()
-                    };
-
-                    return Ok(OneshotOutput {
-                        session_id,
-                        response: partial.clone(),
-                        tool_calls: tool_calls.clone(),
-                        duration_us: turn_duration_us,
-                        usage: turn_usage,
-                        interaction_needed: Some(InteractionNeededOutput {
-                            prompt,
-                            source_label,
-                            kind,
-                            options,
-                            allow_freeform,
-                            response: partial,
-                            tool_calls,
-                        }),
-                    });
-                }
-                notifications::SESSION_ERROR => {
-                    if let Some(params) = &notif.params {
-                        if let Some(error) = params.get("error").and_then(|v| v.as_str()) {
-                            anyhow::bail!("session error: {error}");
+                    notifications::TOOL_REQUEST => {
+                        if let Some(params) = &notif.params {
+                            let tool_name = params
+                                .get("tool_name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let tool_use_id = params
+                                .get("tool_use_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            on_progress(OneshotProgressEvent::ToolRequested {
+                                tool_name: tool_name.clone(),
+                            });
+                            tool_calls.push(ToolCallRecord {
+                                tool_name,
+                                tool_use_id,
+                            });
                         }
                     }
-                }
-                notifications::TURN_COMPLETE => {
-                    if let Some(params) = &notif.params {
-                        turn_duration_us = params.get("duration_us").and_then(|v| v.as_u64());
-                        turn_usage = params.get("usage").and_then(|usage| {
-                            Some(TokenUsageOutput {
-                                input_tokens: usage.get("input_tokens")?.as_u64()?,
-                                output_tokens: usage.get("output_tokens")?.as_u64()?,
-                            })
+                    notifications::INTERACTION_NEEDED => {
+                        on_progress(OneshotProgressEvent::InteractionNeeded);
+                        if maybe_auto_approve(&mut client, &session_id, &notif, auto_approve)
+                            .await?
+                        {
+                            continue;
+                        }
+
+                        let prompt = interaction_prompt(&notif).to_string();
+                        let source_label = source_label(&notif).map(ToString::to_string);
+                        let kind = interaction_kind(&notif).to_string();
+                        let options = interaction_options(&notif);
+                        let allow_freeform = interaction_allow_freeform(&notif);
+                        let partial = if !completed_text.is_empty() {
+                            completed_text.clone()
+                        } else {
+                            delta_buffer.clone()
+                        };
+
+                        return Ok(OneshotOutput {
+                            session_id,
+                            response: partial.clone(),
+                            tool_calls: tool_calls.clone(),
+                            duration_us: turn_duration_us,
+                            usage: turn_usage,
+                            interaction_needed: Some(InteractionNeededOutput {
+                                prompt,
+                                source_label,
+                                kind,
+                                options,
+                                allow_freeform,
+                                response: partial,
+                                tool_calls,
+                            }),
                         });
                     }
-                    on_progress(OneshotProgressEvent::TurnComplete);
-                    break;
+                    notifications::SESSION_ERROR => {
+                        if let Some(params) = &notif.params {
+                            if let Some(error) = params.get("error").and_then(|v| v.as_str()) {
+                                anyhow::bail!("session error: {error}");
+                            }
+                        }
+                    }
+                    notifications::TURN_COMPLETE => {
+                        if let Some(params) = &notif.params {
+                            turn_duration_us = params.get("duration_us").and_then(|v| v.as_u64());
+                            turn_usage = params.get("usage").and_then(|usage| {
+                                Some(TokenUsageOutput {
+                                    input_tokens: usage.get("input_tokens")?.as_u64()?,
+                                    output_tokens: usage.get("output_tokens")?.as_u64()?,
+                                })
+                            });
+                        }
+                        on_progress(OneshotProgressEvent::TurnComplete);
+                        break;
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             None => {
                 anyhow::bail!("connection to daemon lost");
             }
@@ -331,7 +343,9 @@ where
 }
 
 pub async fn fetch_available_skills(client: &mut IpcClient) -> anyhow::Result<Vec<String>> {
-    let result = client.call(methods::LIST_SKILLS, None).await?;
+    let result = client
+        .call(methods::LIST_SKILLS, working_directory_params())
+        .await?;
     let value = result.map_err(|message| anyhow::anyhow!(message))?;
     Ok(value
         .as_array()
@@ -451,95 +465,102 @@ pub(crate) async fn execute_interaction_response(
 
     loop {
         match client.recv_notification().await {
-            Some(notif) => match notif.method.as_str() {
-                notifications::STREAM_DELTA => {
-                    if let Some(params) = &notif.params {
-                        if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
-                            delta_buffer.push_str(delta);
-                        }
-                    }
+            Some(notif) => {
+                if interaction_session_id(&notif).is_some_and(|id| id != session_id) {
+                    continue;
                 }
-                notifications::TEXT_COMPLETE => {
-                    if let Some(params) = &notif.params {
-                        if let Some(full_text) = params.get("full_text").and_then(|v| v.as_str()) {
-                            if !full_text.trim().is_empty() {
-                                if !completed_text.is_empty() {
-                                    completed_text.push('\n');
-                                }
-                                completed_text.push_str(full_text);
+                match notif.method.as_str() {
+                    notifications::STREAM_DELTA => {
+                        if let Some(params) = &notif.params {
+                            if let Some(delta) = params.get("delta").and_then(|v| v.as_str()) {
+                                delta_buffer.push_str(delta);
                             }
                         }
                     }
-                    delta_buffer.clear();
-                }
-                notifications::TOOL_REQUEST => {
-                    if let Some(params) = &notif.params {
-                        let tool_name = params
-                            .get("tool_name")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        let tool_use_id = params
-                            .get("tool_use_id")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        tool_calls.push(ToolCallRecord {
-                            tool_name,
-                            tool_use_id,
-                        });
+                    notifications::TEXT_COMPLETE => {
+                        if let Some(params) = &notif.params {
+                            if let Some(full_text) =
+                                params.get("full_text").and_then(|v| v.as_str())
+                            {
+                                if !full_text.trim().is_empty() {
+                                    if !completed_text.is_empty() {
+                                        completed_text.push('\n');
+                                    }
+                                    completed_text.push_str(full_text);
+                                }
+                            }
+                        }
+                        delta_buffer.clear();
                     }
-                }
-                notifications::INTERACTION_NEEDED => {
-                    let prompt = interaction_prompt(&notif).to_string();
-                    let source_label = source_label(&notif).map(ToString::to_string);
-                    let kind = interaction_kind(&notif).to_string();
-                    let options = interaction_options(&notif);
-                    let allow_freeform = interaction_allow_freeform(&notif);
-                    let partial = if !completed_text.is_empty() {
-                        completed_text.clone()
-                    } else {
-                        delta_buffer.clone()
-                    };
-
-                    return Ok(OneshotOutput {
-                        session_id: session_id.to_string(),
-                        response: partial.clone(),
-                        tool_calls: tool_calls.clone(),
-                        duration_us: turn_duration_us,
-                        usage: turn_usage,
-                        interaction_needed: Some(InteractionNeededOutput {
-                            prompt,
-                            source_label,
-                            kind,
-                            options,
-                            allow_freeform,
-                            response: partial,
-                            tool_calls,
-                        }),
-                    });
-                }
-                notifications::SESSION_ERROR => {
-                    if let Some(params) = &notif.params {
-                        if let Some(error) = params.get("error").and_then(|v| v.as_str()) {
-                            anyhow::bail!("session error: {error}");
+                    notifications::TOOL_REQUEST => {
+                        if let Some(params) = &notif.params {
+                            let tool_name = params
+                                .get("tool_name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            let tool_use_id = params
+                                .get("tool_use_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("unknown")
+                                .to_string();
+                            tool_calls.push(ToolCallRecord {
+                                tool_name,
+                                tool_use_id,
+                            });
                         }
                     }
-                }
-                notifications::TURN_COMPLETE => {
-                    if let Some(params) = &notif.params {
-                        turn_duration_us = params.get("duration_us").and_then(|v| v.as_u64());
-                        turn_usage = params.get("usage").and_then(|v| {
-                            Some(TokenUsageOutput {
-                                input_tokens: v.get("input_tokens")?.as_u64()?,
-                                output_tokens: v.get("output_tokens")?.as_u64()?,
-                            })
+                    notifications::INTERACTION_NEEDED => {
+                        let prompt = interaction_prompt(&notif).to_string();
+                        let source_label = source_label(&notif).map(ToString::to_string);
+                        let kind = interaction_kind(&notif).to_string();
+                        let options = interaction_options(&notif);
+                        let allow_freeform = interaction_allow_freeform(&notif);
+                        let partial = if !completed_text.is_empty() {
+                            completed_text.clone()
+                        } else {
+                            delta_buffer.clone()
+                        };
+
+                        return Ok(OneshotOutput {
+                            session_id: session_id.to_string(),
+                            response: partial.clone(),
+                            tool_calls: tool_calls.clone(),
+                            duration_us: turn_duration_us,
+                            usage: turn_usage,
+                            interaction_needed: Some(InteractionNeededOutput {
+                                prompt,
+                                source_label,
+                                kind,
+                                options,
+                                allow_freeform,
+                                response: partial,
+                                tool_calls,
+                            }),
                         });
                     }
-                    break;
+                    notifications::SESSION_ERROR => {
+                        if let Some(params) = &notif.params {
+                            if let Some(error) = params.get("error").and_then(|v| v.as_str()) {
+                                anyhow::bail!("session error: {error}");
+                            }
+                        }
+                    }
+                    notifications::TURN_COMPLETE => {
+                        if let Some(params) = &notif.params {
+                            turn_duration_us = params.get("duration_us").and_then(|v| v.as_u64());
+                            turn_usage = params.get("usage").and_then(|v| {
+                                Some(TokenUsageOutput {
+                                    input_tokens: v.get("input_tokens")?.as_u64()?,
+                                    output_tokens: v.get("output_tokens")?.as_u64()?,
+                                })
+                            });
+                        }
+                        break;
+                    }
+                    _ => {}
                 }
-                _ => {}
-            },
+            }
             None => {
                 anyhow::bail!("connection to daemon lost");
             }
@@ -565,7 +586,9 @@ pub(crate) async fn execute_interaction_response(
 pub async fn run_skills_list(socket_path: &Path, json_output: bool) -> anyhow::Result<()> {
     let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
-    let result = client.call(methods::LIST_SKILLS, None).await?;
+    let result = client
+        .call(methods::LIST_SKILLS, working_directory_params())
+        .await?;
     match result {
         Ok(value) => {
             if json_output {
@@ -599,7 +622,8 @@ pub async fn run_skills_list(socket_path: &Path, json_output: bool) -> anyhow::R
 pub async fn run_skills_show(socket_path: &Path, name: &str) -> anyhow::Result<()> {
     let (mut client, _daemon_spawned) = IpcClient::connect_or_launch(socket_path).await?;
 
-    let params = serde_json::json!({ "name": name });
+    let mut params = working_directory_params().unwrap_or_else(|| serde_json::json!({}));
+    params["name"] = serde_json::json!(name);
     let result = client.call(methods::GET_SKILL, Some(params)).await?;
     match result {
         Ok(value) => {
