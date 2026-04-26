@@ -322,6 +322,7 @@ async fn dispatch_scheduled_action(
                 .send(CoreInput::UserMessage {
                     session_id,
                     content,
+                    turn_id: uuid::Uuid::new_v4().to_string(),
                 })
                 .await
                 .map_err(|_| SchedulerError::Closed)
@@ -367,6 +368,7 @@ mod tests {
             CoreInput::UserMessage {
                 session_id,
                 content,
+                ..
             } => {
                 assert_eq!(session_id, session_one);
                 assert_eq!(content, "first");
@@ -377,6 +379,7 @@ mod tests {
             CoreInput::UserMessage {
                 session_id,
                 content,
+                ..
             } => {
                 assert_eq!(session_id, session_three);
                 assert_eq!(content, "second");
@@ -389,6 +392,7 @@ mod tests {
             CoreInput::UserMessage {
                 session_id,
                 content,
+                ..
             } => {
                 assert_eq!(session_id, session_two);
                 assert_eq!(content, "later");
@@ -422,6 +426,7 @@ mod tests {
             CoreInput::UserMessage {
                 session_id: current_session_id,
                 content,
+                ..
             }
                 if current_session_id == session_id && content == "recurring"
         ));
@@ -432,6 +437,7 @@ mod tests {
             CoreInput::UserMessage {
                 session_id: current_session_id,
                 content,
+                ..
             }
                 if current_session_id == session_id && content == "recurring"
         ));

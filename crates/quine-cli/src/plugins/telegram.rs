@@ -36,6 +36,7 @@ enum TelegramInteractionKind {
 #[derive(Debug, Clone)]
 struct TelegramPendingInteraction {
     session_id: String,
+    turn_id: Option<String>,
     prompt: String,
     source_label: Option<String>,
     kind: TelegramInteractionKind,
@@ -545,6 +546,7 @@ impl TelegramBot {
                 .as_ref()
                 .map(|interaction| TelegramPendingInteraction {
                     session_id: output.session_id.clone(),
+                    turn_id: interaction.turn_id.clone(),
                     prompt: interaction.prompt.clone(),
                     source_label: interaction.source_label.clone(),
                     kind: TelegramInteractionKind::from_output_kind(&interaction.kind),
@@ -586,6 +588,7 @@ impl TelegramBot {
                 &response,
                 selected_indices,
                 false,
+                pending.turn_id.as_deref(),
             )
             .await
             {
@@ -620,6 +623,7 @@ impl TelegramBot {
             &response,
             selected_indices,
             false,
+            pending.turn_id.as_deref(),
         )
         .await
         {
@@ -2101,6 +2105,7 @@ fn format_reply(output: &OneshotOutput) -> String {
     if let Some(interaction) = &output.interaction_needed {
         let pending = TelegramPendingInteraction {
             session_id: output.session_id.clone(),
+            turn_id: interaction.turn_id.clone(),
             prompt: interaction.prompt.clone(),
             source_label: interaction.source_label.clone(),
             kind: TelegramInteractionKind::from_output_kind(&interaction.kind),
@@ -2931,6 +2936,7 @@ mod tests {
             interaction_needed: Some(InteractionNeededOutput {
                 prompt: "Need approval".into(),
                 source_label: Some("permission:1".into()),
+                turn_id: Some("turn-test".into()),
                 kind: "SingleSelect".into(),
                 options: vec!["approve once".into(), "deny once".into()],
                 allow_freeform: false,
@@ -2957,6 +2963,7 @@ mod tests {
     fn multi_select_interaction_renders_toggle_and_submit_buttons() {
         let interaction = TelegramPendingInteraction {
             session_id: "s".into(),
+            turn_id: None,
             prompt: "Choose repositories".into(),
             source_label: None,
             kind: TelegramInteractionKind::MultiSelect,
@@ -2980,6 +2987,7 @@ mod tests {
     fn multi_select_submit_synthesizes_text_from_selected_options() {
         let interaction = TelegramPendingInteraction {
             session_id: "s".into(),
+            turn_id: None,
             prompt: "Choose repositories".into(),
             source_label: None,
             kind: TelegramInteractionKind::MultiSelect,

@@ -654,14 +654,17 @@ impl HarnessService for LocalHarness {
         &self,
         session_id: SessionId,
         content: String,
-    ) -> Result<(), HarnessError> {
+    ) -> Result<String, HarnessError> {
+        let turn_id = uuid::Uuid::new_v4().to_string();
         self.core_input
             .send(CoreInput::UserMessage {
                 session_id,
                 content,
+                turn_id: turn_id.clone(),
             })
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+        Ok(turn_id)
     }
 
     async fn exit_plan_mode(&self, session_id: SessionId) -> Result<(), HarnessError> {
