@@ -1,5 +1,7 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
@@ -12,6 +14,7 @@ use quine_harness::protocol::{
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 const HEALTHCHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const DEBUG_INIT_ENV: &str = "QUINE_DEBUG_INIT";
+static CHAT_SOCKET_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 fn debug_init_enabled() -> bool {
     std::env::var_os(DEBUG_INIT_ENV).is_some()
@@ -46,6 +49,81 @@ fn should_remove_stale_socket(socket_path: &Path, error: &anyhow::Error) -> bool
 
 fn should_replace_unhealthy_socket(socket_path: &Path) -> bool {
     socket_path.exists()
+}
+
+fn isolated_chat_socket_path(default_socket_path: &Path) -> PathBuf {
+    let parent = default_socket_path
+        .parent()
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("/tmp"));
+    let stem = default_socket_path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("quine-harness");
+    let pid = std::process::id();
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+
+    for _ in 0..100 {
+        let counter = CHAT_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let candidate = parent.join(format!("{stem}-chat-{pid}-{timestamp}-{counter}.sock"));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+
+    parent.join(format!(
+        "{stem}-chat-{pid}-{timestamp}-{}.sock",
+        CHAT_SOCKET_COUNTER.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
+/// Return the socket path that `quine chat` should use when the user did not
+/// pass `--socket`.
+///
+/// A healthy daemon on the default socket means another local agent session is
+/// already active. In that case, use a fresh socket so chat launches and owns an
+/// isolated daemon instead of attaching to the default one.
+pub async fn default_chat_socket_path(default_socket_path: PathBuf) -> anyhow::Result<PathBuf> {
+    match IpcClient::connect(&default_socket_path).await {
+        Ok(mut client) => {
+            debug_init(format!(
+                "default daemon socket is accepting connections at {}",
+                default_socket_path.display()
+            ));
+            if let Err(error) = client.health_check().await {
+                let socket_path = isolated_chat_socket_path(&default_socket_path);
+                debug_init(format!(
+                    "default daemon at {} failed health check ({error}); using isolated chat socket {}",
+                    default_socket_path.display(),
+                    socket_path.display()
+                ));
+                return Ok(socket_path);
+            }
+
+            let socket_path = isolated_chat_socket_path(&default_socket_path);
+            debug_init(format!(
+                "default daemon is healthy at {}; using isolated chat socket {}",
+                default_socket_path.display(),
+                socket_path.display()
+            ));
+            Ok(socket_path)
+        }
+        Err(error) if should_launch_daemon(&error) => {
+            debug_init(format!(
+                "default daemon is not running at {}; using default socket",
+                default_socket_path.display()
+            ));
+            Ok(default_socket_path)
+        }
+        Err(error) => Err(error.context(format!(
+            "failed to inspect default daemon at {}",
+            default_socket_path.display()
+        ))),
+    }
 }
 
 /// IPC client that connects to the harness daemon via Unix domain socket.
@@ -277,6 +355,7 @@ mod tests {
     use quine_harness::protocol::JsonRpcRequest;
     use std::sync::{LazyLock, Mutex};
     use tempfile::{tempdir, NamedTempFile};
+    use tokio::net::UnixListener;
 
     static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -323,6 +402,64 @@ mod tests {
         ));
         assert!(should_replace_unhealthy_socket(existing_socket.path()));
         assert!(!should_replace_unhealthy_socket(missing_socket.as_path()));
+    }
+
+    #[test]
+    fn isolated_chat_socket_path_stays_near_default_socket() {
+        let default_socket = Path::new("/tmp/quine-harness.sock");
+        let socket_path = isolated_chat_socket_path(default_socket);
+
+        assert_ne!(socket_path, default_socket);
+        assert_eq!(socket_path.parent(), default_socket.parent());
+
+        let file_name = socket_path
+            .file_name()
+            .and_then(|file_name| file_name.to_str())
+            .unwrap();
+        assert!(file_name.starts_with("quine-harness-chat-"));
+        assert!(file_name.ends_with(".sock"));
+    }
+
+    #[tokio::test]
+    async fn default_chat_socket_path_reuses_default_when_daemon_is_missing() {
+        let tempdir = tempdir().unwrap();
+        let socket_path = tempdir.path().join("harness.sock");
+
+        assert_eq!(
+            default_chat_socket_path(socket_path.clone()).await.unwrap(),
+            socket_path
+        );
+    }
+
+    #[tokio::test]
+    async fn default_chat_socket_path_uses_isolated_socket_when_default_daemon_is_healthy() {
+        let tempdir = tempdir().unwrap();
+        let default_socket = tempdir.path().join("harness.sock");
+        let listener = UnixListener::bind(&default_socket).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines.next_line().await.unwrap().unwrap();
+            let request: JsonRpcRequest = serde_json::from_str(&line).unwrap();
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "result": "ok",
+            });
+            let mut line = serde_json::to_string(&response).unwrap();
+            line.push('\n');
+            writer.write_all(line.as_bytes()).await.unwrap();
+        });
+
+        let socket_path = default_chat_socket_path(default_socket.clone())
+            .await
+            .unwrap();
+        server.await.unwrap();
+
+        assert_ne!(socket_path, default_socket);
+        assert_eq!(socket_path.parent(), default_socket.parent());
     }
 
     #[test]

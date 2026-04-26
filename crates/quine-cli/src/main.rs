@@ -344,9 +344,10 @@ async fn main() -> anyhow::Result<()> {
             session_group,
             tui_mouse_mode,
         } => {
-            let socket_path = socket
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(default_socket_path);
+            let socket_path = match socket {
+                Some(socket) => std::path::PathBuf::from(socket),
+                None => client::default_chat_socket_path(default_socket_path()).await?,
+            };
             if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                 tui::run_tui_chat(
                     &socket_path,
