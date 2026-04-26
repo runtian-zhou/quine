@@ -2,9 +2,10 @@ use std::path::Path;
 use std::sync::Arc;
 
 use chrono::Utc;
+use std::collections::HashMap;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 
 use crate::metrics;
 use crate::protocol::{
@@ -36,6 +37,7 @@ pub async fn run_ipc_server(
     tracing::info!("IPC server listening on {:?}", socket_path);
 
     let shutdown_signal = Arc::new(Notify::new());
+    let active_turns = Arc::new(Mutex::new(HashMap::new()));
 
     loop {
         tokio::select! {
@@ -43,9 +45,10 @@ pub async fn run_ipc_server(
                 let (stream, _addr) = result?;
                 let svc = Arc::clone(&service);
                 let shutdown = Arc::clone(&shutdown_signal);
+                let active_turns = Arc::clone(&active_turns);
 
                 tokio::spawn(async move {
-                    if let Err(e) = handle_connection(stream, svc, shutdown).await {
+                    if let Err(e) = handle_connection(stream, svc, shutdown, active_turns).await {
                         tracing::error!("connection error: {e}");
                     }
                 });
@@ -67,6 +70,7 @@ async fn handle_connection(
     stream: tokio::net::UnixStream,
     service: Arc<dyn HarnessService>,
     shutdown_signal: Arc<Notify>,
+    active_turns: Arc<Mutex<HashMap<quine_core::SessionId, String>>>,
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -76,11 +80,22 @@ async fn handle_connection(
     let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<String>(256);
 
     tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
+        loop {
+            let event = match event_rx.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(skipped, "IPC subscriber lagged broadcast events");
+                    continue;
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+
             // Log the event asynchronously.
             log_core_output(&event).await;
 
-            let notification = core_output_to_notification(&event);
+            let notification =
+                core_output_to_notification_with_turn_tracking(&event, Arc::clone(&active_turns))
+                    .await;
             if let Ok(json) = serde_json::to_string(&notification) {
                 if notify_tx.send(format!("{json}\n")).await.is_err() {
                     break;
@@ -276,6 +291,17 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
                 payload,
             )
         }
+        quine_core::CoreOutput::TurnStarted {
+            session_id,
+            turn_id,
+        } => (
+            serde_json::to_value(session_id)
+                .ok()
+                .and_then(|v| v.as_str().map(String::from))
+                .unwrap_or_default(),
+            "turn_started",
+            serde_json::json!({"turn_id": turn_id}),
+        ),
         quine_core::CoreOutput::ChildSpawned {
             parent_id,
             child_id,
@@ -678,8 +704,14 @@ async fn handle_request(
                     let _ = session_log::append_log_entry(&entry).await;
 
                     match service.send_message(session_id, content.to_string()).await {
-                        Ok(()) => {
-                            let resp = JsonRpcResponse::success(id, "ok");
+                        Ok(turn_id) => {
+                            let resp = JsonRpcResponse::success(
+                                id,
+                                serde_json::json!({
+                                    "status": "ok",
+                                    "turn_id": turn_id,
+                                }),
+                            );
                             Some(serde_json::to_string(&resp).unwrap_or_default())
                         }
                         Err(e) => {
@@ -1666,6 +1698,16 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
             }
             JsonRpcNotification::new(notifications::TURN_COMPLETE, Some(params))
         }
+        quine_core::CoreOutput::TurnStarted {
+            session_id,
+            turn_id,
+        } => JsonRpcNotification::new(
+            notifications::TURN_STARTED,
+            Some(serde_json::json!({
+                "session_id": session_id,
+                "turn_id": turn_id,
+            })),
+        ),
         quine_core::CoreOutput::ChildSpawned {
             parent_id,
             child_id,
@@ -1706,6 +1748,77 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
     }
 }
 
+async fn core_output_to_notification_with_turn_tracking(
+    event: &quine_core::CoreOutput,
+    active_turns: Arc<Mutex<HashMap<quine_core::SessionId, String>>>,
+) -> JsonRpcNotification {
+    if let quine_core::CoreOutput::TurnStarted {
+        session_id,
+        turn_id,
+    } = event
+    {
+        active_turns
+            .lock()
+            .await
+            .insert(*session_id, turn_id.clone());
+        return core_output_to_notification(event);
+    }
+
+    if let quine_core::CoreOutput::TurnComplete { session_id, .. } = event {
+        let turn_id = active_turns.lock().await.remove(session_id);
+        let mut notification = core_output_to_notification(event);
+        if let Some(turn_id) = turn_id {
+            add_turn_id_to_notification(&mut notification, &turn_id);
+        }
+        return notification;
+    }
+
+    let session_id = core_output_session_id(event);
+    let turn_id = match session_id {
+        Some(session_id) => active_turns.lock().await.get(&session_id).cloned(),
+        None => None,
+    };
+
+    let mut notification = core_output_to_notification(event);
+    if let Some(turn_id) = turn_id {
+        add_turn_id_to_notification(&mut notification, &turn_id);
+    }
+    notification
+}
+
+fn core_output_session_id(event: &quine_core::CoreOutput) -> Option<quine_core::SessionId> {
+    match event {
+        quine_core::CoreOutput::ReasoningDelta { session_id, .. }
+        | quine_core::CoreOutput::StreamDelta { session_id, .. }
+        | quine_core::CoreOutput::TextComplete { session_id, .. }
+        | quine_core::CoreOutput::ToolRequest { session_id, .. }
+        | quine_core::CoreOutput::SessionStateChanged { session_id, .. }
+        | quine_core::CoreOutput::SessionError { session_id, .. }
+        | quine_core::CoreOutput::InteractionNeeded { session_id, .. }
+        | quine_core::CoreOutput::PlanProgress { session_id, .. }
+        | quine_core::CoreOutput::SessionStatusReport { session_id, .. }
+        | quine_core::CoreOutput::ToolResult { session_id, .. }
+        | quine_core::CoreOutput::TurnComplete { session_id, .. }
+        | quine_core::CoreOutput::MessageReceived { session_id, .. }
+        | quine_core::CoreOutput::TurnStarted { session_id, .. } => Some(*session_id),
+        quine_core::CoreOutput::ChildSpawned { .. }
+        | quine_core::CoreOutput::ChildExited { .. }
+        | quine_core::CoreOutput::CheckpointRequested { .. } => None,
+    }
+}
+
+fn add_turn_id_to_notification(notification: &mut JsonRpcNotification, turn_id: &str) {
+    let Some(params) = notification.params.as_mut() else {
+        return;
+    };
+    let Some(object) = params.as_object_mut() else {
+        return;
+    };
+    object
+        .entry("turn_id")
+        .or_insert_with(|| serde_json::Value::String(turn_id.to_string()));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1744,7 +1857,7 @@ mod tests {
             &self,
             _session_id: quine_core::SessionId,
             _content: String,
-        ) -> Result<(), HarnessError> {
+        ) -> Result<String, HarnessError> {
             Err(HarnessError::Internal {
                 message: "not used in test".into(),
             })
@@ -1840,6 +1953,80 @@ mod tests {
             .get("allow_freeform")
             .expect("allow_freeform field missing");
         assert_eq!(allow_freeform, true);
+    }
+
+    #[tokio::test]
+    async fn tracked_notifications_attach_turn_id_to_stream_events() {
+        let session_id = quine_core::SessionId::new();
+        let active_turns = Arc::new(Mutex::new(HashMap::new()));
+        let turn_id = "turn-123".to_string();
+
+        let started = quine_core::CoreOutput::TurnStarted {
+            session_id,
+            turn_id: turn_id.clone(),
+        };
+        let started_notif =
+            core_output_to_notification_with_turn_tracking(&started, active_turns.clone()).await;
+        assert_eq!(started_notif.method, notifications::TURN_STARTED);
+
+        let delta = quine_core::CoreOutput::StreamDelta {
+            session_id,
+            delta: "hello".into(),
+        };
+        let delta_notif =
+            core_output_to_notification_with_turn_tracking(&delta, active_turns).await;
+        assert_eq!(
+            delta_notif
+                .params
+                .as_ref()
+                .and_then(|params| params.get("turn_id"))
+                .and_then(|value| value.as_str()),
+            Some(turn_id.as_str())
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_notifications_clear_turn_id_after_turn_complete() {
+        let session_id = quine_core::SessionId::new();
+        let active_turns = Arc::new(Mutex::new(HashMap::new()));
+        let turn_id = "turn-123".to_string();
+
+        let started = quine_core::CoreOutput::TurnStarted {
+            session_id,
+            turn_id: turn_id.clone(),
+        };
+        let _ =
+            core_output_to_notification_with_turn_tracking(&started, active_turns.clone()).await;
+
+        let complete = quine_core::CoreOutput::TurnComplete {
+            session_id,
+            duration_us: 7,
+            usage: None,
+            cache_usage: None,
+        };
+        let complete_notif =
+            core_output_to_notification_with_turn_tracking(&complete, active_turns.clone()).await;
+        assert_eq!(
+            complete_notif
+                .params
+                .as_ref()
+                .and_then(|params| params.get("turn_id"))
+                .and_then(|value| value.as_str()),
+            Some(turn_id.as_str())
+        );
+
+        let idle = quine_core::CoreOutput::SessionStateChanged {
+            session_id,
+            state: quine_core::SessionState::Idle,
+        };
+        let idle_notif = core_output_to_notification_with_turn_tracking(&idle, active_turns).await;
+        assert_eq!(
+            idle_notif
+                .params
+                .as_ref()
+                .and_then(|params| params.get("turn_id")),
+            None
+        );
     }
 
     #[tokio::test]

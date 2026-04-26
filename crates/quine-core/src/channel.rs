@@ -73,6 +73,8 @@ pub enum CoreInput {
     UserMessage {
         session_id: SessionId,
         content: String,
+        /// Correlates streamed outputs with the user message that started the turn.
+        turn_id: String,
     },
 
     /// Leave read-only plan mode for an existing session.
@@ -321,6 +323,12 @@ pub enum CoreOutput {
 
     /// A stable checkpoint was requested after a committed state transition.
     CheckpointRequested { checkpoint: CoreCheckpoint },
+
+    /// A user-message turn has started.
+    TurnStarted {
+        session_id: SessionId,
+        turn_id: String,
+    },
 }
 
 /// Configuration for channel buffer sizes.
@@ -418,6 +426,7 @@ mod tests {
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "hello".into(),
+                turn_id: "turn-test".into(),
             })
             .await
             .unwrap();

@@ -10,9 +10,11 @@ use crate::interaction::{
 };
 use crate::session::{build_create_session_params, resolve_resume_target};
 use quine_harness::{
-    protocol::{methods, notifications},
+    protocol::{methods, notifications, JsonRpcNotification},
     PermissionPromptBehavior,
 };
+
+const TURN_EVENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 pub(crate) async fn connect_existing_client(socket_path: &Path) -> anyhow::Result<IpcClient> {
     let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -73,6 +75,8 @@ pub struct InteractionNeededOutput {
     pub prompt: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
     pub kind: String,
     #[serde(default)]
     pub options: Vec<String>,
@@ -80,6 +84,46 @@ pub struct InteractionNeededOutput {
     pub allow_freeform: bool,
     pub response: String,
     pub tool_calls: Vec<ToolCallRecord>,
+}
+
+fn send_message_turn_id(result: &serde_json::Value) -> Option<String> {
+    result
+        .get("turn_id")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+}
+
+fn notification_turn_id(notification: &JsonRpcNotification) -> Option<&str> {
+    notification
+        .params
+        .as_ref()
+        .and_then(|params| params.get("turn_id"))
+        .and_then(|value| value.as_str())
+}
+
+fn notification_matches_turn(
+    notification: &JsonRpcNotification,
+    expected_turn_id: Option<&str>,
+) -> bool {
+    match expected_turn_id {
+        Some(expected) => notification_turn_id(notification)
+            .map(|actual| actual == expected)
+            .unwrap_or(false),
+        None => true,
+    }
+}
+
+async fn recv_notification_with_timeout(
+    client: &mut IpcClient,
+) -> anyhow::Result<JsonRpcNotification> {
+    match tokio::time::timeout(TURN_EVENT_TIMEOUT, client.recv_notification()).await {
+        Ok(Some(notification)) => Ok(notification),
+        Ok(None) => anyhow::bail!("connection to daemon lost"),
+        Err(_) => anyhow::bail!(
+            "timed out waiting for session turn event after {} seconds",
+            TURN_EVENT_TIMEOUT.as_secs()
+        ),
+    }
 }
 
 /// Token usage in one-shot output.
@@ -196,9 +240,10 @@ where
         "content": message,
     });
     let result = client.call(methods::SEND_MESSAGE, Some(params)).await?;
-    if let Err(e) = result {
-        anyhow::bail!("failed to send message: {e}");
-    }
+    let expected_turn_id = match result {
+        Ok(value) => send_message_turn_id(&value),
+        Err(e) => anyhow::bail!("failed to send message: {e}"),
+    };
 
     let mut completed_text = String::new();
     let mut delta_buffer = String::new();
@@ -206,12 +251,33 @@ where
     let mut turn_duration_us: Option<u64> = None;
     let mut turn_usage: Option<TokenUsageOutput> = None;
     let mut saw_stream_delta = false;
+    let mut collecting_turn = expected_turn_id.is_none();
 
     loop {
-        match client.recv_notification().await {
-            Some(notif) => {
+        match recv_notification_with_timeout(&mut client).await {
+            Ok(notif) => {
                 if interaction_session_id(&notif).is_some_and(|id| id != session_id.as_str()) {
                     continue;
+                }
+                let matches_expected_turn =
+                    notification_matches_turn(&notif, expected_turn_id.as_deref());
+                if notif.method == notifications::TURN_STARTED {
+                    if matches_expected_turn {
+                        collecting_turn = true;
+                        completed_text.clear();
+                        delta_buffer.clear();
+                        tool_calls.clear();
+                    }
+                    continue;
+                }
+                if !matches_expected_turn {
+                    continue;
+                }
+                if !collecting_turn {
+                    collecting_turn = true;
+                    completed_text.clear();
+                    delta_buffer.clear();
+                    tool_calls.clear();
                 }
                 match notif.method.as_str() {
                     notifications::STREAM_DELTA => {
@@ -289,6 +355,7 @@ where
                             interaction_needed: Some(InteractionNeededOutput {
                                 prompt,
                                 source_label,
+                                turn_id: expected_turn_id.clone(),
                                 kind,
                                 options,
                                 allow_freeform,
@@ -320,9 +387,7 @@ where
                     _ => {}
                 }
             }
-            None => {
-                anyhow::bail!("connection to daemon lost");
-            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -420,7 +485,8 @@ pub async fn run_respond(
     json_output: bool,
 ) -> anyhow::Result<()> {
     let output =
-        execute_interaction_response(socket_path, session_id, response, Vec::new(), true).await?;
+        execute_interaction_response(socket_path, session_id, response, Vec::new(), true, None)
+            .await?;
 
     if json_output {
         println!("{}", serde_json::to_string_pretty(&output)?);
@@ -437,6 +503,7 @@ pub(crate) async fn execute_interaction_response(
     response: &str,
     selected_indices: Vec<usize>,
     allow_daemon_launch: bool,
+    expected_turn_id: Option<&str>,
 ) -> anyhow::Result<OneshotOutput> {
     let (mut client, _daemon_spawned) = if allow_daemon_launch {
         IpcClient::connect_or_launch(socket_path).await?
@@ -464,9 +531,12 @@ pub(crate) async fn execute_interaction_response(
     let mut turn_usage: Option<TokenUsageOutput> = None;
 
     loop {
-        match client.recv_notification().await {
-            Some(notif) => {
+        match recv_notification_with_timeout(&mut client).await {
+            Ok(notif) => {
                 if interaction_session_id(&notif).is_some_and(|id| id != session_id) {
+                    continue;
+                }
+                if !notification_matches_turn(&notif, expected_turn_id) {
                     continue;
                 }
                 match notif.method.as_str() {
@@ -531,6 +601,7 @@ pub(crate) async fn execute_interaction_response(
                             interaction_needed: Some(InteractionNeededOutput {
                                 prompt,
                                 source_label,
+                                turn_id: expected_turn_id.map(ToString::to_string),
                                 kind,
                                 options,
                                 allow_freeform,
@@ -561,9 +632,7 @@ pub(crate) async fn execute_interaction_response(
                     _ => {}
                 }
             }
-            None => {
-                anyhow::bail!("connection to daemon lost");
-            }
+            Err(error) => return Err(error),
         }
     }
 
@@ -742,6 +811,47 @@ mod tests {
         assert_eq!(parsed.response, "Hello!");
         assert_eq!(parsed.tool_calls.len(), 1);
         assert_eq!(parsed.tool_calls[0].tool_name, "bash");
+    }
+
+    #[test]
+    fn send_message_turn_id_extracts_protocol_object() {
+        let value = serde_json::json!({
+            "status": "ok",
+            "turn_id": "turn-123",
+        });
+
+        assert_eq!(send_message_turn_id(&value).as_deref(), Some("turn-123"));
+        assert!(send_message_turn_id(&serde_json::json!("ok")).is_none());
+    }
+
+    #[test]
+    fn notification_turn_matching_filters_other_turns() {
+        let expected = Some("turn-a");
+        let matching = JsonRpcNotification::new(
+            notifications::STREAM_DELTA,
+            Some(serde_json::json!({
+                "session_id": "session-1",
+                "turn_id": "turn-a",
+            })),
+        );
+        let other = JsonRpcNotification::new(
+            notifications::STREAM_DELTA,
+            Some(serde_json::json!({
+                "session_id": "session-1",
+                "turn_id": "turn-b",
+            })),
+        );
+        let legacy = JsonRpcNotification::new(
+            notifications::STREAM_DELTA,
+            Some(serde_json::json!({
+                "session_id": "session-1",
+            })),
+        );
+
+        assert!(notification_matches_turn(&matching, expected));
+        assert!(!notification_matches_turn(&other, expected));
+        assert!(!notification_matches_turn(&legacy, expected));
+        assert!(notification_matches_turn(&legacy, None));
     }
 
     #[test]

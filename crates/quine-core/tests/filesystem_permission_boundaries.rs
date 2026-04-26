@@ -108,6 +108,7 @@ async fn run_tool_turn(
         .send(CoreInput::UserMessage {
             session_id,
             content: "run the scripted tool".into(),
+            turn_id: uuid::Uuid::new_v4().to_string(),
         })
         .await
         .unwrap();

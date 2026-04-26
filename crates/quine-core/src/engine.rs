@@ -1092,7 +1092,10 @@ struct SessionHandle {
 }
 
 enum SessionCommand {
-    UserMessage(String),
+    UserMessage {
+        content: String,
+        turn_id: String,
+    },
     ExitPlanMode {
         reply: oneshot::Sender<Result<(), String>>,
     },
@@ -2934,6 +2937,7 @@ async fn start_child_session(
     io.deferred_inputs.push_back(CoreInput::UserMessage {
         session_id: child_id,
         content: task,
+        turn_id: uuid::Uuid::new_v4().to_string(),
     });
     Ok(())
 }
@@ -4547,7 +4551,9 @@ impl SessionActor {
 
     async fn handle_command(&mut self, command: SessionCommand) -> bool {
         match command {
-            SessionCommand::UserMessage(content) => self.handle_user_message(content).await,
+            SessionCommand::UserMessage { content, turn_id } => {
+                self.handle_user_message(content, turn_id).await
+            }
             SessionCommand::ExitPlanMode { reply } => {
                 let result = if !matches!(
                     self.session.state,
@@ -4689,7 +4695,7 @@ impl SessionActor {
         }
     }
 
-    async fn handle_user_message(&mut self, content: String) -> bool {
+    async fn handle_user_message(&mut self, content: String, turn_id: String) -> bool {
         debug_log_session(
             self.session_id,
             format!("received UserMessage ({} chars)", content.len()),
@@ -4704,6 +4710,13 @@ impl SessionActor {
             Some(default_turn_diagnostics_for_session(&self.session));
         self.set_status_report(None).await;
         self.emit_state(SessionState::Streaming).await;
+        let _ = self
+            .output
+            .send(CoreOutput::TurnStarted {
+                session_id: self.session_id,
+                turn_id,
+            })
+            .await;
 
         let outcome = self.handle_turn().await;
         self.finish_turn(outcome).await
@@ -5607,7 +5620,7 @@ impl SessionActor {
             | SessionCommand::UpdateSessionLlm { .. }
             | SessionCommand::CompactSession { .. }
             | SessionCommand::ToolResult { .. }
-            | SessionCommand::UserMessage(_)
+            | SessionCommand::UserMessage { .. }
             | SessionCommand::Shutdown => {
                 self.deferred_commands.push_back(command);
                 false
@@ -6374,9 +6387,16 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                             let _ = reply.send(Err("unknown session".into()));
                         }
                     }
-                    CoreInput::UserMessage { session_id, content } => {
+                    CoreInput::UserMessage {
+                        session_id,
+                        content,
+                        turn_id,
+                    } => {
                         if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
-                            let _ = session_handle.command_tx.send(SessionCommand::UserMessage(content)).await;
+                            let _ = session_handle.command_tx.send(SessionCommand::UserMessage {
+                                content,
+                                turn_id,
+                            }).await;
                         } else {
                             let _ = handle.output.send(CoreOutput::SessionError {
                                 session_id,
@@ -6529,7 +6549,10 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                             state: SessionState::Idle,
                                         }).await;
                                         if let Some(child_handle) = registry.read().await.get(&child_id).cloned() {
-                                            let _ = child_handle.command_tx.send(SessionCommand::UserMessage(task)).await;
+                                            let _ = child_handle.command_tx.send(SessionCommand::UserMessage {
+                                                content: task,
+                                                turn_id: uuid::Uuid::new_v4().to_string(),
+                                            }).await;
                                         }
                                         emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
                                         let _ = reply.send(Ok(()));
@@ -9303,6 +9326,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id: other_session_id,
                 content: "hello".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -9331,7 +9355,8 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             deferred_inputs.pop_front(),
             Some(CoreInput::UserMessage {
                 session_id,
-                content
+                content,
+                ..
             }) if session_id == other_session_id && content == "hello"
         ));
     }
@@ -10117,6 +10142,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 .send(CoreInput::UserMessage {
                     session_id,
                     content: content.into(),
+                    turn_id: uuid::Uuid::new_v4().to_string(),
                 })
                 .await
                 .unwrap();
@@ -10208,6 +10234,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "add a listing summary to session memory".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -10307,6 +10334,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 .send(CoreInput::UserMessage {
                     session_id,
                     content: content.into(),
+                    turn_id: uuid::Uuid::new_v4().to_string(),
                 })
                 .await
                 .unwrap();
@@ -10380,6 +10408,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 .send(CoreInput::UserMessage {
                     session_id,
                     content: "seed session memory".into(),
+                    turn_id: uuid::Uuid::new_v4().to_string(),
                 })
                 .await
                 .unwrap();
@@ -10475,6 +10504,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "resume after restore".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -10566,6 +10596,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "resume".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -10604,6 +10635,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "hello".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -10720,16 +10752,18 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let _ = output.recv().await.unwrap();
         let _ = output.recv().await.unwrap();
 
+        let turn_id = uuid::Uuid::new_v4().to_string();
         harness
             .input
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "hello".into(),
+                turn_id: turn_id.clone(),
             })
             .await
             .unwrap();
 
-        // Expect: SessionStateChanged(Streaming), TextComplete, TurnComplete
+        // Expect: SessionStateChanged(Streaming), TurnStarted, TextComplete, TurnComplete
         let event = output.recv().await.unwrap();
         assert!(matches!(
             event,
@@ -10737,6 +10771,15 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 state: SessionState::Streaming,
                 ..
             }
+        ));
+
+        let event = output.recv().await.unwrap();
+        assert!(matches!(
+            event,
+            CoreOutput::TurnStarted {
+                session_id: started_session_id,
+                turn_id: started_turn_id,
+            } if started_session_id == session_id && started_turn_id == turn_id
         ));
 
         let event = output.recv().await.unwrap();
@@ -10849,11 +10892,13 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let _ = output.recv().await.unwrap();
         let _ = output.recv().await.unwrap();
 
+        let turn_id = uuid::Uuid::new_v4().to_string();
         harness
             .input
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "hello".into(),
+                turn_id: turn_id.clone(),
             })
             .await
             .unwrap();
@@ -10865,6 +10910,15 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 state: SessionState::Streaming,
                 ..
             }
+        ));
+
+        let event = output.recv().await.unwrap();
+        assert!(matches!(
+            event,
+            CoreOutput::TurnStarted {
+                session_id: started_session_id,
+                turn_id: started_turn_id,
+            } if started_session_id == session_id && started_turn_id == turn_id
         ));
 
         let event = output.recv().await.unwrap();
@@ -10932,6 +10986,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id: session_a,
                 content: "first".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -10940,6 +10995,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id: session_b,
                 content: "second".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -11157,6 +11213,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "run echo".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -11437,6 +11494,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "run echo".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -11560,6 +11618,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "run pwd".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -11677,6 +11736,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "inspect the note".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -11796,6 +11856,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "try to mutate in plan mode".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -12065,6 +12126,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id: receiver_id,
                 content: "wait for a message".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();

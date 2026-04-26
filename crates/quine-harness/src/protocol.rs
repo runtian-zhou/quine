@@ -136,6 +136,7 @@ pub mod notifications {
     pub const REASONING_DELTA: &str = "reasoning_delta";
     pub const STREAM_DELTA: &str = "stream_delta";
     pub const TEXT_COMPLETE: &str = "text_complete";
+    pub const TURN_STARTED: &str = "turn_started";
     pub const TOOL_REQUEST: &str = "tool_request";
     pub const TOOL_RESULT: &str = "tool_result";
     pub const SESSION_STATE_CHANGED: &str = "session_state_changed";
