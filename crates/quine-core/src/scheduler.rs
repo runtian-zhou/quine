@@ -5,8 +5,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::{Duration, Instant};
 
 use crate::channel::CoreInput;
-use crate::permission::PermissionPromptBehavior;
-use crate::session::{InheritanceFlags, SessionId};
+use crate::session::SessionId;
 
 #[derive(Debug)]
 pub(crate) struct SchedulerHandle {
@@ -19,30 +18,12 @@ impl SchedulerHandle {
         session_id: SessionId,
         content: String,
         delay: Duration,
+        cadence: Option<Duration>,
     ) -> Result<(), SchedulerError> {
         self.send(SchedulerCommand::Schedule {
             action: ScheduledAction::UserMessage {
                 session_id,
                 content,
-            },
-            delay,
-        })
-        .await
-    }
-
-    pub(crate) async fn schedule_spawn_session(
-        &self,
-        parent_id: SessionId,
-        task: String,
-        system_prompt: Option<String>,
-        delay: Duration,
-        cadence: Option<Duration>,
-    ) -> Result<(), SchedulerError> {
-        self.send(SchedulerCommand::Schedule {
-            action: ScheduledAction::SpawnSession {
-                parent_id,
-                task,
-                system_prompt,
                 cadence,
             },
             delay,
@@ -136,11 +117,6 @@ enum ScheduledAction {
     UserMessage {
         session_id: SessionId,
         content: String,
-    },
-    SpawnSession {
-        parent_id: SessionId,
-        task: String,
-        system_prompt: Option<String>,
         cadence: Option<Duration>,
     },
 }
@@ -327,44 +303,25 @@ async fn dispatch_scheduled_action(
         ScheduledAction::UserMessage {
             session_id,
             content,
-        } => input_tx
-            .send(CoreInput::UserMessage {
-                session_id,
-                content,
-            })
-            .await
-            .map_err(|_| SchedulerError::Closed),
-        ScheduledAction::SpawnSession {
-            parent_id,
-            task,
-            system_prompt,
             cadence,
         } => {
             if let Some(cadence) = cadence {
                 pending.push(QueuedCommand {
                     execute_at: queued.execute_at + cadence,
                     sequence: *next_sequence,
-                    action: ScheduledAction::SpawnSession {
-                        parent_id,
-                        task: task.clone(),
-                        system_prompt: system_prompt.clone(),
+                    action: ScheduledAction::UserMessage {
+                        session_id,
+                        content: content.clone(),
                         cadence: Some(cadence),
                     },
                 });
                 *next_sequence += 1;
             }
 
-            let (reply_tx, _reply_rx) = oneshot::channel();
             input_tx
-                .send(CoreInput::SpawnSession {
-                    parent_id,
-                    child_id: SessionId::new(),
-                    task,
-                    system_prompt,
-                    prompt_behavior: PermissionPromptBehavior::Background,
-                    permission_rules: crate::permission::PermissionRuleSet::default(),
-                    inheritance: InheritanceFlags::default(),
-                    reply: reply_tx,
+                .send(CoreInput::UserMessage {
+                    session_id,
+                    content,
                 })
                 .await
                 .map_err(|_| SchedulerError::Closed)
@@ -385,15 +342,20 @@ mod tests {
         let session_three = SessionId::new();
 
         handle
-            .schedule_user_message(session_two, "later".into(), Duration::from_secs(30))
+            .schedule_user_message(session_two, "later".into(), Duration::from_secs(30), None)
             .await
             .unwrap();
         handle
-            .schedule_user_message(session_one, "first".into(), Duration::from_secs(10))
+            .schedule_user_message(session_one, "first".into(), Duration::from_secs(10), None)
             .await
             .unwrap();
         handle
-            .schedule_user_message(session_three, "second".into(), Duration::from_secs(10))
+            .schedule_user_message(
+                session_three,
+                "second".into(),
+                Duration::from_secs(10),
+                None,
+            )
             .await
             .unwrap();
 
@@ -439,16 +401,15 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn recurring_spawn_reschedules_from_launch_time() {
+    async fn recurring_user_message_reschedules_from_launch_time() {
         let (input_tx, mut input_rx) = mpsc::channel(16);
         let (handle, task) = spawn_scheduler(input_tx);
-        let parent_id = SessionId::new();
+        let session_id = SessionId::new();
 
         handle
-            .schedule_spawn_session(
-                parent_id,
+            .schedule_user_message(
+                session_id,
                 "recurring".into(),
-                Some("system".into()),
                 Duration::from_secs(10),
                 Some(Duration::from_secs(5)),
             )
@@ -458,19 +419,21 @@ mod tests {
         tokio::time::advance(Duration::from_secs(10)).await;
         assert!(matches!(
             input_rx.recv().await.unwrap(),
-            CoreInput::SpawnSession {
-                prompt_behavior: PermissionPromptBehavior::Background,
-                ..
+            CoreInput::UserMessage {
+                session_id: current_session_id,
+                content,
             }
+                if current_session_id == session_id && content == "recurring"
         ));
 
         tokio::time::advance(Duration::from_secs(6)).await;
         assert!(matches!(
             input_rx.recv().await.unwrap(),
-            CoreInput::SpawnSession {
-                prompt_behavior: PermissionPromptBehavior::Background,
-                ..
+            CoreInput::UserMessage {
+                session_id: current_session_id,
+                content,
             }
+                if current_session_id == session_id && content == "recurring"
         ));
 
         handle.shutdown().await.unwrap();
@@ -524,7 +487,7 @@ mod tests {
         let session_id = SessionId::new();
 
         handle
-            .schedule_user_message(session_id, "later".into(), Duration::from_secs(30))
+            .schedule_user_message(session_id, "later".into(), Duration::from_secs(30), None)
             .await
             .unwrap();
         handle.shutdown().await.unwrap();

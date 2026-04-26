@@ -9,6 +9,7 @@ use tokio::sync::Mutex;
 
 use crate::client::IpcClient;
 use crate::context_debug::{fetch_session_context, SessionContextSnapshot};
+use crate::duration::parse_duration_literal;
 use crate::run::{self, OneshotOutput, OneshotProgressEvent, RunOneshotOptions};
 use crate::session::{create_session, create_slash_skill_session};
 use crate::slash_command::{parse_slash_command, SlashCommand};
@@ -1519,8 +1520,8 @@ impl TelegramBot {
                     return Ok(());
                 };
                 let params = serde_json::json!({
-                    "parent_id": session_id,
-                    "task": request,
+                    "session_id": session_id,
+                    "content": request,
                     "delay_secs": delay_secs,
                     "cadence_secs": cadence_secs,
                 });
@@ -1906,31 +1907,11 @@ fn parse_loop_arguments(arguments: &str) -> Result<(String, Duration, Option<Dur
         );
     }
 
-    let duration = parse_duration(duration_text)?;
+    let duration = parse_duration_literal(duration_text)?;
     match mode {
         "every" => Ok((request, Duration::ZERO, Some(duration))),
         "in" => Ok((request, duration, None)),
         _ => Err("Usage: /loop every <duration> <message> | /loop in <duration> <message>".into()),
-    }
-}
-
-fn parse_duration(input: &str) -> Result<Duration, String> {
-    if input.is_empty() {
-        return Err("Duration cannot be empty".into());
-    }
-    let split_at = input
-        .find(|c: char| !c.is_ascii_digit())
-        .ok_or_else(|| "Duration must include a unit like s, m, h, or d".to_string())?;
-    let (value, unit) = input.split_at(split_at);
-    let amount = value
-        .parse::<u64>()
-        .map_err(|_| format!("Invalid duration value: {input}"))?;
-    match unit {
-        "s" => Ok(Duration::from_secs(amount)),
-        "m" => Ok(Duration::from_secs(amount * 60)),
-        "h" => Ok(Duration::from_secs(amount * 60 * 60)),
-        "d" => Ok(Duration::from_secs(amount * 60 * 60 * 24)),
-        _ => Err(format!("Unsupported duration unit: {unit}")),
     }
 }
 
