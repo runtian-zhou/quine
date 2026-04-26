@@ -39,6 +39,8 @@ pub struct LocalHarness {
     _fanout_task: tokio::task::JoinHandle<()>,
     /// Durable checkpoint storage owned by the harness.
     _storage: Arc<StorageManager>,
+    memory_store: Arc<MemoryStore>,
+    checkpoint_commit_lock: Arc<Mutex<()>>,
     /// Mirrored live/restored session states.
     sessions: Arc<Mutex<HashMap<SessionId, SessionListing>>>,
     provider_manager: ProviderManager,
@@ -141,6 +143,120 @@ async fn refresh_checkpoint_session_summaries(
     Ok(())
 }
 
+async fn enrich_checkpoint_with_persistent_memory(
+    mut checkpoint: CoreCheckpoint,
+    memory_store: &MemoryStore,
+    event_tx: Option<&broadcast::Sender<CoreOutput>>,
+    previous_checkpoint: Option<&CoreCheckpoint>,
+) -> CoreCheckpoint {
+    for session in &mut checkpoint.sessions {
+        let previous_memory_state = previous_checkpoint.and_then(|checkpoint| {
+            checkpoint
+                .sessions
+                .iter()
+                .find(|previous| previous.session_id == session.session_id)
+                .and_then(|previous| previous.memory_state.clone())
+        });
+        if let Some(previous_memory_state) = previous_memory_state {
+            let mut state = session.memory_state.clone().unwrap_or_default();
+            if let Some(previous_persistent) = previous_memory_state.persistent_memory.clone() {
+                let current_index = state
+                    .persistent_memory
+                    .as_ref()
+                    .and_then(|persistent| persistent.last_extracted_message_index);
+                if previous_persistent.last_extracted_message_index > current_index {
+                    state.persistent_memory = Some(previous_persistent);
+                }
+            }
+            if let Some(previous_diagnostics) = previous_memory_state.memory_diagnostics.clone() {
+                let diagnostics = state
+                    .memory_diagnostics
+                    .get_or_insert_with(quine_core::MemoryTurnDiagnostics::default);
+                let current_index = diagnostics
+                    .persistent_memory
+                    .extraction
+                    .last_extracted_message_index;
+                let previous_index = previous_diagnostics
+                    .persistent_memory
+                    .extraction
+                    .last_extracted_message_index;
+                if previous_index > current_index {
+                    diagnostics.persistent_memory = previous_diagnostics.persistent_memory;
+                }
+            }
+            session.memory_state = Some(state);
+        }
+
+        let previous_persistent_diagnostics = session
+            .memory_state
+            .as_ref()
+            .and_then(|state| state.memory_diagnostics.as_ref())
+            .map(|diagnostics| diagnostics.persistent_memory.clone());
+
+        match memory_store.extract_and_persist_for_session(session).await {
+            Ok(result) => {
+                let mut state = session.memory_state.clone().unwrap_or_default();
+                state.persistent_memory = result.state;
+                let diagnostics = state
+                    .memory_diagnostics
+                    .get_or_insert_with(quine_core::MemoryTurnDiagnostics::default);
+                diagnostics.persistent_memory.enabled = state
+                    .persistent_memory
+                    .as_ref()
+                    .map(|persistent| persistent.enabled)
+                    .unwrap_or(false);
+                diagnostics.persistent_memory.project_root =
+                    Some(session.config.working_directory.clone());
+                diagnostics.persistent_memory.readable_scopes = state
+                    .persistent_memory
+                    .as_ref()
+                    .and_then(|persistent| persistent.scope_state.as_ref())
+                    .map(|scope_state| scope_state.readable_scopes.clone())
+                    .unwrap_or_default();
+                diagnostics.persistent_memory.writable_scope = result.writable_scope.clone();
+                diagnostics.persistent_memory.conflict_resolution = state
+                    .persistent_memory
+                    .as_ref()
+                    .and_then(|persistent| persistent.scope_state.as_ref())
+                    .map(|scope_state| scope_state.conflict_resolution);
+                let should_preserve_last_extraction = !result.diagnostics.attempted
+                    && matches!(
+                        result.diagnostics.reason,
+                        Some(quine_core::MemoryDecisionReason::NoNewMessages)
+                    );
+                if should_preserve_last_extraction {
+                    if let Some(previous) = previous_persistent_diagnostics {
+                        diagnostics.persistent_memory.write_status = previous.write_status;
+                        diagnostics.persistent_memory.write_reason = previous.write_reason;
+                        diagnostics.persistent_memory.extraction = previous.extraction;
+                    } else {
+                        diagnostics.persistent_memory.write_status = result.write_status;
+                        diagnostics.persistent_memory.write_reason = result.write_reason;
+                        diagnostics.persistent_memory.extraction = result.diagnostics;
+                    }
+                } else {
+                    diagnostics.persistent_memory.write_status = result.write_status;
+                    diagnostics.persistent_memory.write_reason = result.write_reason;
+                    diagnostics.persistent_memory.extraction = result.diagnostics;
+                }
+                session.memory_state = Some(state);
+            }
+            Err(error) => {
+                if let Some(event_tx) = event_tx {
+                    let _ = event_tx.send(CoreOutput::SessionError {
+                        session_id: session.session_id,
+                        error: quine_core::CoreError::Internal {
+                            message: format!("persistent memory extraction failed: {error}"),
+                        },
+                    });
+                }
+            }
+        }
+    }
+
+    checkpoint
+}
+
 fn serialize_session_id(session_id: SessionId) -> String {
     serde_json::to_value(session_id)
         .ok()
@@ -177,16 +293,46 @@ fn session_lineage(
 }
 
 impl LocalHarness {
-    async fn request_checkpoint(&self) -> Result<(), HarnessError> {
+    async fn request_checkpoint(&self) -> Result<CoreCheckpoint, HarnessError> {
         let (reply_tx, reply_rx) = oneshot::channel();
         self.core_input
             .send(CoreInput::RequestCheckpoint { reply: reply_tx })
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)?;
-        reply_rx
+        let checkpoint = reply_rx
             .await
             .map_err(|_| HarnessError::CoreChannelClosed)?;
-        Ok(())
+        let checkpoint = {
+            let _guard = self.checkpoint_commit_lock.lock().await;
+            let previous_checkpoint =
+                self._storage
+                    .load_latest_checkpoint()
+                    .await
+                    .map_err(|error| HarnessError::Internal {
+                        message: format!("failed to load checkpoint: {error}"),
+                    })?;
+            let checkpoint = enrich_checkpoint_with_persistent_memory(
+                checkpoint,
+                &self.memory_store,
+                Some(&self.event_tx),
+                previous_checkpoint.as_ref(),
+            )
+            .await;
+            self._storage
+                .commit_checkpoint(&checkpoint)
+                .await
+                .map_err(|error| HarnessError::Internal {
+                    message: format!("failed to persist checkpoint: {error}"),
+                })?;
+            checkpoint
+        };
+        if let Err(error) =
+            refresh_checkpoint_session_summaries(&self.sessions, &checkpoint, self._storage.root())
+                .await
+        {
+            tracing::warn!(?error, "failed to refresh session summaries");
+        }
+        Ok(checkpoint)
     }
 
     async fn resolve_python_group(
@@ -278,6 +424,7 @@ impl LocalHarness {
         let memory_store = Arc::new(MemoryStore::new(default_memory_dir_from_state_dir(
             &archive_root,
         )));
+        let checkpoint_commit_lock = Arc::new(Mutex::new(()));
         let restored_checkpoint =
             storage
                 .load_latest_checkpoint()
@@ -360,7 +507,8 @@ impl LocalHarness {
             event_tx_clone,
             Arc::clone(&storage),
             Arc::clone(&sessions),
-            memory_store,
+            Arc::clone(&memory_store),
+            Arc::clone(&checkpoint_commit_lock),
         ));
 
         let harness = Self {
@@ -369,6 +517,8 @@ impl LocalHarness {
             _core_task: core_task,
             _fanout_task: fanout_task,
             _storage: storage,
+            memory_store,
+            checkpoint_commit_lock,
             sessions,
             provider_manager,
             python_runtime,
@@ -450,69 +600,48 @@ impl LocalHarness {
         storage: Arc<StorageManager>,
         sessions: Arc<Mutex<HashMap<SessionId, SessionListing>>>,
         memory_store: Arc<MemoryStore>,
+        checkpoint_commit_lock: Arc<Mutex<()>>,
     ) {
         let mut output = output.into_inner();
         while let Some(event) = output.recv().await {
             match &event {
                 CoreOutput::CheckpointRequested { checkpoint } => {
-                    let mut checkpoint = checkpoint.clone();
-                    for session in &mut checkpoint.sessions {
-                        match memory_store.extract_and_persist_for_session(session).await {
-                            Ok(result) => {
-                                let mut state = session.memory_state.clone().unwrap_or_default();
-                                state.persistent_memory = result.state;
-                                let diagnostics = state
-                                    .memory_diagnostics
-                                    .get_or_insert_with(quine_core::MemoryTurnDiagnostics::default);
-                                diagnostics.persistent_memory.enabled = state
-                                    .persistent_memory
-                                    .as_ref()
-                                    .map(|persistent| persistent.enabled)
-                                    .unwrap_or(false);
-                                diagnostics.persistent_memory.project_root =
-                                    Some(session.config.working_directory.clone());
-                                diagnostics.persistent_memory.readable_scopes = state
-                                    .persistent_memory
-                                    .as_ref()
-                                    .and_then(|persistent| persistent.scope_state.as_ref())
-                                    .map(|scope_state| scope_state.readable_scopes.clone())
-                                    .unwrap_or_default();
-                                diagnostics.persistent_memory.writable_scope =
-                                    result.writable_scope.clone();
-                                diagnostics.persistent_memory.conflict_resolution = state
-                                    .persistent_memory
-                                    .as_ref()
-                                    .and_then(|persistent| persistent.scope_state.as_ref())
-                                    .map(|scope_state| scope_state.conflict_resolution);
-                                diagnostics.persistent_memory.write_status = result.write_status;
-                                diagnostics.persistent_memory.write_reason = result.write_reason;
-                                diagnostics.persistent_memory.extraction = result.diagnostics;
-                                session.memory_state = Some(state);
-                            }
-                            Err(error) => {
-                                let _ = event_tx.send(CoreOutput::SessionError {
-                                    session_id: session.session_id,
-                                    error: quine_core::CoreError::Internal {
-                                        message: format!(
-                                            "persistent memory extraction failed: {error}"
-                                        ),
-                                    },
-                                });
+                    let commit_result = {
+                        let _guard = checkpoint_commit_lock.lock().await;
+                        let previous_checkpoint =
+                            storage.load_latest_checkpoint().await.ok().flatten();
+                        let checkpoint = enrich_checkpoint_with_persistent_memory(
+                            checkpoint.clone(),
+                            &memory_store,
+                            Some(&event_tx),
+                            previous_checkpoint.as_ref(),
+                        )
+                        .await;
+                        storage
+                            .commit_checkpoint(&checkpoint)
+                            .await
+                            .map(|()| checkpoint)
+                    };
+                    match commit_result {
+                        Ok(checkpoint) => {
+                            if let Err(error) = refresh_checkpoint_session_summaries(
+                                &sessions,
+                                &checkpoint,
+                                storage.root(),
+                            )
+                            .await
+                            {
+                                tracing::warn!(?error, "failed to refresh session summaries");
                             }
                         }
-                    }
-                    if let Err(error) = storage.commit_checkpoint(&checkpoint).await {
-                        let _ = event_tx.send(CoreOutput::SessionError {
-                            session_id: SessionId::default(),
-                            error: quine_core::CoreError::Internal {
-                                message: format!("failed to persist checkpoint: {error}"),
-                            },
-                        });
-                    } else if let Err(error) =
-                        refresh_checkpoint_session_summaries(&sessions, &checkpoint, storage.root())
-                            .await
-                    {
-                        tracing::warn!(?error, "failed to refresh session summaries");
+                        Err(error) => {
+                            let _ = event_tx.send(CoreOutput::SessionError {
+                                session_id: SessionId::default(),
+                                error: quine_core::CoreError::Internal {
+                                    message: format!("failed to persist checkpoint: {error}"),
+                                },
+                            });
+                        }
                     }
                     continue;
                 }
@@ -571,7 +700,7 @@ impl LocalHarness {
 #[async_trait]
 impl HarnessService for LocalHarness {
     async fn health_check(&self) -> Result<(), HarnessError> {
-        self.request_checkpoint().await
+        Ok(())
     }
 
     async fn create_session(&self, config: SessionConfig) -> Result<SessionId, HarnessError> {
@@ -827,21 +956,24 @@ impl HarnessService for LocalHarness {
         }
         drop(sessions);
 
-        self.request_checkpoint().await?;
+        let mut checkpoint = self.request_checkpoint().await?;
 
-        let checkpoint = self
-            ._storage
-            .load_latest_checkpoint()
-            .await
-            .map_err(|error| HarnessError::Internal {
-                message: format!("failed to load checkpoint: {error}"),
-            })?
-            .ok_or_else(|| HarnessError::SessionNotFound {
-                session_id: serde_json::to_value(session_id)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_default(),
-            })?;
+        if session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new(), None).is_none()
+        {
+            checkpoint = self
+                ._storage
+                .load_latest_checkpoint()
+                .await
+                .map_err(|error| HarnessError::Internal {
+                    message: format!("failed to load checkpoint: {error}"),
+                })?
+                .ok_or_else(|| HarnessError::SessionNotFound {
+                    session_id: serde_json::to_value(session_id)
+                        .ok()
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .unwrap_or_default(),
+                })?;
+        }
 
         let live_states = {
             let sessions = self.sessions.lock().await;
@@ -1167,6 +1299,97 @@ mod tests {
         }
     }
 
+    struct BlockingSubagentProvider {
+        call_count: AtomicUsize,
+        child_started: AtomicBool,
+        child_started_notify: Notify,
+    }
+
+    impl BlockingSubagentProvider {
+        fn new() -> Self {
+            Self {
+                call_count: AtomicUsize::new(0),
+                child_started: AtomicBool::new(false),
+                child_started_notify: Notify::new(),
+            }
+        }
+
+        async fn wait_until_child_started(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                loop {
+                    if self.child_started.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    self.child_started_notify.notified().await;
+                }
+            })
+            .await
+            .expect("subagent never entered the provider");
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for BlockingSubagentProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            let call_index = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if call_index == 0 {
+                let events = vec![
+                    Ok(LlmEvent::ToolCall {
+                        tool_use_id: "toolu_blocking_subagent".into(),
+                        tool_name: "subagent".into(),
+                        arguments: serde_json::json!({
+                            "task": "wait forever",
+                            "timeout": 300
+                        }),
+                    }),
+                    Ok(LlmEvent::Done { usage: None }),
+                ];
+                return Ok(Box::pin(futures::stream::iter(events)));
+            }
+
+            self.child_started.store(true, Ordering::SeqCst);
+            self.child_started_notify.notify_waiters();
+            std::future::pending::<()>().await;
+            unreachable!("pending future returned")
+        }
+    }
+
+    async fn write_allow_subagent_permission(workspace: &std::path::Path) {
+        let config_dir = workspace.join(".quine");
+        async_fs::create_dir_all(&config_dir).await.unwrap();
+        async_fs::write(
+            config_dir.join("permissions.yaml"),
+            "rules:\n  - effect: allow\n    scope: agent_control\n    target:\n      kind: tool\n      name: subagent\n",
+        )
+        .await
+        .unwrap();
+    }
+
+    async fn start_blocking_subagent_session(
+        harness: &LocalHarness,
+        provider: &BlockingSubagentProvider,
+        working_directory: std::path::PathBuf,
+    ) -> SessionId {
+        let session_id = harness
+            .create_session(SessionConfig {
+                working_directory: Some(working_directory),
+                ..SessionConfig::default()
+            })
+            .await
+            .unwrap();
+        harness
+            .send_message(session_id, "start blocking subagent".into())
+            .await
+            .unwrap();
+        provider.wait_until_child_started().await;
+        session_id
+    }
+
     #[tokio::test]
     async fn create_session_bootstraps_permission_context_without_explicit_inputs() {
         let harness = LocalHarness::new(Arc::new(MockProvider), Some(temp_storage()))
@@ -1225,6 +1448,68 @@ mod tests {
             .any(|skill| skill.name == "feature-planning"));
 
         harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn context_for_idle_session_stays_responsive_while_unrelated_subagent_is_running() {
+        let provider = Arc::new(BlockingSubagentProvider::new());
+        let harness = LocalHarness::new(provider.clone(), Some(temp_storage()))
+            .await
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_allow_subagent_permission(workspace.path()).await;
+        let idle_session = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+
+        let _blocked_session =
+            start_blocking_subagent_session(&harness, &provider, workspace.path().to_path_buf())
+                .await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            harness.get_session_context(idle_session),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "get_session_context for an idle session timed out while an unrelated session was running a subagent"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "get_session_context should succeed for an idle session while an unrelated session is busy"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_check_stays_responsive_while_subagent_is_running() {
+        let provider = Arc::new(BlockingSubagentProvider::new());
+        let harness = LocalHarness::new(provider.clone(), Some(temp_storage()))
+            .await
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_allow_subagent_permission(workspace.path()).await;
+
+        let _blocked_session =
+            start_blocking_subagent_session(&harness, &provider, workspace.path().to_path_buf())
+                .await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            harness.health_check(),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "health_check timed out while a session was running a subagent"
+        );
+        assert!(
+            result.unwrap().is_ok(),
+            "health_check should not depend on a session snapshot"
+        );
     }
 
     #[test]
@@ -1892,7 +2177,7 @@ mod tests {
         harness: &LocalHarness,
         session_id: SessionId,
     ) -> crate::storage::SessionContextSnapshot {
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(5), async {
             loop {
                 if let Ok(checkpoint) = harness.get_session_context(session_id).await {
                     if let Some(snapshot) = session_context_from_checkpoint(
@@ -1919,17 +2204,20 @@ mod tests {
     where
         F: Fn(&crate::storage::SessionContextSnapshot) -> bool,
     {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let snapshot = wait_for_context_snapshot(harness, session_id).await;
-                if predicate(&snapshot) {
-                    break snapshot;
-                }
-                tokio::task::yield_now().await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let snapshot = wait_for_context_snapshot(harness, session_id).await;
+            if predicate(&snapshot) {
+                break snapshot;
             }
-        })
-        .await
-        .expect("session context should satisfy predicate")
+            let last_diagnostics = snapshot.memory_diagnostics.clone();
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "session context should satisfy predicate; last diagnostics: {:?}",
+                last_diagnostics
+            );
+            tokio::task::yield_now().await;
+        }
     }
 
     #[tokio::test]

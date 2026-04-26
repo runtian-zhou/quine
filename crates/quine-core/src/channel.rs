@@ -176,8 +176,10 @@ pub enum CoreInput {
         reply: oneshot::Sender<Option<String>>,
     },
 
-    /// Persist and acknowledge a fresh checkpoint of the current core state.
-    RequestCheckpoint { reply: oneshot::Sender<()> },
+    /// Persist and return a fresh checkpoint of the current core state.
+    RequestCheckpoint {
+        reply: oneshot::Sender<CoreCheckpoint>,
+    },
 
     /// Internal signal that a background session-memory refresh has finished.
     SessionMemoryRefreshFinished {
