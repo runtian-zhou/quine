@@ -3091,8 +3091,8 @@ async fn execute_tool_call(
                         return ToolOutcome::Cancelled;
                     }
                     Some(CoreInput::RequestCheckpoint { reply }) => {
-                        emit_checkpoint_request(sessions, engine.session_tree, io.output).await;
-                        let _ = reply.send(());
+                        let checkpoint = snapshot_sessions(sessions, engine.session_tree).await;
+                        let _ = reply.send(checkpoint);
                     }
                     Some(other) => io.deferred_inputs.push_back(other),
                     None => {
@@ -5888,6 +5888,20 @@ impl SessionActor {
                             Err(join_err) => ToolOutcome::Error { message: format!("tool task panicked: {join_err}") },
                         };
                     }
+                    maybe_command = self.command_rx.recv() => {
+                        match maybe_command {
+                            Some(command) => {
+                                if self.handle_control_command(command).await {
+                                    break 'tool_loop ToolOutcome::Cancelled;
+                                }
+                            }
+                            None => {
+                                break 'tool_loop ToolOutcome::Error {
+                                    message: "input channel closed during interactive execution".into(),
+                                };
+                            }
+                        }
+                    }
                     interaction = req_rx.recv() => {
                         if let Some((request, reply_tx)) = interaction {
                             let _ = self.output.send(CoreOutput::InteractionNeeded {
@@ -6587,8 +6601,8 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         let _ = reply.send(result);
                     }
                     CoreInput::RequestCheckpoint { reply } => {
-                        emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
-                        let _ = reply.send(());
+                        let checkpoint = snapshot_registry_sessions(&registry, &session_tree).await;
+                        let _ = reply.send(checkpoint);
                     }
                     CoreInput::WaitSession { parent_id, child_id, reply, non_blocking, timeout: _ } => {
                         let tree = session_tree.read().await;
@@ -6869,6 +6883,48 @@ mod tests {
             provider,
             max_context_window: None,
             model_profile: None,
+        }
+    }
+
+    async fn wait_for_test_files(paths: &[&std::path::Path], description: &str) {
+        let deadline = tokio::time::Instant::now() + TokioDuration::from_secs(5);
+        loop {
+            let missing = paths
+                .iter()
+                .filter(|path| !path.exists())
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>();
+            if missing.is_empty() {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {description}; missing: {}",
+                missing.join(", ")
+            );
+            tokio::time::sleep(TokioDuration::from_millis(50)).await;
+        }
+    }
+
+    async fn wait_for_summary_metadata_index(
+        path: &std::path::Path,
+        minimum_index: usize,
+        description: &str,
+    ) {
+        let deadline = tokio::time::Instant::now() + TokioDuration::from_secs(5);
+        let mut last_observed = None;
+        loop {
+            if let Ok(metadata) = load_summary_metadata(path) {
+                last_observed = Some(metadata.last_summarized_message_index);
+                if metadata.last_summarized_message_index >= minimum_index {
+                    return;
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for {description}; last observed metadata index: {last_observed:?}"
+            );
+            tokio::time::sleep(TokioDuration::from_millis(50)).await;
         }
     }
 
@@ -10020,7 +10076,6 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             }
         }
 
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
         let summary_path = temp
             .path()
             .join("sessions")
@@ -10033,6 +10088,11 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .join(session_id.to_string())
             .join("session-memory")
             .join("summary.meta.json");
+        wait_for_test_files(
+            &[summary_path.as_path(), metadata_path.as_path()],
+            "session memory foundation files",
+        )
+        .await;
         assert!(summary_path.exists(), "summary file should exist");
         assert!(metadata_path.exists(), "summary metadata should exist");
         let summary = std::fs::read_to_string(&summary_path).unwrap();
@@ -10115,17 +10175,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 .send(CoreInput::RequestCheckpoint { reply: reply_tx })
                 .await
                 .unwrap();
-            reply_rx.await.unwrap();
-
-            let checkpoint = loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(1), harness.output.recv())
-                    .await
-                {
-                    Ok(Some(CoreOutput::CheckpointRequested { checkpoint })) => break checkpoint,
-                    Ok(Some(_)) => {}
-                    other => panic!("unexpected event while waiting for checkpoint: {other:?}"),
-                }
-            };
+            let checkpoint = reply_rx.await.unwrap();
 
             let persisted = checkpoint
                 .sessions
@@ -10189,7 +10239,14 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         reply_rx.await.unwrap().unwrap();
         let _ = harness.output.recv().await.unwrap();
 
-        for content in ["LIVE ROUND 1", "LIVE ROUND 2"] {
+        let metadata_path = temp
+            .path()
+            .join("sessions")
+            .join(session_id.to_string())
+            .join("session-memory")
+            .join("summary.meta.json");
+
+        for (index, content) in ["LIVE ROUND 1", "LIVE ROUND 2"].into_iter().enumerate() {
             harness
                 .input
                 .send(CoreInput::UserMessage {
@@ -10207,15 +10264,15 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     other => panic!("unexpected event while waiting for TurnComplete: {other:?}"),
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            let minimum_index = if index == 0 { 1 } else { 4 };
+            wait_for_summary_metadata_index(
+                &metadata_path,
+                minimum_index,
+                "session memory refresh metadata to advance",
+            )
+            .await;
         }
 
-        let metadata_path = temp
-            .path()
-            .join("sessions")
-            .join(session_id.to_string())
-            .join("session-memory")
-            .join("summary.meta.json");
         let metadata = load_summary_metadata(&metadata_path).unwrap();
         assert!(metadata.last_summarized_message_index >= 4);
 
@@ -10280,7 +10337,6 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     other => panic!("unexpected event while waiting for TurnComplete: {other:?}"),
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
             harness.input.send(CoreInput::Shutdown).await.unwrap();
             loop_handle.await.unwrap();
         }
@@ -10292,6 +10348,11 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .join("session-memory");
         let summary_path = summary_dir.join("summary.md");
         let metadata_path = summary_dir.join("summary.meta.json");
+        wait_for_test_files(
+            &[summary_path.as_path(), metadata_path.as_path()],
+            "session memory files before restore",
+        )
+        .await;
         std::fs::remove_file(&summary_path).unwrap();
         std::fs::remove_file(&metadata_path).unwrap();
 
@@ -10371,7 +10432,11 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 other => panic!("unexpected event while waiting for TurnComplete: {other:?}"),
             }
         }
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        wait_for_test_files(
+            &[summary_path.as_path(), metadata_path.as_path()],
+            "session memory files after restore",
+        )
+        .await;
         assert!(summary_path.exists(), "summary file should be recreated");
         assert!(metadata_path.exists(), "metadata file should be recreated");
 
