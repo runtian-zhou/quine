@@ -26,7 +26,9 @@ use serde::Deserialize;
 
 use crate::client::IpcClient;
 use crate::context_debug::fetch_session_context;
-use crate::interaction::{maybe_auto_approve, prompt as interaction_prompt};
+use crate::interaction::{
+    maybe_auto_approve, prompt as interaction_prompt, session_id as interaction_session_id,
+};
 use crate::ps::{format_session_summary, prepend_summary};
 use crate::run::fetch_available_skills;
 use crate::session::{
@@ -474,6 +476,11 @@ async fn run_event_loop(
             maybe_notif = client.recv_notification() => {
                 match maybe_notif {
                     Some(notif) => {
+                        if interaction_session_id(&notif)
+                            .is_some_and(|session_id| session_id != app.session_id.as_str())
+                        {
+                            continue;
+                        }
                         if notif.method == notifications::INTERACTION_NEEDED
                             && maybe_auto_approve(client, &app.session_id, &notif, auto_approve).await?
                         {

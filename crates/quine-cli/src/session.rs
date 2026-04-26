@@ -2,6 +2,7 @@ use crate::client::IpcClient;
 use quine_harness::protocol::methods;
 use quine_harness::PermissionPromptBehavior;
 use quine_llm::Message;
+use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ResumeTarget {
@@ -15,14 +16,20 @@ pub(crate) struct CreatedSession {
     pub(crate) max_context_window: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
+struct SessionCreateOptions<'a> {
+    working_directory: Option<&'a Path>,
+    model_profile: Option<&'a str>,
+    session_group: Option<&'a str>,
+}
+
 fn build_session_params(
     skills: &[String],
     plan_mode: bool,
     prompt_behavior: PermissionPromptBehavior,
     initial_messages: &[Message],
     system_prompt: Option<String>,
-    model_profile: Option<&str>,
-    session_group: Option<&str>,
+    options: SessionCreateOptions<'_>,
 ) -> Option<serde_json::Value> {
     let mut session_params = serde_json::json!({});
     if !skills.is_empty() {
@@ -30,6 +37,10 @@ fn build_session_params(
     }
     if let Some(system_prompt) = system_prompt {
         session_params["system_prompt"] = serde_json::json!(system_prompt);
+    }
+    if let Some(working_directory) = options.working_directory {
+        session_params["working_directory"] =
+            serde_json::json!(working_directory.to_string_lossy().to_string());
     }
     if plan_mode {
         session_params["plan_mode"] = serde_json::json!(true);
@@ -42,10 +53,10 @@ fn build_session_params(
         session_params["initial_messages"] =
             serde_json::to_value(initial_messages).expect("initial messages should serialize");
     }
-    if let Some(model_profile) = model_profile {
+    if let Some(model_profile) = options.model_profile {
         session_params["model_profile"] = serde_json::json!(model_profile);
     }
-    if let Some(session_group) = session_group {
+    if let Some(session_group) = options.session_group {
         session_params["session_group"] = serde_json::json!(session_group);
     }
 
@@ -57,6 +68,7 @@ pub(crate) fn build_create_session_params(
     plan_mode: bool,
     prompt_behavior: PermissionPromptBehavior,
     initial_messages: &[Message],
+    working_directory: Option<&Path>,
     model_profile: Option<&str>,
     session_group: Option<&str>,
 ) -> Option<serde_json::Value> {
@@ -66,8 +78,11 @@ pub(crate) fn build_create_session_params(
         prompt_behavior,
         initial_messages,
         None,
-        model_profile,
-        session_group,
+        SessionCreateOptions {
+            working_directory,
+            model_profile,
+            session_group,
+        },
     )
 }
 
@@ -156,6 +171,7 @@ pub(crate) async fn create_slash_skill_session(
     request: &str,
 ) -> anyhow::Result<CreatedSession> {
     let skills = [skill_name.to_string()];
+    let working_directory = std::env::current_dir().ok();
     let result = client
         .call(
             methods::CREATE_SESSION,
@@ -165,8 +181,11 @@ pub(crate) async fn create_slash_skill_session(
                 PermissionPromptBehavior::Interactive,
                 &[],
                 slash_skill_arguments_overlay(request),
-                None,
-                None,
+                SessionCreateOptions {
+                    working_directory: working_directory.as_deref(),
+                    model_profile: None,
+                    session_group: None,
+                },
             ),
         )
         .await?;
@@ -204,6 +223,7 @@ pub(crate) async fn create_session_with_initial_messages(
     model_profile: Option<&str>,
     session_group: Option<&str>,
 ) -> anyhow::Result<CreatedSession> {
+    let working_directory = std::env::current_dir().ok();
     let result = client
         .call(
             methods::CREATE_SESSION,
@@ -212,6 +232,7 @@ pub(crate) async fn create_session_with_initial_messages(
                 plan_mode,
                 prompt_behavior,
                 initial_messages,
+                working_directory.as_deref(),
                 model_profile,
                 session_group,
             ),
@@ -281,6 +302,7 @@ pub(crate) async fn set_session_model_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn build_create_session_params_includes_plan_mode() {
@@ -289,6 +311,7 @@ mod tests {
             true,
             PermissionPromptBehavior::Interactive,
             &[],
+            None,
             None,
             None,
         )
@@ -313,6 +336,7 @@ mod tests {
                 &[],
                 None,
                 None,
+                None,
             ),
             None
         );
@@ -325,6 +349,7 @@ mod tests {
             false,
             PermissionPromptBehavior::Headless,
             &[],
+            None,
             None,
             None,
         )
@@ -345,6 +370,7 @@ mod tests {
             false,
             PermissionPromptBehavior::Interactive,
             &[],
+            None,
             Some("claude-sonnet"),
             None,
         )
@@ -354,6 +380,27 @@ mod tests {
             params,
             serde_json::json!({
                 "model_profile": "claude-sonnet"
+            })
+        );
+    }
+
+    #[test]
+    fn build_create_session_params_includes_working_directory() {
+        let params = build_create_session_params(
+            &[],
+            false,
+            PermissionPromptBehavior::Interactive,
+            &[],
+            Some(Path::new("/tmp/project")),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            params,
+            serde_json::json!({
+                "working_directory": "/tmp/project"
             })
         );
     }
