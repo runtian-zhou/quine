@@ -18,7 +18,7 @@ It then creates a GitHub release containing:
 
 - platform tarballs for `quine`
 - `SHA256SUMS`
-- `quine.rb`, a Homebrew formula template pinned to that exact release
+- `quine.rb`, a Homebrew formula template pinned to that exact tagged git revision
 - an updated [`Formula/quine.rb`](../Formula/quine.rb) committed back to the default branch for stable releases
 
 ## Update a Homebrew tap
@@ -29,6 +29,8 @@ This repository can act as its own tap. Because the repository is named `quine` 
 brew tap runtian-zhou/quine https://github.com/runtian-zhou/quine
 brew install quine
 ```
+
+The formula builds `quine` from source from the tagged git revision rather than downloading a release binary asset. This avoids the private-release-asset download problem and keeps the installed binary aligned with the tagged source.
 
 Homebrew's one-argument shorthand:
 
