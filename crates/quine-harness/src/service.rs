@@ -17,6 +17,9 @@ use crate::error::HarnessError;
 /// events to subscribers.
 #[async_trait]
 pub trait HarnessService: Send + Sync {
+    /// Confirm the harness core loop is responsive.
+    async fn health_check(&self) -> Result<(), HarnessError>;
+
     /// Create a new agent session and return its ID.
     async fn create_session(&self, config: SessionConfig) -> Result<SessionId, HarnessError>;
 
@@ -96,7 +99,7 @@ pub trait HarnessService: Send + Sync {
     async fn spawn_child_session(
         &self,
         _parent_id: Option<SessionId>,
-        _task: String,
+        _task: Option<String>,
         _system_prompt: Option<String>,
     ) -> Result<SessionId, HarnessError> {
         Err(HarnessError::Internal {

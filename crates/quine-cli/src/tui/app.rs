@@ -2462,6 +2462,8 @@ mod tests {
                 description: "Review changes".into(),
                 version: "1.0".into(),
                 system_prompt: Some("Review carefully".into()),
+                system_prompt_char_count: 16,
+                system_prompt_truncated: false,
                 source_path: std::path::PathBuf::from("/tmp/project/.quine/skills/review.md"),
                 tool_names: vec!["read_file".into()],
             }],

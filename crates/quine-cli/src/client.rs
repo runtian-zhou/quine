@@ -44,6 +44,10 @@ fn should_remove_stale_socket(socket_path: &Path, error: &anyhow::Error) -> bool
         )
 }
 
+fn should_replace_unhealthy_socket(socket_path: &Path) -> bool {
+    socket_path.exists()
+}
+
 /// IPC client that connects to the harness daemon via Unix domain socket.
 pub struct IpcClient {
     writer: tokio::io::WriteHalf<UnixStream>,
@@ -165,14 +169,25 @@ impl IpcClient {
                     "connected to existing daemon socket at {}",
                     socket_path.display()
                 ));
-                client.health_check().await.map_err(|error| {
-                    anyhow::anyhow!(
-                        "connected to existing daemon at {} but it did not respond to a health check: {error}",
-                        socket_path.display()
-                    )
-                })?;
-                debug_init("existing daemon health check passed");
-                return Ok((client, false));
+                match client.health_check().await {
+                    Ok(()) => {
+                        debug_init("existing daemon health check passed");
+                        return Ok((client, false));
+                    }
+                    Err(error) if should_replace_unhealthy_socket(socket_path) => {
+                        debug_init(format!(
+                            "existing daemon health check failed at {}; removing socket and relaunching: {error}",
+                            socket_path.display()
+                        ));
+                        let _ = tokio::fs::remove_file(socket_path).await;
+                    }
+                    Err(error) => {
+                        return Err(anyhow::anyhow!(
+                            "connected to existing daemon at {} but it did not respond to a health check: {error}",
+                            socket_path.display()
+                        ));
+                    }
+                }
             }
             Err(error) if should_launch_daemon(&error) => {
                 if should_remove_stale_socket(socket_path, &error) {
@@ -306,6 +321,8 @@ mod tests {
             existing_socket.path(),
             &not_found
         ));
+        assert!(should_replace_unhealthy_socket(existing_socket.path()));
+        assert!(!should_replace_unhealthy_socket(missing_socket.as_path()));
     }
 
     #[test]
