@@ -1862,33 +1862,53 @@ fn resolve_config_path(config_path: Option<&Path>) -> anyhow::Result<PathBuf> {
         return Ok(path.to_path_buf());
     }
 
-    let candidates = config_candidates();
-    for candidate in &candidates {
-        if candidate.is_file() {
-            return Ok(candidate.clone());
-        }
+    let candidates = runtime_config_candidates();
+    if let Some(path) = first_existing_config_path(&candidates) {
+        return Ok(path);
     }
 
     anyhow::bail!(
         "Telegram plugin config not found. Checked: {}",
-        candidates
-            .iter()
-            .map(|path| path.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ")
+        if candidates.is_empty() {
+            "<none>".to_string()
+        } else {
+            candidates
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
     );
 }
 
-fn config_candidates() -> Vec<PathBuf> {
-    let mut candidates = vec![PathBuf::from(".quine/plugins/telegram.toml")];
-    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+fn config_candidates(project_root: Option<&Path>, home: Option<&Path>) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(project_root) = project_root {
+        candidates.push(
+            project_root
+                .join(".quine")
+                .join("plugins")
+                .join("telegram.toml"),
+        );
+    }
+    if let Some(home) = home {
         candidates.push(home.join(".quine").join("plugins").join("telegram.toml"));
     }
     candidates
 }
 
+fn runtime_config_candidates() -> Vec<PathBuf> {
+    let project_root = std::env::current_dir().ok();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    config_candidates(project_root.as_deref(), home.as_deref())
+}
+
+fn first_existing_config_path(candidates: &[PathBuf]) -> Option<PathBuf> {
+    candidates.iter().find(|path| path.is_file()).cloned()
+}
+
 fn autostart_config_path() -> Option<PathBuf> {
-    config_candidates().into_iter().find(|path| path.is_file())
+    first_existing_config_path(&runtime_config_candidates())
 }
 
 fn parse_loop_arguments(arguments: &str) -> Result<(String, Duration, Option<Duration>), String> {
@@ -2843,6 +2863,56 @@ pub async fn run_autostart(socket_path: &Path) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use crate::run::InteractionNeededOutput;
+
+    #[test]
+    fn config_candidates_prefer_project_override_before_user_default() {
+        let candidates = config_candidates(
+            Some(Path::new("/tmp/test-project")),
+            Some(Path::new("/tmp/test-home")),
+        );
+        assert_eq!(
+            candidates,
+            vec![
+                PathBuf::from("/tmp/test-project/.quine/plugins/telegram.toml"),
+                PathBuf::from("/tmp/test-home/.quine/plugins/telegram.toml"),
+            ]
+        );
+    }
+
+    #[test]
+    fn first_existing_config_path_prefers_project_override() {
+        let project = tempfile::tempdir().expect("temp project");
+        let home = tempfile::tempdir().expect("temp home");
+        let project_plugins_dir = project.path().join(".quine").join("plugins");
+        let home_plugins_dir = home.path().join(".quine").join("plugins");
+        std::fs::create_dir_all(&project_plugins_dir).expect("create project plugins dir");
+        std::fs::create_dir_all(&home_plugins_dir).expect("create home plugins dir");
+        let project_config = project_plugins_dir.join("telegram.toml");
+        let home_config = home_plugins_dir.join("telegram.toml");
+        std::fs::write(&project_config, "allowed_user_ids = [1]\n").expect("write project config");
+        std::fs::write(&home_config, "allowed_user_ids = [2]\n").expect("write home config");
+
+        let resolved =
+            first_existing_config_path(&config_candidates(Some(project.path()), Some(home.path())))
+                .expect("resolved config path");
+        assert_eq!(resolved, project_config);
+    }
+
+    #[test]
+    fn first_existing_config_path_falls_back_to_user_default() {
+        let home = tempfile::tempdir().expect("temp home");
+        let plugins_dir = home.path().join(".quine").join("plugins");
+        std::fs::create_dir_all(&plugins_dir).expect("create plugins dir");
+        let config_path = plugins_dir.join("telegram.toml");
+        std::fs::write(&config_path, "allowed_user_ids = [1]\n").expect("write config");
+
+        let resolved = first_existing_config_path(&config_candidates(None, Some(home.path())))
+            .expect("resolved config path");
+        assert_eq!(
+            resolved,
+            PathBuf::from(home.path()).join(".quine/plugins/telegram.toml")
+        );
+    }
 
     #[test]
     fn chunk_message_splits_on_character_boundaries() {
