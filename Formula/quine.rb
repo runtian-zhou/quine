@@ -3,7 +3,7 @@ class Quine < Formula
   homepage "https://github.com/runtian-zhou/quine"
   url "https://github.com/runtian-zhou/quine.git",
       tag: "v0.2.4",
-      revision: "b5ed42ed6f8339bdfb9ad037315000df21662289"
+      revision: "d0481480a8240c865716f0095fa7df854eb8eda0"
   version "0.2.4"
   license "MIT OR Apache-2.0"
   depends_on "rust" => :build
