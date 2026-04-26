@@ -128,7 +128,7 @@ pub async fn list_sessions() -> anyhow::Result<Vec<SessionSummary>> {
     }
 
     // Sort by last_active descending.
-    summaries.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+    summaries.sort_by_key(|summary| std::cmp::Reverse(summary.last_active));
     Ok(summaries)
 }
 

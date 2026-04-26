@@ -817,10 +817,8 @@ impl App {
             match entry {
                 HistoryEntry::Text { role, text } => match role.as_str() {
                     "user" => self.push_message(ConversationEntry::User(text)),
-                    "assistant" => {
-                        if !text.is_empty() {
-                            self.push_message(ConversationEntry::AssistantText(text));
-                        }
+                    "assistant" if !text.is_empty() => {
+                        self.push_message(ConversationEntry::AssistantText(text));
                     }
                     _ => {}
                 },

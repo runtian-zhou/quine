@@ -2870,7 +2870,7 @@ async fn start_child_session(
     let inherited_python_runtime = sessions
         .get(&parent_id)
         .map(|parent| Arc::clone(&parent.python_runtime))
-        .unwrap_or_else(PythonRuntime::new);
+        .unwrap_or_default();
 
     let ctx = SessionContext::new(
         child_id,
@@ -6170,7 +6170,6 @@ pub async fn run_core_loop_with_compaction_and_web_provider_and_python_runtime(
     max_context_window: Option<u64>,
     python_runtime: Arc<PythonRuntime>,
 ) {
-    let wake_waits = Arc::new(Notify::new());
     run_core_loop_with_compaction_and_wait_notifier(
         &mut handle,
         provider,
@@ -6178,7 +6177,6 @@ pub async fn run_core_loop_with_compaction_and_web_provider_and_python_runtime(
         restored_checkpoint,
         archive_root,
         max_context_window,
-        wake_waits,
         python_runtime,
     )
     .await;
@@ -6191,7 +6189,6 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
     restored_checkpoint: Option<CoreCheckpoint>,
     archive_root: PathBuf,
     max_context_window: Option<u64>,
-    _wake_waits: Arc<Notify>,
     python_runtime: Arc<PythonRuntime>,
 ) {
     let restored_tree = restored_checkpoint
@@ -7399,8 +7396,10 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         let paths = session.session_memory.paths.clone();
         let template_version = session.session_memory.template_version;
         let refresh_handle = session.session_memory.refresh_handle.clone();
+        let (lock_ready_tx, lock_ready_rx) = tokio::sync::oneshot::channel();
         let writer = tokio::spawn(async move {
             let _guard = refresh_handle.lock.lock().await;
+            let _ = lock_ready_tx.send(());
             tokio::time::sleep(TokioDuration::from_millis(20)).await;
             std::fs::create_dir_all(&paths.directory).unwrap();
             std::fs::write(
@@ -7419,6 +7418,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             )
             .unwrap();
         });
+        lock_ready_rx.await.unwrap();
 
         compact_session_history(
             provider_dyn.as_ref(),
