@@ -1892,26 +1892,25 @@ fn autostart_config_path() -> Option<PathBuf> {
 }
 
 fn parse_loop_arguments(arguments: &str) -> Result<(String, Duration, Option<Duration>), String> {
+    const LOOP_USAGE: &str =
+        "Usage: /loop [every] <duration> <message> | /loop in <duration> <message>";
     let trimmed = arguments.trim();
     let mut parts = trimmed.split_whitespace();
-    let mode = parts.next().ok_or_else(|| {
-        "Usage: /loop every <duration> <message> | /loop in <duration> <message>".to_string()
-    })?;
-    let duration_text = parts.next().ok_or_else(|| {
-        "Usage: /loop every <duration> <message> | /loop in <duration> <message>".to_string()
-    })?;
+    let first = parts.next().ok_or_else(|| LOOP_USAGE.to_string())?;
+    let (mode, duration_text) = match first {
+        "every" | "in" => (first, parts.next().ok_or_else(|| LOOP_USAGE.to_string())?),
+        _ => ("every", first),
+    };
     let request = parts.collect::<Vec<_>>().join(" ");
     if request.is_empty() {
-        return Err(
-            "Usage: /loop every <duration> <message> | /loop in <duration> <message>".into(),
-        );
+        return Err(LOOP_USAGE.into());
     }
 
     let duration = parse_duration_literal(duration_text)?;
     match mode {
         "every" => Ok((request, Duration::ZERO, Some(duration))),
         "in" => Ok((request, duration, None)),
-        _ => Err("Usage: /loop every <duration> <message> | /loop in <duration> <message>".into()),
+        _ => Err(LOOP_USAGE.into()),
     }
 }
 
@@ -2923,6 +2922,16 @@ mod tests {
             interaction.response_text_for(&interaction.selected_indices, ""),
             "core, harness"
         );
+    }
+
+    #[test]
+    fn parse_loop_defaults_to_every() {
+        let (request, delay, cadence) =
+            parse_loop_arguments("5m check logs").expect("default recurring loop");
+
+        assert_eq!(request, "check logs");
+        assert_eq!(delay, Duration::ZERO);
+        assert_eq!(cadence, Some(Duration::from_secs(300)));
     }
 
     #[test]

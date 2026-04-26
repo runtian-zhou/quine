@@ -586,19 +586,18 @@ impl LoopCommand {
 }
 
 fn parse_loop_arguments(arguments: &str) -> Result<LoopCommand, String> {
+    const LOOP_USAGE: &str =
+        "Usage: /loop [every] <duration> <message> | /loop in <duration> <message>";
     let trimmed = arguments.trim();
     let mut parts = trimmed.split_whitespace();
-    let mode = parts.next().ok_or_else(|| {
-        "Usage: /loop every <duration> <message> | /loop in <duration> <message>".to_string()
-    })?;
-    let duration_text = parts.next().ok_or_else(|| {
-        "Usage: /loop every <duration> <message> | /loop in <duration> <message>".to_string()
-    })?;
+    let first = parts.next().ok_or_else(|| LOOP_USAGE.to_string())?;
+    let (mode, duration_text) = match first {
+        "every" | "in" => (first, parts.next().ok_or_else(|| LOOP_USAGE.to_string())?),
+        _ => ("every", first),
+    };
     let request = parts.collect::<Vec<_>>().join(" ");
     if request.is_empty() {
-        return Err(
-            "Usage: /loop every <duration> <message> | /loop in <duration> <message>".into(),
-        );
+        return Err(LOOP_USAGE.into());
     }
     let duration = parse_duration_literal(duration_text)?;
     match mode {
@@ -612,7 +611,7 @@ fn parse_loop_arguments(arguments: &str) -> Result<LoopCommand, String> {
             delay: duration,
             cadence: None,
         }),
-        _ => Err("Usage: /loop every <duration> <message> | /loop in <duration> <message>".into()),
+        _ => Err(LOOP_USAGE.into()),
     }
 }
 
@@ -3243,6 +3242,22 @@ mod tests {
     fn submit_input_loop_every_schedules_immediate_first_run() {
         let mut app = App::new("test".into(), false, None);
         app.input.set_from_string("/loop every 5m check logs");
+
+        let action = app.submit_input();
+
+        assert!(matches!(
+            action,
+            Some(AppAction::ScheduleLoop { request, delay, cadence })
+                if request == "check logs"
+                    && delay == Duration::ZERO
+                    && cadence == Some(Duration::from_secs(300))
+        ));
+    }
+
+    #[test]
+    fn submit_input_loop_defaults_to_every() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/loop 5m check logs");
 
         let action = app.submit_input();
 
