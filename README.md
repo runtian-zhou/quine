@@ -11,6 +11,8 @@ brew tap runtian-zhou/quine https://github.com/runtian-zhou/quine
 brew install quine
 ```
 
+Homebrew builds `quine` from source from the tagged git revision, so the first install can take a few minutes.
+
 Verify the install:
 
 ```bash

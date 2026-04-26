@@ -12,6 +12,7 @@ output_dir="$2"
 release_tag="${RELEASE_TAG:?RELEASE_TAG must be set}"
 release_version="${release_tag#v}"
 repo_slug="${GITHUB_REPOSITORY:-runtian-zhou/quine}"
+release_revision="${RELEASE_REVISION:-$(git rev-parse HEAD)}"
 
 mkdir -p "$output_dir"
 
@@ -57,22 +58,15 @@ cat > "$output_dir/quine.rb" <<EOF
 class Quine < Formula
   desc "Self-bootstrapping AI agent harness"
   homepage "https://github.com/${repo_slug}"
+  url "https://github.com/${repo_slug}.git",
+      tag: "${release_tag}",
+      revision: "${release_revision}"
   version "${release_version}"
   license "MIT OR Apache-2.0"
-
-  if OS.mac? && Hardware::CPU.arm?
-    url "https://github.com/${repo_slug}/releases/download/${release_tag}/${macos_arm64_archive}"
-    sha256 "${macos_arm64_sha}"
-  elsif OS.mac?
-    url "https://github.com/${repo_slug}/releases/download/${release_tag}/${macos_x86_64_archive}"
-    sha256 "${macos_x86_64_sha}"
-  elsif OS.linux? && Hardware::CPU.intel?
-    url "https://github.com/${repo_slug}/releases/download/${release_tag}/${linux_x86_64_archive}"
-    sha256 "${linux_x86_64_sha}"
-  end
+  depends_on "rust" => :build
 
   def install
-    bin.install "quine"
+    system "cargo", "install", "--locked", "--root", prefix, "--path", "crates/quine-cli"
   end
 
   test do
