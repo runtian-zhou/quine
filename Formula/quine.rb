@@ -2,9 +2,9 @@ class Quine < Formula
   desc "Self-bootstrapping AI agent harness"
   homepage "https://github.com/runtian-zhou/quine"
   url "https://github.com/runtian-zhou/quine.git",
-      tag: "v0.2.4",
-      revision: "d0481480a8240c865716f0095fa7df854eb8eda0"
-  version "0.2.4"
+      tag: "v0.2.5",
+      revision: "d8b0829966d2686b30fedcbf0276f5a7c641a14a"
+  version "0.2.5"
   license "MIT OR Apache-2.0"
   depends_on "rust" => :build
 
