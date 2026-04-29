@@ -3135,6 +3135,20 @@ async fn execute_tool_call(
                         let checkpoint = snapshot_sessions(sessions, engine.session_tree).await;
                         let _ = reply.send(checkpoint);
                     }
+                    Some(CoreInput::RequestSessionCheckpoint {
+                        session_id: requested_session_id,
+                        reply,
+                    }) => {
+                        let persisted_session = match sessions.get(&requested_session_id) {
+                            Some(session) => session.snapshot(requested_session_id).await,
+                            None => None,
+                        };
+                        let checkpoint = CoreCheckpoint::new(
+                            persisted_session.into_iter().collect(),
+                            engine.session_tree.snapshot(),
+                        );
+                        let _ = reply.send(checkpoint);
+                    }
                     Some(other) => io.deferred_inputs.push_back(other),
                     None => {
                         if let Some(session) = sessions.get_mut(&session_id) {
@@ -6091,6 +6105,30 @@ async fn snapshot_registry_sessions(
     CoreCheckpoint::new(persisted_sessions, tree)
 }
 
+async fn snapshot_registry_session(
+    registry: &SessionRegistry,
+    session_tree: &SharedSessionTree,
+    session_id: SessionId,
+) -> CoreCheckpoint {
+    let handle = registry.read().await.get(&session_id).cloned();
+    let mut persisted_sessions = Vec::new();
+    if let Some(handle) = handle {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if handle
+            .command_tx
+            .send(SessionCommand::Snapshot { reply: reply_tx })
+            .await
+            .is_ok()
+        {
+            if let Ok(Some(snapshot)) = reply_rx.await {
+                persisted_sessions.push(snapshot);
+            }
+        }
+    }
+    let tree = session_tree.read().await.snapshot();
+    CoreCheckpoint::new(persisted_sessions, tree)
+}
+
 async fn emit_checkpoint_request_for_registry(
     registry: &SessionRegistry,
     session_tree: &SharedSessionTree,
@@ -6649,6 +6687,11 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     }
                     CoreInput::RequestCheckpoint { reply } => {
                         let checkpoint = snapshot_registry_sessions(&registry, &session_tree).await;
+                        let _ = reply.send(checkpoint);
+                    }
+                    CoreInput::RequestSessionCheckpoint { session_id, reply } => {
+                        let checkpoint =
+                            snapshot_registry_session(&registry, &session_tree, session_id).await;
                         let _ = reply.send(checkpoint);
                     }
                     CoreInput::WaitSession { parent_id, child_id, reply, non_blocking, timeout: _ } => {
