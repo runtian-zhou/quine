@@ -10,6 +10,11 @@ use crate::provider::LlmProvider;
 use crate::retry::send_with_retry;
 use crate::types::{LlmEvent, Message, MessageContent, Role, TokenUsage, ToolDefinition};
 
+const INTERNAL_WEB_SEARCH_TOOL_NAME: &str = "web_search";
+const PROVIDER_WEB_SEARCH_TOOL_NAME: &str = "quine_search";
+const INTERNAL_WEB_OPEN_TOOL_NAME: &str = "web_open";
+const PROVIDER_WEB_OPEN_TOOL_NAME: &str = "quine_open_url";
+
 /// Configuration for an OpenAI-compatible LLM endpoint.
 #[derive(Debug, Clone)]
 pub struct OpenAiCompatConfig {
@@ -246,6 +251,61 @@ fn format_tool_result_content(
     serde_json::to_string(&content).unwrap_or_else(|_| output.to_string())
 }
 
+fn provider_tool_name(tool_name: &str) -> String {
+    match tool_name {
+        INTERNAL_WEB_SEARCH_TOOL_NAME => PROVIDER_WEB_SEARCH_TOOL_NAME.to_string(),
+        INTERNAL_WEB_OPEN_TOOL_NAME => PROVIDER_WEB_OPEN_TOOL_NAME.to_string(),
+        _ => tool_name.to_string(),
+    }
+}
+
+fn internal_tool_name(tool_name: &str) -> Option<String> {
+    match tool_name {
+        PROVIDER_WEB_SEARCH_TOOL_NAME => Some(INTERNAL_WEB_SEARCH_TOOL_NAME.to_string()),
+        PROVIDER_WEB_OPEN_TOOL_NAME => Some(INTERNAL_WEB_OPEN_TOOL_NAME.to_string()),
+        "web_search" | "web_search_preview" => None,
+        _ => Some(tool_name.to_string()),
+    }
+}
+
+fn provider_tool_description(tool: &ToolDefinition) -> String {
+    if tool.name == INTERNAL_WEB_SEARCH_TOOL_NAME {
+        "Return a cited answer from online sources.".to_string()
+    } else {
+        tool.description.clone()
+    }
+}
+
+fn rewrite_provider_tool_names_in_system_prompt(text: &str) -> String {
+    let mut removed_web_search = false;
+    let mut lines = Vec::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("- `web_search`") {
+            removed_web_search = true;
+            continue;
+        }
+        if trimmed.starts_with("- `web_open`") {
+            continue;
+        }
+        lines.push(line);
+    }
+
+    let mut rewritten = lines.join("\n");
+    if removed_web_search {
+        if !rewritten.is_empty() {
+            rewritten.push_str("\n\n");
+        }
+        rewritten.push_str("## Provider Tool Aliases\n\n");
+        rewritten.push_str(
+            "- `quine_search`: When the user asks to search online, call this Quine-managed tool. Do not call `web_search`; that native provider tool is unavailable in Quine.\n",
+        );
+        rewritten = rewritten.trim_end().to_string();
+    }
+    rewritten
+}
+
 fn convert_message(msg: &Message, structured_tool_result_content: bool) -> ChatMessage {
     let role = match msg.role {
         Role::System => "system",
@@ -257,7 +317,11 @@ fn convert_message(msg: &Message, structured_tool_result_content: bool) -> ChatM
     match &msg.content {
         MessageContent::Text(text) => ChatMessage {
             role: role.into(),
-            content: Some(serde_json::Value::String(text.clone())),
+            content: Some(serde_json::Value::String(if role == "system" {
+                rewrite_provider_tool_names_in_system_prompt(text)
+            } else {
+                text.clone()
+            })),
             tool_call_id: None,
             tool_calls: None,
         },
@@ -286,7 +350,7 @@ fn convert_message(msg: &Message, structured_tool_result_content: bool) -> ChatM
                         id: tc.tool_use_id.clone(),
                         r#type: "function".into(),
                         function: OpenAiToolCallFunction {
-                            name: tc.tool_name.clone(),
+                            name: provider_tool_name(&tc.tool_name),
                             arguments: OpenAiToolCallArguments::JsonString(
                                 serde_json::to_string(&tc.arguments).unwrap_or_default(),
                             ),
@@ -301,11 +365,12 @@ fn convert_message(msg: &Message, structured_tool_result_content: bool) -> ChatM
 fn convert_tools(tools: &[ToolDefinition]) -> Vec<OpenAiTool> {
     tools
         .iter()
+        .filter(|t| t.name != INTERNAL_WEB_OPEN_TOOL_NAME)
         .map(|t| OpenAiTool {
             r#type: "function".into(),
             function: OpenAiFunction {
-                name: t.name.clone(),
-                description: t.description.clone(),
+                name: provider_tool_name(&t.name),
+                description: provider_tool_description(t),
                 parameters: t.parameters.clone(),
             },
         })
@@ -531,24 +596,17 @@ impl ToolCallAccumulator {
             .into_iter()
             .filter(|c| !c.id.is_empty())
             .filter_map(|c| {
+                let tool_name = internal_tool_name(&c.name)?;
                 let arguments = serde_json::from_str(&c.arguments)
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                if should_suppress_provider_tool_call(&c.name, &arguments) {
-                    return None;
-                }
                 Some(LlmEvent::ToolCall {
                     tool_use_id: c.id,
-                    tool_name: c.name,
+                    tool_name,
                     arguments,
                 })
             })
             .collect()
     }
-}
-
-fn should_suppress_provider_tool_call(tool_name: &str, arguments: &serde_json::Value) -> bool {
-    matches!(tool_name, "web_search" | "web_search_preview")
-        && arguments.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
 #[async_trait]
@@ -823,6 +881,32 @@ mod tests {
     }
 
     #[test]
+    fn convert_message_rewrites_reserved_web_search_name_in_system_prompt() {
+        let msg = Message::system(
+            "- `web_search`: Search online\n- `web_open`: Open URL\n- `read_file`: Read a file",
+        );
+        let chat = convert_message(&msg, false);
+        assert_eq!(chat.role, "system");
+        let content = chat.content.expect("system content");
+        assert!(content
+            .as_str()
+            .expect("content string")
+            .contains("`quine_search`"));
+        assert!(content
+            .as_str()
+            .expect("content string")
+            .contains("`read_file`"));
+        assert!(!content
+            .as_str()
+            .expect("content string")
+            .contains("- `web_search`"));
+        assert!(!content
+            .as_str()
+            .expect("content string")
+            .contains("- `web_open`"));
+    }
+
+    #[test]
     fn convert_message_tool_result() {
         let msg = Message::tool_result("id-1", "output", false);
         let chat = convert_message(&msg, false);
@@ -895,6 +979,71 @@ mod tests {
         assert_eq!(
             json["function"]["arguments"],
             "{\"file_path\":\"/tmp/test.txt\"}"
+        );
+    }
+
+    #[test]
+    fn convert_message_tool_use_aliases_web_search_for_provider() {
+        let msg = Message::assistant_tool_use(
+            None,
+            vec![
+                crate::types::ToolUseRequest {
+                    tool_use_id: "id-1".into(),
+                    tool_name: "web_search".into(),
+                    arguments: serde_json::json!({"query": "rust mlx support"}),
+                },
+                crate::types::ToolUseRequest {
+                    tool_use_id: "id-2".into(),
+                    tool_name: "web_open".into(),
+                    arguments: serde_json::json!({"url": "https://example.com"}),
+                },
+            ],
+        );
+        let chat = convert_message(&msg, false);
+        let tool_calls = chat.tool_calls.expect("tool calls");
+        let search_json = serde_json::to_value(&tool_calls[0]).unwrap();
+        let open_json = serde_json::to_value(&tool_calls[1]).unwrap();
+        assert_eq!(search_json["function"]["name"], "quine_search");
+        assert_eq!(
+            search_json["function"]["arguments"],
+            "{\"query\":\"rust mlx support\"}"
+        );
+        assert_eq!(open_json["function"]["name"], "quine_open_url");
+    }
+
+    #[test]
+    fn convert_tools_aliases_web_search_and_omits_web_open_for_provider() {
+        let tools = convert_tools(&[
+            ToolDefinition {
+                name: "web_search".into(),
+                description: "Search online".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                read_only: true,
+                idempotent: true,
+            },
+            ToolDefinition {
+                name: "web_open".into(),
+                description: "Open URL".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                read_only: true,
+                idempotent: true,
+            },
+            ToolDefinition {
+                name: "read_file".into(),
+                description: "Read a file".into(),
+                parameters: serde_json::json!({"type": "object"}),
+                read_only: true,
+                idempotent: true,
+            },
+        ]);
+        let names: Vec<_> = tools
+            .iter()
+            .map(|tool| tool.function.name.as_str())
+            .collect();
+        assert_eq!(names, vec!["quine_search", "read_file"]);
+        assert_eq!(
+            tools[0].function.description,
+            "Return a cited answer from online sources."
         );
     }
 
@@ -1114,7 +1263,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_accumulator_suppresses_empty_provider_web_search_call() {
+    fn tool_call_accumulator_suppresses_native_provider_web_search_call() {
         let mut acc = ToolCallAccumulator::default();
         acc.process_delta(
             &OpenAiToolCallDelta {
@@ -1132,14 +1281,32 @@ mod tests {
     }
 
     #[test]
-    fn tool_call_accumulator_keeps_web_search_call_with_query() {
+    fn tool_call_accumulator_suppresses_native_web_search_preview_call() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: Some(0),
+                id: Some("ws_123".into()),
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: Some("web_search_preview".into()),
+                    arguments: Some(r#"{"query":"latest rust release"}"#.into()),
+                }),
+            },
+            false,
+        );
+
+        assert!(acc.take_completed().is_empty());
+    }
+
+    #[test]
+    fn tool_call_accumulator_maps_provider_web_search_alias_to_internal_name() {
         let mut acc = ToolCallAccumulator::default();
         acc.process_delta(
             &OpenAiToolCallDelta {
                 index: Some(0),
                 id: Some("call_1".into()),
                 function: Some(OpenAiToolCallFunctionDelta {
-                    name: Some("web_search".into()),
+                    name: Some("quine_search".into()),
                     arguments: Some(r#"{"query":"weather in New York today"}"#.into()),
                 }),
             },
@@ -1159,6 +1326,54 @@ mod tests {
             }
             _ => panic!("expected ToolCall event"),
         }
+    }
+
+    #[test]
+    fn tool_call_accumulator_maps_provider_web_open_alias_to_internal_name() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: Some(0),
+                id: Some("call_1".into()),
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: Some("quine_open_url".into()),
+                    arguments: Some(r#"{"url":"https://example.com"}"#.into()),
+                }),
+            },
+            false,
+        );
+
+        let events = acc.take_completed();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            LlmEvent::ToolCall {
+                tool_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(tool_name, "web_open");
+                assert_eq!(arguments["url"], "https://example.com");
+            }
+            _ => panic!("expected ToolCall event"),
+        }
+    }
+
+    #[test]
+    fn tool_call_accumulator_suppresses_reserved_web_search_even_with_query() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: Some(0),
+                id: Some("ws_123".into()),
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: Some("web_search".into()),
+                    arguments: Some(r#"{"query":"weather in New York today"}"#.into()),
+                }),
+            },
+            false,
+        );
+
+        assert!(acc.take_completed().is_empty());
     }
 
     #[test]
