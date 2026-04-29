@@ -69,6 +69,17 @@ fn should_show_tool_result_preview(tool_name: &str) -> bool {
     matches!(tool_name, "plan" | "bash" | "web_search" | "web_open")
 }
 
+fn truncate_tool_summary(summary: String) -> String {
+    const MAX_SUMMARY_CHARS: usize = 60;
+    if summary.chars().count() <= MAX_SUMMARY_CHARS {
+        return summary;
+    }
+
+    let mut truncated: String = summary.chars().take(MAX_SUMMARY_CHARS - 1).collect();
+    truncated.push('…');
+    truncated
+}
+
 fn build_apply_patch_preview(arguments: &serde_json::Value) -> Option<String> {
     let file_path = arguments.get("file_path")?.as_str()?;
     let mut lines = vec![format!("apply_patch: {file_path}")];
@@ -849,11 +860,7 @@ impl App {
         arguments: serde_json::Value,
     ) {
         let summary = summarize_tool_call(&tool_name, &arguments);
-        let summary = if summary.len() > 60 {
-            format!("{}…", &summary[..59])
-        } else {
-            summary
-        };
+        let summary = truncate_tool_summary(summary);
         self.push_message(ConversationEntry::ToolCall {
             tool_name: tool_name.clone(),
             tool_use_id,
@@ -2166,11 +2173,7 @@ impl App {
                         .to_string();
                     let arguments = params.get("arguments").cloned().unwrap_or_default();
                     let summary = summarize_tool_call(&tool_name, &arguments);
-                    let summary = if summary.len() > 60 {
-                        format!("{}…", &summary[..59])
-                    } else {
-                        summary
-                    };
+                    let summary = truncate_tool_summary(summary);
                     self.set_phase(AgentPhase::RunningTool(tool_name.clone()));
                     let timeout = match tool_name.as_str() {
                         "bash" => Some(Duration::from_secs(
@@ -2959,6 +2962,14 @@ mod tests {
                 ..
             }) if tool_name == "web_search" && preview.contains("Answer with citations")
         ));
+    }
+
+    #[test]
+    fn tool_summary_truncation_handles_multibyte_text() {
+        let summary = truncate_tool_summary("検索".repeat(40));
+
+        assert_eq!(summary.chars().count(), 60);
+        assert!(summary.ends_with('…'));
     }
 
     #[test]
