@@ -204,6 +204,12 @@ struct ChatCompletionsWebRequest {
 #[derive(Serialize)]
 struct ChatCompletionsWebTool {
     r#type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    filters: Option<WebSearchFilters>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user_location: Option<UserLocation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    external_web_access: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -217,7 +223,7 @@ struct ReasoningConfig {
     effort: String,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct WebSearchTool {
     r#type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -228,12 +234,12 @@ struct WebSearchTool {
     external_web_access: Option<bool>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct WebSearchFilters {
     allowed_domains: Vec<String>,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct UserLocation {
     r#type: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -413,8 +419,11 @@ fn dedupe_sources(sources: &mut Vec<WebSource>) {
 fn chat_completions_web_tools(tools: &[WebSearchTool]) -> Vec<ChatCompletionsWebTool> {
     tools
         .iter()
-        .map(|_| ChatCompletionsWebTool {
-            r#type: "web_search_preview".into(),
+        .map(|tool| ChatCompletionsWebTool {
+            r#type: tool.r#type.clone(),
+            filters: tool.filters.clone(),
+            user_location: tool.user_location.clone(),
+            external_web_access: tool.external_web_access,
         })
         .collect()
 }
@@ -515,16 +524,38 @@ mod tests {
     }
 
     #[test]
-    fn chat_completions_tool_payload_uses_preview_type() {
+    fn chat_completions_tool_payload_preserves_responses_web_tool() {
         let tools = chat_completions_web_tools(&[WebSearchTool {
             r#type: "web_search".into(),
-            filters: None,
-            user_location: None,
+            filters: Some(WebSearchFilters {
+                allowed_domains: vec!["example.com".into()],
+            }),
+            user_location: Some(UserLocation {
+                r#type: "approximate".into(),
+                country: Some("US".into()),
+                city: None,
+                region: None,
+                timezone: Some("America/New_York".into()),
+            }),
             external_web_access: Some(true),
         }]);
 
         let value = serde_json::to_value(tools).unwrap();
-        assert_eq!(value, serde_json::json!([{ "type": "web_search_preview" }]));
+        assert_eq!(
+            value,
+            serde_json::json!([{
+                "type": "web_search",
+                "filters": {
+                    "allowed_domains": ["example.com"]
+                },
+                "user_location": {
+                    "type": "approximate",
+                    "country": "US",
+                    "timezone": "America/New_York"
+                },
+                "external_web_access": true
+            }])
+        );
     }
 
     #[test]
