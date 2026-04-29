@@ -56,10 +56,17 @@ fn summarize_tool_call(tool_name: &str, arguments: &serde_json::Value) -> String
             .get("command")
             .or(arguments.get("file_path"))
             .or(arguments.get("question"))
+            .or(arguments.get("query"))
+            .or(arguments.get("q"))
+            .or(arguments.get("url"))
             .and_then(|s| s.as_str())
             .unwrap_or("")
             .to_string(),
     }
+}
+
+fn should_show_tool_result_preview(tool_name: &str) -> bool {
+    matches!(tool_name, "plan" | "bash" | "web_search" | "web_open")
 }
 
 fn build_apply_patch_preview(arguments: &serde_json::Value) -> Option<String> {
@@ -785,6 +792,8 @@ impl App {
     }
 
     pub fn load_session_context(&mut self, snapshot: SessionContextSnapshot) {
+        self.session_id = snapshot.session_id.clone();
+        self.plan_mode = snapshot.plan_mode;
         self.loaded_skill_commands = snapshot
             .loaded_skills
             .iter()
@@ -802,19 +811,92 @@ impl App {
                     }
                     _ => {}
                 },
-                HistoryEntry::ToolUse { role, text, .. } => {
+                HistoryEntry::ToolUse {
+                    role,
+                    text,
+                    tool_calls,
+                } => {
                     if role == "assistant" {
                         if let Some(text) = text.filter(|value| !value.is_empty()) {
                             self.push_message(ConversationEntry::AssistantText(text));
                         }
+                        for call in tool_calls {
+                            self.push_restored_tool_call(
+                                call.tool_name,
+                                call.tool_use_id,
+                                call.arguments,
+                            );
+                        }
                     }
                 }
-                HistoryEntry::ToolResult { .. } => {}
+                HistoryEntry::ToolResult {
+                    tool_use_id,
+                    output,
+                    is_error,
+                    ..
+                } => self.apply_restored_tool_result(&tool_use_id, &output, is_error),
             }
         }
 
         self.invalidate_conversation_cache();
         self.auto_scroll();
+    }
+
+    fn push_restored_tool_call(
+        &mut self,
+        tool_name: String,
+        tool_use_id: String,
+        arguments: serde_json::Value,
+    ) {
+        let summary = summarize_tool_call(&tool_name, &arguments);
+        let summary = if summary.len() > 60 {
+            format!("{}…", &summary[..59])
+        } else {
+            summary
+        };
+        self.push_message(ConversationEntry::ToolCall {
+            tool_name: tool_name.clone(),
+            tool_use_id,
+            summary,
+            status: ToolStatus::Running {
+                started_at: Instant::now(),
+                timeout: None,
+            },
+            result_preview: None,
+        });
+        if tool_name == "apply_patch" {
+            if let Some(preview) = build_apply_patch_preview(&arguments) {
+                self.push_message(ConversationEntry::PatchPreview(preview));
+            }
+        }
+    }
+
+    fn apply_restored_tool_result(&mut self, tool_use_id: &str, output: &str, is_error: bool) {
+        for entry in self.messages.iter_mut().rev() {
+            if let ConversationEntry::ToolCall {
+                tool_name,
+                tool_use_id: id,
+                status,
+                result_preview,
+                ..
+            } = entry
+            {
+                if id == tool_use_id {
+                    *status = if is_error {
+                        ToolStatus::Error { duration_us: 0 }
+                    } else {
+                        ToolStatus::Success { duration_us: 0 }
+                    };
+                    if should_show_tool_result_preview(tool_name) {
+                        let trimmed = trim_blank_lines(output);
+                        if !trimmed.is_empty() {
+                            *result_preview = Some(trimmed);
+                        }
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     /// Advance the spinner animation frame.
@@ -2148,7 +2230,7 @@ impl App {
                                 } else {
                                     ToolStatus::Success { duration_us }
                                 };
-                                if tool_name == "plan" || tool_name == "bash" {
+                                if should_show_tool_result_preview(tool_name) {
                                     let trimmed = trim_blank_lines(content);
                                     if !trimmed.is_empty() {
                                         *result_preview = Some(trimmed);
@@ -2484,6 +2566,83 @@ mod tests {
     }
 
     #[test]
+    fn load_session_context_restores_conversation_and_tool_history() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "resumed-session".into(),
+            created_at: Utc::now(),
+            state: "idle".into(),
+            system_prompt: Some("system".into()),
+            skills: vec![],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: true,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
+            prompt_memory: None,
+            compact_memory_summary_markdown: None,
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            status_report: None,
+            history: vec![
+                HistoryEntry::Text {
+                    role: "user".into(),
+                    text: "search rust async".into(),
+                },
+                HistoryEntry::ToolUse {
+                    role: "assistant".into(),
+                    text: Some("I will search.".into()),
+                    tool_calls: vec![crate::context_debug::ToolCallEntry {
+                        tool_use_id: "toolu_search".into(),
+                        tool_name: "web_search".into(),
+                        arguments: serde_json::json!({"query": "rust async"}),
+                    }],
+                },
+                HistoryEntry::ToolResult {
+                    role: "tool".into(),
+                    tool_use_id: "toolu_search".into(),
+                    output: "Answer with citations\n\nSources:\n- Example".into(),
+                    is_error: false,
+                },
+                HistoryEntry::Text {
+                    role: "assistant".into(),
+                    text: "Done.".into(),
+                },
+            ],
+        };
+        let mut app = App::new("old-session".into(), false, None);
+
+        app.load_session_context(snapshot);
+
+        assert_eq!(app.session_id, "resumed-session");
+        assert!(app.plan_mode);
+        assert!(matches!(
+            app.messages.first(),
+            Some(ConversationEntry::User(text)) if text == "search rust async"
+        ));
+        assert!(matches!(
+            app.messages.get(1),
+            Some(ConversationEntry::AssistantText(text)) if text == "I will search."
+        ));
+        assert!(matches!(
+            app.messages.get(2),
+            Some(ConversationEntry::ToolCall {
+                tool_name,
+                summary,
+                status: ToolStatus::Success { duration_us: 0 },
+                result_preview: Some(preview),
+                ..
+            }) if tool_name == "web_search"
+                && summary == "rust async"
+                && preview.contains("Answer with citations")
+        ));
+        assert!(matches!(
+            app.messages.get(3),
+            Some(ConversationEntry::AssistantText(text)) if text == "Done."
+        ));
+    }
+
+    #[test]
     fn selected_conversation_text_uses_visual_line_ranges() {
         let mut app = App::new("session".into(), false, None);
         app.conversation_cache = Some(ConversationRenderCache {
@@ -2751,6 +2910,54 @@ mod tests {
                 result_preview: Some(preview),
                 ..
             }) if tool_name == "bash" && preview.contains("/tmp/project") && preview.contains("line three")
+        ));
+    }
+
+    #[test]
+    fn web_search_tool_request_and_result_are_visible() {
+        let mut app = App::new("test".into(), false, None);
+        let request = make_notif(
+            notifications::TOOL_REQUEST,
+            serde_json::json!({
+                "tool_name": "web_search",
+                "tool_use_id": "toolu_web",
+                "arguments": {
+                    "query": "mlx rust support"
+                }
+            }),
+        );
+        app.apply_notification(&request);
+
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::ToolCall {
+                tool_name,
+                summary,
+                status: ToolStatus::Running { timeout: None, .. },
+                ..
+            }) if tool_name == "web_search" && summary == "mlx rust support"
+        ));
+
+        let result = make_notif(
+            notifications::TOOL_RESULT,
+            serde_json::json!({
+                "tool_use_id": "toolu_web",
+                "tool_name": "web_search",
+                "content": "Answer with citations\n\nSources:\n- Example: https://example.com",
+                "is_error": false,
+                "duration_us": 42
+            }),
+        );
+        app.apply_notification(&result);
+
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::ToolCall {
+                tool_name,
+                status: ToolStatus::Success { duration_us: 42 },
+                result_preview: Some(preview),
+                ..
+            }) if tool_name == "web_search" && preview.contains("Answer with citations")
         ));
     }
 

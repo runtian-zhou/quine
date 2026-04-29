@@ -157,6 +157,28 @@ struct PermissionRuleDocument {
     rules: Vec<ConfiguredPermissionRule>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct UserConfigDocument {
+    #[serde(default)]
+    web_search: Option<ConfiguredWebSearch>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ConfiguredWebSearch {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    api_key: Option<String>,
+    #[serde(default)]
+    api_key_env: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+}
+
 #[derive(Debug, Deserialize)]
 struct ConfiguredPermissionRule {
     effect: PermissionRuleEffect,
@@ -164,10 +186,40 @@ struct ConfiguredPermissionRule {
     target: PermissionTarget,
 }
 
+fn user_config_path() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".quine").join("config.yaml"))
+}
+
 fn user_permission_rules_path() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| home.join(".quine").join("permissions.yaml"))
+}
+
+fn load_user_config_document() -> anyhow::Result<UserConfigDocument> {
+    let Some(path) = user_config_path() else {
+        return Ok(UserConfigDocument::default());
+    };
+    if !path.exists() {
+        return Ok(UserConfigDocument::default());
+    }
+
+    let contents = std::fs::read_to_string(&path)
+        .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
+    serde_yaml::from_str(&contents)
+        .map_err(|error| anyhow::anyhow!("failed to parse {}: {error}", path.display()))
+}
+
+fn load_user_web_search_config() -> Option<ConfiguredWebSearch> {
+    match load_user_config_document() {
+        Ok(document) => document.web_search,
+        Err(error) => {
+            eprintln!("[daemon] ignoring user config: {error}");
+            None
+        }
+    }
 }
 
 pub fn project_permission_rules_path(working_directory: &std::path::Path) -> PathBuf {
@@ -265,9 +317,28 @@ pub fn resolve_session_llm_config(model_profile: Option<&str>) -> anyhow::Result
 }
 
 fn web_config_from_env() -> WebProviderConfig {
+    let user_config = load_user_web_search_config();
     let explicit_provider = std::env::var("WEB_PROVIDER").ok();
+    if explicit_provider.is_none()
+        && user_config
+            .as_ref()
+            .and_then(|config| config.enabled)
+            .is_some_and(|enabled| !enabled)
+    {
+        return WebProviderConfig::None;
+    }
+
+    let explicit_web_base_url = std::env::var("WEB_BASE_URL").ok();
+    let configured_web_base_url = user_config
+        .as_ref()
+        .and_then(|config| config.base_url.clone());
     let provider = explicit_provider
         .clone()
+        .or_else(|| {
+            user_config
+                .as_ref()
+                .and_then(|config| config.provider.clone())
+        })
         .map(Ok)
         .unwrap_or_else(|| std::env::var("LLM_PROVIDER"))
         .unwrap_or_else(|_| "openai".into());
@@ -279,30 +350,70 @@ fn web_config_from_env() -> WebProviderConfig {
         return WebProviderConfig::None;
     }
 
-    let api_key = std::env::var("WEB_API_KEY")
-        .or_else(|_| std::env::var("LLM_API_KEY"))
-        .or_else(|_| std::env::var("OPENAI_API_KEY"))
-        .ok();
+    let base_url = explicit_web_base_url
+        .clone()
+        .or_else(|| configured_web_base_url.clone())
+        .map(Ok)
+        .unwrap_or_else(|| std::env::var("LLM_BASE_URL"))
+        .or_else(|_| std::env::var("OPENAI_BASE_URL"))
+        .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".into());
 
-    let Some(api_key) = api_key else {
-        if explicit_provider.is_some() {
-            eprintln!(
-                "[daemon] web provider `{provider}` disabled because WEB_API_KEY, OPENAI_API_KEY, or LLM_API_KEY is not set"
-            );
+    let api_key = std::env::var("WEB_API_KEY")
+        .ok()
+        .or_else(|| {
+            user_config
+                .as_ref()
+                .and_then(|config| config.api_key.clone())
+        })
+        .or_else(|| {
+            user_config
+                .as_ref()
+                .and_then(|config| config.api_key_env.as_deref())
+                .and_then(|env_name| std::env::var(env_name).ok())
+        })
+        .or_else(|| std::env::var("LLM_API_KEY").ok())
+        .or_else(|| std::env::var("OPENAI_API_KEY").ok());
+
+    let explicitly_configured_web_endpoint =
+        explicit_web_base_url.is_some() || configured_web_base_url.is_some();
+    let explicitly_configured_web_provider = explicit_provider.is_some() || user_config.is_some();
+
+    let api_key = match api_key {
+        Some(api_key) => api_key,
+        None if explicitly_configured_web_provider
+            && explicitly_configured_web_endpoint
+            && is_loopback_base_url(&base_url) =>
+        {
+            String::new()
         }
-        return WebProviderConfig::None;
+        None => {
+            if explicit_provider.is_some() || user_config.is_some() {
+                eprintln!(
+                    "[daemon] web provider `{provider}` disabled because WEB_API_KEY, OPENAI_API_KEY, or LLM_API_KEY is not set"
+                );
+            }
+            return WebProviderConfig::None;
+        }
     };
 
+    let model = std::env::var("WEB_MODEL")
+        .ok()
+        .or_else(|| user_config.as_ref().and_then(|config| config.model.clone()))
+        .or_else(|| std::env::var("LLM_MODEL").ok())
+        .unwrap_or_else(|| "gpt-5.4".into());
+
     WebProviderConfig::OpenAi(OpenAiWebConfig {
-        base_url: std::env::var("WEB_BASE_URL")
-            .or_else(|_| std::env::var("LLM_BASE_URL"))
-            .or_else(|_| std::env::var("OPENAI_BASE_URL"))
-            .unwrap_or_else(|_| "http://127.0.0.1:8000/v1".into()),
+        base_url,
         api_key,
-        model: std::env::var("WEB_MODEL")
-            .or_else(|_| std::env::var("LLM_MODEL"))
-            .unwrap_or_else(|_| "gpt-5.4".into()),
+        model,
     })
+}
+
+fn is_loopback_base_url(base_url: &str) -> bool {
+    let lower = base_url.to_ascii_lowercase();
+    lower.starts_with("http://127.0.0.1")
+        || lower.starts_with("http://localhost")
+        || lower.starts_with("http://[::1]")
 }
 
 pub fn create_web_provider_from_env() -> Arc<dyn quine_llm::WebProvider> {
@@ -334,6 +445,22 @@ mod tests {
     fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
         let _guard = ENV_LOCK.lock().unwrap();
         f()
+    }
+
+    fn snapshot_env(names: &[&'static str]) -> Vec<(&'static str, Option<std::ffi::OsString>)> {
+        names
+            .iter()
+            .map(|name| (*name, std::env::var_os(name)))
+            .collect()
+    }
+
+    fn restore_env(snapshot: Vec<(&'static str, Option<std::ffi::OsString>)>) {
+        for (name, value) in snapshot {
+            match value {
+                Some(value) => unsafe { std::env::set_var(name, value) },
+                None => unsafe { std::env::remove_var(name) },
+            }
+        }
     }
 
     #[test]
@@ -584,12 +711,17 @@ rules:
     #[test]
     fn web_config_defaults_to_none_when_no_key_is_available() {
         with_env_lock(|| {
-            let previous_web_provider = std::env::var_os("WEB_PROVIDER");
-            let previous_llm_provider = std::env::var_os("LLM_PROVIDER");
-            let previous_web_api_key = std::env::var_os("WEB_API_KEY");
-            let previous_llm_api_key = std::env::var_os("LLM_API_KEY");
-            let previous_openai_api_key = std::env::var_os("OPENAI_API_KEY");
+            let snapshot = snapshot_env(&[
+                "HOME",
+                "WEB_PROVIDER",
+                "LLM_PROVIDER",
+                "WEB_API_KEY",
+                "LLM_API_KEY",
+                "OPENAI_API_KEY",
+            ]);
+            let home = TempDir::new().unwrap();
             unsafe {
+                std::env::set_var("HOME", home.path());
                 std::env::remove_var("WEB_PROVIDER");
                 std::env::remove_var("LLM_PROVIDER");
                 std::env::remove_var("WEB_API_KEY");
@@ -599,38 +731,24 @@ rules:
 
             assert!(matches!(web_config_from_env(), WebProviderConfig::None));
 
-            match previous_web_provider {
-                Some(value) => unsafe { std::env::set_var("WEB_PROVIDER", value) },
-                None => unsafe { std::env::remove_var("WEB_PROVIDER") },
-            }
-            match previous_llm_provider {
-                Some(value) => unsafe { std::env::set_var("LLM_PROVIDER", value) },
-                None => unsafe { std::env::remove_var("LLM_PROVIDER") },
-            }
-            match previous_web_api_key {
-                Some(value) => unsafe { std::env::set_var("WEB_API_KEY", value) },
-                None => unsafe { std::env::remove_var("WEB_API_KEY") },
-            }
-            match previous_llm_api_key {
-                Some(value) => unsafe { std::env::set_var("LLM_API_KEY", value) },
-                None => unsafe { std::env::remove_var("LLM_API_KEY") },
-            }
-            match previous_openai_api_key {
-                Some(value) => unsafe { std::env::set_var("OPENAI_API_KEY", value) },
-                None => unsafe { std::env::remove_var("OPENAI_API_KEY") },
-            }
+            restore_env(snapshot);
         });
     }
 
     #[test]
     fn web_config_uses_openai_when_key_is_available() {
         with_env_lock(|| {
-            let previous_web_provider = std::env::var_os("WEB_PROVIDER");
-            let previous_llm_provider = std::env::var_os("LLM_PROVIDER");
-            let previous_web_api_key = std::env::var_os("WEB_API_KEY");
-            let previous_web_base_url = std::env::var_os("WEB_BASE_URL");
-            let previous_web_model = std::env::var_os("WEB_MODEL");
+            let snapshot = snapshot_env(&[
+                "HOME",
+                "WEB_PROVIDER",
+                "LLM_PROVIDER",
+                "WEB_API_KEY",
+                "WEB_BASE_URL",
+                "WEB_MODEL",
+            ]);
+            let home = TempDir::new().unwrap();
             unsafe {
+                std::env::set_var("HOME", home.path());
                 std::env::set_var("WEB_PROVIDER", "openai");
                 std::env::remove_var("LLM_PROVIDER");
                 std::env::set_var("WEB_API_KEY", "test-key");
@@ -647,26 +765,109 @@ rules:
                 WebProviderConfig::None => panic!("expected OpenAI web config"),
             }
 
-            match previous_web_provider {
-                Some(value) => unsafe { std::env::set_var("WEB_PROVIDER", value) },
-                None => unsafe { std::env::remove_var("WEB_PROVIDER") },
+            restore_env(snapshot);
+        });
+    }
+
+    #[test]
+    fn web_config_allows_explicit_loopback_endpoint_without_key() {
+        with_env_lock(|| {
+            let snapshot = snapshot_env(&[
+                "HOME",
+                "WEB_PROVIDER",
+                "LLM_PROVIDER",
+                "WEB_API_KEY",
+                "LLM_API_KEY",
+                "OPENAI_API_KEY",
+                "WEB_BASE_URL",
+                "LLM_BASE_URL",
+                "OPENAI_BASE_URL",
+                "WEB_MODEL",
+                "LLM_MODEL",
+            ]);
+            let home = TempDir::new().unwrap();
+            unsafe {
+                std::env::set_var("HOME", home.path());
+                std::env::set_var("WEB_PROVIDER", "openai");
+                std::env::remove_var("LLM_PROVIDER");
+                std::env::remove_var("WEB_API_KEY");
+                std::env::remove_var("LLM_API_KEY");
+                std::env::remove_var("OPENAI_API_KEY");
+                std::env::set_var("WEB_BASE_URL", "http://127.0.0.1:8000/v1");
+                std::env::remove_var("LLM_BASE_URL");
+                std::env::remove_var("OPENAI_BASE_URL");
+                std::env::set_var("WEB_MODEL", "local-search");
+                std::env::remove_var("LLM_MODEL");
             }
-            match previous_llm_provider {
-                Some(value) => unsafe { std::env::set_var("LLM_PROVIDER", value) },
-                None => unsafe { std::env::remove_var("LLM_PROVIDER") },
+
+            match web_config_from_env() {
+                WebProviderConfig::OpenAi(config) => {
+                    assert_eq!(config.api_key, "");
+                    assert_eq!(config.base_url, "http://127.0.0.1:8000/v1");
+                    assert_eq!(config.model, "local-search");
+                }
+                WebProviderConfig::None => panic!("expected OpenAI web config"),
             }
-            match previous_web_api_key {
-                Some(value) => unsafe { std::env::set_var("WEB_API_KEY", value) },
-                None => unsafe { std::env::remove_var("WEB_API_KEY") },
+
+            restore_env(snapshot);
+        });
+    }
+
+    #[test]
+    fn web_config_uses_user_config_file_for_loopback_without_key() {
+        with_env_lock(|| {
+            let snapshot = snapshot_env(&[
+                "HOME",
+                "WEB_PROVIDER",
+                "LLM_PROVIDER",
+                "WEB_API_KEY",
+                "LLM_API_KEY",
+                "OPENAI_API_KEY",
+                "WEB_BASE_URL",
+                "LLM_BASE_URL",
+                "OPENAI_BASE_URL",
+                "WEB_MODEL",
+                "LLM_MODEL",
+            ]);
+            let home = TempDir::new().unwrap();
+            let config_dir = home.path().join(".quine");
+            std::fs::create_dir_all(&config_dir).unwrap();
+            std::fs::write(
+                config_dir.join("config.yaml"),
+                r#"
+web_search:
+  enabled: true
+  provider: openai
+  base_url: http://127.0.0.1:8000/v1
+  model: local-search
+"#,
+            )
+            .unwrap();
+
+            unsafe {
+                std::env::set_var("HOME", home.path());
+                std::env::remove_var("WEB_PROVIDER");
+                std::env::remove_var("LLM_PROVIDER");
+                std::env::remove_var("WEB_API_KEY");
+                std::env::remove_var("LLM_API_KEY");
+                std::env::remove_var("OPENAI_API_KEY");
+                std::env::remove_var("WEB_BASE_URL");
+                std::env::remove_var("LLM_BASE_URL");
+                std::env::remove_var("OPENAI_BASE_URL");
+                std::env::remove_var("WEB_MODEL");
+                std::env::remove_var("LLM_MODEL");
             }
-            match previous_web_base_url {
-                Some(value) => unsafe { std::env::set_var("WEB_BASE_URL", value) },
-                None => unsafe { std::env::remove_var("WEB_BASE_URL") },
+
+            match web_config_from_env() {
+                WebProviderConfig::OpenAi(config) => {
+                    assert_eq!(config.api_key, "");
+                    assert_eq!(config.base_url, "http://127.0.0.1:8000/v1");
+                    assert_eq!(config.model, "local-search");
+                }
+                WebProviderConfig::None => panic!("expected OpenAI web config"),
             }
-            match previous_web_model {
-                Some(value) => unsafe { std::env::set_var("WEB_MODEL", value) },
-                None => unsafe { std::env::remove_var("WEB_MODEL") },
-            }
+
+            restore_env(snapshot);
         });
     }
 }

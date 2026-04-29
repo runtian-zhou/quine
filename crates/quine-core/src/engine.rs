@@ -555,6 +555,17 @@ fn build_tool_registry_for_session(
     tool_registry
 }
 
+fn advertised_tool_definitions(
+    tool_registry: &ToolRegistry,
+    web_provider: &Arc<dyn WebProvider>,
+) -> Vec<ToolDefinition> {
+    let mut tools = tool_registry.tool_definitions();
+    if !web_provider.is_configured() {
+        tools.retain(|tool| !matches!(tool.name.as_str(), "web_search" | "web_open"));
+    }
+    tools
+}
+
 fn prompt_memory_mode_from_env() -> PromptMemoryMode {
     match std::env::var("QUINE_PROMPT_MEMORY_MODE")
         .unwrap_or_else(|_| "disabled".into())
@@ -788,7 +799,7 @@ impl SessionContext {
             persisted_config.plan_mode,
             prompt_behavior,
         );
-        let tools = tool_registry.tool_definitions();
+        let tools = advertised_tool_definitions(&tool_registry, web_provider);
 
         let combined_prompt = build_combined_system_prompt(
             &working_directory,
@@ -924,7 +935,7 @@ impl SessionContext {
             &session.persisted_config,
             &skills,
         );
-        session.tools = session.tool_registry.tool_definitions();
+        session.tools = advertised_tool_definitions(&session.tool_registry, web_provider);
         session.persisted_config = config;
         session.persisted_config.skill_names = restored_skill_names;
         session.created_at = created_at;
@@ -1006,7 +1017,7 @@ impl SessionContext {
             &self.persisted_config,
             &skills,
         );
-        self.tools = self.tool_registry.tool_definitions();
+        self.tools = advertised_tool_definitions(&self.tool_registry, web_provider);
         self.system_prompt = build_combined_system_prompt(
             &self.persisted_config.working_directory,
             &self.persisted_config,
@@ -1545,6 +1556,7 @@ async fn call_llm_with_messages(
         }
     }
 
+    let tool_calls = deduplicate_pending_tool_calls(session_id, tool_calls);
     let turn = if tool_calls.is_empty() {
         LlmTurnResult::Text(full_text)
     } else {
@@ -1686,6 +1698,7 @@ async fn call_llm_interruptible(
         }
     }
 
+    let tool_calls = deduplicate_pending_tool_calls(session_id, tool_calls);
     let turn = if tool_calls.is_empty() {
         LlmTurnResult::Text(full_text)
     } else {
@@ -1769,6 +1782,30 @@ struct PendingToolCall {
     tool_use_id: String,
     tool_name: String,
     arguments: serde_json::Value,
+}
+
+fn deduplicate_pending_tool_calls(
+    session_id: SessionId,
+    calls: Vec<PendingToolCall>,
+) -> Vec<PendingToolCall> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(calls.len());
+
+    for call in calls {
+        if seen.insert(call.tool_use_id.clone()) {
+            deduped.push(call);
+        } else {
+            debug_log_session(
+                session_id,
+                format!(
+                    "dropped duplicate tool call id={} name={}",
+                    call.tool_use_id, call.tool_name
+                ),
+            );
+        }
+    }
+
+    deduped
 }
 
 struct LlmCallResult {
@@ -5545,6 +5582,7 @@ impl SessionActor {
             }
         }
 
+        let tool_calls = deduplicate_pending_tool_calls(self.session_id, tool_calls);
         let turn = if tool_calls.is_empty() {
             LlmTurnResult::Text(full_text)
         } else {
@@ -8445,6 +8483,64 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[tokio::test]
+    async fn call_llm_with_messages_deduplicates_tool_call_ids() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolCallThenTextProvider {
+            call_count: AtomicU32::new(0),
+            tool_calls: vec![
+                (
+                    "toolu_duplicate".into(),
+                    "read_file".into(),
+                    serde_json::json!({"path": "first"}),
+                ),
+                (
+                    "toolu_duplicate".into(),
+                    "read_file".into(),
+                    serde_json::json!({"path": "second"}),
+                ),
+                (
+                    "toolu_unique".into(),
+                    "find".into(),
+                    serde_json::json!({"name": "*.rs"}),
+                ),
+            ],
+            final_text: "done".into(),
+        });
+
+        let result = call_llm_with_messages(
+            provider.as_ref(),
+            &[Message::user("inspect")],
+            &[],
+            SessionId::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        match result.turn {
+            LlmTurnResult::ToolCalls { calls, .. } => {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].tool_use_id, "toolu_duplicate");
+                assert_eq!(calls[0].arguments["path"], "first");
+                assert_eq!(calls[1].tool_use_id, "toolu_unique");
+            }
+            LlmTurnResult::Text(text) => panic!("expected tool calls, got text: {text}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_omits_web_tools_when_web_provider_is_disabled() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_, session) =
+            make_session_for_compaction(&provider, temp_dir.path().to_path_buf(), Vec::new()).await;
+
+        assert!(!session.tools.iter().any(|tool| tool.name == "web_search"));
+        assert!(!session.tools.iter().any(|tool| tool.name == "web_open"));
+        assert!(session.tool_registry.get("web_search").is_some());
+        assert!(session.tool_registry.get("web_open").is_some());
+    }
+
+    #[tokio::test]
     async fn concurrent_tool_batch_preserves_request_order_in_outputs() {
         let provider: Arc<dyn LlmProvider> = Arc::new(ToolCallThenTextProvider {
             call_count: AtomicU32::new(0),
@@ -11064,6 +11160,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "first".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -11087,6 +11184,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "second".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
