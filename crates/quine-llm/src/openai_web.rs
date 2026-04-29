@@ -14,7 +14,7 @@ use crate::web::{
 pub struct OpenAiWebConfig {
     /// Base URL for the Responses API root, e.g. `https://api.openai.com/v1`.
     pub base_url: String,
-    /// API key used for authentication.
+    /// API key used for authentication. Leave empty to omit bearer auth.
     pub api_key: String,
     /// Model identifier used for web-backed requests.
     pub model: String,
@@ -34,6 +34,15 @@ impl OpenAiWebProvider {
             .build()
             .unwrap_or_default();
         Self { config, client }
+    }
+
+    fn post_json(&self, url: String) -> reqwest::RequestBuilder {
+        let req = self.client.post(url);
+        if self.config.api_key.is_empty() {
+            req
+        } else {
+            req.bearer_auth(&self.config.api_key)
+        }
     }
 
     async fn run_request(
@@ -63,11 +72,7 @@ impl OpenAiWebProvider {
             include: vec!["web_search_call.action.sources".into()],
             input,
         };
-        let req = self
-            .client
-            .post(responses_url)
-            .bearer_auth(&self.config.api_key)
-            .json(&response_request);
+        let req = self.post_json(responses_url).json(&response_request);
         let response = send_with_retry(req, "openai_web").await?;
         let status = response.status();
         let body = response.text().await.map_err(LlmError::from)?;
@@ -82,7 +87,7 @@ impl OpenAiWebProvider {
 
         // Some OpenAI-compatible local servers expose web search through
         // `/chat/completions` using `responses_tools` rather than `/responses`.
-        if status == reqwest::StatusCode::NOT_FOUND {
+        if should_fallback_to_chat_completions(status, &body) {
             return self
                 .run_chat_completions_request(
                     response_request.model,
@@ -115,16 +120,12 @@ impl OpenAiWebProvider {
                 role: "user".into(),
                 content: input,
             }],
-            responses_tools: tools,
+            responses_tools: chat_completions_web_tools(&tools),
             responses_tool_choice: "auto".into(),
             stream: false,
         };
 
-        let req = self
-            .client
-            .post(url)
-            .bearer_auth(&self.config.api_key)
-            .json(&request);
+        let req = self.post_json(url).json(&request);
         let response = send_with_retry(req, "openai_web_chat_compat").await?;
         let status = response.status();
         let body = response.text().await.map_err(LlmError::from)?;
@@ -195,9 +196,14 @@ struct ResponsesRequest {
 struct ChatCompletionsWebRequest {
     model: String,
     messages: Vec<ChatMessage>,
-    responses_tools: Vec<WebSearchTool>,
+    responses_tools: Vec<ChatCompletionsWebTool>,
     responses_tool_choice: String,
     stream: bool,
+}
+
+#[derive(Serialize)]
+struct ChatCompletionsWebTool {
+    r#type: String,
 }
 
 #[derive(Serialize)]
@@ -404,6 +410,42 @@ fn dedupe_sources(sources: &mut Vec<WebSource>) {
     sources.retain(|source| seen.insert(source.url.clone()));
 }
 
+fn chat_completions_web_tools(tools: &[WebSearchTool]) -> Vec<ChatCompletionsWebTool> {
+    tools
+        .iter()
+        .map(|_| ChatCompletionsWebTool {
+            r#type: "web_search_preview".into(),
+        })
+        .collect()
+}
+
+fn should_fallback_to_chat_completions(status: reqwest::StatusCode, body: &str) -> bool {
+    if matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            | reqwest::StatusCode::NOT_IMPLEMENTED
+    ) {
+        return true;
+    }
+
+    status == reqwest::StatusCode::BAD_REQUEST
+        && response_error_code_is(body, "RESPONSES_TOOLS_REJECTED")
+}
+
+fn response_error_code_is(body: &str, expected: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("error")
+                .and_then(|error| error.get("code"))
+                .and_then(|code| code.as_str())
+                .map(|code| code.eq_ignore_ascii_case(expected))
+        })
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -470,5 +512,46 @@ mod tests {
         assert_eq!(result.text, "Current news summary");
         assert!(result.citations.is_empty());
         assert!(result.sources.is_empty());
+    }
+
+    #[test]
+    fn chat_completions_tool_payload_uses_preview_type() {
+        let tools = chat_completions_web_tools(&[WebSearchTool {
+            r#type: "web_search".into(),
+            filters: None,
+            user_location: None,
+            external_web_access: Some(true),
+        }]);
+
+        let value = serde_json::to_value(tools).unwrap();
+        assert_eq!(value, serde_json::json!([{ "type": "web_search_preview" }]));
+    }
+
+    #[test]
+    fn chat_completions_fallback_is_limited_to_missing_responses_endpoint() {
+        assert!(should_fallback_to_chat_completions(
+            reqwest::StatusCode::NOT_FOUND,
+            ""
+        ));
+        assert!(should_fallback_to_chat_completions(
+            reqwest::StatusCode::METHOD_NOT_ALLOWED,
+            ""
+        ));
+        assert!(should_fallback_to_chat_completions(
+            reqwest::StatusCode::NOT_IMPLEMENTED,
+            ""
+        ));
+        assert!(should_fallback_to_chat_completions(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":"RESPONSES_TOOLS_REJECTED","message":"Upstream error"}}"#
+        ));
+        assert!(!should_fallback_to_chat_completions(
+            reqwest::StatusCode::BAD_REQUEST,
+            r#"{"error":{"code":"OTHER_BAD_REQUEST","message":"invalid request"}}"#
+        ));
+        assert!(!should_fallback_to_chat_completions(
+            reqwest::StatusCode::UNAUTHORIZED,
+            ""
+        ));
     }
 }

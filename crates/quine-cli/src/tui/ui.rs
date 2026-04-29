@@ -437,10 +437,12 @@ fn push_tool_batch_entry_lines(
         if let Some(preview) = call.result_preview.as_deref() {
             let preview = preview.trim();
             if !preview.is_empty() {
-                if call.tool_name == "plan" {
-                    render_grouped_plan_preview(lines, preview, area_width);
-                } else if call.tool_name == "bash" {
-                    render_bash_preview_box(lines, preview, area_width);
+                match call.tool_name.as_str() {
+                    "plan" => render_grouped_plan_preview(lines, preview, area_width),
+                    "bash" | "web_search" | "web_open" => {
+                        render_bash_preview_box(lines, preview, area_width)
+                    }
+                    _ => {}
                 }
             }
         }
@@ -533,7 +535,7 @@ fn push_conversation_entry_lines(
                         ]));
                     }
                 }
-            } else if tool_name == "bash" {
+            } else if matches!(tool_name.as_str(), "bash" | "web_search" | "web_open") {
                 if let Some(preview) = result_preview {
                     render_bash_preview_box(lines, preview, area_width);
                 }
@@ -2452,6 +2454,28 @@ mod tests {
         assert!(lines
             .iter()
             .any(|line| line.contains("… output truncated …")));
+    }
+
+    #[test]
+    fn draw_renders_web_search_preview_in_box() {
+        let mut app = App::new("test".into(), false, None);
+        app.messages.push(ConversationEntry::ToolCall {
+            tool_name: "web_search".into(),
+            tool_use_id: "tc1".into(),
+            summary: "mlx rust support".into(),
+            status: ToolStatus::Success { duration_us: 150 },
+            result_preview: Some(
+                "Answer with citations\nSources:\n- Example: https://example.com".into(),
+            ),
+        });
+
+        let lines = build_conversation_lines(&app, 80);
+        let rendered: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        assert!(rendered.iter().any(|line| line.contains("web_search")));
+        assert!(rendered
+            .iter()
+            .any(|line| line.contains("Answer with citations")));
+        assert!(rendered.iter().any(|line| line.contains("┌")));
     }
 
     #[test]

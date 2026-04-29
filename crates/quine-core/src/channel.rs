@@ -183,6 +183,12 @@ pub enum CoreInput {
         reply: oneshot::Sender<CoreCheckpoint>,
     },
 
+    /// Return a fresh checkpoint containing only the requested session.
+    RequestSessionCheckpoint {
+        session_id: SessionId,
+        reply: oneshot::Sender<CoreCheckpoint>,
+    },
+
     /// Internal signal that a background session-memory refresh has finished.
     SessionMemoryRefreshFinished {
         session_id: SessionId,

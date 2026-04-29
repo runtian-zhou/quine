@@ -555,6 +555,17 @@ fn build_tool_registry_for_session(
     tool_registry
 }
 
+fn advertised_tool_definitions(
+    tool_registry: &ToolRegistry,
+    web_provider: &Arc<dyn WebProvider>,
+) -> Vec<ToolDefinition> {
+    let mut tools = tool_registry.tool_definitions();
+    if !web_provider.is_configured() {
+        tools.retain(|tool| !matches!(tool.name.as_str(), "web_search" | "web_open"));
+    }
+    tools
+}
+
 fn prompt_memory_mode_from_env() -> PromptMemoryMode {
     match std::env::var("QUINE_PROMPT_MEMORY_MODE")
         .unwrap_or_else(|_| "disabled".into())
@@ -788,7 +799,7 @@ impl SessionContext {
             persisted_config.plan_mode,
             prompt_behavior,
         );
-        let tools = tool_registry.tool_definitions();
+        let tools = advertised_tool_definitions(&tool_registry, web_provider);
 
         let combined_prompt = build_combined_system_prompt(
             &working_directory,
@@ -924,7 +935,7 @@ impl SessionContext {
             &session.persisted_config,
             &skills,
         );
-        session.tools = session.tool_registry.tool_definitions();
+        session.tools = advertised_tool_definitions(&session.tool_registry, web_provider);
         session.persisted_config = config;
         session.persisted_config.skill_names = restored_skill_names;
         session.created_at = created_at;
@@ -1006,7 +1017,7 @@ impl SessionContext {
             &self.persisted_config,
             &skills,
         );
-        self.tools = self.tool_registry.tool_definitions();
+        self.tools = advertised_tool_definitions(&self.tool_registry, web_provider);
         self.system_prompt = build_combined_system_prompt(
             &self.persisted_config.working_directory,
             &self.persisted_config,
@@ -1545,6 +1556,7 @@ async fn call_llm_with_messages(
         }
     }
 
+    let tool_calls = deduplicate_pending_tool_calls(session_id, tool_calls);
     let turn = if tool_calls.is_empty() {
         LlmTurnResult::Text(full_text)
     } else {
@@ -1686,6 +1698,7 @@ async fn call_llm_interruptible(
         }
     }
 
+    let tool_calls = deduplicate_pending_tool_calls(session_id, tool_calls);
     let turn = if tool_calls.is_empty() {
         LlmTurnResult::Text(full_text)
     } else {
@@ -1769,6 +1782,30 @@ struct PendingToolCall {
     tool_use_id: String,
     tool_name: String,
     arguments: serde_json::Value,
+}
+
+fn deduplicate_pending_tool_calls(
+    session_id: SessionId,
+    calls: Vec<PendingToolCall>,
+) -> Vec<PendingToolCall> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(calls.len());
+
+    for call in calls {
+        if seen.insert(call.tool_use_id.clone()) {
+            deduped.push(call);
+        } else {
+            debug_log_session(
+                session_id,
+                format!(
+                    "dropped duplicate tool call id={} name={}",
+                    call.tool_use_id, call.tool_name
+                ),
+            );
+        }
+    }
+
+    deduped
 }
 
 struct LlmCallResult {
@@ -3096,6 +3133,20 @@ async fn execute_tool_call(
                     }
                     Some(CoreInput::RequestCheckpoint { reply }) => {
                         let checkpoint = snapshot_sessions(sessions, engine.session_tree).await;
+                        let _ = reply.send(checkpoint);
+                    }
+                    Some(CoreInput::RequestSessionCheckpoint {
+                        session_id: requested_session_id,
+                        reply,
+                    }) => {
+                        let persisted_session = match sessions.get(&requested_session_id) {
+                            Some(session) => session.snapshot(requested_session_id).await,
+                            None => None,
+                        };
+                        let checkpoint = CoreCheckpoint::new(
+                            persisted_session.into_iter().collect(),
+                            engine.session_tree.snapshot(),
+                        );
                         let _ = reply.send(checkpoint);
                     }
                     Some(other) => io.deferred_inputs.push_back(other),
@@ -5545,6 +5596,7 @@ impl SessionActor {
             }
         }
 
+        let tool_calls = deduplicate_pending_tool_calls(self.session_id, tool_calls);
         let turn = if tool_calls.is_empty() {
             LlmTurnResult::Text(full_text)
         } else {
@@ -6037,6 +6089,30 @@ async fn snapshot_registry_sessions(
     let handles: Vec<SessionHandle> = registry.read().await.values().cloned().collect();
     let mut persisted_sessions = Vec::new();
     for handle in handles {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        if handle
+            .command_tx
+            .send(SessionCommand::Snapshot { reply: reply_tx })
+            .await
+            .is_ok()
+        {
+            if let Ok(Some(snapshot)) = reply_rx.await {
+                persisted_sessions.push(snapshot);
+            }
+        }
+    }
+    let tree = session_tree.read().await.snapshot();
+    CoreCheckpoint::new(persisted_sessions, tree)
+}
+
+async fn snapshot_registry_session(
+    registry: &SessionRegistry,
+    session_tree: &SharedSessionTree,
+    session_id: SessionId,
+) -> CoreCheckpoint {
+    let handle = registry.read().await.get(&session_id).cloned();
+    let mut persisted_sessions = Vec::new();
+    if let Some(handle) = handle {
         let (reply_tx, reply_rx) = oneshot::channel();
         if handle
             .command_tx
@@ -6611,6 +6687,11 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     }
                     CoreInput::RequestCheckpoint { reply } => {
                         let checkpoint = snapshot_registry_sessions(&registry, &session_tree).await;
+                        let _ = reply.send(checkpoint);
+                    }
+                    CoreInput::RequestSessionCheckpoint { session_id, reply } => {
+                        let checkpoint =
+                            snapshot_registry_session(&registry, &session_tree, session_id).await;
                         let _ = reply.send(checkpoint);
                     }
                     CoreInput::WaitSession { parent_id, child_id, reply, non_blocking, timeout: _ } => {
@@ -8442,6 +8523,64 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         assert_eq!(partitions[1].1[0].tool_use_id, "toolu_3");
         assert_eq!(partitions[2].1[0].tool_use_id, "toolu_4");
         assert_eq!(partitions[2].1[1].tool_use_id, "toolu_5");
+    }
+
+    #[tokio::test]
+    async fn call_llm_with_messages_deduplicates_tool_call_ids() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolCallThenTextProvider {
+            call_count: AtomicU32::new(0),
+            tool_calls: vec![
+                (
+                    "toolu_duplicate".into(),
+                    "read_file".into(),
+                    serde_json::json!({"path": "first"}),
+                ),
+                (
+                    "toolu_duplicate".into(),
+                    "read_file".into(),
+                    serde_json::json!({"path": "second"}),
+                ),
+                (
+                    "toolu_unique".into(),
+                    "find".into(),
+                    serde_json::json!({"name": "*.rs"}),
+                ),
+            ],
+            final_text: "done".into(),
+        });
+
+        let result = call_llm_with_messages(
+            provider.as_ref(),
+            &[Message::user("inspect")],
+            &[],
+            SessionId::new(),
+            None,
+        )
+        .await
+        .unwrap();
+
+        match result.turn {
+            LlmTurnResult::ToolCalls { calls, .. } => {
+                assert_eq!(calls.len(), 2);
+                assert_eq!(calls[0].tool_use_id, "toolu_duplicate");
+                assert_eq!(calls[0].arguments["path"], "first");
+                assert_eq!(calls[1].tool_use_id, "toolu_unique");
+            }
+            LlmTurnResult::Text(text) => panic!("expected tool calls, got text: {text}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_omits_web_tools_when_web_provider_is_disabled() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let temp_dir = tempfile::tempdir().unwrap();
+        let (_, session) =
+            make_session_for_compaction(&provider, temp_dir.path().to_path_buf(), Vec::new()).await;
+
+        assert!(!session.tools.iter().any(|tool| tool.name == "web_search"));
+        assert!(!session.tools.iter().any(|tool| tool.name == "web_open"));
+        assert!(session.tool_registry.get("web_search").is_some());
+        assert!(session.tool_registry.get("web_open").is_some());
     }
 
     #[tokio::test]
@@ -11064,6 +11203,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "first".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();
@@ -11087,6 +11227,7 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .send(CoreInput::UserMessage {
                 session_id,
                 content: "second".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
             })
             .await
             .unwrap();

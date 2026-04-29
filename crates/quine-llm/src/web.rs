@@ -53,6 +53,10 @@ pub struct WebOpenRequest {
 /// Trait abstracting the backing service for web-enabled tools.
 #[async_trait]
 pub trait WebProvider: Send + Sync {
+    fn is_configured(&self) -> bool {
+        true
+    }
+
     async fn search(&self, request: WebSearchRequest) -> anyhow::Result<WebResult>;
 
     async fn open(&self, request: WebOpenRequest) -> anyhow::Result<WebResult>;
@@ -63,6 +67,10 @@ pub struct NoopWebProvider;
 
 #[async_trait]
 impl WebProvider for NoopWebProvider {
+    fn is_configured(&self) -> bool {
+        false
+    }
+
     async fn search(&self, _request: WebSearchRequest) -> anyhow::Result<WebResult> {
         anyhow::bail!("web tools are not configured")
     }

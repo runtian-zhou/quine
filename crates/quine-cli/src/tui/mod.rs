@@ -374,11 +374,7 @@ pub async fn run_tui_chat(
         session.max_context_window,
     );
     if let Ok(snapshot) = fetch_session_context(&mut client, &app.session_id).await {
-        app.loaded_skill_commands = snapshot
-            .loaded_skills
-            .into_iter()
-            .map(|skill| skill.name)
-            .collect();
+        app.load_session_context(snapshot);
     }
     if let Ok(profiles) = load_model_profile_names() {
         app.set_model_profile_candidates(profiles);

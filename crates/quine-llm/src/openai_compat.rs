@@ -530,17 +530,25 @@ impl ToolCallAccumulator {
         self.calls
             .into_iter()
             .filter(|c| !c.id.is_empty())
-            .map(|c| {
+            .filter_map(|c| {
                 let arguments = serde_json::from_str(&c.arguments)
                     .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
-                LlmEvent::ToolCall {
+                if should_suppress_provider_tool_call(&c.name, &arguments) {
+                    return None;
+                }
+                Some(LlmEvent::ToolCall {
                     tool_use_id: c.id,
                     tool_name: c.name,
                     arguments,
-                }
+                })
             })
             .collect()
     }
+}
+
+fn should_suppress_provider_tool_call(tool_name: &str, arguments: &serde_json::Value) -> bool {
+    matches!(tool_name, "web_search" | "web_search_preview")
+        && arguments.as_object().is_some_and(serde_json::Map::is_empty)
 }
 
 #[async_trait]
@@ -1100,6 +1108,54 @@ mod tests {
                 assert_eq!(tool_use_id, "openai-tool-call-1");
                 assert_eq!(tool_name, "read_file");
                 assert_eq!(arguments["file_path"], "/tmp/test.txt");
+            }
+            _ => panic!("expected ToolCall event"),
+        }
+    }
+
+    #[test]
+    fn tool_call_accumulator_suppresses_empty_provider_web_search_call() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: Some(0),
+                id: Some("ws_123".into()),
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: Some("web_search".into()),
+                    arguments: Some("{}".into()),
+                }),
+            },
+            false,
+        );
+
+        assert!(acc.take_completed().is_empty());
+    }
+
+    #[test]
+    fn tool_call_accumulator_keeps_web_search_call_with_query() {
+        let mut acc = ToolCallAccumulator::default();
+        acc.process_delta(
+            &OpenAiToolCallDelta {
+                index: Some(0),
+                id: Some("call_1".into()),
+                function: Some(OpenAiToolCallFunctionDelta {
+                    name: Some("web_search".into()),
+                    arguments: Some(r#"{"query":"weather in New York today"}"#.into()),
+                }),
+            },
+            false,
+        );
+
+        let events = acc.take_completed();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            LlmEvent::ToolCall {
+                tool_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(tool_name, "web_search");
+                assert_eq!(arguments["query"], "weather in New York today");
             }
             _ => panic!("expected ToolCall event"),
         }

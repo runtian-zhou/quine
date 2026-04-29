@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -209,7 +210,10 @@ async fn run_subagent_inner(
         .as_ref()
         .map(|ch| wrap_channel_with_label(ch, label));
 
-    let tools = tool_registry.tool_definitions();
+    let mut tools = tool_registry.tool_definitions();
+    if !web_provider.is_configured() {
+        tools.retain(|tool| !matches!(tool.name.as_str(), "web_search" | "web_open"));
+    }
 
     // Build conversation history.
     let mut history: Vec<Message> = Vec::new();
@@ -244,6 +248,9 @@ async fn run_subagent_inner(
                 Err(e) => return Err(format!("LLM stream error: {e}")),
             }
         }
+
+        let mut seen_tool_use_ids = HashSet::new();
+        tool_calls.retain(|(tool_use_id, _, _)| seen_tool_use_ids.insert(tool_use_id.clone()));
 
         if tool_calls.is_empty() {
             // LLM produced text without tool calls — done.

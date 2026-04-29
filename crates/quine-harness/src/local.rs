@@ -127,6 +127,30 @@ fn persisted_listing_summary(session: &quine_core::PersistedSession) -> Option<S
         .and_then(|state| state.listing_summary.clone())
 }
 
+fn merge_checkpoint_update(
+    previous: Option<CoreCheckpoint>,
+    update: CoreCheckpoint,
+) -> CoreCheckpoint {
+    let mut merged =
+        previous.unwrap_or_else(|| CoreCheckpoint::new(Vec::new(), update.session_tree.clone()));
+    merged.format_version = update.format_version;
+    merged.session_tree = update.session_tree;
+
+    for updated_session in update.sessions {
+        if let Some(existing) = merged
+            .sessions
+            .iter_mut()
+            .find(|session| session.session_id == updated_session.session_id)
+        {
+            *existing = updated_session;
+        } else {
+            merged.sessions.push(updated_session);
+        }
+    }
+
+    merged
+}
+
 async fn refresh_checkpoint_session_summaries(
     sessions: &Arc<Mutex<HashMap<SessionId, SessionListing>>>,
     checkpoint: &quine_core::persistence::CoreCheckpoint,
@@ -318,6 +342,56 @@ impl LocalHarness {
                 previous_checkpoint.as_ref(),
             )
             .await;
+            self._storage
+                .commit_checkpoint(&checkpoint)
+                .await
+                .map_err(|error| HarnessError::Internal {
+                    message: format!("failed to persist checkpoint: {error}"),
+                })?;
+            checkpoint
+        };
+        if let Err(error) =
+            refresh_checkpoint_session_summaries(&self.sessions, &checkpoint, self._storage.root())
+                .await
+        {
+            tracing::warn!(?error, "failed to refresh session summaries");
+        }
+        Ok(checkpoint)
+    }
+
+    async fn request_session_checkpoint(
+        &self,
+        session_id: SessionId,
+    ) -> Result<CoreCheckpoint, HarnessError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.core_input
+            .send(CoreInput::RequestSessionCheckpoint {
+                session_id,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+        let checkpoint = reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+
+        let checkpoint = {
+            let _guard = self.checkpoint_commit_lock.lock().await;
+            let previous_checkpoint =
+                self._storage
+                    .load_latest_checkpoint()
+                    .await
+                    .map_err(|error| HarnessError::Internal {
+                        message: format!("failed to load checkpoint: {error}"),
+                    })?;
+            let checkpoint = enrich_checkpoint_with_persistent_memory(
+                checkpoint,
+                &self.memory_store,
+                Some(&self.event_tx),
+                previous_checkpoint.as_ref(),
+            )
+            .await;
+            let checkpoint = merge_checkpoint_update(previous_checkpoint, checkpoint);
             self._storage
                 .commit_checkpoint(&checkpoint)
                 .await
@@ -959,7 +1033,7 @@ impl HarnessService for LocalHarness {
         }
         drop(sessions);
 
-        let mut checkpoint = self.request_checkpoint().await?;
+        let mut checkpoint = self.request_session_checkpoint(session_id).await?;
 
         if session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new(), None).is_none()
         {
