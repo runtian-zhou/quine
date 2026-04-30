@@ -11,6 +11,8 @@ Each test case specifies:
 
 Registered tools: `bash`, `read_file`, `write_file`, `ask_user`, `plan`, `subagent`, `spawn`, `wait_child`, `signal`, `send_message`, `recv_message`
 
+Delegation policy: prefer `subagent` for normal task delegation where the caller wants the child result returned in the same turn. Use `spawn`, `wait_child`, `signal`, `send_message`, and `recv_message` only for advanced coordination scenarios such as concurrency, long-lived children, cancellation, or mailbox-based communication.
+
 ---
 
 ## simple_greeting
@@ -83,6 +85,14 @@ Registered tools: `bash`, `read_file`, `write_file`, `ask_user`, `plan`, `subage
 - **Flags**: `--json`
 - **Send**: `"Use the plan tool to create a plan titled 'QA Plan' with one action: id 'step1', title 'Test step', description 'A test action'. Then update that plan's action 'step1' status to 'completed' with result 'Done'. Tell me the final status."`
 - **Expect**: Output contains `completed`
+
+---
+
+## subagent_preferred_for_delegation
+**Description**: Verify the agent prefers `subagent` over `spawn` + `wait_child` for ordinary one-shot delegation.
+- **Flags**: `--json`
+- **Send**: `"Delegate this small task to another agent: use bash to run echo PREFER_SUBAGENT_17 and return the delegated result."`
+- **Expect**: JSON `tool_calls` includes `subagent`; JSON `tool_calls` does not include `spawn` or `wait_child`; `response` contains `PREFER_SUBAGENT_17`
 
 ---
 
