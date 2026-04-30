@@ -108,42 +108,38 @@ fn format_tui_ps_table(mut sessions: Vec<TuiSessionSummary>) -> String {
         .max()
         .unwrap_or(4)
         .max("MODE".len());
-    let summary_width = sessions
-        .iter()
-        .map(|session| tui_session_summary_text(session).len())
-        .max()
-        .unwrap_or(7)
-        .max("SUMMARY".len());
-
     let mut lines = Vec::with_capacity(sessions.len() + 1);
     lines.push(format!(
-        "{:<session_width$}  {:<parent_width$}  {:<state_width$}  {:<mode_width$}  {:<summary_width$}",
+        "{:<session_width$}  {:<parent_width$}  {:<state_width$}  {:<mode_width$}  SUMMARY",
         "SESSION",
         "PARENT",
         "STATUS",
         "MODE",
-        "SUMMARY",
         session_width = session_width,
         parent_width = parent_width,
         state_width = state_width,
         mode_width = mode_width,
-        summary_width = summary_width,
     ));
 
     for session in sessions {
-        lines.push(format!(
-            "{:<session_width$}  {:<parent_width$}  {:<state_width$}  {:<mode_width$}  {:<summary_width$}",
+        let mode = if session.plan_mode { "plan" } else { "chat" };
+        let summary = tui_session_summary_text(&session);
+        let mut line = format!(
+            "{:<session_width$}  {:<parent_width$}  {:<state_width$}  {:<mode_width$}",
             session.session_id,
             session.parent_id.as_deref().unwrap_or("-"),
             session.status,
-            if session.plan_mode { "plan" } else { "chat" },
-            tui_session_summary_text(&session),
+            mode,
             session_width = session_width,
             parent_width = parent_width,
             state_width = state_width,
             mode_width = mode_width,
-            summary_width = summary_width,
-        ));
+        );
+        if !summary.is_empty() {
+            line.push_str("  ");
+            line.push_str(&summary);
+        }
+        lines.push(line);
     }
 
     prepend_summary(&summary, &lines.join("\n"))
@@ -273,12 +269,24 @@ fn format_tui_status_summary(sessions: &[TuiSessionSummary]) -> String {
     format_session_summary(sessions.iter().map(|session| session.status.as_str()))
 }
 
-fn tui_session_summary_text(session: &TuiSessionSummary) -> &str {
+fn tui_session_summary_text(session: &TuiSessionSummary) -> String {
     session
         .summary
         .as_deref()
         .or(session.title.as_deref())
-        .unwrap_or("")
+        .map(collapse_inline_whitespace)
+        .unwrap_or_default()
+}
+
+fn collapse_inline_whitespace(text: &str) -> String {
+    let mut collapsed = String::new();
+    for part in text.split_whitespace() {
+        if !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        collapsed.push_str(part);
+    }
+    collapsed
 }
 
 async fn fetch_tui_ps_output(client: &mut IpcClient, tree: bool) -> anyhow::Result<String> {
@@ -532,6 +540,24 @@ fn mouse_scroll_step(view_height: u32) -> u32 {
     }
 }
 
+fn context_scroll_view_height(app: &app::App) -> u32 {
+    if app.last_context_view_height > 0 {
+        app.last_context_view_height
+    } else {
+        app.last_view_height
+    }
+}
+
+fn context_page_scroll_step(app: &app::App) -> u16 {
+    let view_height = context_scroll_view_height(app);
+    let step = if view_height > 1 {
+        view_height.saturating_sub(1)
+    } else {
+        1
+    };
+    step.min(u32::from(u16::MAX)) as u16
+}
+
 #[cfg(not(target_os = "macos"))]
 fn try_arboard_copy(text: &str) -> Result<&'static str, String> {
     let mut clipboard =
@@ -637,7 +663,12 @@ fn copy_current_conversation_selection(app: &mut app::App) {
 }
 
 fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction> {
-    let step = mouse_scroll_step(app.last_view_height);
+    let scroll_view_height = if app.context_explorer_active() {
+        context_scroll_view_height(app)
+    } else {
+        app.last_view_height
+    };
+    let step = mouse_scroll_step(scroll_view_height);
     match event.kind {
         MouseEventKind::ScrollUp => {
             if app.context_explorer_active() {
@@ -723,21 +754,11 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                         None
                     }
                     KeyCode::PageUp => {
-                        let step = if app.last_view_height > 2 {
-                            app.last_view_height.saturating_sub(2) as u16
-                        } else {
-                            10
-                        };
-                        app.context_explorer_scroll_up(step);
+                        app.context_explorer_scroll_up(context_page_scroll_step(app));
                         None
                     }
                     KeyCode::PageDown => {
-                        let step = if app.last_view_height > 2 {
-                            app.last_view_height.saturating_sub(2) as u16
-                        } else {
-                            10
-                        };
-                        app.context_explorer_scroll_down(step);
+                        app.context_explorer_scroll_down(context_page_scroll_step(app));
                         None
                     }
                     KeyCode::Home => {
@@ -1238,6 +1259,33 @@ mod tests {
         }
     }
 
+    fn empty_context_snapshot() -> crate::context_debug::SessionContextSnapshot {
+        crate::context_debug::SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: Vec::new(),
+            working_directory: std::path::PathBuf::from("."),
+            plan_mode: false,
+            available_tools: Vec::new(),
+            loaded_skills: Vec::new(),
+            plans: Vec::new(),
+            lineage: crate::context_debug::SessionLineageSnapshot {
+                parent_id: None,
+                root_id: "session-1".into(),
+                depth: 0,
+                child_ids: Vec::new(),
+            },
+            prompt_memory: None,
+            compact_memory_summary_markdown: None,
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            status_report: None,
+            history: Vec::new(),
+        }
+    }
+
     fn sample_tui_session(
         session_id: &str,
         parent_id: Option<&str>,
@@ -1258,6 +1306,35 @@ mod tests {
     fn format_tui_ps_table_includes_summary() {
         let output = format_tui_ps_table(vec![sample_tui_session("s1", None, "running")]);
         assert!(output.starts_with("1 sessions · 1 running\n\nSESSION"));
+    }
+
+    #[test]
+    fn format_tui_ps_table_avoids_trailing_padding() {
+        let mut summarized = sample_tui_session("s2", None, "idle");
+        summarized.summary = Some("A long session summary that should not pad every row".into());
+        let output = format_tui_ps_table(vec![sample_tui_session("s1", None, "idle"), summarized]);
+
+        assert!(
+            output.lines().all(|line| !line.ends_with(' ')),
+            "unexpected trailing spaces in output:\n{output:?}"
+        );
+        let unsummarized_line = output
+            .lines()
+            .find(|line| line.starts_with("s1"))
+            .expect("unsummarized session row should be present");
+        assert!(
+            unsummarized_line.ends_with("chat"),
+            "unexpected unsummarized row: {unsummarized_line:?}"
+        );
+    }
+
+    #[test]
+    fn format_tui_ps_table_collapses_multiline_summaries() {
+        let mut session = sample_tui_session("s1", None, "idle");
+        session.summary = Some("Session memory summary:\n\n## Current State\n- now".into());
+        let output = format_tui_ps_table(vec![session]);
+
+        assert!(output.contains("Session memory summary: ## Current State - now"));
     }
 
     #[test]
@@ -1466,30 +1543,7 @@ mod tests {
     fn mouse_scroll_targets_context_explorer_when_open() {
         let mut app = app::App::new("test".into(), false, None);
         app.last_view_height = 15;
-        app.open_context_explorer(crate::context_debug::SessionContextSnapshot {
-            session_id: "session-1".into(),
-            created_at: chrono::Utc::now(),
-            state: "idle".into(),
-            system_prompt: None,
-            skills: Vec::new(),
-            working_directory: std::path::PathBuf::from("."),
-            plan_mode: false,
-            available_tools: Vec::new(),
-            loaded_skills: Vec::new(),
-            plans: Vec::new(),
-            lineage: crate::context_debug::SessionLineageSnapshot {
-                parent_id: None,
-                root_id: "session-1".into(),
-                depth: 0,
-                child_ids: Vec::new(),
-            },
-            prompt_memory: None,
-            compact_memory_summary_markdown: None,
-            memory_diagnostics: None,
-            permission_diagnostics: None,
-            status_report: None,
-            history: Vec::new(),
-        });
+        app.open_context_explorer(empty_context_snapshot());
 
         let action = handle_terminal_event(
             &mut app,
@@ -1509,6 +1563,66 @@ mod tests {
             Some(5)
         );
         assert_eq!(app.scroll_offset, 0);
+    }
+
+    #[test]
+    fn context_mouse_scroll_uses_context_view_height_when_known() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.last_view_height = 30;
+        app.open_context_explorer(empty_context_snapshot());
+        app.last_context_view_height = 9;
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollDown,
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            }),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(
+            app.context_explorer
+                .as_ref()
+                .map(|explorer| explorer.scroll_offset),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn context_page_scroll_uses_context_view_height_when_known() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.last_view_height = 30;
+        app.open_context_explorer(empty_context_snapshot());
+        app.last_context_view_height = 8;
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE)),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(
+            app.context_explorer
+                .as_ref()
+                .map(|explorer| explorer.scroll_offset),
+            Some(7)
+        );
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE)),
+        );
+
+        assert!(action.is_none());
+        assert_eq!(
+            app.context_explorer
+                .as_ref()
+                .map(|explorer| explorer.scroll_offset),
+            Some(0)
+        );
     }
 
     #[test]
