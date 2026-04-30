@@ -51,6 +51,17 @@ pub trait HarnessService: Send + Sync {
     /// Compact an existing session's conversation history.
     async fn compact_session(&self, session_id: SessionId) -> Result<(), HarnessError>;
 
+    /// Truncate an existing session's conversation history after a selected entry.
+    async fn unwind_session(
+        &self,
+        _session_id: SessionId,
+        _history_index: usize,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Internal {
+            message: "not implemented".into(),
+        })
+    }
+
     /// Submit the result of a tool invocation requested by the core.
     async fn submit_tool_result(
         &self,

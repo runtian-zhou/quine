@@ -449,16 +449,17 @@ async fn run_event_loop(
     socket_path: &Path,
     auto_approve: bool,
 ) -> anyhow::Result<()> {
-    let mut last_context_visible = app.context_explorer_active();
+    let mut last_context_visible = app.context_explorer_active() || app.unwind_selector_active();
     loop {
         // Draw.
         terminal.draw(|frame| {
-            if app.context_explorer_active() != last_context_visible {
+            let context_visible = app.context_explorer_active() || app.unwind_selector_active();
+            if context_visible != last_context_visible {
                 frame.render_widget(TuiClear, frame.area());
             }
             ui::draw(frame, app)
         })?;
-        last_context_visible = app.context_explorer_active();
+        last_context_visible = app.context_explorer_active() || app.unwind_selector_active();
 
         if app.should_quit {
             break;
@@ -663,7 +664,7 @@ fn copy_current_conversation_selection(app: &mut app::App) {
 }
 
 fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction> {
-    let scroll_view_height = if app.context_explorer_active() {
+    let scroll_view_height = if app.context_explorer_active() || app.unwind_selector_active() {
         context_scroll_view_height(app)
     } else {
         app.last_view_height
@@ -673,6 +674,8 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
         MouseEventKind::ScrollUp => {
             if app.context_explorer_active() {
                 app.context_explorer_scroll_up(step.min(u16::MAX as u32) as u16);
+            } else if app.unwind_selector_active() {
+                app.unwind_page_up(step.min(u16::MAX as u32) as u16);
             } else {
                 app.scroll_up(step);
             }
@@ -681,6 +684,8 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
         MouseEventKind::ScrollDown => {
             if app.context_explorer_active() {
                 app.context_explorer_scroll_down(step.min(u16::MAX as u32) as u16);
+            } else if app.unwind_selector_active() {
+                app.unwind_page_down(step.min(u16::MAX as u32) as u16);
             } else {
                 app.scroll_down(step);
             }
@@ -688,6 +693,7 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
         }
         MouseEventKind::Down(MouseButton::Left) => {
             if !app.context_explorer_active()
+                && !app.unwind_selector_active()
                 && app.begin_conversation_drag_at_mouse(event.column, event.row)
             {
                 app.set_status_notice("selection started");
@@ -696,6 +702,7 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             if !app.context_explorer_active()
+                && !app.unwind_selector_active()
                 && app.update_conversation_drag_at_mouse(event.column, event.row)
             {
                 if let Some(text) = app.selected_conversation_text() {
@@ -708,7 +715,7 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
             None
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            if !app.context_explorer_active() {
+            if !app.context_explorer_active() && !app.unwind_selector_active() {
                 if app
                     .finish_conversation_drag_at_mouse(event.column, event.row)
                     .is_some()
@@ -731,6 +738,43 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
         Event::Key(KeyEvent {
             code, modifiers, ..
         }) => {
+            if app.unwind_selector_active() {
+                return match code {
+                    KeyCode::Esc => {
+                        app.close_unwind_selector();
+                        None
+                    }
+                    KeyCode::Enter => app
+                        .selected_unwind_history_index()
+                        .map(|history_index| AppAction::UnwindSession { history_index }),
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.unwind_move_up();
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.unwind_move_down();
+                        None
+                    }
+                    KeyCode::PageUp => {
+                        app.unwind_page_up(context_page_scroll_step(app));
+                        None
+                    }
+                    KeyCode::PageDown => {
+                        app.unwind_page_down(context_page_scroll_step(app));
+                        None
+                    }
+                    KeyCode::Home => {
+                        app.unwind_move_to_first();
+                        None
+                    }
+                    KeyCode::End => {
+                        app.unwind_move_to_last();
+                        None
+                    }
+                    _ => None,
+                };
+            }
+
             if app.context_explorer_active() {
                 return match code {
                     KeyCode::Esc => {
@@ -928,12 +972,7 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                         // Agent is busy — cancel in-flight work.
                         Some(AppAction::Cancel)
                     } else {
-                        // Agent is idle — clear input buffer.
-                        app.input.clear();
-                        app.refresh_slash_command_options();
-                        app.refresh_model_profile_options();
-                        app.refresh_switch_session_options();
-                        None
+                        Some(AppAction::ShowUnwind)
                     }
                 }
                 KeyCode::Tab => {
@@ -1006,6 +1045,55 @@ async fn execute_action(
                 }
             }
             app.set_phase(AgentPhase::Idle);
+        }
+        AppAction::ShowUnwind => {
+            match fetch_session_context(client, &app.session_id).await {
+                Ok(snapshot) => app.open_unwind_selector(snapshot),
+                Err(error) => {
+                    app.push_message(app::ConversationEntry::Error(error.to_string()));
+                    app.auto_scroll();
+                }
+            }
+            app.set_phase(AgentPhase::Idle);
+        }
+        AppAction::UnwindSession { history_index } => {
+            if app.phase != AgentPhase::Idle {
+                app.close_unwind_selector();
+                app.push_message(app::ConversationEntry::Error(
+                    "Cannot unwind context while the session is busy.".into(),
+                ));
+                app.auto_scroll();
+                return Ok(());
+            }
+            let params = serde_json::json!({
+                "session_id": app.session_id,
+                "history_index": history_index,
+            });
+            match client.call(methods::UNWIND_SESSION, Some(params)).await {
+                Ok(Ok(_)) => match fetch_session_context(client, &app.session_id).await {
+                    Ok(context) => {
+                        app.load_session_context(context);
+                        app.set_status_notice(format!(
+                            "context unwound to history entry {}",
+                            history_index + 1
+                        ));
+                    }
+                    Err(error) => {
+                        app.push_message(app::ConversationEntry::Error(format!(
+                            "context unwound, but reload failed: {error}"
+                        )));
+                    }
+                },
+                Ok(Err(error)) => {
+                    app.push_message(app::ConversationEntry::Error(error));
+                }
+                Err(error) => {
+                    app.push_message(app::ConversationEntry::Error(error.to_string()));
+                }
+            }
+            app.close_unwind_selector();
+            app.set_phase(AgentPhase::Idle);
+            app.auto_scroll();
         }
         AppAction::CompactSession => {
             let params = serde_json::json!({
@@ -1623,6 +1711,94 @@ mod tests {
                 .map(|explorer| explorer.scroll_offset),
             Some(0)
         );
+    }
+
+    #[test]
+    fn esc_opens_unwind_selector_action_when_idle_and_input_empty() {
+        let mut app = app::App::new("test".into(), false, None);
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+
+        assert!(matches!(action, Some(AppAction::ShowUnwind)));
+    }
+
+    #[test]
+    fn esc_opens_unwind_selector_action_when_idle_even_with_input() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.input.set_from_string("draft");
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+
+        assert!(matches!(action, Some(AppAction::ShowUnwind)));
+        assert_eq!(app.input.content(), "draft");
+    }
+
+    #[test]
+    fn esc_cancels_when_session_is_busy() {
+        let mut app = app::App::new("test".into(), false, None);
+        app.set_phase(AgentPhase::Thinking);
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+
+        assert!(matches!(action, Some(AppAction::Cancel)));
+    }
+
+    #[test]
+    fn unwind_selector_enter_returns_selected_history_index() {
+        let mut snapshot = empty_context_snapshot();
+        snapshot.history = vec![
+            crate::context_debug::HistoryEntry::Text {
+                role: "user".into(),
+                text: "first".into(),
+            },
+            crate::context_debug::HistoryEntry::Text {
+                role: "assistant".into(),
+                text: "second".into(),
+            },
+        ];
+        let mut app = app::App::new("test".into(), false, None);
+        app.open_unwind_selector(snapshot);
+        app.unwind_move_up();
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert!(matches!(
+            action,
+            Some(AppAction::UnwindSession { history_index: 0 })
+        ));
+    }
+
+    #[test]
+    fn unwind_selector_esc_closes_without_action() {
+        let mut snapshot = empty_context_snapshot();
+        snapshot
+            .history
+            .push(crate::context_debug::HistoryEntry::Text {
+                role: "user".into(),
+                text: "first".into(),
+            });
+        let mut app = app::App::new("test".into(), false, None);
+        app.open_unwind_selector(snapshot);
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+        );
+
+        assert!(action.is_none());
+        assert!(!app.unwind_selector_active());
     }
 
     #[test]

@@ -244,6 +244,10 @@ pub struct SwitchSessionCandidate {
 pub enum AppAction {
     SendMessage(String),
     ShowContext,
+    ShowUnwind,
+    UnwindSession {
+        history_index: usize,
+    },
     ListSessions {
         tree: bool,
     },
@@ -506,6 +510,36 @@ impl ContextExplorerState {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct UnwindState {
+    pub snapshot: SessionContextSnapshot,
+    pub selected_index: usize,
+    pub scroll_offset: u16,
+}
+
+impl UnwindState {
+    fn new(snapshot: SessionContextSnapshot) -> Self {
+        let selected_index = snapshot.history.len().saturating_sub(1);
+        Self {
+            snapshot,
+            selected_index,
+            scroll_offset: 0,
+        }
+    }
+
+    fn entry_count(&self) -> usize {
+        self.snapshot.history.len()
+    }
+
+    pub fn selected_history_index(&self) -> Option<usize> {
+        if self.entry_count() == 0 {
+            None
+        } else {
+            Some(self.selected_index.min(self.entry_count() - 1))
+        }
+    }
+}
+
 /// The main application state.
 pub struct App {
     pub messages: Vec<ConversationEntry>,
@@ -555,6 +589,8 @@ pub struct App {
     conversation_drag_anchor: Option<ConversationSelectionPoint>,
     /// Interactive explorer for large `/context` snapshots in the TUI.
     pub context_explorer: Option<ContextExplorerState>,
+    /// Interactive selector for truncating the model context to an earlier history entry.
+    pub unwind_selector: Option<UnwindState>,
     /// Monotonic revision for conversation-affecting state.
     conversation_revision: u64,
     /// Cached rendered conversation lines and wrapped height for the current width.
@@ -707,6 +743,7 @@ impl App {
             conversation_selection: None,
             conversation_drag_anchor: None,
             context_explorer: None,
+            unwind_selector: None,
             conversation_revision: 0,
             conversation_cache: None,
         }
@@ -794,6 +831,7 @@ impl App {
         self.conversation_selection = None;
         self.conversation_drag_anchor = None;
         self.context_explorer = None;
+        self.unwind_selector = None;
         self.invalidate_conversation_cache();
         self.auto_scroll();
     }
@@ -814,6 +852,9 @@ impl App {
             .map(|skill| skill.name.clone())
             .collect();
         self.status_report = snapshot.status_report.clone();
+        self.context_explorer = None;
+        self.unwind_selector = None;
+        self.last_context_view_height = 0;
         self.messages.clear();
 
         for entry in snapshot.history {
@@ -1704,6 +1745,7 @@ impl App {
             .map(|skill| skill.name.clone())
             .collect();
         self.context_explorer = Some(ContextExplorerState::new(snapshot));
+        self.unwind_selector = None;
         self.last_context_view_height = 0;
         self.conversation_cache = None;
     }
@@ -1712,6 +1754,85 @@ impl App {
         self.context_explorer = None;
         self.last_context_view_height = 0;
         self.conversation_cache = None;
+    }
+
+    pub fn unwind_selector_active(&self) -> bool {
+        self.unwind_selector.is_some()
+    }
+
+    pub fn open_unwind_selector(&mut self, snapshot: SessionContextSnapshot) {
+        self.loaded_skill_commands = snapshot
+            .loaded_skills
+            .iter()
+            .map(|skill| skill.name.clone())
+            .collect();
+        self.context_explorer = None;
+        self.unwind_selector = Some(UnwindState::new(snapshot));
+        self.last_context_view_height = 0;
+        self.conversation_cache = None;
+    }
+
+    pub fn close_unwind_selector(&mut self) {
+        self.unwind_selector = None;
+        self.last_context_view_height = 0;
+        self.conversation_cache = None;
+    }
+
+    pub fn selected_unwind_history_index(&self) -> Option<usize> {
+        self.unwind_selector
+            .as_ref()
+            .and_then(UnwindState::selected_history_index)
+    }
+
+    pub fn unwind_move_up(&mut self) {
+        if let Some(selector) = self.unwind_selector.as_mut() {
+            selector.selected_index = selector.selected_index.saturating_sub(1);
+            selector.scroll_offset = 0;
+        }
+    }
+
+    pub fn unwind_move_down(&mut self) {
+        if let Some(selector) = self.unwind_selector.as_mut() {
+            let count = selector.entry_count();
+            if count > 0 {
+                selector.selected_index = (selector.selected_index + 1).min(count - 1);
+                selector.scroll_offset = 0;
+            }
+        }
+    }
+
+    pub fn unwind_page_up(&mut self, rows: u16) {
+        if let Some(selector) = self.unwind_selector.as_mut() {
+            selector.selected_index = selector.selected_index.saturating_sub(usize::from(rows));
+            selector.scroll_offset = 0;
+        }
+    }
+
+    pub fn unwind_page_down(&mut self, rows: u16) {
+        if let Some(selector) = self.unwind_selector.as_mut() {
+            let count = selector.entry_count();
+            if count > 0 {
+                selector.selected_index =
+                    (selector.selected_index + usize::from(rows)).min(count - 1);
+                selector.scroll_offset = 0;
+            }
+        }
+    }
+
+    pub fn unwind_move_to_first(&mut self) {
+        if let Some(selector) = self.unwind_selector.as_mut() {
+            selector.selected_index = 0;
+            selector.scroll_offset = 0;
+        }
+    }
+
+    pub fn unwind_move_to_last(&mut self) {
+        if let Some(selector) = self.unwind_selector.as_mut() {
+            if selector.entry_count() > 0 {
+                selector.selected_index = selector.entry_count() - 1;
+            }
+            selector.scroll_offset = 0;
+        }
     }
 
     pub fn context_explorer_prev_tab(&mut self) {

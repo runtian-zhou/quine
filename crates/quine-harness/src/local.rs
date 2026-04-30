@@ -926,6 +926,28 @@ impl HarnessService for LocalHarness {
             .map_err(|message| HarnessError::Internal { message })
     }
 
+    async fn unwind_session(
+        &self,
+        session_id: SessionId,
+        history_index: usize,
+    ) -> Result<(), HarnessError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        self.core_input
+            .send(CoreInput::UnwindSession {
+                session_id,
+                history_index,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+        reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|message| HarnessError::Internal { message })?;
+        self.request_checkpoint().await?;
+        Ok(())
+    }
+
     async fn submit_tool_result(
         &self,
         session_id: SessionId,
@@ -2295,6 +2317,80 @@ mod tests {
             );
             tokio::task::yield_now().await;
         }
+    }
+
+    #[tokio::test]
+    async fn local_harness_unwind_session_truncates_context() {
+        let storage = temp_storage();
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let mut rx = harness.subscribe();
+        let session_id = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+
+        harness
+            .send_message(session_id, "first turn".into())
+            .await
+            .unwrap();
+        assert_eq!(wait_for_turn(&mut rx, session_id).await, "first turn");
+
+        harness
+            .send_message(session_id, "second turn".into())
+            .await
+            .unwrap();
+        assert_eq!(wait_for_turn(&mut rx, session_id).await, "second turn");
+
+        let before = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot.history.iter().any(|entry| {
+                matches!(
+                    entry,
+                    crate::storage::HistoryEntry::Text { role, text }
+                        if role == "user" && text == "second turn"
+                )
+            })
+        })
+        .await;
+        let first_user_index = before
+            .history
+            .iter()
+            .position(|entry| {
+                matches!(
+                    entry,
+                    crate::storage::HistoryEntry::Text { role, text }
+                        if role == "user" && text == "first turn"
+                )
+            })
+            .expect("first user message should be present");
+
+        harness
+            .unwind_session(session_id, first_user_index)
+            .await
+            .unwrap();
+
+        let after = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
+            snapshot.history.len() == first_user_index + 1
+                && !snapshot.history.iter().any(|entry| {
+                    matches!(
+                        entry,
+                        crate::storage::HistoryEntry::Text { text, .. }
+                            if text.contains("second turn")
+                    )
+                })
+        })
+        .await;
+
+        assert_eq!(after.history.len(), first_user_index + 1);
+        assert!(matches!(
+            after.history.get(first_user_index),
+            Some(crate::storage::HistoryEntry::Text { role, text })
+                if role == "user" && text == "first turn"
+        ));
+
+        harness.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(storage.root());
     }
 
     #[tokio::test]
