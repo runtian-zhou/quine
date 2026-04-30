@@ -788,6 +788,57 @@ async fn handle_request(
             }
         }
 
+        methods::UNWIND_SESSION => {
+            let params = request.params.as_ref();
+            let session_id_str = params
+                .and_then(|p| p.get("session_id"))
+                .and_then(|v| v.as_str());
+            let history_index = params
+                .and_then(|p| p.get("history_index"))
+                .and_then(|v| v.as_u64())
+                .and_then(|value| usize::try_from(value).ok());
+
+            match (session_id_str, history_index) {
+                (Some(sid), Some(history_index)) => {
+                    let session_id: quine_core::SessionId =
+                        match serde_json::from_value(serde_json::Value::String(sid.to_string())) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                let resp = JsonRpcErrorResponse::new(
+                                    id,
+                                    error_codes::INVALID_PARAMS,
+                                    format!("invalid session_id: {e}"),
+                                );
+                                return Some(serde_json::to_string(&resp).unwrap_or_default());
+                            }
+                        };
+
+                    match service.unwind_session(session_id, history_index).await {
+                        Ok(()) => {
+                            let resp = JsonRpcResponse::success(id, "ok");
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                        Err(e) => {
+                            let resp = JsonRpcErrorResponse::new(
+                                id,
+                                error_codes::INTERNAL_ERROR,
+                                e.to_string(),
+                            );
+                            Some(serde_json::to_string(&resp).unwrap_or_default())
+                        }
+                    }
+                }
+                _ => {
+                    let resp = JsonRpcErrorResponse::new(
+                        id,
+                        error_codes::INVALID_PARAMS,
+                        "missing session_id or history_index",
+                    );
+                    Some(serde_json::to_string(&resp).unwrap_or_default())
+                }
+            }
+        }
+
         methods::GET_SESSION_CONTEXT => {
             let params = request.params.as_ref();
             let session_id_str = params

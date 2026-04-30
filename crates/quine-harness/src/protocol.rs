@@ -110,6 +110,7 @@ pub mod methods {
     pub const EXIT_PLAN_MODE: &str = "exit_plan_mode";
     pub const SET_SESSION_MODEL_PROFILE: &str = "set_session_model_profile";
     pub const SEND_MESSAGE: &str = "send_message";
+    pub const UNWIND_SESSION: &str = "unwind_session";
     pub const COMPACT_SESSION: &str = "compact_session";
     pub const SUBMIT_TOOL_RESULT: &str = "submit_tool_result";
     pub const CANCEL: &str = "cancel";

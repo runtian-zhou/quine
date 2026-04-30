@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
     AgentPhase, App, ContextExplorerState, ContextExplorerTab, ConversationEntry,
-    ConversationRenderCache, InputBuffer, ToolBatchCall, ToolStatus,
+    ConversationRenderCache, InputBuffer, ToolBatchCall, ToolStatus, UnwindState,
 };
 
 /// Format a duration in microseconds to a human-readable string.
@@ -136,7 +136,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     draw_conversation(frame, app, chunks[conversation_index]);
     draw_input(frame, app, chunks[conversation_index + 1]);
-    if let Some(explorer) = app.context_explorer.as_mut() {
+    if let Some(selector) = app.unwind_selector.as_mut() {
+        let view_height = draw_unwind_selector(frame, chunks[conversation_index], selector);
+        app.last_context_view_height = u32::from(view_height);
+    } else if let Some(explorer) = app.context_explorer.as_mut() {
         let view_height = draw_context_explorer(frame, chunks[conversation_index], explorer);
         app.last_context_view_height = u32::from(view_height);
     } else {
@@ -471,9 +474,7 @@ fn push_conversation_entry_lines(
             ]));
         }
         ConversationEntry::AssistantText(text) => {
-            for line in text.lines() {
-                lines.push(render_inline_markup_line("  ", line, Style::default()));
-            }
+            render_markdown_text_lines(lines, text, "  ", Style::default(), area_width);
         }
         ConversationEntry::ToolBatch { calls } => {
             push_tool_batch_entry_lines(lines, calls, area_width);
@@ -646,19 +647,25 @@ fn push_conversation_entry_lines(
     }
 }
 
-fn append_live_lines(lines: &mut Vec<Line<'static>>, app: &App) {
+fn append_live_lines(lines: &mut Vec<Line<'static>>, app: &App, area_width: u16) {
     if !app.streaming_buffer.is_empty() {
         let mut started = false;
+        let mut visible = Vec::new();
         for line in app.streaming_buffer.lines() {
             if !started && line.trim().is_empty() {
                 continue;
             }
             started = true;
-            lines.push(render_inline_markup_line(
+            visible.push(line.to_string());
+        }
+        if !visible.is_empty() {
+            render_markdown_text_lines(
+                lines,
+                &visible.join("\n"),
                 "",
-                line,
                 Style::default().add_modifier(Modifier::DIM),
-            ));
+                area_width,
+            );
         }
     }
 
@@ -686,6 +693,129 @@ fn render_inline_markup_line(prefix: &str, text: &str, base_style: Style) -> Lin
     }
     spans.extend(render_inline_markup_spans(text, base_style));
     Line::from(spans)
+}
+
+fn code_fence_language(line: &str) -> Option<Option<String>> {
+    let rest = line.trim_start().strip_prefix("```")?;
+    let language = rest.trim();
+    Some((!language.is_empty()).then(|| language.to_string()))
+}
+
+fn render_markdown_text_lines(
+    lines: &mut Vec<Line<'static>>,
+    text: &str,
+    prefix: &str,
+    base_style: Style,
+    area_width: u16,
+) {
+    let mut in_code_block = false;
+    let mut code_language = None;
+    let mut code_lines = Vec::new();
+
+    for line in text.lines() {
+        if let Some(language) = code_fence_language(line) {
+            if in_code_block {
+                render_code_block_box(
+                    lines,
+                    &code_lines,
+                    code_language.as_deref(),
+                    area_width,
+                    prefix.width(),
+                    base_style,
+                );
+                in_code_block = false;
+                code_language = None;
+                code_lines.clear();
+            } else {
+                in_code_block = true;
+                code_language = language;
+                code_lines.clear();
+            }
+            continue;
+        }
+
+        if in_code_block {
+            code_lines.push(line.to_string());
+        } else {
+            lines.push(render_inline_markup_line(prefix, line, base_style));
+        }
+    }
+
+    if in_code_block {
+        render_code_block_box(
+            lines,
+            &code_lines,
+            code_language.as_deref(),
+            area_width,
+            prefix.width(),
+            base_style,
+        );
+    }
+}
+
+fn render_code_block_box(
+    lines: &mut Vec<Line<'static>>,
+    code_lines: &[String],
+    language: Option<&str>,
+    width: u16,
+    indent: usize,
+    base_style: Style,
+) {
+    let reserved = indent + 4;
+    let inner_width = usize::from(width).saturating_sub(reserved).max(1);
+    let body_width = inner_width + 2;
+    let indent_text = " ".repeat(indent);
+    let border_style = base_style.fg(Color::Cyan);
+    let label_style = base_style.fg(Color::Yellow).add_modifier(Modifier::BOLD);
+    let code_style = base_style.fg(Color::White);
+
+    if let Some(language) = language.filter(|value| !value.is_empty()) {
+        let label = format!(" {language} ");
+        if label.width() < body_width {
+            lines.push(Line::from(vec![
+                Span::styled(format!("{indent_text}┌"), border_style),
+                Span::styled(label.clone(), label_style),
+                Span::styled("─".repeat(body_width - label.width()), border_style),
+                Span::styled("┐", border_style),
+            ]));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("{indent_text}┌{}┐", "─".repeat(body_width)),
+                border_style,
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            format!("{indent_text}┌{}┐", "─".repeat(body_width)),
+            border_style,
+        )));
+    }
+
+    let wrapped = if code_lines.is_empty() {
+        vec![" ".to_string()]
+    } else {
+        let code = code_lines.join("\n");
+        let wrapped = wrap_box_lines(&code, inner_width);
+        if wrapped.is_empty() {
+            vec![" ".to_string()]
+        } else {
+            wrapped
+        }
+    };
+    for line in wrapped {
+        let content_width = line.width();
+        let padding = " ".repeat(inner_width.saturating_sub(content_width));
+        lines.push(Line::from(vec![
+            Span::styled(format!("{indent_text}│ "), border_style),
+            Span::styled(format!("{line}{padding}"), code_style),
+            Span::styled(" │", border_style),
+        ]));
+    }
+
+    lines.push(Line::from(Span::styled(
+        format!("{indent_text}└{}┘", "─".repeat(body_width)),
+        border_style,
+    )));
 }
 
 fn render_inline_markup_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
@@ -807,7 +937,7 @@ fn build_conversation_lines(app: &App, area_width: u16) -> Vec<Line<'static>> {
         push_conversation_entry_lines(&mut lines, &entry, area_width, app.max_context_window);
         previous_entry = Some(entry);
     }
-    append_live_lines(&mut lines, app);
+    append_live_lines(&mut lines, app, area_width);
     lines
 }
 
@@ -1175,9 +1305,16 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
 
 /// Compute the number of visual rows a single line occupies when wrapped to `area_width`.
 fn format_context_entry_label(index: usize, explorer: &ContextExplorerState) -> String {
-    let entry_number = index + 1;
     match explorer.snapshot.history.get(index) {
-        Some(crate::context_debug::HistoryEntry::Text { role, text }) => {
+        Some(entry) => format_history_entry_label(index, entry),
+        None => format!("{:>3}. <missing>", index + 1),
+    }
+}
+
+fn format_history_entry_label(index: usize, entry: &crate::context_debug::HistoryEntry) -> String {
+    let entry_number = index + 1;
+    match entry {
+        crate::context_debug::HistoryEntry::Text { role, text } => {
             let first_line = text.lines().next().unwrap_or("").trim();
             if first_line.is_empty() {
                 format!("{entry_number:>3}. {role}: <blank>")
@@ -1185,11 +1322,11 @@ fn format_context_entry_label(index: usize, explorer: &ContextExplorerState) -> 
                 format!("{entry_number:>3}. {role}: {first_line}")
             }
         }
-        Some(crate::context_debug::HistoryEntry::ToolUse {
+        crate::context_debug::HistoryEntry::ToolUse {
             role,
             text,
             tool_calls,
-        }) => {
+        } => {
             let suffix = text
                 .as_deref()
                 .and_then(|value| value.lines().next())
@@ -1225,15 +1362,14 @@ fn format_context_entry_label(index: usize, explorer: &ContextExplorerState) -> 
                 }
             }
         }
-        Some(crate::context_debug::HistoryEntry::ToolResult {
+        crate::context_debug::HistoryEntry::ToolResult {
             tool_use_id,
             is_error,
             ..
-        }) => {
+        } => {
             let status = if *is_error { "error" } else { "ok" };
             format!("{entry_number:>3}. tool result {tool_use_id} ({status})")
         }
-        None => format!("{entry_number:>3}. <missing>"),
     }
 }
 
@@ -1772,6 +1908,107 @@ fn draw_context_explorer(
     scrollable_height
 }
 
+fn draw_unwind_selector(frame: &mut Frame, area: Rect, selector: &mut UnwindState) -> u16 {
+    let popup = centered_rect(86, 75, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(" Unwind Context ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Clear, inner);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let selected_entry = selector
+        .selected_history_index()
+        .map(|index| index + 1)
+        .unwrap_or(0);
+    let summary = vec![
+        Line::from(format!(
+            "session {} | state {} | {} entries",
+            selector.snapshot.session_id,
+            selector.snapshot.state,
+            selector.snapshot.history.len()
+        )),
+        Line::from(format!(
+            "keep through entry {selected_entry}; entries after it are removed from model context"
+        )),
+    ];
+    frame.render_widget(Clear, sections[0]);
+    frame.render_widget(
+        Paragraph::new(summary).wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    frame.render_widget(Clear, sections[1]);
+    let entry_count = selector.snapshot.history.len();
+    if entry_count == 0 {
+        frame.render_widget(
+            Paragraph::new("No conversation history available.")
+                .alignment(Alignment::Center)
+                .block(Block::default().title(" Entries ").borders(Borders::ALL)),
+            sections[1],
+        );
+    } else {
+        if selector.selected_index >= entry_count {
+            selector.selected_index = entry_count - 1;
+        }
+        let list_items: Vec<ListItem> = selector
+            .snapshot
+            .history
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| {
+                let marker = if index == selector.selected_index {
+                    "> "
+                } else {
+                    "  "
+                };
+                ListItem::new(Line::from(format!(
+                    "{marker}{}",
+                    format_history_entry_label(index, entry)
+                )))
+            })
+            .collect();
+        let list_height = sections[1].height.saturating_sub(2) as usize;
+        let list_scroll = context_list_scroll(selector.selected_index, entry_count, list_height);
+        selector.scroll_offset = list_scroll;
+        let list = List::new(list_items)
+            .block(Block::default().title(" Entries ").borders(Borders::ALL))
+            .highlight_style(
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            )
+            .highlight_symbol("");
+        let mut list_state = ListState::default().with_selected(Some(selector.selected_index));
+        *list_state.offset_mut() = usize::from(selector.scroll_offset);
+        frame.render_stateful_widget(list, sections[1], &mut list_state);
+    }
+
+    let footer = Paragraph::new("Esc close • ↑↓/j k choose • Enter unwind")
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        );
+    frame.render_widget(Clear, sections[2]);
+    frame.render_widget(footer, sections[2]);
+    sections[1].height.saturating_sub(2)
+}
+
 fn paint_blank_area(frame: &mut Frame, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -2100,6 +2337,66 @@ mod tests {
     }
 
     #[test]
+    fn assistant_text_renders_fenced_code_block_without_delimiters() {
+        let mut lines = Vec::new();
+
+        push_conversation_entry_lines(
+            &mut lines,
+            &ConversationEntry::AssistantText(
+                "Before\n```rust\nlet value = 42;\nprintln!(\"{value}\");\n```\nAfter".into(),
+            ),
+            80,
+            None,
+        );
+
+        let rendered = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("Before"));
+        assert!(rendered.contains("After"));
+        assert!(rendered.contains("let value = 42;"));
+        assert!(rendered.contains("println!(\"{value}\");"));
+        assert!(rendered.contains("rust"));
+        assert!(!rendered.contains("```"));
+
+        let code_line = lines
+            .iter()
+            .find(|line| line.to_string().contains("let value = 42;"))
+            .expect("code line should render");
+        assert!(code_line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(Color::White)));
+        assert!(code_line
+            .spans
+            .iter()
+            .any(|span| span.style.fg == Some(Color::Cyan)));
+    }
+
+    #[test]
+    fn assistant_text_renders_unclosed_fenced_code_block() {
+        let mut lines = Vec::new();
+
+        push_conversation_entry_lines(
+            &mut lines,
+            &ConversationEntry::AssistantText("```bash\necho running".into()),
+            80,
+            None,
+        );
+
+        let rendered = lines
+            .iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("bash"));
+        assert!(rendered.contains("echo running"));
+        assert!(!rendered.contains("```"));
+    }
+
+    #[test]
     fn draw_context_explorer_marks_selected_entry() {
         let snapshot = SessionContextSnapshot {
             session_id: "session-1".into(),
@@ -2144,6 +2441,50 @@ mod tests {
             .filter(|cell| cell.symbol() == "›")
             .count();
         assert!(selected >= 1);
+    }
+
+    #[test]
+    fn draw_unwind_selector_lists_history_entries() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec![],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
+            prompt_memory: None,
+            compact_memory_summary_markdown: None,
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            status_report: None,
+            history: vec![
+                HistoryEntry::Text {
+                    role: "user".into(),
+                    text: "first".into(),
+                },
+                HistoryEntry::Text {
+                    role: "assistant".into(),
+                    text: "second".into(),
+                },
+            ],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_unwind_selector(snapshot);
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = buffer_lines(terminal.backend()).join("\n");
+        assert!(rendered.contains("Unwind Context"));
+        assert!(rendered.contains("user: first"));
+        assert!(rendered.contains("assistant: second"));
+        assert!(app.last_context_view_height > 0);
     }
 
     #[test]

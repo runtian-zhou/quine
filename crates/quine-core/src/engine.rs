@@ -1113,6 +1113,58 @@ impl SessionContext {
         self.rebuild_session_config_with_web_provider(web_provider)
             .await
     }
+
+    fn unwind_history(
+        &mut self,
+        session_id: SessionId,
+        history_index: usize,
+    ) -> Result<usize, CoreError> {
+        if history_index >= self.history.len() {
+            return Err(CoreError::Internal {
+                message: format!(
+                    "history index {history_index} is out of range for {} messages",
+                    self.history.len()
+                ),
+            });
+        }
+
+        let retained = history_index.saturating_add(1);
+        self.history.truncate(retained);
+        self.history = sanitize_restored_history(session_id, std::mem::take(&mut self.history));
+        self.last_prompt_memory_user_index = None;
+        self.last_prompt_memory = PersistedPromptMemoryState {
+            mode: self.persisted_config.prompt_memory_mode,
+            ..PersistedPromptMemoryState::default()
+        };
+        self.last_prompt_cache_tokens = None;
+        self.session_memory.refresh_in_flight = false;
+        self.session_memory.last_summarized_message_index = None;
+        self.session_memory.last_refresh_at = None;
+        self.session_memory.listing_summary = None;
+        self.status_report = None;
+        self.current_turn_tool_rounds = 0;
+        self.last_memory_diagnostics = Some(default_turn_diagnostics_for_session(self));
+
+        for path in [
+            &self.session_memory.paths.summary_path,
+            &self.session_memory.paths.metadata_path,
+        ] {
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(CoreError::Internal {
+                        message: format!(
+                            "failed to remove stale session memory file {}: {error}",
+                            path.display()
+                        ),
+                    });
+                }
+            }
+        }
+
+        Ok(self.history.len())
+    }
 }
 
 #[derive(Clone)]
@@ -1137,6 +1189,10 @@ enum SessionCommand {
         reply: oneshot::Sender<Result<(), String>>,
     },
     CompactSession {
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    UnwindSession {
+        history_index: usize,
         reply: oneshot::Sender<Result<(), String>>,
     },
     ToolResult {
@@ -4736,6 +4792,29 @@ impl SessionActor {
                 let _ = reply.send(result);
                 true
             }
+            SessionCommand::UnwindSession {
+                history_index,
+                reply,
+            } => {
+                let result = if self.session.state != SessionState::Idle {
+                    Err(format!(
+                        "cannot unwind context while session is {:?}",
+                        self.session.state
+                    ))
+                } else {
+                    self.session
+                        .unwind_history(self.session_id, history_index)
+                        .map(|_| ())
+                        .map_err(|error| format!("failed to unwind context: {error}"))
+                };
+                let is_ok = result.is_ok();
+                let _ = reply.send(result);
+                if is_ok {
+                    self.emit_state(self.session.state).await;
+                    self.emit_checkpoint_hint().await;
+                }
+                true
+            }
             SessionCommand::ToolResult {
                 tool_use_id,
                 result,
@@ -5749,6 +5828,10 @@ impl SessionActor {
                 let _ = reply.send(message);
                 false
             }
+            SessionCommand::UnwindSession { reply, .. } => {
+                let _ = reply.send(Err("cannot unwind context while session is busy".into()));
+                false
+            }
             SessionCommand::InteractionResponse(_)
             | SessionCommand::ExitPlanMode { .. }
             | SessionCommand::UpdateSessionLlm { .. }
@@ -6584,6 +6667,16 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                     CoreInput::CompactSession { session_id, reply } => {
                         if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
                             let _ = session_handle.command_tx.send(SessionCommand::CompactSession { reply }).await;
+                        } else {
+                            let _ = reply.send(Err("session not found".into()));
+                        }
+                    }
+                    CoreInput::UnwindSession { session_id, history_index, reply } => {
+                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle.command_tx.send(SessionCommand::UnwindSession {
+                                history_index,
+                                reply,
+                            }).await;
                         } else {
                             let _ = reply.send(Err("session not found".into()));
                         }

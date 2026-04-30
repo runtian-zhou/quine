@@ -98,6 +98,13 @@ pub enum CoreInput {
         cadence: Option<Duration>,
     },
 
+    /// Truncate a session's stored context after the selected history message.
+    UnwindSession {
+        session_id: SessionId,
+        history_index: usize,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+
     /// Compact a session's stored context without sending a new user message.
     CompactSession {
         session_id: SessionId,
