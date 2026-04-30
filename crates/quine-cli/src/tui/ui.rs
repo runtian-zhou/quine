@@ -469,7 +469,7 @@ fn push_conversation_entry_lines(
         }
         ConversationEntry::AssistantText(text) => {
             for line in text.lines() {
-                lines.push(Line::from(Span::raw(format!("  {line}"))));
+                lines.push(render_inline_markup_line("  ", line, Style::default()));
             }
         }
         ConversationEntry::ToolBatch { calls } => {
@@ -651,10 +651,11 @@ fn append_live_lines(lines: &mut Vec<Line<'static>>, app: &App) {
                 continue;
             }
             started = true;
-            lines.push(Line::from(Span::styled(
-                line.to_string(),
+            lines.push(render_inline_markup_line(
+                "",
+                line,
                 Style::default().add_modifier(Modifier::DIM),
-            )));
+            ));
         }
     }
 
@@ -673,6 +674,72 @@ fn append_live_lines(lines: &mut Vec<Line<'static>>, app: &App) {
         }
         AgentPhase::Streaming | AgentPhase::Idle => {}
     }
+}
+
+fn render_inline_markup_line(prefix: &str, text: &str, base_style: Style) -> Line<'static> {
+    let mut spans = Vec::new();
+    if !prefix.is_empty() {
+        spans.push(Span::styled(prefix.to_string(), base_style));
+    }
+    spans.extend(render_inline_markup_spans(text, base_style));
+    Line::from(spans)
+}
+
+fn render_inline_markup_spans(text: &str, base_style: Style) -> Vec<Span<'static>> {
+    let highlight_style = base_style.fg(Color::White).add_modifier(Modifier::BOLD);
+    let quote_style = base_style.fg(Color::Cyan);
+    let mut spans = Vec::new();
+    let mut plain = String::new();
+    let mut index = 0usize;
+
+    let flush_plain = |spans: &mut Vec<Span<'static>>, plain: &mut String| {
+        if !plain.is_empty() {
+            spans.push(Span::styled(std::mem::take(plain), base_style));
+        }
+    };
+
+    while index < text.len() {
+        let rest = &text[index..];
+        if let Some(after_marker) = rest.strip_prefix("**") {
+            if let Some(end) = after_marker.find("**").filter(|end| *end > 0) {
+                flush_plain(&mut spans, &mut plain);
+                spans.push(Span::styled(
+                    after_marker[..end].to_string(),
+                    highlight_style,
+                ));
+                index += 2 + end + 2;
+                continue;
+            }
+            plain.push_str("**");
+            index += 2;
+            continue;
+        }
+
+        if let Some(after_marker) = rest.strip_prefix('`') {
+            if let Some(end) = after_marker.find('`').filter(|end| *end > 0) {
+                flush_plain(&mut spans, &mut plain);
+                spans.push(Span::styled(after_marker[..end].to_string(), quote_style));
+                index += 1 + end + 1;
+                continue;
+            }
+            plain.push('`');
+            index += 1;
+            continue;
+        }
+
+        let ch = rest
+            .chars()
+            .next()
+            .expect("index is inside a non-empty string");
+        plain.push(ch);
+        index += ch.len_utf8();
+    }
+
+    flush_plain(&mut spans, &mut plain);
+    if spans.is_empty() {
+        spans.push(Span::styled(String::new(), base_style));
+    }
+    spans
 }
 
 fn is_tool_group_entry(entry: &ConversationEntry) -> bool {
@@ -1995,6 +2062,30 @@ mod tests {
             "ctx limit 200000"
         );
         assert_eq!(format_context_status(None, None), "ctx n/a");
+    }
+
+    #[test]
+    fn render_inline_markup_styles_highlights_and_quotes() {
+        let line =
+            render_inline_markup_line("  ", "fix **cache** with `reqwest`", Style::default());
+
+        assert_eq!(line.to_string(), "  fix cache with reqwest");
+        assert_eq!(line.spans[2].content.as_ref(), "cache");
+        assert!(line.spans[2].style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(line.spans[2].style.fg, Some(Color::White));
+        assert_eq!(line.spans[4].content.as_ref(), "reqwest");
+        assert_eq!(line.spans[4].style.fg, Some(Color::Cyan));
+    }
+
+    #[test]
+    fn render_inline_markup_preserves_unmatched_delimiters() {
+        let line = render_inline_markup_line("", "keep **open and `dangling", Style::default());
+
+        assert_eq!(line.to_string(), "keep **open and `dangling");
+        assert!(line
+            .spans
+            .iter()
+            .all(|span| !span.style.add_modifier.contains(Modifier::BOLD)));
     }
 
     #[test]
