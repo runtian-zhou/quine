@@ -262,11 +262,13 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
         quine_core::CoreOutput::TurnComplete {
             session_id,
             duration_us,
+            status,
             usage,
             cache_usage,
         } => {
             let mut payload = serde_json::json!({
                 "duration_us": duration_us,
+                "status": status,
             });
             if let Some(u) = usage {
                 payload["usage"] = serde_json::json!({
@@ -356,11 +358,15 @@ async fn log_core_output(event: &quine_core::CoreOutput) {
 
     if let quine_core::CoreOutput::TurnComplete {
         session_id,
+        status,
         usage,
         cache_usage,
         ..
     } = event
     {
+        if !matches!(status, quine_core::TurnStatus::Success) {
+            return;
+        }
         let session_id = serde_json::to_value(session_id)
             .ok()
             .and_then(|v| v.as_str().map(String::from))
@@ -1675,12 +1681,14 @@ fn core_output_to_notification(event: &quine_core::CoreOutput) -> JsonRpcNotific
         quine_core::CoreOutput::TurnComplete {
             session_id,
             duration_us,
+            status,
             usage,
             cache_usage,
         } => {
             let mut params = serde_json::json!({
                 "session_id": session_id,
                 "duration_us": duration_us,
+                "status": status,
             });
             if let Some(u) = usage {
                 params["usage"] = serde_json::json!({
@@ -2001,6 +2009,7 @@ mod tests {
         let complete = quine_core::CoreOutput::TurnComplete {
             session_id,
             duration_us: 7,
+            status: quine_core::TurnStatus::Success,
             usage: None,
             cache_usage: None,
         };
@@ -2013,6 +2022,76 @@ mod tests {
                 .and_then(|params| params.get("turn_id"))
                 .and_then(|value| value.as_str()),
             Some(turn_id.as_str())
+        );
+
+        let idle = quine_core::CoreOutput::SessionStateChanged {
+            session_id,
+            state: quine_core::SessionState::Idle,
+        };
+        let idle_notif = core_output_to_notification_with_turn_tracking(&idle, active_turns).await;
+        assert_eq!(
+            idle_notif
+                .params
+                .as_ref()
+                .and_then(|params| params.get("turn_id")),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn tracked_notifications_keep_turn_id_until_failed_turn_complete() {
+        let session_id = quine_core::SessionId::new();
+        let active_turns = Arc::new(Mutex::new(HashMap::new()));
+        let turn_id = "turn-123".to_string();
+
+        let started = quine_core::CoreOutput::TurnStarted {
+            session_id,
+            turn_id: turn_id.clone(),
+        };
+        let _ =
+            core_output_to_notification_with_turn_tracking(&started, active_turns.clone()).await;
+
+        let error = quine_core::CoreOutput::SessionError {
+            session_id,
+            error: quine_core::CoreError::LlmError {
+                message: "stream failed".into(),
+            },
+        };
+        let error_notif =
+            core_output_to_notification_with_turn_tracking(&error, active_turns.clone()).await;
+        assert_eq!(
+            error_notif
+                .params
+                .as_ref()
+                .and_then(|params| params.get("turn_id"))
+                .and_then(|value| value.as_str()),
+            Some(turn_id.as_str())
+        );
+
+        let complete = quine_core::CoreOutput::TurnComplete {
+            session_id,
+            duration_us: 7,
+            status: quine_core::TurnStatus::Failed,
+            usage: None,
+            cache_usage: None,
+        };
+        let complete_notif =
+            core_output_to_notification_with_turn_tracking(&complete, active_turns.clone()).await;
+        assert_eq!(
+            complete_notif
+                .params
+                .as_ref()
+                .and_then(|params| params.get("turn_id"))
+                .and_then(|value| value.as_str()),
+            Some(turn_id.as_str())
+        );
+        assert_eq!(
+            complete_notif
+                .params
+                .as_ref()
+                .and_then(|params| params.get("status"))
+                .and_then(|value| value.as_str()),
+            Some("failed")
         );
 
         let idle = quine_core::CoreOutput::SessionStateChanged {

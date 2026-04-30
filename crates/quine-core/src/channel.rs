@@ -226,6 +226,18 @@ pub enum ToolOutcome {
     Cancelled,
 }
 
+/// Final status for a completed agent turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnStatus {
+    /// The turn completed normally.
+    Success,
+    /// The turn failed after it started.
+    Failed,
+    /// The turn was cancelled before normal completion.
+    Cancelled,
+}
+
 /// Events the core sends out to the harness.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum CoreOutput {
@@ -323,6 +335,7 @@ pub enum CoreOutput {
     TurnComplete {
         session_id: SessionId,
         duration_us: u64,
+        status: TurnStatus,
         usage: Option<quine_llm::TokenUsage>,
         cache_usage: Option<quine_llm::PromptCacheUsage>,
     },
