@@ -1935,9 +1935,10 @@ fn draw_unwind_selector(frame: &mut Frame, area: Rect, selector: &mut UnwindStat
         .unwrap_or(0);
     let summary = vec![
         Line::from(format!(
-            "session {} | state {} | {} entries",
+            "session {} | state {} | {} user inputs | {} entries",
             selector.snapshot.session_id,
             selector.snapshot.state,
+            selector.entry_count(),
             selector.snapshot.history.len()
         )),
         Line::from(format!(
@@ -1951,10 +1952,10 @@ fn draw_unwind_selector(frame: &mut Frame, area: Rect, selector: &mut UnwindStat
     );
 
     frame.render_widget(Clear, sections[1]);
-    let entry_count = selector.snapshot.history.len();
+    let entry_count = selector.entry_count();
     if entry_count == 0 {
         frame.render_widget(
-            Paragraph::new("No conversation history available.")
+            Paragraph::new("No user input history available.")
                 .alignment(Alignment::Center)
                 .block(Block::default().title(" Entries ").borders(Borders::ALL)),
             sections[1],
@@ -1964,11 +1965,9 @@ fn draw_unwind_selector(frame: &mut Frame, area: Rect, selector: &mut UnwindStat
             selector.selected_index = entry_count - 1;
         }
         let list_items: Vec<ListItem> = selector
-            .snapshot
-            .history
-            .iter()
+            .user_history_entries()
             .enumerate()
-            .map(|(index, entry)| {
+            .map(|(index, (history_index, entry))| {
                 let marker = if index == selector.selected_index {
                     "> "
                 } else {
@@ -1976,7 +1975,7 @@ fn draw_unwind_selector(frame: &mut Frame, area: Rect, selector: &mut UnwindStat
                 };
                 ListItem::new(Line::from(format!(
                     "{marker}{}",
-                    format_history_entry_label(index, entry)
+                    format_history_entry_label(history_index, entry)
                 )))
             })
             .collect();
@@ -2471,6 +2470,25 @@ mod tests {
                     role: "assistant".into(),
                     text: "second".into(),
                 },
+                HistoryEntry::ToolUse {
+                    role: "assistant".into(),
+                    text: None,
+                    tool_calls: vec![crate::context_debug::ToolCallEntry {
+                        tool_use_id: "toolu_hidden".into(),
+                        tool_name: "bash".into(),
+                        arguments: serde_json::json!({"command": "echo hidden"}),
+                    }],
+                },
+                HistoryEntry::ToolResult {
+                    role: "tool".into(),
+                    tool_use_id: "toolu_hidden".into(),
+                    output: "hidden".into(),
+                    is_error: false,
+                },
+                HistoryEntry::Text {
+                    role: "user".into(),
+                    text: "third".into(),
+                },
             ],
         };
         let mut app = App::new("test".into(), false, None);
@@ -2483,7 +2501,9 @@ mod tests {
         let rendered = buffer_lines(terminal.backend()).join("\n");
         assert!(rendered.contains("Unwind Context"));
         assert!(rendered.contains("user: first"));
-        assert!(rendered.contains("assistant: second"));
+        assert!(rendered.contains("user: third"));
+        assert!(!rendered.contains("assistant: second"));
+        assert!(!rendered.contains("toolu_hidden"));
         assert!(app.last_context_view_height > 0);
     }
 
