@@ -63,7 +63,13 @@ const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are a helpful coding assistant. You help users with software engineering tasks \
 using the tools available to you. Each message from the user is a new request — \
 respond to it directly. Use tools when needed to read files, run commands, or \
-write code. Be concise and accurate.";
+write code. Be concise and accurate.
+
+When you need to delegate a subtask to another agent, prefer the subagent tool. \
+Use subagent for synchronous delegation where you want the child agent's final \
+result returned directly in the same turn. Only use spawn, wait_child, signal, \
+send_message, or recv_message when you specifically need long-lived child control, \
+concurrent child sessions, signaling, or inter-agent coordination.";
 
 #[cfg_attr(not(test), allow(dead_code))]
 const CONCURRENT_TOOL_BATCH_ALLOWLIST: &[&str] = &["find", "read_file"];
@@ -654,6 +660,8 @@ fn render_available_tool_descriptions(tools: &[ToolDefinition]) -> String {
 
     let mut lines = Vec::with_capacity(tools.len() + 2);
     lines.push("## Available Tools".to_string());
+    lines.push(String::new());
+    lines.push("Prefer `subagent` for ordinary task delegation. Use `spawn`, `wait_child`, `signal`, `send_message`, and `recv_message` only for advanced coordination patterns such as concurrency, long-lived children, cancellation, or mailbox-based communication.".to_string());
     lines.push(String::new());
     for tool in tools {
         let mut qualifiers = Vec::new();
