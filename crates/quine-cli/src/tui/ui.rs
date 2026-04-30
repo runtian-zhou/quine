@@ -136,8 +136,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     draw_conversation(frame, app, chunks[conversation_index]);
     draw_input(frame, app, chunks[conversation_index + 1]);
-    if let Some(explorer) = app.context_explorer.as_ref() {
-        draw_context_explorer(frame, chunks[conversation_index], explorer);
+    if let Some(explorer) = app.context_explorer.as_mut() {
+        let view_height = draw_context_explorer(frame, chunks[conversation_index], explorer);
+        app.last_context_view_height = u32::from(view_height);
+    } else {
+        app.last_context_view_height = 0;
     }
     draw_status_notice_overlay(frame, app);
 }
@@ -1495,7 +1498,11 @@ fn compact_summary_lines(
     lines
 }
 
-fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplorerState) {
+fn draw_context_explorer(
+    frame: &mut Frame,
+    area: Rect,
+    explorer: &mut ContextExplorerState,
+) -> u16 {
     let popup = centered_rect(90, 85, area);
     frame.render_widget(Clear, popup);
 
@@ -1572,7 +1579,7 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
     frame.render_widget(Clear, sections[1]);
     frame.render_widget(tabs, sections[1]);
 
-    match explorer.active_tab {
+    let scrollable_height = match explorer.active_tab {
         ContextExplorerTab::History => {
             frame.render_widget(Clear, sections[2]);
             let columns = Layout::default()
@@ -1624,12 +1631,9 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
             let detail_block = Block::default().title(" Detail ").borders(Borders::ALL);
             let detail_inner = detail_block.inner(columns[1]);
             frame.render_widget(detail_block, columns[1]);
-            render_text_area(
-                frame,
-                detail_inner,
-                &format_context_entry_detail(explorer),
-                explorer.scroll_offset,
-            );
+            let detail = format_context_entry_detail(explorer);
+            render_text_area(frame, detail_inner, &detail, &mut explorer.scroll_offset);
+            detail_inner.height
         }
         ContextExplorerTab::Tools => {
             frame.render_widget(Clear, sections[2]);
@@ -1684,12 +1688,9 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
                 .borders(Borders::ALL);
             let detail_inner = detail_block.inner(columns[1]);
             frame.render_widget(detail_block, columns[1]);
-            render_text_area(
-                frame,
-                detail_inner,
-                &format_tool_detail(explorer),
-                explorer.scroll_offset,
-            );
+            let detail = format_tool_detail(explorer);
+            render_text_area(frame, detail_inner, &detail, &mut explorer.scroll_offset);
+            detail_inner.height
         }
         ContextExplorerTab::Skills => {
             frame.render_widget(Clear, sections[2]);
@@ -1744,26 +1745,20 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
                 .borders(Borders::ALL);
             let detail_inner = detail_block.inner(columns[1]);
             frame.render_widget(detail_block, columns[1]);
-            render_text_area(
-                frame,
-                detail_inner,
-                &format_skill_detail(explorer),
-                explorer.scroll_offset,
-            );
+            let detail = format_skill_detail(explorer);
+            render_text_area(frame, detail_inner, &detail, &mut explorer.scroll_offset);
+            detail_inner.height
         }
         ContextExplorerTab::Plans => {
             frame.render_widget(Clear, sections[2]);
             let plans_block = Block::default().title(" Plans ").borders(Borders::ALL);
             let plans_inner = plans_block.inner(sections[2]);
             frame.render_widget(plans_block, sections[2]);
-            render_lines_area(
-                frame,
-                plans_inner,
-                &format_plans_tab_lines(explorer),
-                explorer.scroll_offset,
-            );
+            let lines = format_plans_tab_lines(explorer);
+            render_lines_area(frame, plans_inner, &lines, &mut explorer.scroll_offset);
+            plans_inner.height
         }
-    }
+    };
 
     let footer = Paragraph::new("Esc close • ←→/h l tabs • ↑↓/j k navigate • PgUp/PgDn scroll")
         .alignment(Alignment::Center)
@@ -1774,6 +1769,7 @@ fn draw_context_explorer(frame: &mut Frame, area: Rect, explorer: &ContextExplor
         );
     frame.render_widget(Clear, sections[3]);
     frame.render_widget(footer, sections[3]);
+    scrollable_height
 }
 
 fn paint_blank_area(frame: &mut Frame, area: Rect) {
@@ -1788,7 +1784,7 @@ fn paint_blank_area(frame: &mut Frame, area: Rect) {
     }
 }
 
-fn render_text_area(frame: &mut Frame, area: Rect, text: &str, scroll_offset: u16) {
+fn render_text_area(frame: &mut Frame, area: Rect, text: &str, scroll_offset: &mut u16) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1798,7 +1794,12 @@ fn render_text_area(frame: &mut Frame, area: Rect, text: &str, scroll_offset: u1
     render_wrapped_lines(frame, area, &wrapped, scroll_offset);
 }
 
-fn render_lines_area(frame: &mut Frame, area: Rect, lines: &[Line<'static>], scroll_offset: u16) {
+fn render_lines_area(
+    frame: &mut Frame,
+    area: Rect,
+    lines: &[Line<'static>],
+    scroll_offset: &mut u16,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -1813,11 +1814,21 @@ fn render_lines_area(frame: &mut Frame, area: Rect, lines: &[Line<'static>], scr
     render_wrapped_lines(frame, area, &wrapped, scroll_offset);
 }
 
-fn render_wrapped_lines(frame: &mut Frame, area: Rect, wrapped: &[String], scroll_offset: u16) {
+fn render_wrapped_lines(
+    frame: &mut Frame,
+    area: Rect,
+    wrapped: &[String],
+    scroll_offset: &mut u16,
+) {
     let style = Style::default().fg(Color::White).bg(Color::Reset);
     let buffer = frame.buffer_mut();
-    let start = scroll_offset as usize;
     let visible_rows = area.height as usize;
+    let max_scroll = wrapped
+        .len()
+        .saturating_sub(visible_rows)
+        .min(usize::from(u16::MAX)) as u16;
+    *scroll_offset = (*scroll_offset).min(max_scroll);
+    let start = usize::from(*scroll_offset);
 
     for row in 0..visible_rows {
         let y = area.top() + row as u16;
@@ -2184,6 +2195,48 @@ mod tests {
             .filter(|cell| cell.symbol() == "›" && cell.bg == Color::Yellow)
             .count();
         assert!(selected >= 1);
+    }
+
+    #[test]
+    fn draw_context_explorer_records_detail_height_and_clamps_scroll() {
+        let snapshot = SessionContextSnapshot {
+            session_id: "session-1".into(),
+            created_at: chrono::Utc::now(),
+            state: "idle".into(),
+            system_prompt: None,
+            skills: vec![],
+            working_directory: std::path::PathBuf::from("/tmp/project"),
+            plan_mode: false,
+            available_tools: vec![],
+            loaded_skills: vec![],
+            plans: vec![],
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
+            prompt_memory: None,
+            compact_memory_summary_markdown: None,
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            status_report: None,
+            history: vec![HistoryEntry::Text {
+                role: "user".into(),
+                text: "short context entry".into(),
+            }],
+        };
+        let mut app = App::new("test".into(), false, None);
+        app.open_context_explorer(snapshot);
+        app.context_explorer_scroll_down(200);
+
+        let backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert!(app.last_context_view_height > 0);
+        assert!(app.last_context_view_height < app.last_view_height);
+        assert_eq!(
+            app.context_explorer
+                .as_ref()
+                .map(|explorer| explorer.scroll_offset),
+            Some(0)
+        );
     }
 
     #[test]

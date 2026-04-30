@@ -548,6 +548,8 @@ pub struct App {
     pub pending_plan_exit: Option<PendingPlanExit>,
     /// Last known conversation view height (set during rendering for scroll step sizing).
     pub last_view_height: u32,
+    /// Last known `/context` scrollable detail height (set during overlay rendering).
+    pub last_context_view_height: u32,
     pub conversation_viewport: Option<ConversationViewport>,
     pub conversation_selection: Option<ConversationSelection>,
     conversation_drag_anchor: Option<ConversationSelectionPoint>,
@@ -700,6 +702,7 @@ impl App {
             plan_mode,
             pending_plan_exit: None,
             last_view_height: 0,
+            last_context_view_height: 0,
             conversation_viewport: None,
             conversation_selection: None,
             conversation_drag_anchor: None,
@@ -1701,11 +1704,13 @@ impl App {
             .map(|skill| skill.name.clone())
             .collect();
         self.context_explorer = Some(ContextExplorerState::new(snapshot));
+        self.last_context_view_height = 0;
         self.conversation_cache = None;
     }
 
     pub fn close_context_explorer(&mut self) {
         self.context_explorer = None;
+        self.last_context_view_height = 0;
         self.conversation_cache = None;
     }
 
