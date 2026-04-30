@@ -1764,9 +1764,39 @@ mod tests {
                 role: "assistant".into(),
                 text: "second".into(),
             },
+            crate::context_debug::HistoryEntry::ToolUse {
+                role: "assistant".into(),
+                text: None,
+                tool_calls: vec![crate::context_debug::ToolCallEntry {
+                    tool_use_id: "toolu_hidden".into(),
+                    tool_name: "bash".into(),
+                    arguments: serde_json::json!({"command": "echo hidden"}),
+                }],
+            },
+            crate::context_debug::HistoryEntry::ToolResult {
+                role: "tool".into(),
+                tool_use_id: "toolu_hidden".into(),
+                output: "hidden".into(),
+                is_error: false,
+            },
+            crate::context_debug::HistoryEntry::Text {
+                role: "user".into(),
+                text: "third".into(),
+            },
         ];
         let mut app = app::App::new("test".into(), false, None);
         app.open_unwind_selector(snapshot);
+
+        let action = handle_terminal_event(
+            &mut app,
+            Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+        );
+
+        assert!(matches!(
+            action,
+            Some(AppAction::UnwindSession { history_index: 4 })
+        ));
+
         app.unwind_move_up();
 
         let action = handle_terminal_event(

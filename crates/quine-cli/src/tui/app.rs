@@ -515,28 +515,53 @@ pub struct UnwindState {
     pub snapshot: SessionContextSnapshot,
     pub selected_index: usize,
     pub scroll_offset: u16,
+    user_history_indices: Vec<usize>,
 }
 
 impl UnwindState {
     fn new(snapshot: SessionContextSnapshot) -> Self {
-        let selected_index = snapshot.history.len().saturating_sub(1);
+        let user_history_indices = snapshot
+            .history
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                HistoryEntry::Text { role, .. } if role == "user" => Some(index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let selected_index = user_history_indices.len().saturating_sub(1);
         Self {
             snapshot,
             selected_index,
             scroll_offset: 0,
+            user_history_indices,
         }
     }
 
-    fn entry_count(&self) -> usize {
-        self.snapshot.history.len()
+    pub fn entry_count(&self) -> usize {
+        self.user_history_indices.len()
     }
 
     pub fn selected_history_index(&self) -> Option<usize> {
-        if self.entry_count() == 0 {
+        let entry_count = self.entry_count();
+        if entry_count == 0 {
             None
         } else {
-            Some(self.selected_index.min(self.entry_count() - 1))
+            self.user_history_indices
+                .get(self.selected_index.min(entry_count - 1))
+                .copied()
         }
+    }
+
+    pub fn user_history_entries(&self) -> impl Iterator<Item = (usize, &HistoryEntry)> {
+        self.user_history_indices
+            .iter()
+            .filter_map(|&history_index| {
+                self.snapshot
+                    .history
+                    .get(history_index)
+                    .map(|entry| (history_index, entry))
+            })
     }
 }
 
