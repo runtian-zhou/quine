@@ -403,19 +403,49 @@ fn previous_live_segment_start(history: &[Message], end_exclusive: usize) -> Opt
     }
 }
 
+fn provider_safe_tail_start(history: &[Message], candidate: usize) -> Option<usize> {
+    if candidate > history.len() {
+        return None;
+    }
+
+    if !matches!(
+        history.get(candidate).map(|message| &message.content),
+        Some(MessageContent::ToolResult { .. })
+    ) {
+        return Some(candidate);
+    }
+
+    let mut start = candidate;
+    while start > 0
+        && matches!(
+            history[start - 1].content,
+            MessageContent::ToolResult { .. }
+        )
+    {
+        start -= 1;
+    }
+
+    if start > 0 && matches!(history[start - 1].content, MessageContent::ToolUse { .. }) {
+        Some(start - 1)
+    } else {
+        None
+    }
+}
+
 fn compaction_plan_from_snapshot(
     state: &SessionMemoryState,
     history: &[Message],
     snapshot: SessionMemoryCompactionSnapshot,
 ) -> Option<CompactionPlan> {
     let live_tail_start = live_tail_start(history).unwrap_or(history.len());
-    let tail_start = snapshot
+    let raw_tail_start = snapshot
         .metadata
         .last_summarized_message_index
         .checked_add(1)
         .unwrap_or(history.len());
+    let tail_start = provider_safe_tail_start(history, raw_tail_start)?;
 
-    if tail_start > history.len() || tail_start > live_tail_start {
+    if tail_start > live_tail_start {
         return None;
     }
 
@@ -499,8 +529,34 @@ fn role_label(role: Role) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::memory::{restore_memory_state, SessionSummaryMetadata};
+    use chrono::Utc;
     use quine_llm::ToolUseRequest;
+    use std::path::Path;
     use uuid::Uuid;
+
+    fn test_session_memory_state(
+        state_root: &Path,
+        last_summarized_message_index: usize,
+    ) -> SessionMemoryState {
+        let mut state = restore_memory_state(state_root, crate::session::SessionId::new(), None);
+        state.last_summarized_message_index = Some(last_summarized_message_index);
+        state
+    }
+
+    fn test_compaction_snapshot(
+        summary_markdown: &str,
+        last_summarized_message_index: usize,
+    ) -> SessionMemoryCompactionSnapshot {
+        SessionMemoryCompactionSnapshot {
+            summary_markdown: summary_markdown.into(),
+            metadata: SessionSummaryMetadata {
+                last_summarized_message_index,
+                updated_at: Utc::now(),
+                template_version: 1,
+            },
+        }
+    }
 
     #[test]
     fn split_history_keeps_latest_user_message_live() {
@@ -514,6 +570,93 @@ mod tests {
         let (prefix, tail) = split_history_for_compaction(&history);
         assert_eq!(prefix.len(), 3);
         assert_eq!(tail.len(), 1);
+    }
+
+    #[test]
+    fn session_memory_tail_start_keeps_tool_use_with_retained_tool_result() {
+        let archive_root =
+            std::env::temp_dir().join(format!("quine-core-compaction-{}", Uuid::new_v4()));
+        let state = test_session_memory_state(&archive_root, 2);
+        let history = vec![
+            Message::system("system"),
+            Message::user("run a tool"),
+            Message::assistant_tool_use(
+                Some("checking".into()),
+                vec![ToolUseRequest {
+                    tool_use_id: "call_1".into(),
+                    tool_name: "bash".into(),
+                    arguments: serde_json::json!({"cmd": "pwd"}),
+                }],
+            ),
+            Message::tool_result("call_1", "tool output", false),
+            Message::user("continue"),
+        ];
+
+        let plan =
+            compaction_plan_from_snapshot(&state, &history, test_compaction_snapshot("summary", 2))
+                .expect("snapshot boundary inside tool exchange should be repaired");
+
+        assert_eq!(plan.tail_start, 2);
+        let compacted = apply_compaction_plan(&history, "archive.json", &plan);
+        assert!(matches!(
+            compacted[2].content,
+            MessageContent::ToolUse { .. }
+        ));
+        assert!(matches!(
+            compacted[3].content,
+            MessageContent::ToolResult { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(archive_root);
+    }
+
+    #[test]
+    fn session_memory_tail_start_keeps_full_multi_tool_result_block() {
+        let archive_root =
+            std::env::temp_dir().join(format!("quine-core-compaction-{}", Uuid::new_v4()));
+        let state = test_session_memory_state(&archive_root, 2);
+        let history = vec![
+            Message::system("system"),
+            Message::assistant_tool_use(
+                None,
+                vec![
+                    ToolUseRequest {
+                        tool_use_id: "call_1".into(),
+                        tool_name: "read_file".into(),
+                        arguments: serde_json::json!({"path": "Cargo.toml"}),
+                    },
+                    ToolUseRequest {
+                        tool_use_id: "call_2".into(),
+                        tool_name: "find".into(),
+                        arguments: serde_json::json!({"pattern": "*.rs"}),
+                    },
+                ],
+            ),
+            Message::tool_result("call_1", "first output", false),
+            Message::tool_result("call_2", "second output", false),
+            Message::user("continue"),
+        ];
+
+        let plan =
+            compaction_plan_from_snapshot(&state, &history, test_compaction_snapshot("summary", 2))
+                .expect("snapshot boundary between tool results should be repaired");
+
+        assert_eq!(plan.tail_start, 1);
+        let compacted = apply_compaction_plan(&history, "archive.json", &plan);
+        assert!(matches!(
+            compacted[2].content,
+            MessageContent::ToolUse { .. }
+        ));
+        assert!(matches!(
+            compacted[3].content,
+            MessageContent::ToolResult { .. }
+        ));
+        assert!(matches!(
+            compacted[4].content,
+            MessageContent::ToolResult { .. }
+        ));
+
+        let _ = std::fs::remove_dir_all(archive_root);
     }
 
     #[tokio::test]
