@@ -386,6 +386,13 @@ impl SuspendedWait {
             Self::Mailbox { tool_use_id, .. } | Self::ChildExit { tool_use_id, .. } => tool_use_id,
         }
     }
+
+    fn tool_name(&self) -> &'static str {
+        match self {
+            Self::Mailbox { .. } => "recv_message",
+            Self::ChildExit { .. } => "wait_child",
+        }
+    }
 }
 
 struct SessionInit {
@@ -1219,6 +1226,7 @@ enum SessionCommand {
         child_id: SessionId,
         status: ExitStatus,
     },
+    WaitTimeout,
     Shutdown,
 }
 
@@ -1322,6 +1330,14 @@ async fn resume_session_from_wait(
     }) else {
         return;
     };
+    let Some(tool_name) = sessions.get(&session_id).and_then(|session| {
+        session
+            .suspended_wait
+            .as_ref()
+            .map(SuspendedWait::tool_name)
+    }) else {
+        return;
+    };
 
     let (output_text, is_error) = match &tool_result {
         ToolOutcome::Success { output } => (output.clone(), false),
@@ -1337,7 +1353,7 @@ async fn resume_session_from_wait(
             session,
             session_id,
             &tool_use_id,
-            "suspended_wait",
+            tool_name,
             &output_text,
             is_error,
         )
@@ -1370,7 +1386,7 @@ async fn resume_session_from_wait(
         .send(CoreOutput::ToolResult {
             session_id,
             tool_use_id: tool_use_id.clone(),
-            tool_name: "suspended_wait".into(),
+            tool_name: tool_name.into(),
             content: output_text,
             is_error,
             duration_us: 0,
@@ -3370,8 +3386,8 @@ async fn execute_tool_call(
             if let Some(session) = sessions.get_mut(&session_id) {
                 session.cancel_tx = None;
             }
-            return ToolOutcome::Success {
-                output: "null".into(),
+            return ToolOutcome::Error {
+                message: format!("session {child_id:?} is not a child of {session_id:?}"),
             };
         }
 
@@ -4354,6 +4370,11 @@ async fn handle_llm_turn(
                             let tool_start = std::time::Instant::now();
                             let result =
                                 execute_tool_call(call, sessions, session_id, io, engine).await;
+                            let should_suspend = matches!(result, ToolOutcome::Cancelled)
+                                && sessions
+                                    .get(&session_id)
+                                    .and_then(|session| session.suspended_wait.as_ref())
+                                    .is_some();
                             completed_calls.push(CompletedConcurrentToolCall {
                                 index: completed_calls.len(),
                                 tool_use_id: call.tool_use_id.clone(),
@@ -4362,6 +4383,9 @@ async fn handle_llm_turn(
                                 result,
                                 duration_us: tool_start.elapsed().as_micros() as u64,
                             });
+                            if should_suspend {
+                                break;
+                            }
                         }
                     }
 
@@ -4421,6 +4445,11 @@ async fn handle_llm_turn(
                         let tool_start = std::time::Instant::now();
                         let result =
                             execute_tool_call(call, sessions, session_id, io, engine).await;
+                        let should_suspend = matches!(result, ToolOutcome::Cancelled)
+                            && sessions
+                                .get(&session_id)
+                                .and_then(|session| session.suspended_wait.as_ref())
+                                .is_some();
                         completed_calls.push(CompletedConcurrentToolCall {
                             index: completed_calls.len(),
                             tool_use_id: call.tool_use_id.clone(),
@@ -4429,12 +4458,24 @@ async fn handle_llm_turn(
                             result,
                             duration_us: tool_start.elapsed().as_micros() as u64,
                         });
+                        if should_suspend {
+                            break;
+                        }
                     }
                     completed_calls
                 };
 
                 let mut saw_cancelled_tool = false;
                 for completed_call in &completed_calls {
+                    let should_resume = matches!(completed_call.result, ToolOutcome::Cancelled)
+                        && sessions
+                            .get(&session_id)
+                            .and_then(|session| session.suspended_wait.as_ref())
+                            .is_some();
+                    if should_resume {
+                        return TurnOutcome::Suspended;
+                    }
+
                     let (tool_output, is_error) = match &completed_call.result {
                         ToolOutcome::Success { output } => (output.clone(), false),
                         ToolOutcome::Error { message } => (message.clone(), true),
@@ -4513,18 +4554,8 @@ async fn handle_llm_turn(
                         ));
                     }
 
-                    let should_resume = matches!(completed_call.result, ToolOutcome::Cancelled)
-                        && sessions
-                            .get(&session_id)
-                            .and_then(|session| session.suspended_wait.as_ref())
-                            .is_some();
-
                     if matches!(completed_call.result, ToolOutcome::Cancelled) {
                         saw_cancelled_tool = true;
-                    }
-
-                    if should_resume {
-                        return TurnOutcome::Suspended;
                     }
 
                     if !concurrent_mode && matches!(completed_call.result, ToolOutcome::Cancelled) {
@@ -4721,7 +4752,21 @@ impl SessionActor {
         if let Some(command) = self.deferred_commands.pop_front() {
             return Some(command);
         }
-        self.command_rx.recv().await
+        let Some(deadline) = self
+            .session
+            .suspended_wait
+            .as_ref()
+            .and_then(SuspendedWait::timeout_at)
+        else {
+            return self.command_rx.recv().await;
+        };
+        if deadline <= Instant::now() {
+            return Some(SessionCommand::WaitTimeout);
+        }
+        tokio::select! {
+            command = self.command_rx.recv() => command,
+            _ = tokio::time::sleep_until(deadline) => Some(SessionCommand::WaitTimeout),
+        }
     }
 
     async fn handle_command(&mut self, command: SessionCommand) -> bool {
@@ -4887,6 +4932,21 @@ impl SessionActor {
             }
             SessionCommand::ChildExited { child_id, status } => {
                 self.handle_child_exited(child_id, status).await;
+                true
+            }
+            SessionCommand::WaitTimeout => {
+                if let Some(message) = self
+                    .session
+                    .suspended_wait
+                    .as_ref()
+                    .map(SuspendedWait::timeout_message)
+                {
+                    let _ = self
+                        .resume_from_wait(Some(ToolOutcome::Error {
+                            message: message.to_string(),
+                        }))
+                        .await;
+                }
                 true
             }
             SessionCommand::Shutdown => false,
@@ -5100,6 +5160,7 @@ impl SessionActor {
             return Ok(());
         };
         let tool_use_id = wait.tool_use_id().to_string();
+        let tool_name = wait.tool_name();
         let result = if let Some(result) = explicit_result {
             result
         } else {
@@ -5147,7 +5208,7 @@ impl SessionActor {
             &self.session,
             self.session_id,
             &tool_use_id,
-            "suspended_wait",
+            tool_name,
             &output_text,
             is_error,
         )
@@ -5179,7 +5240,7 @@ impl SessionActor {
             .send(CoreOutput::ToolResult {
                 session_id: self.session_id,
                 tool_use_id,
-                tool_name: "suspended_wait".into(),
+                tool_name: tool_name.into(),
                 content: output_text,
                 is_error,
                 duration_us: 0,
@@ -5477,6 +5538,8 @@ impl SessionActor {
                             .await;
                         let tool_start = std::time::Instant::now();
                         let result = self.execute_tool_call(call).await;
+                        let should_suspend = matches!(result, ToolOutcome::Cancelled)
+                            && self.session.suspended_wait.is_some();
                         completed_calls.push(CompletedConcurrentToolCall {
                             index: completed_calls.len(),
                             tool_use_id: call.tool_use_id.clone(),
@@ -5485,10 +5548,20 @@ impl SessionActor {
                             result,
                             duration_us: tool_start.elapsed().as_micros() as u64,
                         });
+                        if should_suspend {
+                            break;
+                        }
                     }
 
                     let mut saw_cancelled_tool = false;
                     for completed_call in &completed_calls {
+                        let should_suspend =
+                            matches!(completed_call.result, ToolOutcome::Cancelled)
+                                && self.session.suspended_wait.is_some();
+                        if should_suspend {
+                            return TurnOutcome::Suspended;
+                        }
+
                         let (tool_output, is_error) = match &completed_call.result {
                             ToolOutcome::Success { output } => (output.clone(), false),
                             ToolOutcome::Error { message } => (message.clone(), true),
@@ -5541,13 +5614,6 @@ impl SessionActor {
                             &history_output,
                             is_error,
                         ));
-
-                        let should_suspend =
-                            matches!(completed_call.result, ToolOutcome::Cancelled)
-                                && self.session.suspended_wait.is_some();
-                        if should_suspend {
-                            return TurnOutcome::Suspended;
-                        }
 
                         if matches!(completed_call.result, ToolOutcome::Cancelled) {
                             saw_cancelled_tool = true;
@@ -5806,6 +5872,7 @@ impl SessionActor {
                 false
             }
             SessionCommand::ChildExited { .. } => false,
+            SessionCommand::WaitTimeout => false,
             SessionCommand::Snapshot { reply } => {
                 let _ = reply.send(self.session.snapshot(self.session_id).await);
                 false
@@ -5962,7 +6029,8 @@ impl SessionActor {
                 .map(Duration::from_millis);
 
             let tree = self.session_tree.read().await;
-            let result = if tree.parent_of(child_id) == Some(self.session_id) {
+            let is_child = tree.parent_of(child_id) == Some(self.session_id);
+            let result = if is_child {
                 tree.exit_status(child_id).cloned()
             } else {
                 None
@@ -5970,6 +6038,14 @@ impl SessionActor {
             drop(tree);
 
             self.session.cancel_tx = None;
+            if !is_child {
+                return ToolOutcome::Error {
+                    message: format!(
+                        "session {child_id:?} is not a child of {:?}",
+                        self.session_id
+                    ),
+                };
+            }
             if let Some(status) = result {
                 return ToolOutcome::Success {
                     output: serde_json::to_string(&status).unwrap_or_else(|_| "unknown".into()),
@@ -8481,6 +8557,187 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             }
         }
         assert!(saw_tool_error);
+    }
+
+    #[tokio::test]
+    async fn session_actor_wait_timeout_resumes_with_original_tool_name() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let session_id = SessionId::new();
+        let child_id = SessionId::new();
+        let mut session = SessionContext::new(
+            session_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                initial_messages: vec![Message::assistant_tool_use(None, vec![])],
+                archive_root: std::env::temp_dir().join("quine-core-actor-wait-timeout"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
+                session_group: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.state = SessionState::Waiting;
+        session.suspended_wait = Some(SuspendedWait::ChildExit {
+            tool_use_id: "toolu_wait_timeout".into(),
+            child_id,
+            timeout_at: Some(Instant::now() - Duration::from_millis(1)),
+        });
+
+        let (_command_tx, command_rx) = tokio::sync::mpsc::channel(4);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(16);
+        let (core_input_tx, _core_input_rx) = tokio::sync::mpsc::channel(4);
+        let (runtime_event_tx, _runtime_event_rx) = tokio::sync::mpsc::channel(4);
+        let session_tree = Arc::new(RwLock::new(SessionTree::new()));
+        let mut actor = SessionActor {
+            session_id,
+            parent_id: None,
+            session,
+            command_rx,
+            deferred_commands: VecDeque::new(),
+            output: output_tx,
+            core_input_tx,
+            runtime_event_tx,
+            session_tree,
+            web_provider: Arc::new(NoopWebProvider),
+        };
+
+        let command = actor.next_command().await.unwrap();
+        assert!(matches!(command, SessionCommand::WaitTimeout));
+        assert!(actor.handle_command(command).await);
+        assert!(actor.session.suspended_wait.is_none());
+
+        let mut saw_wait_child_timeout = false;
+        while let Ok(event) = output_rx.try_recv() {
+            if let CoreOutput::ToolResult {
+                tool_name,
+                content,
+                is_error,
+                ..
+            } = event
+            {
+                saw_wait_child_timeout =
+                    tool_name == "wait_child" && is_error && content == "wait_child timed out";
+            }
+        }
+        assert!(saw_wait_child_timeout);
+    }
+
+    #[tokio::test]
+    async fn session_actor_wait_child_suspends_without_cancelled_tool_result() {
+        let parent_id = SessionId::new();
+        let child_id = SessionId::new();
+        let provider: Arc<dyn LlmProvider> = Arc::new(ToolCallThenTextProvider {
+            call_count: AtomicU32::new(0),
+            tool_calls: vec![(
+                "toolu_wait_child".into(),
+                "wait_child".into(),
+                serde_json::json!({"child_id": format!("{child_id:?}")}),
+            )],
+            final_text: "parent resumed".into(),
+        });
+        let mut session = SessionContext::new(
+            parent_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                initial_messages: vec![Message::user("wait for child")],
+                archive_root: std::env::temp_dir().join("quine-core-actor-wait-child"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
+                session_group: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.permission_context.set_mode(PermissionMode::Bypass);
+        session.state = SessionState::Streaming;
+
+        let (_command_tx, command_rx) = tokio::sync::mpsc::channel(4);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(32);
+        let (core_input_tx, _core_input_rx) = tokio::sync::mpsc::channel(4);
+        let (runtime_event_tx, _runtime_event_rx) = tokio::sync::mpsc::channel(4);
+        let session_tree = Arc::new(RwLock::new(SessionTree::new()));
+        session_tree.write().await.add_child(parent_id, child_id);
+        let mut actor = SessionActor {
+            session_id: parent_id,
+            parent_id: None,
+            session,
+            command_rx,
+            deferred_commands: VecDeque::new(),
+            output: output_tx,
+            core_input_tx,
+            runtime_event_tx,
+            session_tree: Arc::clone(&session_tree),
+            web_provider: Arc::new(NoopWebProvider),
+        };
+
+        let outcome = actor.handle_turn().await;
+        assert!(matches!(outcome, TurnOutcome::Suspended));
+        assert!(matches!(
+            actor.session.suspended_wait.as_ref(),
+            Some(SuspendedWait::ChildExit { child_id: waiting_child, .. }) if *waiting_child == child_id
+        ));
+
+        let mut saw_cancelled_wait_child_result = false;
+        while let Ok(event) = output_rx.try_recv() {
+            if let CoreOutput::ToolResult {
+                tool_name, content, ..
+            } = event
+            {
+                if tool_name == "wait_child" && content == "Tool execution was cancelled" {
+                    saw_cancelled_wait_child_result = true;
+                }
+            }
+        }
+        assert!(!saw_cancelled_wait_child_result);
+
+        let status = ExitStatus::Success {
+            output: "child done".into(),
+        };
+        session_tree
+            .write()
+            .await
+            .record_exit(child_id, status.clone());
+        actor.handle_child_exited(child_id, status).await;
+
+        let mut saw_resumed_wait_child_result = false;
+        while let Ok(event) = output_rx.try_recv() {
+            if let CoreOutput::ToolResult {
+                tool_name,
+                content,
+                is_error,
+                ..
+            } = event
+            {
+                if tool_name == "wait_child" && !is_error && content.contains("child done") {
+                    saw_resumed_wait_child_result = true;
+                }
+            }
+        }
+        assert!(saw_resumed_wait_child_result);
+        assert!(actor.session.suspended_wait.is_none());
     }
 
     #[tokio::test]
