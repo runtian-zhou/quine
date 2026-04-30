@@ -18,7 +18,7 @@ pub mod tool;
 
 pub use channel::{
     create_channels, ChannelConfig, CoreHandle, CoreInput, CoreOutput, HarnessHandle,
-    SessionLlmConfig, ToolOutcome,
+    SessionLlmConfig, ToolOutcome, TurnStatus,
 };
 pub use engine::{
     run_core_loop, run_core_loop_with_compaction, run_core_loop_with_compaction_and_web_provider,

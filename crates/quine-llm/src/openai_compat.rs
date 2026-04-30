@@ -1,3 +1,4 @@
+use std::error::Error as _;
 use std::pin::Pin;
 
 use async_trait::async_trait;
@@ -424,6 +425,39 @@ fn split_reasoning_tags(text: &str, in_think_block: &mut bool) -> (String, Strin
     (visible, reasoning)
 }
 
+fn format_stream_read_error(
+    model: &str,
+    status: u16,
+    buffered_chars: usize,
+    error: &reqwest::Error,
+) -> String {
+    let mut flags = Vec::new();
+    if error.is_decode() {
+        flags.push("decode");
+    }
+    if error.is_body() {
+        flags.push("body");
+    }
+    if error.is_timeout() {
+        flags.push("timeout");
+    }
+    if error.is_connect() {
+        flags.push("connect");
+    }
+    let flags = if flags.is_empty() {
+        "none".to_string()
+    } else {
+        flags.join(",")
+    };
+    let source = error
+        .source()
+        .map(|source| format!("; source: {source}"))
+        .unwrap_or_default();
+    format!(
+        "openai_compat stream read failed (model `{model}`, status {status}, buffered_chars {buffered_chars}, reqwest_flags {flags}): {error}{source}"
+    )
+}
+
 fn parse_qwen_parameter_value(text: &str) -> serde_json::Value {
     let trimmed = text.trim();
     serde_json::from_str(trimmed).unwrap_or_else(|_| serde_json::Value::String(trimmed.to_string()))
@@ -654,6 +688,8 @@ impl LlmProvider for OpenAiCompatProvider {
             return Err(LlmError::ProviderHttp { status, body }.into());
         }
 
+        let response_status = response.status().as_u16();
+        let model = self.config.model.clone();
         let byte_stream = response.bytes_stream();
 
         let event_stream = stream::unfold(
@@ -665,6 +701,7 @@ impl LlmProvider for OpenAiCompatProvider {
                 None::<TokenUsage>,
                 false,
                 false,
+                model,
             ),
             move |(
                 mut byte_stream,
@@ -674,6 +711,7 @@ impl LlmProvider for OpenAiCompatProvider {
                 mut usage,
                 mut in_think_block,
                 mut done,
+                model,
             )| async move {
                 if done {
                     return None;
@@ -712,6 +750,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                         usage,
                                         in_think_block,
                                         done,
+                                        model,
                                     ),
                                 ));
                             }
@@ -786,6 +825,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                                 usage,
                                                 in_think_block,
                                                 done,
+                                                model,
                                             ),
                                         ));
                                     }
@@ -805,6 +845,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                             usage,
                                             in_think_block,
                                             done,
+                                            model,
                                         ),
                                     ));
                                 }
@@ -821,8 +862,10 @@ impl LlmProvider for OpenAiCompatProvider {
                             buffer.push_str(&String::from_utf8_lossy(&bytes));
                         }
                         Some(Err(e)) => {
+                            let message =
+                                format_stream_read_error(&model, response_status, buffer.len(), &e);
                             return Some((
-                                stream::iter(vec![Err(e.into())]),
+                                stream::iter(vec![Err(anyhow::anyhow!(message))]),
                                 (
                                     byte_stream,
                                     buffer,
@@ -831,6 +874,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     usage,
                                     in_think_block,
                                     done,
+                                    model,
                                 ),
                             ));
                         }
@@ -855,6 +899,7 @@ impl LlmProvider for OpenAiCompatProvider {
                                     usage,
                                     in_think_block,
                                     done,
+                                    model,
                                 ),
                             ));
                         }

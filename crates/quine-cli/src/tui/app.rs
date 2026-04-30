@@ -2352,6 +2352,18 @@ impl App {
             }
             notifications::SESSION_ERROR => {
                 self.note_backend_event("error");
+                self.reasoning_buffer.clear();
+                if !self.streaming_buffer.trim().is_empty() {
+                    let text = trim_blank_lines(&std::mem::take(&mut self.streaming_buffer));
+                    if !text.is_empty() {
+                        self.current_turn_assistant_text = Some(text.clone());
+                        self.push_message(ConversationEntry::AssistantText(text));
+                    }
+                }
+                if !self.streaming_buffer.is_empty() {
+                    self.streaming_buffer.clear();
+                    self.invalidate_conversation_cache();
+                }
                 if let Some(err) = notif
                     .params
                     .as_ref()
@@ -2360,6 +2372,8 @@ impl App {
                 {
                     self.push_message(ConversationEntry::Error(err.to_string()));
                 }
+                self.set_phase(AgentPhase::Idle);
+                self.auto_scroll();
             }
             notifications::INTERACTION_NEEDED => {
                 self.note_backend_event("interaction");
@@ -3017,6 +3031,35 @@ mod tests {
         ));
 
         assert_eq!(app.phase, AgentPhase::Idle);
+    }
+
+    #[test]
+    fn session_error_flushes_active_streaming_state() {
+        let mut app = App::new("session-1".into(), false, None);
+        app.reasoning_buffer = "thinking".into();
+        app.streaming_buffer = "\n\npartial output\n\n".into();
+        app.set_phase(AgentPhase::Streaming);
+
+        app.apply_notification(&make_notif(
+            notifications::SESSION_ERROR,
+            serde_json::json!({
+                "session_id": "session-1",
+                "error": "LLM error: error decoding response body"
+            }),
+        ));
+
+        assert_eq!(app.phase, AgentPhase::Idle);
+        assert!(app.reasoning_buffer.is_empty());
+        assert!(app.streaming_buffer.is_empty());
+        assert!(matches!(
+            app.messages.first(),
+            Some(ConversationEntry::AssistantText(text)) if text == "partial output"
+        ));
+        assert!(matches!(
+            app.messages.last(),
+            Some(ConversationEntry::Error(error))
+                if error == "LLM error: error decoding response body"
+        ));
     }
 
     #[test]

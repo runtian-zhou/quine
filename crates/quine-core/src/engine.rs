@@ -16,7 +16,7 @@ use tokio::task::JoinSet;
 use tokio::time::{Duration, Instant};
 
 use crate::channel::{
-    CoreHandle, CoreInput, CoreOutput, MailboxMessage, MessageSource, ToolOutcome,
+    CoreHandle, CoreInput, CoreOutput, MailboxMessage, MessageSource, ToolOutcome, TurnStatus,
 };
 use crate::compaction::{self, CompactionTrigger, DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT};
 use crate::error::CoreError;
@@ -82,6 +82,28 @@ fn debug_log_session(session_id: SessionId, message: impl AsRef<str>) {
     if debug_enabled() {
         eprintln!("[core][session={session_id:?}] {}", message.as_ref());
     }
+}
+
+async fn emit_failed_turn(
+    output: &mpsc::Sender<CoreOutput>,
+    session_id: SessionId,
+    error: CoreError,
+    duration_us: u64,
+    usage: Option<quine_llm::TokenUsage>,
+    cache_usage: Option<PromptCacheUsage>,
+) {
+    let _ = output
+        .send(CoreOutput::SessionError { session_id, error })
+        .await;
+    let _ = output
+        .send(CoreOutput::TurnComplete {
+            session_id,
+            duration_us,
+            status: TurnStatus::Failed,
+            usage,
+            cache_usage,
+        })
+        .await;
 }
 
 fn schedule_session_memory_refresh(
@@ -1502,7 +1524,7 @@ async fn call_llm_with_messages(
         .send(messages, tools)
         .await
         .map_err(|e| CoreError::LlmError {
-            message: e.to_string(),
+            message: format!("{e:#}"),
         })?;
 
     let mut stream = stream_result;
@@ -1550,7 +1572,7 @@ async fn call_llm_with_messages(
             }
             Err(e) => {
                 return Err(CoreError::LlmError {
-                    message: e.to_string(),
+                    message: format!("{e:#}"),
                 });
             }
         }
@@ -1589,7 +1611,7 @@ async fn call_llm_interruptible(
         tokio::select! {
             stream_result = &mut send_future => {
                 break stream_result.map_err(|e| CoreError::LlmError {
-                    message: e.to_string(),
+                    message: format!("{e:#}"),
                 })?;
             }
             maybe_input = io.input.recv() => {
@@ -1666,7 +1688,7 @@ async fn call_llm_interruptible(
                     }
                     Err(e) => {
                         return Err(CoreError::LlmError {
-                            message: e.to_string(),
+                            message: format!("{e:#}"),
                         });
                     }
                 }
@@ -3825,11 +3847,24 @@ async fn handle_llm_turn(
             return TurnOutcome::Failed("session not found".into());
         };
         if let Err(error) = archive_old_tool_results_in_history(session, session_id).await {
+            session.state = SessionState::Idle;
+            let duration_us = turn_start.elapsed().as_micros() as u64;
             let _ = io
                 .output
-                .send(CoreOutput::SessionError { session_id, error })
+                .send(CoreOutput::SessionStateChanged {
+                    session_id,
+                    state: SessionState::Idle,
+                })
                 .await;
-            session.state = SessionState::Idle;
+            emit_failed_turn(
+                io.output,
+                session_id,
+                error,
+                duration_us,
+                accumulated_usage.clone(),
+                accumulated_cache_usage.clone(),
+            )
+            .await;
             return TurnOutcome::Failed("session error".into());
         }
 
@@ -3851,11 +3886,24 @@ async fn handle_llm_turn(
                 compact_session_history(&*provider, session, session_id, CompactionTrigger::Auto)
                     .await
             {
+                session.state = SessionState::Idle;
+                let duration_us = turn_start.elapsed().as_micros() as u64;
                 let _ = io
                     .output
-                    .send(CoreOutput::SessionError { session_id, error })
+                    .send(CoreOutput::SessionStateChanged {
+                        session_id,
+                        state: SessionState::Idle,
+                    })
                     .await;
-                session.state = SessionState::Idle;
+                emit_failed_turn(
+                    io.output,
+                    session_id,
+                    error,
+                    duration_us,
+                    accumulated_usage.clone(),
+                    accumulated_cache_usage.clone(),
+                )
+                .await;
                 return TurnOutcome::Failed("session error".into());
             }
         }
@@ -3874,6 +3922,7 @@ async fn handle_llm_turn(
                 .send(CoreOutput::TurnComplete {
                     session_id,
                     duration_us,
+                    status: TurnStatus::Cancelled,
                     usage: accumulated_usage.clone(),
                     cache_usage: accumulated_cache_usage.clone(),
                 })
@@ -3884,10 +3933,24 @@ async fn handle_llm_turn(
             Some(session) => match build_provider_messages(session).await {
                 Ok(history) => history,
                 Err(error) => {
+                    session.state = SessionState::Idle;
+                    let duration_us = turn_start.elapsed().as_micros() as u64;
                     let _ = io
                         .output
-                        .send(CoreOutput::SessionError { session_id, error })
+                        .send(CoreOutput::SessionStateChanged {
+                            session_id,
+                            state: SessionState::Idle,
+                        })
                         .await;
+                    emit_failed_turn(
+                        io.output,
+                        session_id,
+                        error,
+                        duration_us,
+                        accumulated_usage.clone(),
+                        accumulated_cache_usage.clone(),
+                    )
+                    .await;
                     return TurnOutcome::Failed("session error".into());
                 }
             },
@@ -3942,6 +4005,7 @@ async fn handle_llm_turn(
                     .send(CoreOutput::TurnComplete {
                         session_id,
                         duration_us,
+                        status: TurnStatus::Cancelled,
                         usage: accumulated_usage.clone(),
                         cache_usage: accumulated_cache_usage.clone(),
                     })
@@ -4024,6 +4088,7 @@ async fn handle_llm_turn(
                     .send(CoreOutput::TurnComplete {
                         session_id,
                         duration_us,
+                        status: TurnStatus::Success,
                         usage: accumulated_usage,
                         cache_usage: accumulated_cache_usage,
                     })
@@ -4202,6 +4267,7 @@ async fn handle_llm_turn(
                                     .send(CoreOutput::TurnComplete {
                                         session_id,
                                         duration_us,
+                                        status: TurnStatus::Cancelled,
                                         usage: accumulated_usage.clone(),
                                         cache_usage: accumulated_cache_usage.clone(),
                                     })
@@ -4268,6 +4334,7 @@ async fn handle_llm_turn(
                                 .send(CoreOutput::TurnComplete {
                                     session_id,
                                     duration_us,
+                                    status: TurnStatus::Cancelled,
                                     usage: accumulated_usage.clone(),
                                     cache_usage: accumulated_cache_usage.clone(),
                                 })
@@ -4371,22 +4438,15 @@ async fn handle_llm_turn(
                                         state: SessionState::Idle,
                                     })
                                     .await;
-                                let _ = io
-                                    .output
-                                    .send(CoreOutput::SessionError {
-                                        session_id,
-                                        error: error.clone(),
-                                    })
-                                    .await;
-                                let _ = io
-                                    .output
-                                    .send(CoreOutput::TurnComplete {
-                                        session_id,
-                                        duration_us,
-                                        usage: accumulated_usage.clone(),
-                                        cache_usage: accumulated_cache_usage.clone(),
-                                    })
-                                    .await;
+                                emit_failed_turn(
+                                    io.output,
+                                    session_id,
+                                    error.clone(),
+                                    duration_us,
+                                    accumulated_usage.clone(),
+                                    accumulated_cache_usage.clone(),
+                                )
+                                .await;
                                 return TurnOutcome::Failed(error.to_string());
                             }
                         };
@@ -4434,6 +4494,7 @@ async fn handle_llm_turn(
                             .send(CoreOutput::TurnComplete {
                                 session_id,
                                 duration_us,
+                                status: TurnStatus::Cancelled,
                                 usage: accumulated_usage.clone(),
                                 cache_usage: accumulated_cache_usage.clone(),
                             })
@@ -4499,6 +4560,7 @@ async fn handle_llm_turn(
                         .send(CoreOutput::TurnComplete {
                             session_id,
                             duration_us,
+                            status: TurnStatus::Cancelled,
                             usage: accumulated_usage.clone(),
                             cache_usage: accumulated_cache_usage.clone(),
                         })
@@ -4556,10 +4618,16 @@ async fn handle_llm_turn(
                         state: SessionState::Idle,
                     })
                     .await;
-                let _ = io
-                    .output
-                    .send(CoreOutput::SessionError { session_id, error })
-                    .await;
+                let duration_us = turn_start.elapsed().as_micros() as u64;
+                emit_failed_turn(
+                    io.output,
+                    session_id,
+                    error,
+                    duration_us,
+                    accumulated_usage.clone(),
+                    accumulated_cache_usage.clone(),
+                )
+                .await;
                 return TurnOutcome::Failed("session error".into());
             }
         }
@@ -5060,14 +5128,18 @@ impl SessionActor {
             if let Err(error) =
                 archive_old_tool_results_in_history(&mut self.session, self.session_id).await
             {
-                let _ = self
-                    .output
-                    .send(CoreOutput::SessionError {
-                        session_id: self.session_id,
-                        error,
-                    })
-                    .await;
                 self.session.state = SessionState::Idle;
+                let duration_us = turn_start.elapsed().as_micros() as u64;
+                self.emit_state(SessionState::Idle).await;
+                emit_failed_turn(
+                    &self.output,
+                    self.session_id,
+                    error,
+                    duration_us,
+                    accumulated_usage.clone(),
+                    accumulated_cache_usage.clone(),
+                )
+                .await;
                 return TurnOutcome::Failed("session error".into());
             }
 
@@ -5086,14 +5158,18 @@ impl SessionActor {
                 )
                 .await
                 {
-                    let _ = self
-                        .output
-                        .send(CoreOutput::SessionError {
-                            session_id: self.session_id,
-                            error,
-                        })
-                        .await;
                     self.session.state = SessionState::Idle;
+                    let duration_us = turn_start.elapsed().as_micros() as u64;
+                    self.emit_state(SessionState::Idle).await;
+                    emit_failed_turn(
+                        &self.output,
+                        self.session_id,
+                        error,
+                        duration_us,
+                        accumulated_usage.clone(),
+                        accumulated_cache_usage.clone(),
+                    )
+                    .await;
                     return TurnOutcome::Failed("session error".into());
                 }
             }
@@ -5109,6 +5185,7 @@ impl SessionActor {
                     .send(CoreOutput::TurnComplete {
                         session_id: self.session_id,
                         duration_us,
+                        status: TurnStatus::Cancelled,
                         usage: accumulated_usage.clone(),
                         cache_usage: accumulated_cache_usage.clone(),
                     })
@@ -5119,13 +5196,18 @@ impl SessionActor {
             let history = match build_provider_messages(&mut self.session).await {
                 Ok(history) => history,
                 Err(error) => {
-                    let _ = self
-                        .output
-                        .send(CoreOutput::SessionError {
-                            session_id: self.session_id,
-                            error,
-                        })
-                        .await;
+                    self.session.state = SessionState::Idle;
+                    let duration_us = turn_start.elapsed().as_micros() as u64;
+                    self.emit_state(SessionState::Idle).await;
+                    emit_failed_turn(
+                        &self.output,
+                        self.session_id,
+                        error,
+                        duration_us,
+                        accumulated_usage.clone(),
+                        accumulated_cache_usage.clone(),
+                    )
+                    .await;
                     return TurnOutcome::Failed("session error".into());
                 }
             };
@@ -5151,6 +5233,7 @@ impl SessionActor {
                         .send(CoreOutput::TurnComplete {
                             session_id: self.session_id,
                             duration_us,
+                            status: TurnStatus::Cancelled,
                             usage: accumulated_usage.clone(),
                             cache_usage: accumulated_cache_usage.clone(),
                         })
@@ -5219,6 +5302,7 @@ impl SessionActor {
                         .send(CoreOutput::TurnComplete {
                             session_id: self.session_id,
                             duration_us,
+                            status: TurnStatus::Success,
                             usage: accumulated_usage,
                             cache_usage: accumulated_cache_usage,
                         })
@@ -5296,6 +5380,7 @@ impl SessionActor {
                                 .send(CoreOutput::TurnComplete {
                                     session_id: self.session_id,
                                     duration_us,
+                                    status: TurnStatus::Cancelled,
                                     usage: accumulated_usage.clone(),
                                     cache_usage: accumulated_cache_usage.clone(),
                                 })
@@ -5360,22 +5445,15 @@ impl SessionActor {
                                 self.session.state = SessionState::Idle;
                                 let duration_us = turn_start.elapsed().as_micros() as u64;
                                 self.emit_state(SessionState::Idle).await;
-                                let _ = self
-                                    .output
-                                    .send(CoreOutput::SessionError {
-                                        session_id: self.session_id,
-                                        error: error.clone(),
-                                    })
-                                    .await;
-                                let _ = self
-                                    .output
-                                    .send(CoreOutput::TurnComplete {
-                                        session_id: self.session_id,
-                                        duration_us,
-                                        usage: accumulated_usage.clone(),
-                                        cache_usage: accumulated_cache_usage.clone(),
-                                    })
-                                    .await;
+                                emit_failed_turn(
+                                    &self.output,
+                                    self.session_id,
+                                    error.clone(),
+                                    duration_us,
+                                    accumulated_usage.clone(),
+                                    accumulated_cache_usage.clone(),
+                                )
+                                .await;
                                 return TurnOutcome::Failed(error.to_string());
                             }
                         };
@@ -5431,6 +5509,7 @@ impl SessionActor {
                             .send(CoreOutput::TurnComplete {
                                 session_id: self.session_id,
                                 duration_us,
+                                status: TurnStatus::Cancelled,
                                 usage: accumulated_usage.clone(),
                                 cache_usage: accumulated_cache_usage.clone(),
                             })
@@ -5479,13 +5558,16 @@ impl SessionActor {
                     self.set_status_report(None).await;
                     self.session.state = SessionState::Idle;
                     self.emit_state(SessionState::Idle).await;
-                    let _ = self
-                        .output
-                        .send(CoreOutput::SessionError {
-                            session_id: self.session_id,
-                            error,
-                        })
-                        .await;
+                    let duration_us = turn_start.elapsed().as_micros() as u64;
+                    emit_failed_turn(
+                        &self.output,
+                        self.session_id,
+                        error,
+                        duration_us,
+                        accumulated_usage.clone(),
+                        accumulated_cache_usage.clone(),
+                    )
+                    .await;
                     return TurnOutcome::Failed("session error".into());
                 }
             }
@@ -5505,7 +5587,7 @@ impl SessionActor {
             tokio::select! {
                 stream_result = &mut send_future => {
                     break stream_result.map_err(|e| CoreError::LlmError {
-                        message: e.to_string(),
+                        message: format!("{e:#}"),
                     })?;
                 }
                 maybe_command = self.command_rx.recv() => {
@@ -5573,7 +5655,7 @@ impl SessionActor {
                         }
                         Err(e) => {
                             return Err(CoreError::LlmError {
-                                message: e.to_string(),
+                                message: format!("{e:#}"),
                             });
                         }
                     }
@@ -6785,6 +6867,27 @@ mod tests {
                 ]
             };
             Ok(Box::pin(futures::stream::iter(events)))
+        }
+    }
+
+    struct FailingStreamProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for FailingStreamProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            Ok(Box::pin(futures::stream::iter([
+                Ok(LlmEvent::ReasoningDelta {
+                    text: "thinking".into(),
+                }),
+                Err(anyhow::anyhow!(
+                    "openai_compat stream read failed: error decoding response body"
+                )),
+            ])))
         }
     }
 
@@ -10926,6 +11029,99 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         let event = output.recv().await.unwrap();
         assert!(matches!(event, CoreOutput::TurnComplete { .. }));
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn llm_stream_error_emits_session_error_and_failed_turn_complete() {
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let provider: Arc<dyn LlmProvider> = Arc::new(FailingStreamProvider);
+
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                session_group: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        reply_rx.await.unwrap().unwrap();
+
+        let _ = output.recv().await.unwrap();
+        let _ = output.recv().await.unwrap();
+
+        let turn_id = uuid::Uuid::new_v4().to_string();
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "hello".into(),
+                turn_id: turn_id.clone(),
+            })
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            CoreOutput::SessionStateChanged {
+                state: SessionState::Streaming,
+                ..
+            }
+        ));
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            CoreOutput::TurnStarted {
+                session_id: started_session_id,
+                turn_id: started_turn_id,
+            } if started_session_id == session_id && started_turn_id == turn_id
+        ));
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            CoreOutput::ReasoningDelta { delta, .. } if delta == "thinking"
+        ));
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            CoreOutput::SessionStateChanged {
+                state: SessionState::Idle,
+                ..
+            }
+        ));
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            CoreOutput::SessionError {
+                error: CoreError::LlmError { message },
+                ..
+            } if message.contains("openai_compat stream read failed")
+                && message.contains("error decoding response body")
+        ));
+        assert!(matches!(
+            output.recv().await.unwrap(),
+            CoreOutput::TurnComplete {
+                status: TurnStatus::Failed,
+                ..
+            }
+        ));
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();
