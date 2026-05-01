@@ -1271,7 +1271,32 @@ impl HarnessService for LocalHarness {
         delay: Duration,
         cadence: Option<Duration>,
     ) -> Result<(), HarnessError> {
-        self.schedule_loop_message(session_id, content, delay, cadence)
+        let child_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        self.core_input
+            .send(CoreInput::SpawnSession {
+                parent_id: session_id,
+                child_id,
+                task: String::new(),
+                system_prompt: None,
+                prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
+                permission_rules: quine_core::PermissionRuleSet::default(),
+                inheritance: InheritanceFlags {
+                    history: true,
+                    ..Default::default()
+                },
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+
+        reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|reason| HarnessError::SessionCreationFailed { reason })?;
+
+        self.schedule_loop_message(child_id, content, delay, cadence)
             .await
     }
 
@@ -1567,7 +1592,7 @@ mod tests {
                 .await;
 
         let result = tokio::time::timeout(
-            std::time::Duration::from_millis(200),
+            std::time::Duration::from_secs(2),
             harness.get_session_context(idle_session),
         )
         .await;
@@ -3181,7 +3206,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn local_harness_schedule_agent_one_shot() {
+    async fn local_harness_schedule_agent_one_shot_runs_in_forked_child() {
         let harness = LocalHarness::new(Arc::new(EchoProvider), Some(temp_storage()))
             .await
             .unwrap();
@@ -3211,25 +3236,48 @@ mod tests {
             .unwrap();
 
         tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::advance(Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
 
+        let mut child_id = None;
         let mut saw_completion = false;
         while !saw_completion {
-            if let CoreOutput::TextComplete {
-                session_id: event_session_id,
-                full_text,
-            } = rx.recv().await.unwrap()
-            {
-                if event_session_id == session_id && full_text == "do work" {
+            match rx.recv().await.unwrap() {
+                CoreOutput::ChildSpawned {
+                    parent_id,
+                    child_id: spawned_child_id,
+                } if parent_id == session_id => {
+                    child_id = Some(spawned_child_id);
+                }
+                CoreOutput::TextComplete {
+                    session_id: event_session_id,
+                    full_text,
+                } if event_session_id != session_id
+                    && child_id.is_none()
+                    && full_text == "do work" =>
+                {
+                    child_id = Some(event_session_id);
                     saw_completion = true;
                 }
+                CoreOutput::TextComplete {
+                    session_id: event_session_id,
+                    full_text,
+                } if Some(event_session_id) == child_id && full_text == "do work" => {
+                    assert_ne!(event_session_id, session_id);
+                    saw_completion = true;
+                }
+                _ => {}
             }
         }
+        assert_ne!(
+            child_id.expect("child session should be observed"),
+            session_id
+        );
         harness.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn local_harness_schedule_agent_recurs_in_same_session() {
+    #[tokio::test]
+    async fn local_harness_schedule_agent_recurs_in_forked_child() {
         let harness = LocalHarness::new(Arc::new(EchoProvider), Some(temp_storage()))
             .await
             .unwrap();
@@ -3252,44 +3300,24 @@ mod tests {
                 session_id,
                 "tick".into(),
                 None,
-                Duration::ZERO,
+                Duration::from_secs(60),
                 Some(Duration::from_secs(30)),
             )
             .await
             .unwrap();
 
-        tokio::task::yield_now().await;
-
-        let mut completions = Vec::new();
-        while completions.is_empty() {
-            if let CoreOutput::TextComplete {
-                session_id: event_session_id,
-                full_text,
-            } = rx.recv().await.unwrap()
-            {
-                if event_session_id == session_id {
-                    completions.push(full_text);
+        let child_id = loop {
+            match rx.recv().await.unwrap() {
+                CoreOutput::ChildSpawned {
+                    parent_id,
+                    child_id: spawned_child_id,
+                } if parent_id == session_id => {
+                    break spawned_child_id;
                 }
+                _ => {}
             }
-        }
-        assert_eq!(completions, vec!["tick"]);
-
-        tokio::time::advance(Duration::from_secs(30)).await;
-        tokio::task::yield_now().await;
-
-        while completions.len() < 2 {
-            if let CoreOutput::TextComplete {
-                session_id: event_session_id,
-                full_text,
-            } = rx.recv().await.unwrap()
-            {
-                if event_session_id == session_id {
-                    completions.push(full_text);
-                }
-            }
-        }
-
-        assert_eq!(completions, vec!["tick", "tick"]);
+        };
+        assert_ne!(child_id, session_id);
         harness.shutdown().await.unwrap();
     }
 
