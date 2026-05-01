@@ -6849,7 +6849,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         system_prompt,
                         prompt_behavior,
                         permission_rules,
-                        inheritance: _inheritance,
+                        inheritance,
                         reply,
                     } => {
                         if registry.read().await.contains_key(&child_id) {
@@ -6857,6 +6857,54 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                             continue;
                         }
                         let parent_handle = registry.read().await.get(&parent_id).cloned();
+                        let inherited_snapshot = if inheritance.history {
+                            match &parent_handle {
+                                Some(handle) => {
+                                    let (snapshot_reply_tx, snapshot_reply_rx) = oneshot::channel();
+                                    if handle
+                                        .command_tx
+                                        .send(SessionCommand::Snapshot {
+                                            reply: snapshot_reply_tx,
+                                        })
+                                        .await
+                                        .is_err()
+                                    {
+                                        let _ = reply.send(Err("parent session unavailable".into()));
+                                        continue;
+                                    }
+                                    match snapshot_reply_rx.await {
+                                        Ok(Some(mut persisted)) => {
+                                            persisted.session_id = child_id;
+                                            persisted.created_at = Utc::now();
+                                            persisted.state = PersistedSessionState::Idle;
+                                            if let Some(system_prompt) = system_prompt.clone() {
+                                                persisted.config.system_prompt =
+                                                    Some(system_prompt);
+                                            }
+                                            persisted.permission_state = None;
+                                            persisted.status_report = None;
+                                            Some(persisted)
+                                        }
+                                        Ok(None) => {
+                                            let _ = reply.send(Err(
+                                                "parent session is not in a forkable state".into(),
+                                            ));
+                                            continue;
+                                        }
+                                        Err(_) => {
+                                            let _ = reply.send(Err("parent snapshot failed".into()));
+                                            continue;
+                                        }
+                                    }
+                                }
+                                None => {
+                                    let _ = reply.send(Err("unknown parent session".into()));
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
                         let inherited_provider = parent_handle
                             .as_ref()
                             .map(|handle| Arc::clone(&handle.provider))
@@ -6871,34 +6919,51 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                             .as_ref()
                             .and_then(|handle| handle.max_context_window)
                             .or(max_context_window);
-                        match SessionContext::new(
-                            child_id,
-                            SessionInit {
-                                system_prompt,
-                                skills: Vec::new(),
-                                working_directory: std::env::current_dir().unwrap_or_default(),
-                                plan_mode: false,
-                                prompt_behavior,
-                                initial_messages: Vec::new(),
-                                archive_root: archive_root.clone(),
-                                max_context_window: inherited_max_context_window,
-                                prompt_memory_mode: PromptMemoryMode::Disabled,
-                                agent_key: None,
-                                team_key: None,
-                                memory_policy: MemoryPolicyConfig::default(),
-                                model_profile: inherited_model_profile,
-                                session_group: inherited_session_group.clone(),
-                                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
-                                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
-                            },
-                            &inherited_provider,
-                        )
-                        .await
-                        {
+                        let session_result = if let Some(persisted) = inherited_snapshot {
+                            SessionContext::from_persisted_with_web_provider(
+                                persisted,
+                                &inherited_provider,
+                                &web_provider,
+                                archive_root.clone(),
+                                inherited_max_context_window,
+                                Arc::clone(&python_runtime),
+                            )
+                            .await
+                            .map(|(_, session)| session)
+                        } else {
+                            SessionContext::new(
+                                child_id,
+                                SessionInit {
+                                    system_prompt,
+                                    skills: Vec::new(),
+                                    working_directory: std::env::current_dir().unwrap_or_default(),
+                                    plan_mode: false,
+                                    prompt_behavior,
+                                    initial_messages: Vec::new(),
+                                    archive_root: archive_root.clone(),
+                                    max_context_window: inherited_max_context_window,
+                                    prompt_memory_mode: PromptMemoryMode::Disabled,
+                                    agent_key: None,
+                                    team_key: None,
+                                    memory_policy: MemoryPolicyConfig::default(),
+                                    model_profile: inherited_model_profile,
+                                    session_group: inherited_session_group.clone(),
+                                    auto_compact_threshold_percent:
+                                        DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                                    status_report_min_tool_rounds:
+                                        default_status_report_min_tool_rounds(),
+                                },
+                                &inherited_provider,
+                            )
+                            .await
+                        };
+                        match session_result {
                             Ok(mut ctx) => {
                                 ctx.python_runtime = Arc::clone(&python_runtime);
-                                ctx.python_group =
-                                    effective_session_group(child_id, inherited_session_group.as_deref());
+                                ctx.python_group = effective_session_group(
+                                    child_id,
+                                    inherited_session_group.as_deref(),
+                                );
                                 ctx.persisted_config.session_group = inherited_session_group;
                                 ctx.permission_context.set_rules(permission_rules);
                                 session_tree.write().await.add_child(parent_id, child_id);
@@ -6911,16 +6976,29 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                 .await
                                 {
                                     Ok(()) => {
-                                        let _ = handle.output.send(CoreOutput::ChildSpawned { parent_id, child_id }).await;
-                                        let _ = handle.output.send(CoreOutput::SessionStateChanged {
-                                            session_id: child_id,
-                                            state: SessionState::Idle,
-                                        }).await;
-                                        if let Some(child_handle) = registry.read().await.get(&child_id).cloned() {
-                                            let _ = child_handle.command_tx.send(SessionCommand::UserMessage {
-                                                content: task,
-                                                turn_id: uuid::Uuid::new_v4().to_string(),
-                                            }).await;
+                                        let _ = handle
+                                            .output
+                                            .send(CoreOutput::ChildSpawned { parent_id, child_id })
+                                            .await;
+                                        let _ = handle
+                                            .output
+                                            .send(CoreOutput::SessionStateChanged {
+                                                session_id: child_id,
+                                                state: SessionState::Idle,
+                                            })
+                                            .await;
+                                        if !task.is_empty() {
+                                            if let Some(child_handle) =
+                                                registry.read().await.get(&child_id).cloned()
+                                            {
+                                                let _ = child_handle
+                                                    .command_tx
+                                                    .send(SessionCommand::UserMessage {
+                                                        content: task,
+                                                        turn_id: uuid::Uuid::new_v4().to_string(),
+                                                    })
+                                                    .await;
+                                            }
                                         }
                                         emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
                                         let _ = reply.send(Ok(()));
@@ -10850,6 +10928,110 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             }
             other => panic!("expected completed exit status, got {other:?}"),
         }
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_session_can_fork_parent_history() {
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::new("ack"));
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
+
+        let parent_id = SessionId::new();
+        let (create_reply_tx, create_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id: parent_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                session_group: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+                reply: create_reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(create_reply_rx.await.unwrap().is_ok());
+        let _ = output.recv().await.unwrap();
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id: parent_id,
+                content: "remember parent context".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .await
+            .unwrap();
+
+        loop {
+            if matches!(
+                output.recv().await.unwrap(),
+                CoreOutput::TurnComplete {
+                    session_id,
+                    ..
+                } if session_id == parent_id
+            ) {
+                break;
+            }
+        }
+
+        let child_id = SessionId::new();
+        let (spawn_reply_tx, spawn_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::SpawnSession {
+                parent_id,
+                child_id,
+                task: String::new(),
+                system_prompt: None,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
+                inheritance: InheritanceFlags {
+                    history: true,
+                    ..Default::default()
+                },
+                reply: spawn_reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(spawn_reply_rx.await.unwrap().is_ok());
+
+        let (checkpoint_reply_tx, checkpoint_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::RequestSessionCheckpoint {
+                session_id: child_id,
+                reply: checkpoint_reply_tx,
+            })
+            .await
+            .unwrap();
+        let checkpoint = checkpoint_reply_rx.await.unwrap();
+        let child = checkpoint
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == child_id)
+            .expect("child checkpoint");
+
+        assert!(child.history.iter().any(|message| {
+            matches!(
+                &message.content,
+                MessageContent::Text(text) if text == "remember parent context"
+            )
+        }));
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();
