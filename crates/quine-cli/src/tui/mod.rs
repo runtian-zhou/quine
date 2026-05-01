@@ -311,6 +311,18 @@ async fn list_sessions(client: &mut IpcClient) -> anyhow::Result<Vec<TuiSessionS
     Ok(sessions)
 }
 
+fn switch_session_candidates_from_summaries(
+    sessions: Vec<TuiSessionSummary>,
+) -> Vec<SwitchSessionCandidate> {
+    sessions
+        .into_iter()
+        .map(|session| SwitchSessionCandidate {
+            session_id: session.session_id,
+            summary: session.summary.or(session.title),
+        })
+        .collect()
+}
+
 fn print_resume_command(socket_path: &Path, session_id: &str) {
     eprintln!(
         "Resume from this checkpoint with: `quine run --session {} --socket {} \"<message>\"`",
@@ -388,15 +400,7 @@ pub async fn run_tui_chat(
         app.set_model_profile_candidates(profiles);
     }
     if let Ok(sessions) = list_sessions(&mut client).await {
-        app.set_switch_session_candidates(
-            sessions
-                .into_iter()
-                .map(|session| SwitchSessionCandidate {
-                    session_id: session.session_id,
-                    summary: session.summary.or(session.title),
-                })
-                .collect(),
-        );
+        app.set_switch_session_candidates(switch_session_candidates_from_summaries(sessions));
     }
     let mut event_stream = EventStream::new();
     let mut spinner_interval = tokio::time::interval(Duration::from_millis(80));
@@ -482,6 +486,7 @@ async fn run_event_loop(
             maybe_notif = client.recv_notification() => {
                 match maybe_notif {
                     Some(notif) => {
+                        app.observe_session_notification(&notif);
                         if interaction_session_id(&notif)
                             .is_some_and(|session_id| session_id != app.session_id.as_str())
                         {
@@ -1126,14 +1131,9 @@ async fn execute_action(
             }
             match list_sessions(client).await {
                 Ok(sessions) => {
-                    let session_ids = sessions
-                        .into_iter()
-                        .map(|session| SwitchSessionCandidate {
-                            session_id: session.session_id,
-                            summary: session.summary.or(session.title),
-                        })
-                        .collect();
-                    app.set_switch_session_candidates(session_ids);
+                    app.set_switch_session_candidates(switch_session_candidates_from_summaries(
+                        sessions,
+                    ));
                 }
                 Err(error) => {
                     app.push_message(app::ConversationEntry::Error(format!(
@@ -1143,6 +1143,32 @@ async fn execute_action(
             }
             app.set_phase(AgentPhase::Idle);
             app.auto_scroll();
+        }
+        AppAction::OpenSwitchSessionSelector => {
+            match list_sessions(client).await {
+                Ok(sessions) => {
+                    app.set_switch_session_candidates(switch_session_candidates_from_summaries(
+                        sessions,
+                    ));
+                    app.input.set_from_string("/switch ");
+                    app.refresh_switch_session_options();
+                    if app.switch_select_active {
+                        app.set_status_notice("choose a live session");
+                    } else {
+                        app.push_message(app::ConversationEntry::Error(
+                            "No switchable sessions found.".into(),
+                        ));
+                        app.auto_scroll();
+                    }
+                }
+                Err(error) => {
+                    app.push_message(app::ConversationEntry::Error(format!(
+                        "/switch failed: {error}"
+                    )));
+                    app.auto_scroll();
+                }
+            }
+            app.set_phase(AgentPhase::Idle);
         }
         AppAction::ClearSession => {
             let created = create_session(client, available_skills, false, None, None).await?;
@@ -1158,11 +1184,18 @@ async fn execute_action(
             match fetch_session_context(client, &session_id).await {
                 Ok(context) => {
                     let plan_mode = context.plan_mode;
+                    let candidates = app.switch_session_candidates.clone();
                     app.reset_for_new_session(session_id.clone(), plan_mode, None);
+                    app.set_switch_session_candidates(candidates);
                     app.load_session_context(context);
                     app.push_message(app::ConversationEntry::AssistantText(format!(
                         "Switched to session {session_id}."
                     )));
+                    if let Ok(sessions) = list_sessions(client).await {
+                        app.set_switch_session_candidates(
+                            switch_session_candidates_from_summaries(sessions),
+                        );
+                    }
                 }
                 Err(error) => {
                     app.push_message(app::ConversationEntry::Error(format!(
@@ -1170,7 +1203,6 @@ async fn execute_action(
                     )));
                 }
             }
-            app.set_phase(AgentPhase::Idle);
             app.auto_scroll();
         }
         AppAction::SetModelProfile { model_profile } => {

@@ -259,6 +259,7 @@ pub enum AppAction {
     SwitchSession {
         session_id: String,
     },
+    OpenSwitchSessionSelector,
     SendSlashSkillMessage {
         skill_name: String,
         request: String,
@@ -871,6 +872,7 @@ impl App {
     pub fn load_session_context(&mut self, snapshot: SessionContextSnapshot) {
         self.session_id = snapshot.session_id.clone();
         self.plan_mode = snapshot.plan_mode;
+        let state = snapshot.state.clone();
         self.loaded_skill_commands = snapshot
             .loaded_skills
             .iter()
@@ -919,7 +921,19 @@ impl App {
         }
 
         self.invalidate_conversation_cache();
+        self.set_phase_from_session_state(&state);
         self.auto_scroll();
+    }
+
+    fn set_phase_from_session_state(&mut self, state: &str) {
+        match state {
+            "streaming" => self.set_phase(AgentPhase::Streaming),
+            "awaiting_tool_result" if !matches!(self.phase, AgentPhase::RunningTool(_)) => {
+                self.set_phase(AgentPhase::Thinking);
+            }
+            "idle" | "waiting" | "paused" | "destroyed" => self.set_phase(AgentPhase::Idle),
+            _ => {}
+        }
     }
 
     fn push_restored_tool_call(
@@ -1377,11 +1391,7 @@ impl App {
                         "switch" => {
                             let target = arguments.trim();
                             if target.is_empty() {
-                                self.push_message(ConversationEntry::Error(
-                                    "Usage: /switch <session-id>".into(),
-                                ));
-                                self.auto_scroll();
-                                None
+                                Some(AppAction::OpenSwitchSessionSelector)
                             } else {
                                 Some(AppAction::SwitchSession {
                                     session_id: target.to_string(),
@@ -1697,6 +1707,72 @@ impl App {
     pub(crate) fn set_switch_session_candidates(&mut self, sessions: Vec<SwitchSessionCandidate>) {
         self.switch_session_candidates = sessions;
         self.refresh_switch_session_options();
+    }
+
+    pub(crate) fn upsert_switch_session_candidate(
+        &mut self,
+        session_id: String,
+        summary: Option<String>,
+    ) {
+        if let Some(candidate) = self
+            .switch_session_candidates
+            .iter_mut()
+            .find(|candidate| candidate.session_id == session_id)
+        {
+            if summary.is_some() {
+                candidate.summary = summary;
+            }
+        } else {
+            self.switch_session_candidates.push(SwitchSessionCandidate {
+                session_id,
+                summary,
+            });
+        }
+        self.refresh_switch_session_options();
+    }
+
+    pub(crate) fn observe_session_notification(&mut self, notif: &JsonRpcNotification) {
+        match notif.method.as_str() {
+            notifications::CHILD_SPAWNED => {
+                let Some(params) = notif.params.as_ref() else {
+                    return;
+                };
+                let child_id = params
+                    .get("child_id")
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string);
+                let parent_id = params.get("parent_id").and_then(|value| value.as_str());
+                if let Some(child_id) = child_id {
+                    let summary = parent_id.map(|parent| format!("child of {parent}"));
+                    self.upsert_switch_session_candidate(child_id.clone(), summary);
+                    if parent_id == Some(self.session_id.as_str()) {
+                        self.set_status_notice(format!("child session spawned: {child_id}"));
+                    }
+                }
+            }
+            notifications::SESSION_STATE_CHANGED => {
+                let Some(session_id) = notif
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("session_id"))
+                    .and_then(|value| value.as_str())
+                    .map(ToString::to_string)
+                else {
+                    return;
+                };
+                if session_id == self.session_id {
+                    return;
+                }
+                let summary = notif
+                    .params
+                    .as_ref()
+                    .and_then(|params| params.get("state"))
+                    .and_then(|value| value.as_str())
+                    .map(|state| format!("state {state}"));
+                self.upsert_switch_session_candidate(session_id, summary);
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn refresh_switch_session_options(&mut self) {
@@ -3752,6 +3828,40 @@ mod tests {
         ));
         assert!(app.option_select.is_none());
         assert!(!app.switch_select_active);
+    }
+
+    #[test]
+    fn submit_input_switch_without_target_opens_selector_action() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/switch");
+
+        let action = app.submit_input();
+
+        assert!(matches!(action, Some(AppAction::OpenSwitchSessionSelector)));
+    }
+
+    #[test]
+    fn child_spawned_notification_adds_live_switch_candidate() {
+        let mut app = App::new("parent".into(), false, None);
+
+        app.observe_session_notification(&make_notif(
+            notifications::CHILD_SPAWNED,
+            serde_json::json!({
+                "parent_id": "parent",
+                "child_id": "child"
+            }),
+        ));
+
+        assert_eq!(
+            app.switch_session_candidates,
+            vec![SwitchSessionCandidate {
+                session_id: "child".into(),
+                summary: Some("child of parent".into()),
+            }]
+        );
+        assert!(app
+            .current_status_notice()
+            .is_some_and(|notice| notice.contains("child")));
     }
 
     #[test]
