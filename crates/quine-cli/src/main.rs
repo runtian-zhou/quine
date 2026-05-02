@@ -329,6 +329,14 @@ enum DaemonCommands {
     },
 }
 
+fn daemon_start_banner(socket_path: &std::path::Path) -> String {
+    format!(
+        "Daemon listening on {}\nAttach a chat UI with: quine chat --socket {}",
+        socket_path.display(),
+        socket_path.display()
+    )
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
@@ -467,6 +475,8 @@ async fn main() -> anyhow::Result<()> {
                 let socket_path = socket
                     .map(std::path::PathBuf::from)
                     .unwrap_or_else(default_socket_path);
+
+                eprintln!("{}", daemon_start_banner(&socket_path));
 
                 // Start the daemon in-process.
                 let provider = quine_harness::create_provider_from_env();
@@ -633,5 +643,14 @@ mod tests {
             }
             _ => panic!("expected chat command"),
         }
+    }
+
+    #[test]
+    fn daemon_start_banner_includes_socket_and_chat_command() {
+        let socket_path = std::path::Path::new("/tmp/test-quine.sock");
+        let banner = daemon_start_banner(socket_path);
+
+        assert!(banner.contains("/tmp/test-quine.sock"));
+        assert!(banner.contains("quine chat --socket /tmp/test-quine.sock"));
     }
 }

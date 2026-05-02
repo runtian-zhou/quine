@@ -63,7 +63,16 @@ struct TuiSessionSummary {
     #[serde(default)]
     plan_mode: bool,
     #[serde(default)]
+    last_active: Option<String>,
+    #[serde(default)]
     _depth: usize,
+}
+
+fn session_last_active_key(session: &TuiSessionSummary) -> (&str, &str) {
+    (
+        session.last_active.as_deref().unwrap_or(""),
+        session.session_id.as_str(),
+    )
 }
 
 fn format_tui_ps_table(mut sessions: Vec<TuiSessionSummary>) -> String {
@@ -73,9 +82,9 @@ fn format_tui_ps_table(mut sessions: Vec<TuiSessionSummary>) -> String {
     }
 
     sessions.sort_by(|left, right| {
-        left.parent_id
-            .cmp(&right.parent_id)
-            .then_with(|| left.session_id.cmp(&right.session_id))
+        session_last_active_key(right)
+            .cmp(&session_last_active_key(left))
+            .then_with(|| left.parent_id.cmp(&right.parent_id))
     });
 
     let session_width = sessions
@@ -312,8 +321,11 @@ async fn list_sessions(client: &mut IpcClient) -> anyhow::Result<Vec<TuiSessionS
 }
 
 fn switch_session_candidates_from_summaries(
-    sessions: Vec<TuiSessionSummary>,
+    mut sessions: Vec<TuiSessionSummary>,
 ) -> Vec<SwitchSessionCandidate> {
+    sessions
+        .sort_by(|left, right| session_last_active_key(right).cmp(&session_last_active_key(left)));
+
     sessions
         .into_iter()
         .map(|session| SwitchSessionCandidate {
@@ -1418,6 +1430,7 @@ mod tests {
             title: None,
             summary: None,
             plan_mode: false,
+            last_active: None,
             _depth: 0,
         }
     }
@@ -1577,6 +1590,39 @@ mod tests {
         assert!(action.is_none());
         assert_eq!(app.input.content(), "/switch alpha");
         assert!(!app.switch_select_active);
+    }
+
+    #[test]
+    fn switch_candidates_sort_by_latest_activity_descending() {
+        let sessions = vec![
+            TuiSessionSummary {
+                session_id: "older".into(),
+                parent_id: None,
+                status: "idle".into(),
+                title: None,
+                summary: Some("Older".into()),
+                plan_mode: false,
+                last_active: Some("2026-01-01T00:00:00Z".into()),
+                _depth: 0,
+            },
+            TuiSessionSummary {
+                session_id: "newer".into(),
+                parent_id: None,
+                status: "idle".into(),
+                title: None,
+                summary: Some("Newer".into()),
+                plan_mode: false,
+                last_active: Some("2026-01-02T00:00:00Z".into()),
+                _depth: 0,
+            },
+        ];
+
+        let candidates = switch_session_candidates_from_summaries(sessions);
+        let ids: Vec<_> = candidates
+            .into_iter()
+            .map(|candidate| candidate.session_id)
+            .collect();
+        assert_eq!(ids, vec!["newer", "older"]);
     }
 
     #[test]
