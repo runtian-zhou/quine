@@ -51,6 +51,7 @@ pub struct LocalHarness {
 struct SessionListing {
     state: quine_core::SessionState,
     created_at: chrono::DateTime<Utc>,
+    last_active_at: chrono::DateTime<Utc>,
     event_count: usize,
     title: Option<String>,
     summary: Option<String>,
@@ -125,6 +126,28 @@ fn persisted_listing_summary(session: &quine_core::PersistedSession) -> Option<S
         .as_ref()
         .and_then(|state| state.session_memory.as_ref())
         .and_then(|state| state.listing_summary.clone())
+}
+
+fn core_output_session_id(event: &CoreOutput) -> Option<SessionId> {
+    match event {
+        CoreOutput::ReasoningDelta { session_id, .. }
+        | CoreOutput::StreamDelta { session_id, .. }
+        | CoreOutput::TextComplete { session_id, .. }
+        | CoreOutput::ToolRequest { session_id, .. }
+        | CoreOutput::SessionStateChanged { session_id, .. }
+        | CoreOutput::SessionError { session_id, .. }
+        | CoreOutput::InteractionNeeded { session_id, .. }
+        | CoreOutput::PlanProgress { session_id, .. }
+        | CoreOutput::SessionStatusReport { session_id, .. }
+        | CoreOutput::MessageReceived { session_id, .. }
+        | CoreOutput::ToolResult { session_id, .. }
+        | CoreOutput::TurnComplete { session_id, .. }
+        | CoreOutput::TurnStarted { session_id, .. } => Some(*session_id),
+        CoreOutput::ChildSpawned { parent_id, .. } | CoreOutput::ChildExited { parent_id, .. } => {
+            Some(*parent_id)
+        }
+        CoreOutput::CheckpointRequested { .. } => None,
+    }
 }
 
 fn merge_checkpoint_update(
@@ -518,6 +541,7 @@ impl LocalHarness {
                             SessionListing {
                                 state: session.state.into(),
                                 created_at: session.created_at,
+                                last_active_at: session.created_at,
                                 event_count: session.history.len(),
                                 title: None,
                                 summary: persisted_listing_summary(session),
@@ -720,16 +744,21 @@ impl LocalHarness {
                     continue;
                 }
                 CoreOutput::SessionStateChanged { session_id, state } => {
+                    let now = Utc::now();
                     let mut guard = sessions.lock().await;
                     if *state == quine_core::SessionState::Destroyed {
                         guard.remove(session_id);
                     } else {
                         guard
                             .entry(*session_id)
-                            .and_modify(|session| session.state = *state)
+                            .and_modify(|session| {
+                                session.state = *state;
+                                session.last_active_at = now;
+                            })
                             .or_insert_with(|| SessionListing {
                                 state: *state,
-                                created_at: Utc::now(),
+                                created_at: now,
+                                last_active_at: now,
                                 event_count: 0,
                                 title: None,
                                 summary: None,
@@ -740,7 +769,15 @@ impl LocalHarness {
                             });
                     }
                 }
-                _ => {}
+                _ => {
+                    if let Some(session_id) = core_output_session_id(&event) {
+                        let now = Utc::now();
+                        let mut guard = sessions.lock().await;
+                        if let Some(session) = guard.get_mut(&session_id) {
+                            session.last_active_at = now;
+                        }
+                    }
+                }
             }
             // Broadcast to all subscribers (ignore errors if no receivers).
             let _ = event_tx.send(event);
@@ -837,6 +874,7 @@ impl HarnessService for LocalHarness {
             SessionListing {
                 state: quine_core::SessionState::Idle,
                 created_at: Utc::now(),
+                last_active_at: Utc::now(),
                 event_count: 0,
                 title: None,
                 summary: None,
@@ -1019,6 +1057,7 @@ impl HarnessService for LocalHarness {
                     "session_id": session_id,
                     "status": format!("{:?}", session.state).to_lowercase(),
                     "first_event": session.created_at.to_rfc3339(),
+                    "last_active": session.last_active_at.to_rfc3339(),
                     "event_count": session.event_count,
                     "title": session.title,
                     "summary": session.summary,
@@ -1033,9 +1072,15 @@ impl HarnessService for LocalHarness {
             .collect();
         items.sort_by(|left, right| {
             right
-                .get("first_event")
+                .get("last_active")
                 .and_then(|value| value.as_str())
-                .cmp(&left.get("first_event").and_then(|value| value.as_str()))
+                .cmp(&left.get("last_active").and_then(|value| value.as_str()))
+                .then_with(|| {
+                    right
+                        .get("first_event")
+                        .and_then(|value| value.as_str())
+                        .cmp(&left.get("first_event").and_then(|value| value.as_str()))
+                })
         });
         Ok(items)
     }
@@ -1145,6 +1190,7 @@ impl HarnessService for LocalHarness {
             SessionListing {
                 state: quine_core::SessionState::Idle,
                 created_at: Utc::now(),
+                last_active_at: Utc::now(),
                 event_count: 0,
                 title: None,
                 summary: None,

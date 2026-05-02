@@ -281,6 +281,28 @@ fn compact_timestamp(session: &serde_json::Value) -> String {
         .unwrap_or_else(|| "-".to_string())
 }
 
+fn session_last_active_value(session: &serde_json::Value) -> &str {
+    session
+        .get("last_active")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+}
+
+fn sort_session_ids_by_last_active(
+    ids: &mut [String],
+    records: &std::collections::BTreeMap<String, &serde_json::Value>,
+) {
+    ids.sort_by(|left, right| {
+        let left_session = records.get(left);
+        let right_session = records.get(right);
+
+        right_session
+            .map(|session| session_last_active_value(session))
+            .cmp(&left_session.map(|session| session_last_active_value(session)))
+            .then_with(|| left.cmp(right))
+    });
+}
+
 fn parse_timestamp(raw: &str) -> Option<String> {
     DateTime::parse_from_rfc3339(raw).ok().map(|timestamp| {
         timestamp
@@ -370,13 +392,15 @@ fn format_tree_lines(sessions: &[serde_json::Value]) -> Vec<String> {
     }
 
     for ids in children.values_mut() {
-        ids.sort();
+        sort_session_ids_by_last_active(ids, &records);
     }
 
     let mut roots = children.remove(&None).unwrap_or_default();
     if roots.is_empty() {
         roots = records.keys().cloned().collect();
-        roots.sort();
+        sort_session_ids_by_last_active(&mut roots, &records);
+    } else {
+        sort_session_ids_by_last_active(&mut roots, &records);
     }
 
     let mut lines = Vec::new();
@@ -535,5 +559,37 @@ mod tests {
 
         let output = format_ps_tree(&sessions);
         assert!(output.contains("— Top level summary"));
+    }
+
+    #[test]
+    fn format_ps_tree_orders_siblings_by_latest_activity() {
+        let sessions = vec![
+            serde_json::json!({
+                "session_id": "older",
+                "status": "idle",
+                "parent_id": serde_json::Value::Null,
+                "event_count": 1,
+                "first_event": "2026-01-01T00:00:00Z",
+                "last_active": "2026-01-01T00:00:00Z",
+                "summary": "Older"
+            }),
+            serde_json::json!({
+                "session_id": "newer",
+                "status": "idle",
+                "parent_id": serde_json::Value::Null,
+                "event_count": 1,
+                "first_event": "2026-01-01T00:00:00Z",
+                "last_active": "2026-01-02T00:00:00Z",
+                "summary": "Newer"
+            }),
+        ];
+
+        let output = format_ps_tree(&sessions);
+        let newer_index = output.find("newer [idle]").expect("newer in tree");
+        let older_index = output.find("older [idle]").expect("older in tree");
+        assert!(
+            newer_index < older_index,
+            "expected newer session first: {output}"
+        );
     }
 }
