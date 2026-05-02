@@ -1079,7 +1079,7 @@ async fn execute_action(
                     Ok(context) => {
                         app.load_session_context(context);
                         app.set_status_notice(format!(
-                            "context unwound to history entry {}",
+                            "context unwound to before history entry {}",
                             history_index + 1
                         ));
                     }
@@ -1818,6 +1818,15 @@ mod tests {
         ];
         let mut app = app::App::new("test".into(), false, None);
         app.open_unwind_selector(snapshot);
+
+        let user_indices: Vec<_> = app
+            .unwind_selector
+            .as_ref()
+            .expect("unwind selector should be open")
+            .user_history_entries()
+            .map(|(history_index, _)| history_index)
+            .collect();
+        assert_eq!(user_indices, vec![0, 4]);
 
         let action = handle_terminal_event(
             &mut app,

@@ -955,11 +955,9 @@ impl SessionContext {
         .await?;
         if let Some(python_state) = python_state.as_ref() {
             python_runtime
-                .restore_group(&session.python_group, python_state)
-                .await
-                .map_err(|error| CoreError::Internal {
-                    message: format!("failed to restore python group: {error}"),
-                })?;
+                .stage_restore_group(&session.python_group, python_state)
+                .await;
+            python_runtime.initialize_group_in_background(session.python_group.clone());
         }
         session.state = state.into();
         session.history = sanitize_restored_history(session_id, history);
@@ -1143,7 +1141,7 @@ impl SessionContext {
             });
         }
 
-        let retained = history_index.saturating_add(1);
+        let retained = history_index;
         self.history.truncate(retained);
         self.history = sanitize_restored_history(session_id, std::mem::take(&mut self.history));
         self.last_prompt_memory_user_index = None;

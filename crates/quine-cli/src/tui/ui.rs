@@ -1933,6 +1933,7 @@ fn draw_unwind_selector(frame: &mut Frame, area: Rect, selector: &mut UnwindStat
         .selected_history_index()
         .map(|index| index + 1)
         .unwrap_or(0);
+    let unwind_target_entry = selected_entry.saturating_sub(1);
     let summary = vec![
         Line::from(format!(
             "session {} | state {} | {} user inputs | {} entries",
@@ -1942,7 +1943,7 @@ fn draw_unwind_selector(frame: &mut Frame, area: Rect, selector: &mut UnwindStat
             selector.snapshot.history.len()
         )),
         Line::from(format!(
-            "keep through entry {selected_entry}; entries after it are removed from model context"
+            "rewind to before entry {selected_entry}; model context keeps entries through {unwind_target_entry}"
         )),
     ];
     frame.render_widget(Clear, sections[0]);
