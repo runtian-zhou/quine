@@ -259,7 +259,7 @@ fn print_sessions_table(
         );
         let scheduled = scheduled_events_label(session);
         if !scheduled.is_empty() {
-            line.push_str("\n");
+            line.push('\n');
             line.push_str(&format!("  loop: {scheduled}"));
         }
         if highlight.contains(id) {
@@ -350,9 +350,7 @@ fn highlighted_session_ids(
     highlighted
 }
 
-fn sessions_by_id<'a>(
-    sessions: &'a [serde_json::Value],
-) -> BTreeMap<String, &'a serde_json::Value> {
+fn sessions_by_id(sessions: &[serde_json::Value]) -> BTreeMap<String, &serde_json::Value> {
     sessions
         .iter()
         .filter_map(|session| {
