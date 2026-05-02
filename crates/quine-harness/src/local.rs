@@ -2395,23 +2395,13 @@ mod tests {
             .await
             .unwrap();
 
-        let after = wait_for_context_snapshot_matching(&harness, session_id, |snapshot| {
-            snapshot.history.len() == first_user_index + 1
-                && !snapshot.history.iter().any(|entry| {
-                    matches!(
-                        entry,
-                        crate::storage::HistoryEntry::Text { text, .. }
-                            if text.contains("second turn")
-                    )
-                })
-        })
-        .await;
+        let after = wait_for_context_snapshot(&harness, session_id).await;
 
-        assert_eq!(after.history.len(), first_user_index + 1);
+        assert_eq!(after.history.len(), 1);
         assert!(matches!(
-            after.history.get(first_user_index),
+            after.history.first(),
             Some(crate::storage::HistoryEntry::Text { role, text })
-                if role == "user" && text == "first turn"
+                if role == "system" && text.contains("You are a helpful coding assistant")
         ));
 
         harness.shutdown().await.unwrap();

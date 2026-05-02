@@ -211,6 +211,23 @@ impl PythonRuntime {
         Ok(())
     }
 
+    pub async fn stage_restore_group(&self, group: &str, persisted: &PersistedPythonState) {
+        let group_handle = self.group(group).await;
+        let mut state = group_handle.state.lock().await;
+        state.persisted = persisted.clone();
+    }
+
+    pub fn initialize_group_in_background(self: &Arc<Self>, group: String) {
+        let runtime = Arc::clone(self);
+        tokio::spawn(async move {
+            let group_handle = runtime.group(&group).await;
+            let mut state = group_handle.state.lock().await;
+            if let Err(error) = state.ensure_process().await {
+                eprintln!("[python] background initialization failed for group `{group}`: {error}");
+            }
+        });
+    }
+
     pub async fn exec(
         &self,
         group: &str,
@@ -760,5 +777,21 @@ mod tests {
             .unwrap();
         let inspected = runtime.inspect("g2", "x").await.unwrap();
         assert_eq!(inspected.value, Some(Value::from(5)));
+    }
+
+    #[tokio::test]
+    async fn staged_restore_is_applied_on_first_request() {
+        let runtime = PythonRuntime::new();
+        runtime
+            .stage_restore_group(
+                "g3",
+                &PersistedPythonState {
+                    globals: Map::from_iter([(String::from("x"), Value::from(7))]),
+                    function_definitions: Vec::new(),
+                },
+            )
+            .await;
+        let inspected = runtime.inspect("g3", "x").await.unwrap();
+        assert_eq!(inspected.value, Some(Value::from(7)));
     }
 }
