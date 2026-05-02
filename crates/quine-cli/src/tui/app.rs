@@ -519,6 +519,21 @@ pub struct UnwindState {
     user_history_indices: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PsTab {
+    Sessions,
+    Scheduler,
+}
+
+#[derive(Debug, Clone)]
+pub struct PsState {
+    pub title: String,
+    pub sessions_output: String,
+    pub scheduler_output: String,
+    pub active_tab: PsTab,
+    pub scroll_offset: u16,
+}
+
 impl UnwindState {
     fn new(snapshot: SessionContextSnapshot) -> Self {
         let user_history_indices = snapshot
@@ -578,6 +593,7 @@ pub struct App {
     status_notice: Option<(String, Instant)>,
     pub scroll_offset: u32,
     pub user_scrolled: bool,
+    pending_scroll_top_row: Option<u32>,
     pub input: InputBuffer,
     pub interaction_queue: VecDeque<PendingInteraction>,
     pub phase: AgentPhase,
@@ -617,6 +633,8 @@ pub struct App {
     pub context_explorer: Option<ContextExplorerState>,
     /// Interactive selector for truncating the model context to an earlier history entry.
     pub unwind_selector: Option<UnwindState>,
+    /// Popup viewer for `/ps` and `/ps tree` output.
+    pub ps_popup: Option<PsState>,
     /// Monotonic revision for conversation-affecting state.
     conversation_revision: u64,
     /// Cached rendered conversation lines and wrapped height for the current width.
@@ -743,6 +761,7 @@ impl App {
             status_notice: None,
             scroll_offset: 0,
             user_scrolled: false,
+            pending_scroll_top_row: None,
             input: InputBuffer::new(),
             interaction_queue: VecDeque::new(),
             phase: AgentPhase::Idle,
@@ -770,6 +789,7 @@ impl App {
             conversation_drag_anchor: None,
             context_explorer: None,
             unwind_selector: None,
+            ps_popup: None,
             conversation_revision: 0,
             conversation_cache: None,
         }
@@ -789,6 +809,12 @@ impl App {
     pub fn push_message(&mut self, entry: ConversationEntry) {
         self.messages.push(entry);
         self.invalidate_conversation_cache();
+    }
+
+    #[allow(dead_code)]
+    pub fn push_message_and_scroll_to_top(&mut self, entry: ConversationEntry) {
+        self.push_message(entry);
+        self.pending_scroll_top_row = Some(self.scrollable_content_height().saturating_sub(1));
     }
 
     pub fn set_phase(&mut self, phase: AgentPhase) {
@@ -818,6 +844,7 @@ impl App {
         self.conversation_selection = None;
         self.conversation_drag_anchor = None;
         self.context_explorer = None;
+        self.ps_popup = None;
         self.auto_scroll();
     }
 
@@ -858,6 +885,7 @@ impl App {
         self.conversation_drag_anchor = None;
         self.context_explorer = None;
         self.unwind_selector = None;
+        self.ps_popup = None;
         self.invalidate_conversation_cache();
         self.auto_scroll();
     }
@@ -881,6 +909,7 @@ impl App {
         self.status_report = snapshot.status_report.clone();
         self.context_explorer = None;
         self.unwind_selector = None;
+        self.ps_popup = None;
         self.last_context_view_height = 0;
         self.messages.clear();
 
@@ -1861,6 +1890,10 @@ impl App {
         self.unwind_selector.is_some()
     }
 
+    pub fn ps_popup_active(&self) -> bool {
+        self.ps_popup.is_some()
+    }
+
     pub fn open_unwind_selector(&mut self, snapshot: SessionContextSnapshot) {
         self.loaded_skill_commands = snapshot
             .loaded_skills
@@ -1868,6 +1901,7 @@ impl App {
             .map(|skill| skill.name.clone())
             .collect();
         self.context_explorer = None;
+        self.ps_popup = None;
         self.unwind_selector = Some(UnwindState::new(snapshot));
         self.last_context_view_height = 0;
         self.conversation_cache = None;
@@ -1877,6 +1911,67 @@ impl App {
         self.unwind_selector = None;
         self.last_context_view_height = 0;
         self.conversation_cache = None;
+    }
+
+    pub fn open_ps_popup(
+        &mut self,
+        title: String,
+        sessions_output: String,
+        scheduler_output: String,
+    ) {
+        self.context_explorer = None;
+        self.unwind_selector = None;
+        self.ps_popup = Some(PsState {
+            title,
+            sessions_output,
+            scheduler_output,
+            active_tab: PsTab::Sessions,
+            scroll_offset: 0,
+        });
+        self.last_context_view_height = 0;
+    }
+
+    pub fn close_ps_popup(&mut self) {
+        self.ps_popup = None;
+        self.last_context_view_height = 0;
+    }
+
+    pub fn ps_popup_scroll_up(&mut self, rows: u16) {
+        if let Some(popup) = self.ps_popup.as_mut() {
+            popup.scroll_offset = popup.scroll_offset.saturating_sub(rows);
+        }
+    }
+
+    pub fn ps_popup_scroll_down(&mut self, rows: u16) {
+        if let Some(popup) = self.ps_popup.as_mut() {
+            popup.scroll_offset = popup.scroll_offset.saturating_add(rows);
+        }
+    }
+
+    pub fn ps_popup_scroll_to_top(&mut self) {
+        if let Some(popup) = self.ps_popup.as_mut() {
+            popup.scroll_offset = 0;
+        }
+    }
+
+    pub fn ps_popup_scroll_to_bottom(&mut self) {
+        if let Some(popup) = self.ps_popup.as_mut() {
+            popup.scroll_offset = u16::MAX;
+        }
+    }
+
+    pub fn ps_popup_prev_tab(&mut self) {
+        if let Some(popup) = self.ps_popup.as_mut() {
+            popup.active_tab = match popup.active_tab {
+                PsTab::Sessions => PsTab::Scheduler,
+                PsTab::Scheduler => PsTab::Sessions,
+            };
+            popup.scroll_offset = 0;
+        }
+    }
+
+    pub fn ps_popup_next_tab(&mut self) {
+        self.ps_popup_prev_tab();
     }
 
     pub fn selected_unwind_history_index(&self) -> Option<usize> {
@@ -2114,16 +2209,31 @@ impl App {
     pub fn auto_scroll(&mut self) {
         self.user_scrolled = false;
         self.scroll_offset = 0;
+        self.pending_scroll_top_row = None;
+    }
+
+    pub fn take_pending_scroll_top_row(&mut self) -> Option<u32> {
+        self.pending_scroll_top_row.take()
+    }
+
+    #[allow(dead_code)]
+    pub fn scrollable_content_height(&self) -> u32 {
+        self.conversation_cache
+            .as_ref()
+            .map(|cache| cache.content_height)
+            .unwrap_or_else(|| self.messages.len() as u32)
     }
 
     /// Scroll up by a number of wrapped rows.
     pub fn scroll_up(&mut self, rows: u32) {
         self.user_scrolled = true;
+        self.pending_scroll_top_row = None;
         self.scroll_offset = self.scroll_offset.saturating_add(rows);
     }
 
     /// Scroll down by a number of wrapped rows.
     pub fn scroll_down(&mut self, rows: u32) {
+        self.pending_scroll_top_row = None;
         self.scroll_offset = self.scroll_offset.saturating_sub(rows);
         if self.scroll_offset == 0 {
             self.user_scrolled = false;
@@ -3367,6 +3477,25 @@ mod tests {
     }
 
     #[test]
+    fn push_message_and_scroll_to_top_targets_new_message_start() {
+        let mut app = App::new("test".into(), false, None);
+        app.conversation_cache = Some(ConversationRenderCache {
+            width: 80,
+            revision: app.conversation_revision(),
+            lines: vec![Line::from("old")],
+            visual_lines: vec!["old line 1".into(), "old line 2".into()],
+            content_height: 2,
+        });
+
+        app.push_message_and_scroll_to_top(ConversationEntry::AssistantText(
+            "session-1\nsession-2\nsession-3".into(),
+        ));
+
+        assert_eq!(app.take_pending_scroll_top_row(), Some(0));
+        assert_eq!(app.take_pending_scroll_top_row(), None);
+    }
+
+    #[test]
     fn reset_for_new_session_clears_old_transcript_and_buffers() {
         let mut app = App::new("old".into(), false, Some(1024));
         app.messages.push(ConversationEntry::User("stale".into()));
@@ -3531,6 +3660,67 @@ mod tests {
             Some(AppAction::ListSessions { tree: true })
         ));
         assert!(app.messages.is_empty());
+    }
+
+    #[test]
+    fn ps_popup_open_close_and_scroll_work() {
+        let mut app = App::new("test".into(), false, None);
+        app.open_ps_popup(
+            "/ps".into(),
+            "line1\nline2\nline3".into(),
+            "scheduled line".into(),
+        );
+
+        assert!(app.ps_popup_active());
+        assert_eq!(
+            app.ps_popup.as_ref().map(|popup| popup.title.as_str()),
+            Some("/ps")
+        );
+        assert_eq!(
+            app.ps_popup.as_ref().map(|popup| popup.scroll_offset),
+            Some(0)
+        );
+        assert_eq!(
+            app.ps_popup.as_ref().map(|popup| popup.active_tab),
+            Some(PsTab::Sessions)
+        );
+
+        app.ps_popup_scroll_down(3);
+        assert_eq!(
+            app.ps_popup.as_ref().map(|popup| popup.scroll_offset),
+            Some(3)
+        );
+
+        app.ps_popup_scroll_up(2);
+        assert_eq!(
+            app.ps_popup.as_ref().map(|popup| popup.scroll_offset),
+            Some(1)
+        );
+
+        app.ps_popup_scroll_to_bottom();
+        assert_eq!(
+            app.ps_popup.as_ref().map(|popup| popup.scroll_offset),
+            Some(u16::MAX)
+        );
+
+        app.ps_popup_scroll_to_top();
+        assert_eq!(
+            app.ps_popup.as_ref().map(|popup| popup.scroll_offset),
+            Some(0)
+        );
+
+        app.ps_popup_next_tab();
+        assert_eq!(
+            app.ps_popup.as_ref().map(|popup| popup.active_tab),
+            Some(PsTab::Scheduler)
+        );
+        assert_eq!(
+            app.ps_popup.as_ref().map(|popup| popup.scroll_offset),
+            Some(0)
+        );
+
+        app.close_ps_popup();
+        assert!(!app.ps_popup_active());
     }
 
     #[test]

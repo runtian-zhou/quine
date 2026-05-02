@@ -59,6 +59,15 @@ struct SessionListing {
     parent_id: Option<SessionId>,
     model_profile: Option<String>,
     session_group: String,
+    scheduled_events: Vec<ScheduledLoopEventListing>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ScheduledLoopEventListing {
+    prompt: String,
+    delay_secs: u64,
+    cadence_secs: Option<u64>,
+    scheduled_at: chrono::DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -556,6 +565,7 @@ impl LocalHarness {
                                     session.session_id,
                                     session.config.session_group.as_deref(),
                                 ),
+                                scheduled_events: Vec::new(),
                             },
                         )
                     })
@@ -679,12 +689,24 @@ impl LocalHarness {
         self.core_input
             .send(CoreInput::ScheduleUserMessage {
                 session_id,
-                content,
+                content: content.clone(),
                 delay,
                 cadence,
             })
             .await
-            .map_err(|_| HarnessError::CoreChannelClosed)
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+
+        let mut sessions = self.sessions.lock().await;
+        if let Some(session) = sessions.get_mut(&session_id) {
+            session.scheduled_events.push(ScheduledLoopEventListing {
+                prompt: content,
+                delay_secs: delay.as_secs(),
+                cadence_secs: cadence.map(|value| value.as_secs()),
+                scheduled_at: Utc::now(),
+            });
+        }
+
+        Ok(())
     }
 
     /// Fan-out loop: reads events from the core and broadcasts them.
@@ -766,6 +788,7 @@ impl LocalHarness {
                                 parent_id: None,
                                 model_profile: None,
                                 session_group: serialize_session_id(*session_id),
+                                scheduled_events: Vec::new(),
                             });
                     }
                 }
@@ -885,6 +908,7 @@ impl HarnessService for LocalHarness {
                     session_id,
                     config.session_group.as_deref(),
                 ),
+                scheduled_events: Vec::new(),
             },
         );
 
@@ -1067,6 +1091,7 @@ impl HarnessService for LocalHarness {
                     "session_group": session.session_group,
                     "root_id": root_id,
                     "depth": depth,
+                    "scheduled_events": session.scheduled_events.clone(),
                 })
             })
             .collect();
@@ -1202,6 +1227,7 @@ impl HarnessService for LocalHarness {
                 session_group: inherited_model_profile
                     .map(|(_, session_group)| session_group)
                     .unwrap_or_else(|| serialize_session_id(child_id)),
+                scheduled_events: Vec::new(),
             },
         );
 

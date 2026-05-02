@@ -1,7 +1,7 @@
 mod app;
 mod ui;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::Path;
 #[cfg(target_os = "macos")]
@@ -50,7 +50,7 @@ struct TuiModelProfileDefinition {
     provider: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 struct TuiSessionSummary {
     session_id: String,
     #[serde(default)]
@@ -65,7 +65,17 @@ struct TuiSessionSummary {
     #[serde(default)]
     last_active: Option<String>,
     #[serde(default)]
+    scheduled_events: Vec<TuiScheduledEvent>,
+    #[serde(default)]
     _depth: usize,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+struct TuiScheduledEvent {
+    prompt: String,
+    delay_secs: u64,
+    #[serde(default)]
+    cadence_secs: Option<u64>,
 }
 
 fn session_last_active_key(session: &TuiSessionSummary) -> (&str, &str) {
@@ -75,8 +85,91 @@ fn session_last_active_key(session: &TuiSessionSummary) -> (&str, &str) {
     )
 }
 
-fn format_tui_ps_table(mut sessions: Vec<TuiSessionSummary>) -> String {
+fn tui_highlighted_session_ids(
+    sessions: &[TuiSessionSummary],
+    current_session_id: Option<&str>,
+) -> BTreeSet<String> {
+    let Some(current) = current_session_id else {
+        return BTreeSet::new();
+    };
+
+    let mut highlighted = BTreeSet::from([current.to_string()]);
+    if let Some(session) = sessions
+        .iter()
+        .find(|session| session.session_id == current)
+    {
+        if let Some(parent_id) = &session.parent_id {
+            highlighted.insert(parent_id.clone());
+        }
+    }
+    for session in sessions {
+        if session.parent_id.as_deref() == Some(current) {
+            highlighted.insert(session.session_id.clone());
+        }
+    }
+    highlighted
+}
+
+fn tui_scheduled_events_label(session: &TuiSessionSummary) -> String {
+    session
+        .scheduled_events
+        .iter()
+        .map(|event| {
+            let mut label = format!(
+                "in {}s: {}",
+                event.delay_secs,
+                collapse_inline_whitespace(&event.prompt)
+            );
+            if let Some(cadence_secs) = event.cadence_secs {
+                label.push_str(&format!(" (every {}s)", cadence_secs));
+            }
+            label
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn format_tui_scheduler_table(mut sessions: Vec<TuiSessionSummary>) -> String {
+    sessions.sort_by(|left, right| {
+        session_last_active_key(right)
+            .cmp(&session_last_active_key(left))
+            .then_with(|| left.parent_id.cmp(&right.parent_id))
+    });
+
+    let mut rows = Vec::new();
+    for session in sessions {
+        if session.scheduled_events.is_empty() {
+            continue;
+        }
+        for event in session.scheduled_events {
+            let mut line = format!(
+                "{}  in {}s  {}",
+                session.session_id,
+                event.delay_secs,
+                collapse_inline_whitespace(&event.prompt)
+            );
+            if let Some(cadence_secs) = event.cadence_secs {
+                line.push_str(&format!("  (every {}s)", cadence_secs));
+            }
+            rows.push(line);
+        }
+    }
+
+    if rows.is_empty() {
+        return "No scheduled work.".to_string();
+    }
+
+    let mut output = vec!["SESSION  SCHEDULE  PROMPT".to_string()];
+    output.extend(rows);
+    output.join("\n")
+}
+
+fn format_tui_ps_table(
+    mut sessions: Vec<TuiSessionSummary>,
+    current_session_id: Option<&str>,
+) -> String {
     let summary = format_tui_status_summary(&sessions);
+    let highlighted = tui_highlighted_session_ids(&sessions, current_session_id);
     if sessions.is_empty() {
         return summary;
     }
@@ -148,6 +241,14 @@ fn format_tui_ps_table(mut sessions: Vec<TuiSessionSummary>) -> String {
             line.push_str("  ");
             line.push_str(&summary);
         }
+        let scheduled = tui_scheduled_events_label(&session);
+        if !scheduled.is_empty() {
+            line.push_str("\n  loop: ");
+            line.push_str(&scheduled);
+        }
+        if highlighted.contains(&session.session_id) {
+            line = format!("> {line}");
+        }
         lines.push(line);
     }
 
@@ -175,8 +276,12 @@ fn load_model_profile_names() -> anyhow::Result<Vec<String>> {
     Ok(document.profiles.into_keys().collect())
 }
 
-fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
+fn format_tui_ps_tree(
+    sessions: Vec<TuiSessionSummary>,
+    current_session_id: Option<&str>,
+) -> String {
     let summary = format_tui_status_summary(&sessions);
+    let highlighted = tui_highlighted_session_ids(&sessions, current_session_id);
     if sessions.is_empty() {
         return summary;
     }
@@ -210,6 +315,7 @@ fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
         session_id: &str,
         prefix: &str,
         is_last: bool,
+        highlighted: &BTreeSet<String>,
     ) {
         let Some(session) = sessions_by_id.get(session_id) else {
             return;
@@ -224,7 +330,7 @@ fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
         };
 
         let summary = tui_session_summary_text(session);
-        output.push(format!(
+        let mut line = format!(
             "{}{}{} [{}]{}{}",
             prefix,
             branch,
@@ -236,7 +342,15 @@ fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
                 format!(" — {summary}")
             },
             if session.plan_mode { " [plan]" } else { "" },
-        ));
+        );
+        let scheduled = tui_scheduled_events_label(session);
+        if !scheduled.is_empty() {
+            line.push_str(&format!(" [loop: {scheduled}]"));
+        }
+        if highlighted.contains(session_id) {
+            line = format!("> {line}");
+        }
+        output.push(line);
 
         let next_prefix = if prefix.is_empty() {
             String::new()
@@ -255,6 +369,7 @@ fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
                     child_id,
                     &next_prefix,
                     index + 1 == children.len(),
+                    highlighted,
                 );
             }
         }
@@ -269,6 +384,7 @@ fn format_tui_ps_tree(sessions: Vec<TuiSessionSummary>) -> String {
             root_id,
             "",
             index + 1 == roots.len(),
+            &highlighted,
         );
     }
     prepend_summary(&summary, &output.join("\n"))
@@ -298,17 +414,23 @@ fn collapse_inline_whitespace(text: &str) -> String {
     collapsed
 }
 
-async fn fetch_tui_ps_output(client: &mut IpcClient, tree: bool) -> anyhow::Result<String> {
+async fn fetch_tui_ps_output(
+    client: &mut IpcClient,
+    tree: bool,
+    current_session_id: &str,
+) -> anyhow::Result<(String, String)> {
     let response = client
         .call(methods::LIST_SESSIONS, Some(serde_json::json!({})))
         .await?;
     let response = response.map_err(anyhow::Error::msg)?;
     let sessions: Vec<TuiSessionSummary> = serde_json::from_value(response)?;
-    Ok(if tree {
-        format_tui_ps_tree(sessions)
+    let sessions_output = if tree {
+        format_tui_ps_tree(sessions.clone(), Some(current_session_id))
     } else {
-        format_tui_ps_table(sessions)
-    })
+        format_tui_ps_table(sessions.clone(), Some(current_session_id))
+    };
+    let scheduler_output = format_tui_scheduler_table(sessions);
+    Ok((sessions_output, scheduler_output))
 }
 
 async fn list_sessions(client: &mut IpcClient) -> anyhow::Result<Vec<TuiSessionSummary>> {
@@ -465,17 +587,21 @@ async fn run_event_loop(
     socket_path: &Path,
     auto_approve: bool,
 ) -> anyhow::Result<()> {
-    let mut last_context_visible = app.context_explorer_active() || app.unwind_selector_active();
+    let mut last_context_visible =
+        app.context_explorer_active() || app.unwind_selector_active() || app.ps_popup_active();
     loop {
         // Draw.
         terminal.draw(|frame| {
-            let context_visible = app.context_explorer_active() || app.unwind_selector_active();
+            let context_visible = app.context_explorer_active()
+                || app.unwind_selector_active()
+                || app.ps_popup_active();
             if context_visible != last_context_visible {
                 frame.render_widget(TuiClear, frame.area());
             }
             ui::draw(frame, app)
         })?;
-        last_context_visible = app.context_explorer_active() || app.unwind_selector_active();
+        last_context_visible =
+            app.context_explorer_active() || app.unwind_selector_active() || app.ps_popup_active();
 
         if app.should_quit {
             break;
@@ -681,11 +807,12 @@ fn copy_current_conversation_selection(app: &mut app::App) {
 }
 
 fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction> {
-    let scroll_view_height = if app.context_explorer_active() || app.unwind_selector_active() {
-        context_scroll_view_height(app)
-    } else {
-        app.last_view_height
-    };
+    let scroll_view_height =
+        if app.context_explorer_active() || app.unwind_selector_active() || app.ps_popup_active() {
+            context_scroll_view_height(app)
+        } else {
+            app.last_view_height
+        };
     let step = mouse_scroll_step(scroll_view_height);
     match event.kind {
         MouseEventKind::ScrollUp => {
@@ -693,6 +820,8 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
                 app.context_explorer_scroll_up(step.min(u16::MAX as u32) as u16);
             } else if app.unwind_selector_active() {
                 app.unwind_page_up(step.min(u16::MAX as u32) as u16);
+            } else if app.ps_popup_active() {
+                app.ps_popup_scroll_up(step.min(u16::MAX as u32) as u16);
             } else {
                 app.scroll_up(step);
             }
@@ -703,6 +832,8 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
                 app.context_explorer_scroll_down(step.min(u16::MAX as u32) as u16);
             } else if app.unwind_selector_active() {
                 app.unwind_page_down(step.min(u16::MAX as u32) as u16);
+            } else if app.ps_popup_active() {
+                app.ps_popup_scroll_down(step.min(u16::MAX as u32) as u16);
             } else {
                 app.scroll_down(step);
             }
@@ -711,6 +842,7 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
         MouseEventKind::Down(MouseButton::Left) => {
             if !app.context_explorer_active()
                 && !app.unwind_selector_active()
+                && !app.ps_popup_active()
                 && app.begin_conversation_drag_at_mouse(event.column, event.row)
             {
                 app.set_status_notice("selection started");
@@ -720,6 +852,7 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
         MouseEventKind::Drag(MouseButton::Left) => {
             if !app.context_explorer_active()
                 && !app.unwind_selector_active()
+                && !app.ps_popup_active()
                 && app.update_conversation_drag_at_mouse(event.column, event.row)
             {
                 if let Some(text) = app.selected_conversation_text() {
@@ -732,7 +865,10 @@ fn handle_mouse_event(app: &mut app::App, event: MouseEvent) -> Option<AppAction
             None
         }
         MouseEventKind::Up(MouseButton::Left) => {
-            if !app.context_explorer_active() && !app.unwind_selector_active() {
+            if !app.context_explorer_active()
+                && !app.unwind_selector_active()
+                && !app.ps_popup_active()
+            {
                 if app
                     .finish_conversation_drag_at_mouse(event.column, event.row)
                     .is_some()
@@ -786,6 +922,48 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                     }
                     KeyCode::End => {
                         app.unwind_move_to_last();
+                        None
+                    }
+                    _ => None,
+                };
+            }
+
+            if app.ps_popup_active() {
+                return match code {
+                    KeyCode::Esc => {
+                        app.close_ps_popup();
+                        None
+                    }
+                    KeyCode::Left | KeyCode::Char('h') => {
+                        app.ps_popup_prev_tab();
+                        None
+                    }
+                    KeyCode::Right | KeyCode::Char('l') => {
+                        app.ps_popup_next_tab();
+                        None
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.ps_popup_scroll_up(1);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.ps_popup_scroll_down(1);
+                        None
+                    }
+                    KeyCode::PageUp => {
+                        app.ps_popup_scroll_up(context_page_scroll_step(app));
+                        None
+                    }
+                    KeyCode::PageDown => {
+                        app.ps_popup_scroll_down(context_page_scroll_step(app));
+                        None
+                    }
+                    KeyCode::Home => {
+                        app.ps_popup_scroll_to_top();
+                        None
+                    }
+                    KeyCode::End => {
+                        app.ps_popup_scroll_to_bottom();
                         None
                     }
                     _ => None,
@@ -1133,8 +1311,16 @@ async fn execute_action(
             app.auto_scroll();
         }
         AppAction::ListSessions { tree } => {
-            match fetch_tui_ps_output(client, tree).await {
-                Ok(output) => app.push_message(app::ConversationEntry::AssistantText(output)),
+            match fetch_tui_ps_output(client, tree, &app.session_id).await {
+                Ok((sessions_output, scheduler_output)) => app.open_ps_popup(
+                    if tree {
+                        "/ps tree".to_string()
+                    } else {
+                        "/ps".to_string()
+                    },
+                    sessions_output,
+                    scheduler_output,
+                ),
                 Err(error) => {
                     app.push_message(app::ConversationEntry::Error(format!(
                         "/ps failed: {error}"
@@ -1431,13 +1617,14 @@ mod tests {
             summary: None,
             plan_mode: false,
             last_active: None,
+            scheduled_events: Vec::new(),
             _depth: 0,
         }
     }
 
     #[test]
     fn format_tui_ps_table_includes_summary() {
-        let output = format_tui_ps_table(vec![sample_tui_session("s1", None, "running")]);
+        let output = format_tui_ps_table(vec![sample_tui_session("s1", None, "running")], None);
         assert!(output.starts_with("1 sessions · 1 running\n\nSESSION"));
     }
 
@@ -1445,7 +1632,10 @@ mod tests {
     fn format_tui_ps_table_avoids_trailing_padding() {
         let mut summarized = sample_tui_session("s2", None, "idle");
         summarized.summary = Some("A long session summary that should not pad every row".into());
-        let output = format_tui_ps_table(vec![sample_tui_session("s1", None, "idle"), summarized]);
+        let output = format_tui_ps_table(
+            vec![sample_tui_session("s1", None, "idle"), summarized],
+            None,
+        );
 
         assert!(
             output.lines().all(|line| !line.ends_with(' ')),
@@ -1465,17 +1655,42 @@ mod tests {
     fn format_tui_ps_table_collapses_multiline_summaries() {
         let mut session = sample_tui_session("s1", None, "idle");
         session.summary = Some("Session memory summary:\n\n## Current State\n- now".into());
-        let output = format_tui_ps_table(vec![session]);
+        let output = format_tui_ps_table(vec![session], None);
 
         assert!(output.contains("Session memory summary: ## Current State - now"));
     }
 
     #[test]
+    fn format_tui_scheduler_table_lists_scheduled_events() {
+        let mut session = sample_tui_session("s1", None, "idle");
+        session.scheduled_events = vec![TuiScheduledEvent {
+            prompt: "check status".into(),
+            delay_secs: 60,
+            cadence_secs: Some(300),
+        }];
+
+        let output = format_tui_scheduler_table(vec![session]);
+
+        assert!(output.contains("SESSION  SCHEDULE  PROMPT"));
+        assert!(output.contains("s1  in 60s  check status  (every 300s)"));
+    }
+
+    #[test]
+    fn format_tui_scheduler_table_handles_empty_schedule() {
+        let output = format_tui_scheduler_table(vec![sample_tui_session("s1", None, "idle")]);
+
+        assert_eq!(output, "No scheduled work.");
+    }
+
+    #[test]
     fn format_tui_ps_tree_includes_summary() {
-        let output = format_tui_ps_tree(vec![
-            sample_tui_session("parent", None, "waiting"),
-            sample_tui_session("child", Some("parent"), "running"),
-        ]);
+        let output = format_tui_ps_tree(
+            vec![
+                sample_tui_session("parent", None, "waiting"),
+                sample_tui_session("child", Some("parent"), "running"),
+            ],
+            None,
+        );
         assert!(output.starts_with("2 sessions · 1 running · 1 waiting\n\n"));
         assert!(output.contains("parent [waiting]"));
     }
@@ -1603,6 +1818,7 @@ mod tests {
                 summary: Some("Older".into()),
                 plan_mode: false,
                 last_active: Some("2026-01-01T00:00:00Z".into()),
+                scheduled_events: Vec::new(),
                 _depth: 0,
             },
             TuiSessionSummary {
@@ -1613,6 +1829,7 @@ mod tests {
                 summary: Some("Newer".into()),
                 plan_mode: false,
                 last_active: Some("2026-01-02T00:00:00Z".into()),
+                scheduled_events: Vec::new(),
                 _depth: 0,
             },
         ];

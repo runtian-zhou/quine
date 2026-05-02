@@ -227,6 +227,16 @@ struct SessionSummary {
     summary: Option<String>,
     #[serde(default)]
     plan_mode: bool,
+    #[serde(default)]
+    scheduled_events: Vec<TelegramScheduledEvent>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TelegramScheduledEvent {
+    prompt: String,
+    delay_secs: u64,
+    #[serde(default)]
+    cadence_secs: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1243,7 +1253,10 @@ impl TelegramBot {
                 );
                 let (reply, markup) = if tree {
                     (
-                        render_session_tree(&sessions),
+                        render_session_tree(
+                            &sessions,
+                            self.current_session_id(chat_id).await?.as_deref(),
+                        ),
                         session_list_reply_markup(tree, &sessions),
                     )
                 } else {
@@ -2006,9 +2019,27 @@ fn render_session_picker_page(sessions: &[SessionSummary], page: usize) -> (Stri
     (lines.join("\n"), page, total_pages)
 }
 
-fn render_session_tree(sessions: &[SessionSummary]) -> String {
+fn render_session_tree(sessions: &[SessionSummary], current_session_id: Option<&str>) -> String {
     if sessions.is_empty() {
         return "No sessions found.".to_string();
+    }
+
+    let mut highlighted = std::collections::BTreeSet::new();
+    if let Some(current_id) = current_session_id {
+        highlighted.insert(current_id.to_string());
+        if let Some(current_session) = sessions
+            .iter()
+            .find(|session| session.session_id == current_id)
+        {
+            if let Some(parent_id) = &current_session.parent_id {
+                highlighted.insert(parent_id.clone());
+            }
+        }
+        for session in sessions {
+            if session.parent_id.as_deref() == Some(current_id) {
+                highlighted.insert(session.session_id.clone());
+            }
+        }
     }
 
     let mut by_id = HashMap::new();
@@ -2035,6 +2066,7 @@ fn render_session_tree(sessions: &[SessionSummary]) -> String {
         session_id: &str,
         prefix: &str,
         is_last: bool,
+        highlighted: &std::collections::BTreeSet<String>,
     ) {
         let Some(session) = by_id.get(session_id) else {
             return;
@@ -2051,7 +2083,7 @@ fn render_session_tree(sessions: &[SessionSummary]) -> String {
             .as_deref()
             .or(session.title.as_deref())
             .unwrap_or("");
-        output.push(format!(
+        let mut line = format!(
             "{}{}{} [{}]{}{}",
             prefix,
             branch,
@@ -2063,7 +2095,30 @@ fn render_session_tree(sessions: &[SessionSummary]) -> String {
                 format!(" - {summary}")
             },
             if session.plan_mode { " [plan]" } else { "" },
-        ));
+        );
+        let scheduled = session
+            .scheduled_events
+            .iter()
+            .map(|event| {
+                let mut label = format!(
+                    "in {}s: {}",
+                    event.delay_secs,
+                    truncate_text(&event.prompt, 60)
+                );
+                if let Some(cadence_secs) = event.cadence_secs {
+                    label.push_str(&format!(" (every {}s)", cadence_secs));
+                }
+                label
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if !scheduled.is_empty() {
+            line.push_str(&format!(" [loop: {scheduled}]"));
+        }
+        if highlighted.contains(session_id) {
+            line = format!("> {line}");
+        }
+        output.push(line);
 
         let next_prefix = if prefix.is_empty() {
             String::new()
@@ -2082,6 +2137,7 @@ fn render_session_tree(sessions: &[SessionSummary]) -> String {
                     child_id,
                     &next_prefix,
                     index + 1 == child_ids.len(),
+                    highlighted,
                 );
             }
         }
@@ -2096,6 +2152,7 @@ fn render_session_tree(sessions: &[SessionSummary]) -> String {
             root_id,
             "",
             index + 1 == roots.len(),
+            &highlighted,
         );
     }
     output.join("\n")

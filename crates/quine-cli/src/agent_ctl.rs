@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use chrono::{DateTime, Local};
@@ -9,6 +10,7 @@ use quine_harness::protocol::methods;
 /// Handle the `ps` command: list active agent sessions.
 pub async fn handle_ps(
     socket_path: &Path,
+    current_session_id: Option<&str>,
     _all: bool,
     tree: bool,
     json: bool,
@@ -22,7 +24,7 @@ pub async fn handle_ps(
                 println!("{}", serde_json::to_string_pretty(&value)?);
             } else {
                 let sessions: Vec<serde_json::Value> = serde_json::from_value(value)?;
-                print_sessions_table(&sessions, tree);
+                print_sessions_table(&sessions, tree, current_session_id);
             }
         }
         Err(e) => {
@@ -196,8 +198,13 @@ fn parse_signal_string(signal: &str) -> anyhow::Result<String> {
 }
 
 /// Format sessions as a table for terminal output.
-fn print_sessions_table(sessions: &[serde_json::Value], tree: bool) {
+fn print_sessions_table(
+    sessions: &[serde_json::Value],
+    tree: bool,
+    current_session_id: Option<&str>,
+) {
     let summary = format_status_summary(sessions);
+    let highlight = highlighted_session_ids(sessions, current_session_id);
 
     if sessions.is_empty() {
         println!("{summary}");
@@ -205,14 +212,15 @@ fn print_sessions_table(sessions: &[serde_json::Value], tree: bool) {
     }
 
     if tree {
-        let body = format_tree_lines(sessions).join("\n");
+        let body = format_tree_lines(sessions, &highlight).join("\n");
         println!("{}", prepend_summary(&summary, &body));
         return;
     }
 
     let summary_width = sessions
         .iter()
-        .map(|session| session_summary_label(session).len())
+        .map(session_summary_label)
+        .map(str::len)
         .max()
         .unwrap_or(7)
         .max("SUMMARY".len());
@@ -244,11 +252,20 @@ fn print_sessions_table(sessions: &[serde_json::Value], tree: bool) {
             .unwrap_or(0);
         let session_summary = session_summary_label(session);
 
-        lines.push(format!(
+        let mut line = format!(
             "{id:<38} {status:<12} {created:<created_width$} {event_count:<6} {session_summary:<summary_width$}",
             created_width = created_width,
             summary_width = summary_width,
-        ));
+        );
+        let scheduled = scheduled_events_label(session);
+        if !scheduled.is_empty() {
+            line.push_str("\n");
+            line.push_str(&format!("  loop: {scheduled}"));
+        }
+        if highlight.contains(id) {
+            line = format!("> {line}");
+        }
+        lines.push(line);
     }
 
     println!("{}", prepend_summary(&summary, &lines.join("\n")));
@@ -271,6 +288,80 @@ fn session_summary_label(session: &serde_json::Value) -> &str {
         .and_then(serde_json::Value::as_str)
         .or_else(|| session.get("title").and_then(serde_json::Value::as_str))
         .unwrap_or("")
+}
+
+fn scheduled_events_label(session: &serde_json::Value) -> String {
+    let Some(events) = session
+        .get("scheduled_events")
+        .and_then(|value| value.as_array())
+    else {
+        return String::new();
+    };
+    if events.is_empty() {
+        return String::new();
+    }
+
+    events
+        .iter()
+        .filter_map(|event| {
+            let prompt = event.get("prompt").and_then(|value| value.as_str())?;
+            let delay_secs = event
+                .get("delay_secs")
+                .and_then(|value| value.as_u64())
+                .unwrap_or(0);
+            let cadence_secs = event.get("cadence_secs").and_then(|value| value.as_u64());
+            let mut label = format!("in {}s: {}", delay_secs, prompt.replace('\n', " "));
+            if let Some(cadence_secs) = cadence_secs {
+                label.push_str(&format!(" (every {}s)", cadence_secs));
+            }
+            Some(label)
+        })
+        .collect::<Vec<_>>()
+        .join(" | ")
+}
+
+fn highlighted_session_ids(
+    sessions: &[serde_json::Value],
+    current_session_id: Option<&str>,
+) -> BTreeSet<String> {
+    let Some(current) = current_session_id else {
+        return BTreeSet::new();
+    };
+
+    let records = sessions_by_id(sessions);
+    let mut highlighted = BTreeSet::from([current.to_string()]);
+
+    if let Some(session) = records.get(current) {
+        if let Some(parent_id) = session.get("parent_id").and_then(|value| value.as_str()) {
+            highlighted.insert(parent_id.to_string());
+        }
+    }
+
+    for (session_id, session) in &records {
+        if session
+            .get("parent_id")
+            .and_then(|value| value.as_str())
+            .is_some_and(|parent_id| parent_id == current)
+        {
+            highlighted.insert(session_id.clone());
+        }
+    }
+
+    highlighted
+}
+
+fn sessions_by_id<'a>(
+    sessions: &'a [serde_json::Value],
+) -> BTreeMap<String, &'a serde_json::Value> {
+    sessions
+        .iter()
+        .filter_map(|session| {
+            session
+                .get("session_id")
+                .and_then(|value| value.as_str())
+                .map(|session_id| (session_id.to_string(), session))
+        })
+        .collect()
 }
 
 fn compact_timestamp(session: &serde_json::Value) -> String {
@@ -349,6 +440,10 @@ fn format_ps_table(sessions: &[serde_json::Value]) -> String {
             "{id:<38} {status:<12} {created:<created_width$} {event_count:<6} {session_summary}\n",
             created_width = created_width,
         ));
+        let scheduled = scheduled_events_label(session);
+        if !scheduled.is_empty() {
+            output.push_str(&format!("  loop: {scheduled}\n"));
+        }
     }
 
     prepend_summary(&summary, &output)
@@ -361,10 +456,16 @@ fn format_ps_tree(sessions: &[serde_json::Value]) -> String {
         return summary;
     }
 
-    prepend_summary(&summary, &format_tree_lines(sessions).join("\n"))
+    prepend_summary(
+        &summary,
+        &format_tree_lines(sessions, &BTreeSet::new()).join("\n"),
+    )
 }
 
-fn format_tree_lines(sessions: &[serde_json::Value]) -> Vec<String> {
+fn format_tree_lines(
+    sessions: &[serde_json::Value],
+    highlighted: &BTreeSet<String>,
+) -> Vec<String> {
     use std::collections::BTreeMap;
 
     if sessions.is_empty() {
@@ -405,7 +506,7 @@ fn format_tree_lines(sessions: &[serde_json::Value]) -> Vec<String> {
 
     let mut lines = Vec::new();
     for root_id in roots {
-        push_tree_lines(&mut lines, &records, &children, &root_id, 0);
+        push_tree_lines(&mut lines, &records, &children, &root_id, 0, highlighted);
     }
     lines
 }
@@ -416,6 +517,7 @@ fn push_tree_lines(
     children: &std::collections::BTreeMap<Option<String>, Vec<String>>,
     session_id: &str,
     depth: usize,
+    highlighted: &BTreeSet<String>,
 ) {
     if let Some(session) = records.get(session_id) {
         let status = session
@@ -429,7 +531,7 @@ fn push_tree_lines(
         let created = compact_timestamp(session);
         let session_summary = session_summary_label(session);
         let indent = "  ".repeat(depth);
-        lines.push(format!(
+        let mut line = format!(
             "{indent}{} [{}] {} ev {}{}",
             session_id,
             status,
@@ -440,10 +542,18 @@ fn push_tree_lines(
             } else {
                 format!(" — {session_summary}")
             }
-        ));
+        );
+        let scheduled = scheduled_events_label(session);
+        if !scheduled.is_empty() {
+            line.push_str(&format!(" [loop: {scheduled}]"));
+        }
+        if highlighted.contains(session_id) {
+            line = format!("> {line}");
+        }
+        lines.push(line);
         if let Some(child_ids) = children.get(&Some(session_id.to_string())) {
             for child_id in child_ids {
-                push_tree_lines(lines, records, children, child_id, depth + 1);
+                push_tree_lines(lines, records, children, child_id, depth + 1, highlighted);
             }
         }
     }
