@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
+use serde::de::{self, Visitor};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::{MemoryPolicyConfig, ScopedPersistentMemoryState};
@@ -133,11 +134,57 @@ pub struct PersistedPromptMemoryState {
     pub truncated: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum PersistedSessionState {
     Idle,
     Paused,
     Destroyed,
+}
+
+impl<'de> Deserialize<'de> for PersistedSessionState {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PersistedSessionStateVisitor;
+
+        impl Visitor<'_> for PersistedSessionStateVisitor {
+            type Value = PersistedSessionState;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("a persisted session state string")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                match value {
+                    "Idle" => Ok(PersistedSessionState::Idle),
+                    "Paused" => Ok(PersistedSessionState::Paused),
+                    "Destroyed" => Ok(PersistedSessionState::Destroyed),
+                    "Streaming" | "AwaitingToolResult" | "Waiting" => {
+                        // Older checkpoints could contain runtime-only states. No in-flight
+                        // work survives restart, so restore them as usable idle sessions.
+                        Ok(PersistedSessionState::Idle)
+                    }
+                    other => Err(E::unknown_variant(
+                        other,
+                        &[
+                            "Idle",
+                            "Paused",
+                            "Destroyed",
+                            "Streaming",
+                            "AwaitingToolResult",
+                            "Waiting",
+                        ],
+                    )),
+                }
+            }
+        }
+
+        deserializer.deserialize_str(PersistedSessionStateVisitor)
+    }
 }
 
 impl PersistedSessionState {
@@ -213,6 +260,31 @@ mod tests {
         assert_eq!(
             PersistedSessionState::from_runtime(SessionState::Paused),
             Some(PersistedSessionState::Paused)
+        );
+    }
+
+    #[test]
+    fn legacy_unstable_persisted_states_restore_as_idle() {
+        for state in ["Streaming", "AwaitingToolResult", "Waiting"] {
+            let restored: PersistedSessionState =
+                serde_json::from_str(&format!("\"{state}\"")).unwrap();
+            assert_eq!(restored, PersistedSessionState::Idle);
+        }
+    }
+
+    #[test]
+    fn persisted_session_state_serializes_stable_state_names() {
+        assert_eq!(
+            serde_json::to_string(&PersistedSessionState::Idle).unwrap(),
+            "\"Idle\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PersistedSessionState::Paused).unwrap(),
+            "\"Paused\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PersistedSessionState::Destroyed).unwrap(),
+            "\"Destroyed\""
         );
     }
 
