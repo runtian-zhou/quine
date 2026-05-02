@@ -1339,11 +1339,36 @@ impl HarnessService for LocalHarness {
         &self,
         session_id: SessionId,
         content: String,
-        _system_prompt: Option<String>,
+        system_prompt: Option<String>,
         delay: Duration,
         cadence: Option<Duration>,
     ) -> Result<(), HarnessError> {
-        self.schedule_loop_message(session_id, content, delay, cadence)
+        let child_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+
+        self.core_input
+            .send(CoreInput::SpawnSession {
+                parent_id: session_id,
+                child_id,
+                task: String::new(),
+                system_prompt,
+                prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
+                permission_rules: quine_core::PermissionRuleSet::default(),
+                inheritance: InheritanceFlags {
+                    history: true,
+                    ..Default::default()
+                },
+                reply: reply_tx,
+            })
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?;
+
+        reply_rx
+            .await
+            .map_err(|_| HarnessError::CoreChannelClosed)?
+            .map_err(|reason| HarnessError::SessionCreationFailed { reason })?;
+
+        self.schedule_loop_message(child_id, content, delay, cadence)
             .await
     }
 
@@ -3243,7 +3268,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn local_harness_schedule_agent_one_shot_runs_in_current_session() {
+    async fn local_harness_schedule_agent_one_shot_runs_in_forked_child() {
         let harness = LocalHarness::new(Arc::new(EchoProvider), Some(temp_storage()))
             .await
             .unwrap();
@@ -3276,31 +3301,45 @@ mod tests {
         tokio::time::advance(Duration::from_millis(1)).await;
         tokio::task::yield_now().await;
 
+        let mut child_id = None;
         let mut saw_completion = false;
-        let mut saw_child_spawn = false;
         while !saw_completion {
             match rx.recv().await.unwrap() {
-                CoreOutput::ChildSpawned { parent_id, .. } if parent_id == session_id => {
-                    saw_child_spawn = true;
+                CoreOutput::ChildSpawned {
+                    parent_id,
+                    child_id: spawned_child_id,
+                } if parent_id == session_id => {
+                    child_id = Some(spawned_child_id);
                 }
                 CoreOutput::TextComplete {
                     session_id: event_session_id,
                     full_text,
-                } if event_session_id == session_id && full_text == "do work" => {
+                } if event_session_id != session_id
+                    && child_id.is_none()
+                    && full_text == "do work" =>
+                {
+                    child_id = Some(event_session_id);
+                    saw_completion = true;
+                }
+                CoreOutput::TextComplete {
+                    session_id: event_session_id,
+                    full_text,
+                } if Some(event_session_id) == child_id && full_text == "do work" => {
+                    assert_ne!(event_session_id, session_id);
                     saw_completion = true;
                 }
                 _ => {}
             }
         }
-        assert!(
-            !saw_child_spawn,
-            "scheduled one-shot loop should not spawn a child session"
+        assert_ne!(
+            child_id.expect("child session should be observed"),
+            session_id
         );
         harness.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn local_harness_schedule_agent_recurs_in_current_session() {
+    #[tokio::test]
+    async fn local_harness_schedule_agent_recurs_in_forked_child() {
         let harness = LocalHarness::new(Arc::new(EchoProvider), Some(temp_storage()))
             .await
             .unwrap();
@@ -3329,30 +3368,18 @@ mod tests {
             .await
             .unwrap();
 
-        tokio::time::advance(Duration::from_secs(60)).await;
-        tokio::time::advance(Duration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-
-        let mut saw_child_spawn = false;
-        let mut completions = 0usize;
-        while completions < 2 {
+        let child_id = loop {
             match rx.recv().await.unwrap() {
-                CoreOutput::ChildSpawned { parent_id, .. } if parent_id == session_id => {
-                    saw_child_spawn = true;
-                }
-                CoreOutput::TextComplete {
-                    session_id: event_session_id,
-                    full_text,
-                } if event_session_id == session_id && full_text == "tick" => {
-                    completions += 1;
+                CoreOutput::ChildSpawned {
+                    parent_id,
+                    child_id: spawned_child_id,
+                } if parent_id == session_id => {
+                    break spawned_child_id;
                 }
                 _ => {}
             }
-        }
-        assert!(
-            !saw_child_spawn,
-            "scheduled recurring loop should not spawn a child session"
-        );
+        };
+        assert_ne!(child_id, session_id);
         harness.shutdown().await.unwrap();
     }
 
