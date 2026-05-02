@@ -132,7 +132,7 @@ pub struct IpcClient {
     /// Receives JSON-RPC responses (with an `id`).
     response_rx: mpsc::Receiver<String>,
     /// Receives JSON-RPC notifications (no `id`).
-    notification_rx: mpsc::Receiver<JsonRpcNotification>,
+    notification_rx: mpsc::UnboundedReceiver<JsonRpcNotification>,
     next_id: u64,
 }
 
@@ -143,7 +143,7 @@ impl IpcClient {
         let (reader, writer) = tokio::io::split(stream);
 
         let (response_tx, response_rx) = mpsc::channel::<String>(64);
-        let (notification_tx, notification_rx) = mpsc::channel::<JsonRpcNotification>(256);
+        let (notification_tx, notification_rx) = mpsc::unbounded_channel::<JsonRpcNotification>();
 
         // Spawn a reader task that routes incoming lines to either response or notification channel.
         tokio::spawn(async move {
@@ -160,7 +160,7 @@ impl IpcClient {
                     } else if value.get("method").is_some() {
                         // This is a notification.
                         if let Ok(notif) = serde_json::from_str::<JsonRpcNotification>(&line) {
-                            let _ = notification_tx.send(notif).await;
+                            let _ = notification_tx.send(notif);
                         }
                     }
                 }
@@ -352,7 +352,7 @@ impl IpcClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use quine_harness::protocol::JsonRpcRequest;
+    use quine_harness::protocol::{JsonRpcNotification, JsonRpcRequest};
     use std::sync::{LazyLock, Mutex};
     use tempfile::{tempdir, NamedTempFile};
     use tokio::net::UnixListener;
@@ -460,6 +460,55 @@ mod tests {
 
         assert_ne!(socket_path, default_socket);
         assert_eq!(socket_path.parent(), default_socket.parent());
+    }
+
+    #[tokio::test]
+    async fn call_succeeds_even_when_notifications_arrive_before_response() {
+        let tempdir = tempdir().unwrap();
+        let socket_path = tempdir.path().join("harness.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (reader, mut writer) = tokio::io::split(stream);
+            let mut lines = BufReader::new(reader).lines();
+            let line = lines.next_line().await.unwrap().unwrap();
+            let request: JsonRpcRequest = serde_json::from_str(&line).unwrap();
+
+            for index in 0..300 {
+                let notification = JsonRpcNotification::new(
+                    "stream_delta",
+                    Some(serde_json::json!({
+                        "session_id": format!("session-{index}"),
+                        "delta": format!("chunk-{index}"),
+                    })),
+                );
+                let mut line = serde_json::to_string(&notification).unwrap();
+                line.push('\n');
+                writer.write_all(line.as_bytes()).await.unwrap();
+            }
+
+            let response = serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": request.id,
+                "result": { "ok": true },
+            });
+            let mut line = serde_json::to_string(&response).unwrap();
+            line.push('\n');
+            writer.write_all(line.as_bytes()).await.unwrap();
+            writer.flush().await.unwrap();
+        });
+
+        let mut client = IpcClient::connect(&socket_path).await.unwrap();
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(2), client.call("test", None))
+                .await
+                .expect("call should not hang behind queued notifications")
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(result, serde_json::json!({ "ok": true }));
+        server.await.unwrap();
     }
 
     #[test]
