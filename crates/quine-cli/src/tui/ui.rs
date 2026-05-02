@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
     AgentPhase, App, ContextExplorerState, ContextExplorerTab, ConversationEntry,
-    ConversationRenderCache, InputBuffer, ToolBatchCall, ToolStatus, UnwindState,
+    ConversationRenderCache, InputBuffer, PsState, PsTab, ToolBatchCall, ToolStatus, UnwindState,
 };
 
 /// Format a duration in microseconds to a human-readable string.
@@ -138,6 +138,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_input(frame, app, chunks[conversation_index + 1]);
     if let Some(selector) = app.unwind_selector.as_mut() {
         let view_height = draw_unwind_selector(frame, chunks[conversation_index], selector);
+        app.last_context_view_height = u32::from(view_height);
+    } else if let Some(ps_popup) = app.ps_popup.as_mut() {
+        let view_height = draw_ps_popup(frame, chunks[conversation_index], ps_popup);
         app.last_context_view_height = u32::from(view_height);
     } else if let Some(explorer) = app.context_explorer.as_mut() {
         let view_height = draw_context_explorer(frame, chunks[conversation_index], explorer);
@@ -1240,7 +1243,11 @@ fn draw_conversation(frame: &mut Frame, app: &mut App, area: Rect) {
     let view_height = area.height as u32;
     app.last_view_height = view_height;
     let max_scroll = content_height.saturating_sub(view_height);
-    let scroll = if app.user_scrolled {
+    let scroll = if let Some(top_row) = app.take_pending_scroll_top_row() {
+        let clamped_top_row = top_row.min(max_scroll);
+        app.scroll_offset = max_scroll.saturating_sub(clamped_top_row);
+        clamped_top_row
+    } else if app.user_scrolled {
         max_scroll.saturating_sub(app.scroll_offset.min(max_scroll))
     } else {
         max_scroll
@@ -2009,6 +2016,85 @@ fn draw_unwind_selector(frame: &mut Frame, area: Rect, selector: &mut UnwindStat
     sections[1].height.saturating_sub(2)
 }
 
+fn draw_ps_popup(frame: &mut Frame, area: Rect, popup_state: &mut PsState) -> u16 {
+    let popup = centered_rect(86, 75, area);
+    frame.render_widget(Clear, popup);
+
+    let block = Block::default()
+        .title(format!(" {} ", popup_state.title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Magenta));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Clear, inner);
+
+    let sections = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    frame.render_widget(Clear, sections[0]);
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from("Browse active sessions in a dedicated popup."),
+            Line::from("Use `/switch <session-id>` to jump after inspecting the list."),
+        ])
+        .wrap(Wrap { trim: false }),
+        sections[0],
+    );
+
+    let tab_titles = ["Sessions", "Scheduler"];
+    let tab_index = match popup_state.active_tab {
+        PsTab::Sessions => 0,
+        PsTab::Scheduler => 1,
+    };
+    let tabs = Tabs::new(tab_titles)
+        .select(tab_index)
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+    frame.render_widget(Clear, sections[1]);
+    frame.render_widget(tabs, sections[1]);
+
+    let body_title = match popup_state.active_tab {
+        PsTab::Sessions => " Sessions ",
+        PsTab::Scheduler => " Scheduler ",
+    };
+    let body_output = match popup_state.active_tab {
+        PsTab::Sessions => &popup_state.sessions_output,
+        PsTab::Scheduler => &popup_state.scheduler_output,
+    };
+    let body = Block::default().title(body_title).borders(Borders::ALL);
+    let body_inner = body.inner(sections[2]);
+    frame.render_widget(Clear, sections[2]);
+    frame.render_widget(body, sections[2]);
+    render_text_area(
+        frame,
+        body_inner,
+        body_output,
+        &mut popup_state.scroll_offset,
+    );
+
+    let footer = Paragraph::new("Esc close • ←→ switch tabs • ↑↓/PgUp/PgDn/Home/End scroll")
+        .alignment(Alignment::Center)
+        .style(
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::DIM),
+        );
+    frame.render_widget(Clear, sections[3]);
+    frame.render_widget(footer, sections[3]);
+    body_inner.height
+}
+
 fn paint_blank_area(frame: &mut Frame, area: Rect) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -2505,6 +2591,29 @@ mod tests {
         assert!(rendered.contains("user: third"));
         assert!(!rendered.contains("assistant: second"));
         assert!(!rendered.contains("toolu_hidden"));
+        assert!(app.last_context_view_height > 0);
+    }
+
+    #[test]
+    fn draw_ps_popup_shows_output_in_modal() {
+        let mut app = App::new("test".into(), false, None);
+        app.open_ps_popup(
+            "/ps".into(),
+            "SUMMARY\nSESSION1  root  idle  chat  first\nSESSION2  -  waiting  plan  second".into(),
+            "session-1  in 60s: run health check".into(),
+        );
+
+        let backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = buffer_lines(terminal.backend()).join("\n");
+        assert!(rendered.contains("/ps"));
+        assert!(rendered.contains("Browse active sessions in a dedicated popup."));
+        assert!(rendered.contains("Sessions"));
+        assert!(rendered.contains("Scheduler"));
+        assert!(rendered.contains("SESSION1"));
+        assert!(rendered.contains("SESSION2"));
         assert!(app.last_context_view_height > 0);
     }
 
@@ -3677,5 +3786,26 @@ mod tests {
         assert!(lines.iter().any(|line| line.contains("session-7")));
         assert!(lines.iter().any(|line| line.contains("Summary 7")));
         assert!(!lines.iter().any(|line| line.contains("session-1")));
+    }
+
+    #[test]
+    fn draw_conversation_scroll_to_top_row_shows_start_of_long_new_message() {
+        let mut app = App::new("test".into(), false, None);
+        app.push_message(ConversationEntry::User("earlier".into()));
+        app.push_message_and_scroll_to_top(ConversationEntry::AssistantText(
+            (1..=12)
+                .map(|index| format!("session-{index}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+
+        let backend = ratatui::backend::TestBackend::new(40, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let lines = buffer_lines(terminal.backend());
+        assert!(lines.iter().any(|line| line.contains("session-1")));
+        assert!(lines.iter().any(|line| line.contains("session-2")));
+        assert!(!lines.iter().any(|line| line.contains("session-12")));
     }
 }

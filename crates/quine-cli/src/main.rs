@@ -515,7 +515,7 @@ async fn main() -> anyhow::Result<()> {
             let socket_path = socket
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(default_socket_path);
-            agent_ctl::handle_ps(&socket_path, all, tree, json).await?;
+            agent_ctl::handle_ps(&socket_path, None, all, tree, json).await?;
         }
         Commands::Spawn {
             task,
