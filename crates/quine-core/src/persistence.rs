@@ -136,19 +136,22 @@ pub struct PersistedPromptMemoryState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PersistedSessionState {
     Idle,
+    Streaming,
+    AwaitingToolResult,
+    Waiting,
     Paused,
     Destroyed,
 }
 
 impl PersistedSessionState {
-    pub fn from_runtime(state: SessionState) -> Option<Self> {
+    pub fn from_runtime(state: SessionState) -> Self {
         match state {
-            SessionState::Idle => Some(Self::Idle),
-            SessionState::Paused => Some(Self::Paused),
-            SessionState::Destroyed => Some(Self::Destroyed),
-            SessionState::Streaming | SessionState::AwaitingToolResult | SessionState::Waiting => {
-                None
-            }
+            SessionState::Idle => Self::Idle,
+            SessionState::Streaming => Self::Streaming,
+            SessionState::AwaitingToolResult => Self::AwaitingToolResult,
+            SessionState::Waiting => Self::Waiting,
+            SessionState::Paused => Self::Paused,
+            SessionState::Destroyed => Self::Destroyed,
         }
     }
 }
@@ -157,6 +160,9 @@ impl From<PersistedSessionState> for SessionState {
     fn from(value: PersistedSessionState) -> Self {
         match value {
             PersistedSessionState::Idle => SessionState::Idle,
+            PersistedSessionState::Streaming => SessionState::Streaming,
+            PersistedSessionState::AwaitingToolResult => SessionState::AwaitingToolResult,
+            PersistedSessionState::Waiting => SessionState::Waiting,
             PersistedSessionState::Paused => SessionState::Paused,
             PersistedSessionState::Destroyed => SessionState::Destroyed,
         }
@@ -189,30 +195,26 @@ mod tests {
     use crate::planner::{Action, ActionId, ActionStatus, PlanId};
 
     #[test]
-    fn unstable_runtime_states_are_not_persistable() {
+    fn runtime_states_are_persistable() {
         assert_eq!(
             PersistedSessionState::from_runtime(SessionState::Streaming),
-            None
+            PersistedSessionState::Streaming
         );
         assert_eq!(
             PersistedSessionState::from_runtime(SessionState::AwaitingToolResult),
-            None
+            PersistedSessionState::AwaitingToolResult
         );
         assert_eq!(
             PersistedSessionState::from_runtime(SessionState::Waiting),
-            None
+            PersistedSessionState::Waiting
         );
-    }
-
-    #[test]
-    fn stable_runtime_states_are_persistable() {
         assert_eq!(
             PersistedSessionState::from_runtime(SessionState::Idle),
-            Some(PersistedSessionState::Idle)
+            PersistedSessionState::Idle
         );
         assert_eq!(
             PersistedSessionState::from_runtime(SessionState::Paused),
-            Some(PersistedSessionState::Paused)
+            PersistedSessionState::Paused
         );
     }
 

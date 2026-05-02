@@ -11,7 +11,8 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::app::{
     AgentPhase, App, ContextExplorerState, ContextExplorerTab, ConversationEntry,
-    ConversationRenderCache, InputBuffer, PsState, PsTab, ToolBatchCall, ToolStatus, UnwindState,
+    ConversationRenderCache, InputBuffer, PsState, PsTab, StateLiveViewState, ToolBatchCall,
+    ToolStatus, UnwindState,
 };
 
 /// Format a duration in microseconds to a human-readable string.
@@ -141,6 +142,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         app.last_context_view_height = u32::from(view_height);
     } else if let Some(ps_popup) = app.ps_popup.as_mut() {
         let view_height = draw_ps_popup(frame, chunks[conversation_index], ps_popup);
+        app.last_context_view_height = u32::from(view_height);
+    } else if let Some(state_live_view) = app.state_live_view.as_mut() {
+        let view_height = draw_state_live_view(frame, chunks[conversation_index], state_live_view);
         app.last_context_view_height = u32::from(view_height);
     } else if let Some(explorer) = app.context_explorer.as_mut() {
         let view_height = draw_context_explorer(frame, chunks[conversation_index], explorer);
@@ -1226,6 +1230,20 @@ fn draw_status_notice_overlay(frame: &mut Frame, app: &App) {
             .block(Block::default().borders(Borders::ALL).title(" Notice ")),
         area,
     );
+}
+
+/// Render the scrollable conversation view.
+fn draw_state_live_view(frame: &mut Frame, area: Rect, state_live_view: &mut StateLiveViewState) -> u16 {
+    let popup_area = centered_rect(92, 88, area);
+    frame.render_widget(Clear, popup_area);
+    let block = Block::default()
+        .title(format!("{} — live", state_live_view.title))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+    draw_conversation(frame, &mut state_live_view.app, inner);
+    inner.height
 }
 
 /// Render the scrollable conversation view.

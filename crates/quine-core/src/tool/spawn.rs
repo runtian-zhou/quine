@@ -117,8 +117,17 @@ impl Tool for SpawnTool {
                 child_id,
                 task: task.to_string(),
                 system_prompt,
-                prompt_behavior: PermissionPromptBehavior::Interactive,
-                permission_rules: crate::permission::PermissionRuleSet::default(),
+                prompt_behavior: context
+                    .permission_runtime
+                    .as_ref()
+                    .map(|snapshot| snapshot.prompt_behavior)
+                    .unwrap_or(PermissionPromptBehavior::Interactive),
+                permission_rules: context
+                    .permission_runtime
+                    .as_ref()
+                    .map(|snapshot| snapshot.rules.clone())
+                    .unwrap_or_default(),
+                permission_runtime: context.permission_runtime.clone(),
                 inheritance: InheritanceFlags {
                     history: inherit_history,
                     filesystem: inherit_filesystem,
@@ -196,9 +205,36 @@ impl Tool for SpawnTool {
 mod tests {
     use super::*;
     use crate::filesystem::OverlayFilesystem;
+    use crate::permission::{
+        PermissionMode, PermissionPromptBehavior, PermissionRule, PermissionRuleEffect,
+        PermissionRuleSet, PermissionRuntimeSnapshot, PermissionTarget,
+    };
     use std::sync::Arc;
     use tempfile::TempDir;
     use tokio::sync::mpsc;
+
+    fn inherited_permission_runtime() -> PermissionRuntimeSnapshot {
+        let mut rules = PermissionRuleSet::default();
+        rules.session.push(PermissionRule {
+            effect: PermissionRuleEffect::Deny,
+            scope: crate::permission::RuleScope::Workspace,
+            request_scope: None,
+            target: PermissionTarget::Tool {
+                name: "apply_patch".into(),
+            },
+            source_path: None,
+        });
+        PermissionRuntimeSnapshot {
+            mode: PermissionMode::AcceptEdits,
+            pre_plan_mode: Some(PermissionMode::Default),
+            rules,
+            workspace_root: std::path::PathBuf::from("/workspace"),
+            additional_allowed_roots: vec![std::path::PathBuf::from("/tmp/extra")],
+            prompt_behavior: PermissionPromptBehavior::Headless,
+            last_decision: None,
+            pending_approval: None,
+        }
+    }
 
     async fn make_context_with_core_input() -> (
         TempDir,
@@ -222,6 +258,7 @@ mod tests {
             session_group: String::new(),
             python_runtime: crate::python::PythonRuntime::new(),
             core_input: Some(core_input_tx),
+            permission_runtime: Some(inherited_permission_runtime()),
             cancellation: crate::tool::CancellationChannel::never(),
         };
         (base, session_dir, core_input_rx, ctx)
@@ -246,6 +283,7 @@ mod tests {
                 task,
                 system_prompt,
                 prompt_behavior,
+                permission_runtime,
                 inheritance,
                 reply,
                 ..
@@ -253,7 +291,13 @@ mod tests {
                 assert_eq!(parent_id, session_id);
                 assert_eq!(task, "delegate this");
                 assert!(system_prompt.is_none());
-                assert_eq!(prompt_behavior, PermissionPromptBehavior::Interactive);
+                assert_eq!(prompt_behavior, PermissionPromptBehavior::Headless);
+                let permission_runtime = permission_runtime.expect("permission runtime should propagate");
+                assert_eq!(permission_runtime.mode, PermissionMode::AcceptEdits);
+                assert_eq!(permission_runtime.pre_plan_mode, Some(PermissionMode::Default));
+                assert_eq!(permission_runtime.prompt_behavior, PermissionPromptBehavior::Headless);
+                assert_eq!(permission_runtime.additional_allowed_roots, vec![std::path::PathBuf::from("/tmp/extra")]);
+                assert_eq!(permission_runtime.rules.session.len(), 1);
                 assert!(!inheritance.history);
                 assert!(inheritance.filesystem);
                 (child_id, reply)
@@ -285,6 +329,7 @@ mod tests {
             session_group: String::new(),
             python_runtime: crate::python::PythonRuntime::new(),
             core_input: None,
+            permission_runtime: None,
             cancellation: crate::tool::CancellationChannel::never(),
         };
 

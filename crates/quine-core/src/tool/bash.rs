@@ -180,6 +180,7 @@ mod tests {
             session_group: String::new(),
             python_runtime: crate::python::PythonRuntime::new(),
             core_input: None,
+            permission_runtime: None,
             cancellation,
         };
         let tool = BashTool;
@@ -217,6 +218,7 @@ mod tests {
             session_group: String::new(),
             python_runtime: crate::python::PythonRuntime::new(),
             core_input: None,
+            permission_runtime: None,
             cancellation: crate::tool::CancellationChannel::never(),
         };
         (base, ctx)
@@ -325,6 +327,7 @@ mod tests {
             session_group: String::new(),
             python_runtime: crate::python::PythonRuntime::new(),
             core_input: None,
+            permission_runtime: None,
             cancellation,
         };
         let tool = BashTool;

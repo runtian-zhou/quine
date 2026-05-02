@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Duration;
 
 use crate::error::CoreError;
-use crate::permission::{PermissionPromptBehavior, PermissionRuleSet};
+use crate::permission::{PermissionPromptBehavior, PermissionRuleSet, PermissionRuntimeSnapshot};
 use crate::persistence::CoreCheckpoint;
 use crate::session::{ExitStatus, InheritanceFlags, SessionId, SessionSignal, SessionState};
 use crate::skill::Skill;
@@ -136,6 +136,7 @@ pub enum CoreInput {
         system_prompt: Option<String>,
         prompt_behavior: PermissionPromptBehavior,
         permission_rules: PermissionRuleSet,
+        permission_runtime: Option<PermissionRuntimeSnapshot>,
         inheritance: InheritanceFlags,
         reply: oneshot::Sender<Result<(), String>>,
     },

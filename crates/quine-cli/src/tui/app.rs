@@ -244,6 +244,9 @@ pub struct SwitchSessionCandidate {
 pub enum AppAction {
     SendMessage(String),
     ShowContext,
+    ShowSessionViewer {
+        session_id: String,
+    },
     ShowUnwind,
     UnwindSession {
         history_index: usize,
@@ -534,6 +537,11 @@ pub struct PsState {
     pub scroll_offset: u16,
 }
 
+pub struct StateLiveViewState {
+    pub title: String,
+    pub app: Box<App>,
+}
+
 impl UnwindState {
     fn new(snapshot: SessionContextSnapshot) -> Self {
         let user_history_indices = snapshot
@@ -618,6 +626,7 @@ pub struct App {
     pub switch_select_active: bool,
     pub model_profile_candidates: Vec<String>,
     pub switch_session_candidates: Vec<SwitchSessionCandidate>,
+    pub state_session_candidates: Vec<SwitchSessionCandidate>,
     /// Whether this session is in read-only plan mode.
     pub plan_mode: bool,
     /// Pending local confirmation required before leaving plan mode.
@@ -635,6 +644,9 @@ pub struct App {
     pub unwind_selector: Option<UnwindState>,
     /// Popup viewer for `/ps` and `/ps tree` output.
     pub ps_popup: Option<PsState>,
+    /// Live streaming viewer for `/state <session>` when the target session is active.
+    pub state_live_view: Option<StateLiveViewState>,
+    /// Interactive selector used by `/switch` and `/state`.
     /// Monotonic revision for conversation-affecting state.
     conversation_revision: u64,
     /// Cached rendered conversation lines and wrapped height for the current width.
@@ -780,6 +792,7 @@ impl App {
             switch_select_active: false,
             model_profile_candidates: Vec::new(),
             switch_session_candidates: Vec::new(),
+            state_session_candidates: Vec::new(),
             plan_mode,
             pending_plan_exit: None,
             last_view_height: 0,
@@ -790,6 +803,7 @@ impl App {
             context_explorer: None,
             unwind_selector: None,
             ps_popup: None,
+            state_live_view: None,
             conversation_revision: 0,
             conversation_cache: None,
         }
@@ -845,6 +859,7 @@ impl App {
         self.conversation_drag_anchor = None;
         self.context_explorer = None;
         self.ps_popup = None;
+        self.state_live_view = None;
         self.auto_scroll();
     }
 
@@ -878,6 +893,7 @@ impl App {
         self.switch_select_active = false;
         self.model_profile_candidates.clear();
         self.switch_session_candidates.clear();
+        self.state_session_candidates.clear();
         self.plan_mode = plan_mode;
         self.pending_plan_exit = None;
         self.conversation_viewport = None;
@@ -886,6 +902,7 @@ impl App {
         self.context_explorer = None;
         self.unwind_selector = None;
         self.ps_popup = None;
+        self.state_live_view = None;
         self.invalidate_conversation_cache();
         self.auto_scroll();
     }
@@ -910,6 +927,7 @@ impl App {
         self.context_explorer = None;
         self.unwind_selector = None;
         self.ps_popup = None;
+        self.state_live_view = None;
         self.last_context_view_height = 0;
         self.messages.clear();
 
@@ -1394,13 +1412,15 @@ impl App {
                             }
                         }
                         "state" => {
-                            if arguments.is_empty() {
-                                Some(AppAction::ShowContext)
+                            let target = arguments.trim();
+                            if target.is_empty() {
+                                Some(AppAction::ShowSessionViewer {
+                                    session_id: self.session_id.clone(),
+                                })
                             } else {
-                                self.messages
-                                    .push(ConversationEntry::Error("Usage: /state".into()));
-                                self.auto_scroll();
-                                None
+                                Some(AppAction::ShowSessionViewer {
+                                    session_id: target.to_string(),
+                                })
                             }
                         }
                         "clear" => {
@@ -1726,7 +1746,11 @@ impl App {
 
     fn switch_session_prefix(&self) -> Option<String> {
         let content = self.input.content();
-        let remainder = content.strip_prefix("/switch")?;
+        let remainder = if let Some(remainder) = content.strip_prefix("/switch") {
+            remainder
+        } else {
+            content.strip_prefix("/state")?
+        };
         if remainder.contains('\n') {
             return None;
         }
@@ -1738,13 +1762,17 @@ impl App {
         self.refresh_switch_session_options();
     }
 
-    pub(crate) fn upsert_switch_session_candidate(
-        &mut self,
+    pub(crate) fn set_state_session_candidates(&mut self, sessions: Vec<SwitchSessionCandidate>) {
+        self.state_session_candidates = sessions;
+        self.refresh_switch_session_options();
+    }
+
+    fn upsert_session_candidate(
+        candidates: &mut Vec<SwitchSessionCandidate>,
         session_id: String,
         summary: Option<String>,
     ) {
-        if let Some(candidate) = self
-            .switch_session_candidates
+        if let Some(candidate) = candidates
             .iter_mut()
             .find(|candidate| candidate.session_id == session_id)
         {
@@ -1752,11 +1780,28 @@ impl App {
                 candidate.summary = summary;
             }
         } else {
-            self.switch_session_candidates.push(SwitchSessionCandidate {
+            candidates.push(SwitchSessionCandidate {
                 session_id,
                 summary,
             });
         }
+    }
+
+    pub(crate) fn upsert_switch_session_candidate(
+        &mut self,
+        session_id: String,
+        summary: Option<String>,
+    ) {
+        Self::upsert_session_candidate(&mut self.switch_session_candidates, session_id, summary);
+        self.refresh_switch_session_options();
+    }
+
+    pub(crate) fn upsert_state_session_candidate(
+        &mut self,
+        session_id: String,
+        summary: Option<String>,
+    ) {
+        Self::upsert_session_candidate(&mut self.state_session_candidates, session_id, summary);
         self.refresh_switch_session_options();
     }
 
@@ -1773,8 +1818,9 @@ impl App {
                 let parent_id = params.get("parent_id").and_then(|value| value.as_str());
                 if let Some(child_id) = child_id {
                     let summary = parent_id.map(|parent| format!("child of {parent}"));
-                    self.upsert_switch_session_candidate(child_id.clone(), summary);
+                    self.upsert_switch_session_candidate(child_id.clone(), summary.clone());
                     if parent_id == Some(self.session_id.as_str()) {
+                        self.upsert_state_session_candidate(child_id.clone(), summary);
                         self.set_status_notice(format!("child session spawned: {child_id}"));
                     }
                 }
@@ -1798,7 +1844,14 @@ impl App {
                     .and_then(|params| params.get("state"))
                     .and_then(|value| value.as_str())
                     .map(|state| format!("state {state}"));
-                self.upsert_switch_session_candidate(session_id, summary);
+                self.upsert_switch_session_candidate(session_id.clone(), summary.clone());
+                if self
+                    .state_session_candidates
+                    .iter()
+                    .any(|candidate| candidate.session_id == session_id)
+                {
+                    self.upsert_state_session_candidate(session_id, summary);
+                }
             }
             _ => {}
         }
@@ -1813,8 +1866,13 @@ impl App {
             return;
         };
 
-        let options: Vec<String> = self
-            .switch_session_candidates
+        let candidates = if self.input.content().starts_with("/state") {
+            &self.state_session_candidates
+        } else {
+            &self.switch_session_candidates
+        };
+
+        let options: Vec<String> = candidates
             .iter()
             .filter(|session| prefix.is_empty() || session.session_id.starts_with(prefix.as_str()))
             .map(
@@ -1858,7 +1916,13 @@ impl App {
             return false;
         };
         let session_id = option.split('\t').next().unwrap_or(option);
-        self.input.set_from_string(&format!("/switch {session_id}"));
+        let command = if self.input.content().starts_with("/state") {
+            "/state"
+        } else {
+            "/switch"
+        };
+        self.input
+            .set_from_string(&format!("{command} {session_id}"));
         self.switch_select_active = false;
         self.option_select = None;
         true
@@ -1875,6 +1939,7 @@ impl App {
             .map(|skill| skill.name.clone())
             .collect();
         self.context_explorer = Some(ContextExplorerState::new(snapshot));
+        self.state_live_view = None;
         self.unwind_selector = None;
         self.last_context_view_height = 0;
         self.conversation_cache = None;
@@ -1884,6 +1949,66 @@ impl App {
         self.context_explorer = None;
         self.last_context_view_height = 0;
         self.conversation_cache = None;
+    }
+
+    pub fn state_live_view_active(&self) -> bool {
+        self.state_live_view.is_some()
+    }
+
+    pub fn open_state_live_view(&mut self, title: String, snapshot: SessionContextSnapshot) {
+        let mut app = App::new(snapshot.session_id.clone(), snapshot.plan_mode, None);
+        app.load_session_context(snapshot);
+        self.loaded_skill_commands = app.loaded_skill_commands.clone();
+        self.state_live_view = Some(StateLiveViewState {
+            title,
+            app: Box::new(app),
+        });
+        self.context_explorer = None;
+        self.unwind_selector = None;
+        self.ps_popup = None;
+        self.last_context_view_height = 0;
+        self.conversation_cache = None;
+    }
+
+    pub fn close_state_live_view(&mut self) {
+        self.state_live_view = None;
+        self.last_context_view_height = 0;
+        self.conversation_cache = None;
+    }
+
+    pub fn state_live_view_scroll_up(&mut self, rows: u16) {
+        if let Some(view) = self.state_live_view.as_mut() {
+            view.app.scroll_up(u32::from(rows));
+        }
+    }
+
+    pub fn state_live_view_scroll_down(&mut self, rows: u16) {
+        if let Some(view) = self.state_live_view.as_mut() {
+            view.app.scroll_down(u32::from(rows));
+        }
+    }
+
+    pub fn state_live_view_scroll_to_top(&mut self) {
+        if let Some(view) = self.state_live_view.as_mut() {
+            view.app.scroll_up(u32::MAX);
+        }
+    }
+
+    pub fn state_live_view_scroll_to_bottom(&mut self) {
+        if let Some(view) = self.state_live_view.as_mut() {
+            view.app.scroll_down(u32::MAX);
+        }
+    }
+
+    pub fn apply_state_live_view_notification(&mut self, notif: &JsonRpcNotification) -> bool {
+        let Some(view) = self.state_live_view.as_mut() else {
+            return false;
+        };
+        if notification_session_id(notif).is_some_and(|session_id| session_id == view.app.session_id) {
+            view.app.apply_notification(notif);
+            return true;
+        }
+        false
     }
 
     pub fn unwind_selector_active(&self) -> bool {
@@ -1902,6 +2027,7 @@ impl App {
             .collect();
         self.context_explorer = None;
         self.ps_popup = None;
+        self.state_live_view = None;
         self.unwind_selector = Some(UnwindState::new(snapshot));
         self.last_context_view_height = 0;
         self.conversation_cache = None;
@@ -1921,6 +2047,7 @@ impl App {
     ) {
         self.context_explorer = None;
         self.unwind_selector = None;
+        self.state_live_view = None;
         self.ps_popup = Some(PsState {
             title,
             sessions_output,
@@ -4021,13 +4148,96 @@ mod tests {
     }
 
     #[test]
-    fn submit_input_switch_without_target_opens_selector_action() {
+    fn submit_input_state_without_target_targets_current_session() {
         let mut app = App::new("test".into(), false, None);
-        app.input.set_from_string("/switch");
+        app.input.set_from_string("/state");
 
         let action = app.submit_input();
 
-        assert!(matches!(action, Some(AppAction::OpenSwitchSessionSelector)));
+        assert!(matches!(
+            action,
+            Some(AppAction::ShowSessionViewer { session_id }) if session_id == "test"
+        ));
+    }
+
+    #[test]
+    fn state_selector_uses_state_candidates_not_switch_candidates() {
+        let mut app = App::new("parent".into(), false, None);
+        app.input.set_from_string("/state c");
+        app.set_switch_session_candidates(vec![SwitchSessionCandidate {
+            session_id: "cross-session".into(),
+            summary: Some("should not appear".into()),
+        }]);
+        app.set_state_session_candidates(vec![
+            SwitchSessionCandidate {
+                session_id: "child-a".into(),
+                summary: Some("child of parent".into()),
+            },
+            SwitchSessionCandidate {
+                session_id: "child-b".into(),
+                summary: Some("state idle".into()),
+            },
+        ]);
+
+        app.refresh_switch_session_options();
+
+        let options = app
+            .option_select
+            .as_ref()
+            .map(|select| select.options.clone());
+        assert_eq!(
+            options,
+            Some(vec![
+                "child-a\tchild of parent".into(),
+                "child-b\tstate idle".into(),
+            ])
+        );
+    }
+
+    #[test]
+    fn child_spawned_notification_adds_current_session_child_to_state_candidates() {
+        let mut app = App::new("parent".into(), false, None);
+
+        app.observe_session_notification(&make_notif(
+            notifications::CHILD_SPAWNED,
+            serde_json::json!({
+                "parent_id": "parent",
+                "child_id": "child-1"
+            }),
+        ));
+
+        assert!(app
+            .state_session_candidates
+            .iter()
+            .any(|candidate| candidate.session_id == "child-1"));
+    }
+
+    #[test]
+    fn child_spawned_notification_ignores_other_parents_for_state_candidates() {
+        let mut app = App::new("parent".into(), false, None);
+
+        app.observe_session_notification(&make_notif(
+            notifications::CHILD_SPAWNED,
+            serde_json::json!({
+                "parent_id": "other",
+                "child_id": "child-2"
+            }),
+        ));
+
+        assert!(app.state_session_candidates.is_empty());
+    }
+
+    #[test]
+    fn accept_switch_session_option_uses_state_command_when_state_selector_active() {
+        let mut app = App::new("test".into(), false, None);
+        app.input.set_from_string("/state ");
+        app.set_state_session_candidates(vec![SwitchSessionCandidate {
+            session_id: "child".into(),
+            summary: Some("state destroyed".into()),
+        }]);
+
+        assert!(app.accept_switch_session_option());
+        assert_eq!(app.input.content(), "/state child");
     }
 
     #[test]
@@ -4173,26 +4383,94 @@ mod tests {
     }
 
     #[test]
-    fn model_profile_active_backspace_updates_filter_and_options() {
-        let mut app = App::new("test".into(), false, None);
-        app.input.set_from_string("/model local-");
-        app.set_model_profile_candidates(vec![
-            "local-qwen-coder".into(),
-            "local-fast".into(),
-            "remote-prod".into(),
-        ]);
+    fn state_live_view_receives_notifications_for_target_session() {
+        let mut app = App::new("root".into(), false, None);
+        let snapshot = SessionContextSnapshot {
+            session_id: "child".into(),
+            created_at: chrono::Utc::now(),
+            state: "streaming".into(),
+            system_prompt: None,
+            skills: Vec::new(),
+            working_directory: std::env::current_dir().expect("cwd"),
+            plan_mode: false,
+            available_tools: Vec::new(),
+            loaded_skills: Vec::new(),
+            plans: Vec::new(),
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
+            prompt_memory: None,
+            compact_memory_summary_markdown: None,
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            status_report: None,
+            history: Vec::new(),
+        };
 
-        app.input.delete_char_before();
-        app.refresh_model_profile_options();
+        app.open_state_live_view("/state child".into(), snapshot);
+        assert!(app.state_live_view_active());
 
-        assert_eq!(app.input.content(), "/model local");
-        let options = app
-            .option_select
-            .as_ref()
-            .map(|select| select.options.clone());
+        let applied = app.apply_state_live_view_notification(&make_notif(
+            notifications::STREAM_DELTA,
+            serde_json::json!({
+                "session_id": "child",
+                "delta": "hello"
+            }),
+        ));
+
+        assert!(applied);
+        let view = app.state_live_view.as_ref().expect("state live view open");
+        assert_eq!(view.app.streaming_buffer, "hello");
+        assert!(matches!(view.app.phase, AgentPhase::Streaming));
+    }
+
+    #[test]
+    fn state_live_view_scroll_helpers_delegate_to_nested_app() {
+        let mut app = App::new("root".into(), false, None);
+        let snapshot = SessionContextSnapshot {
+            session_id: "child".into(),
+            created_at: chrono::Utc::now(),
+            state: "streaming".into(),
+            system_prompt: None,
+            skills: Vec::new(),
+            working_directory: std::env::current_dir().expect("cwd"),
+            plan_mode: false,
+            available_tools: Vec::new(),
+            loaded_skills: Vec::new(),
+            plans: Vec::new(),
+            lineage: crate::context_debug::SessionLineageSnapshot::default(),
+            prompt_memory: None,
+            compact_memory_summary_markdown: None,
+            memory_diagnostics: None,
+            permission_diagnostics: None,
+            status_report: None,
+            history: Vec::new(),
+        };
+
+        app.open_state_live_view("/state child".into(), snapshot);
+        app.state_live_view_scroll_up(3);
         assert_eq!(
-            options,
-            Some(vec!["local-qwen-coder".into(), "local-fast".into()])
+            app.state_live_view.as_ref().expect("state live view").app.scroll_offset,
+            3
+        );
+
+        app.state_live_view_scroll_down(2);
+        assert_eq!(
+            app.state_live_view.as_ref().expect("state live view").app.scroll_offset,
+            1
+        );
+
+        app.state_live_view_scroll_to_top();
+        assert!(
+            app.state_live_view
+                .as_ref()
+                .expect("state live view")
+                .app
+                .user_scrolled
+        );
+
+        app.state_live_view_scroll_to_bottom();
+        assert_eq!(
+            app.state_live_view.as_ref().expect("state live view").app.scroll_offset,
+            0
         );
     }
 }
