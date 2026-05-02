@@ -195,14 +195,19 @@ async fn run_subagent(
                 working_directory,
                 parent_channel,
                 permission_runtime,
+                cancellation: cancellation.clone(),
             },
         ),
-    )
-    .await;
+    );
 
-    match result {
-        Ok(inner) => inner,
-        Err(_) => Err(format!("subagent timed out after {}s", timeout.as_secs())),
+    tokio::select! {
+        result = result => {
+            match result {
+                Ok(inner) => inner,
+                Err(_) => Err(format!("subagent timed out after {}s", timeout.as_secs())),
+            }
+        }
+        _ = cancellation.cancelled() => Err("subagent cancelled".into()),
     }
 }
 
@@ -333,6 +338,7 @@ struct SubagentRunContext {
     working_directory: PathBuf,
     parent_channel: Option<InteractionChannel>,
     permission_runtime: Option<crate::permission::PermissionRuntimeSnapshot>,
+    cancellation: crate::tool::CancellationChannel,
 }
 
 async fn run_subagent_inner(
@@ -347,6 +353,7 @@ async fn run_subagent_inner(
         working_directory,
         parent_channel,
         permission_runtime,
+        cancellation,
     } = run_context;
     let session_id = SessionId::new();
     let plan_store = crate::tool::plan::new_plan_store();
@@ -461,7 +468,7 @@ async fn run_subagent_inner(
                 python_runtime: crate::python::PythonRuntime::new(),
                 core_input: None,
                 permission_runtime: permission_runtime.clone(),
-                cancellation: crate::tool::CancellationChannel::never(),
+                cancellation: cancellation.clone(),
             };
 
             match tool.execute(arguments.clone(), &ctx).await {
@@ -502,7 +509,7 @@ mod tests {
         Arc,
     };
     use tempfile::TempDir;
-    use tokio::sync::mpsc;
+    use tokio::sync::{mpsc, Barrier};
 
     fn inherited_permission_runtime() -> PermissionRuntimeSnapshot {
         let mut rules = PermissionRuleSet::default();
@@ -641,6 +648,51 @@ mod tests {
             };
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    struct BlockingProvider {
+        started: Arc<Barrier>,
+    }
+
+    #[async_trait]
+    impl LlmProvider for BlockingProvider {
+        async fn send(
+            &self,
+            _messages: &[Message],
+            _tools: &[ToolDefinition],
+        ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+        {
+            self.started.wait().await;
+            futures::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_returns_cancelled_when_parent_cancels() {
+        let started = Arc::new(Barrier::new(2));
+        let provider: Arc<dyn LlmProvider> = Arc::new(BlockingProvider {
+            started: Arc::clone(&started),
+        });
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
+        let (_base, _session, mut ctx) = make_context().await;
+        let (cancel_tx, cancellation) = crate::tool::CancellationChannel::new_pair();
+        ctx.cancellation = cancellation;
+
+        let exec = tokio::spawn(async move {
+            tool.execute(serde_json::json!({"task": "block"}), &ctx)
+                .await
+                .unwrap()
+        });
+
+        started.wait().await;
+        let _ = cancel_tx.send(true);
+
+        let result = tokio::time::timeout(Duration::from_secs(1), exec)
+            .await
+            .expect("subagent should return promptly after cancellation")
+            .unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.content, "subagent cancelled");
     }
 
     #[tokio::test]
