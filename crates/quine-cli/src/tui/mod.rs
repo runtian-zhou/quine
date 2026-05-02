@@ -457,6 +457,23 @@ fn switch_session_candidates_from_summaries(
         .collect()
 }
 
+fn state_session_candidates_from_summaries(
+    mut sessions: Vec<TuiSessionSummary>,
+    current_session_id: &str,
+) -> Vec<SwitchSessionCandidate> {
+    sessions.retain(|session| session.parent_id.as_deref() == Some(current_session_id));
+    sessions
+        .sort_by(|left, right| session_last_active_key(right).cmp(&session_last_active_key(left)));
+
+    sessions
+        .into_iter()
+        .map(|session| SwitchSessionCandidate {
+            session_id: session.session_id,
+            summary: session.summary.or(session.title),
+        })
+        .collect()
+}
+
 fn print_resume_command(socket_path: &Path, session_id: &str) {
     eprintln!(
         "Resume from this checkpoint with: `quine run --session {} --socket {} \"<message>\"`",
@@ -534,7 +551,13 @@ pub async fn run_tui_chat(
         app.set_model_profile_candidates(profiles);
     }
     if let Ok(sessions) = list_sessions(&mut client).await {
-        app.set_switch_session_candidates(switch_session_candidates_from_summaries(sessions));
+        app.set_switch_session_candidates(switch_session_candidates_from_summaries(
+            sessions.clone(),
+        ));
+        app.set_state_session_candidates(state_session_candidates_from_summaries(
+            sessions,
+            &app.session_id,
+        ));
     }
     let mut event_stream = EventStream::new();
     let mut spinner_interval = tokio::time::interval(Duration::from_millis(80));
@@ -587,21 +610,26 @@ async fn run_event_loop(
     socket_path: &Path,
     auto_approve: bool,
 ) -> anyhow::Result<()> {
-    let mut last_context_visible =
-        app.context_explorer_active() || app.unwind_selector_active() || app.ps_popup_active();
+    let mut last_context_visible = app.context_explorer_active()
+        || app.unwind_selector_active()
+        || app.ps_popup_active()
+        || app.state_live_view_active();
     loop {
         // Draw.
         terminal.draw(|frame| {
             let context_visible = app.context_explorer_active()
                 || app.unwind_selector_active()
-                || app.ps_popup_active();
+                || app.ps_popup_active()
+                || app.state_live_view_active();
             if context_visible != last_context_visible {
                 frame.render_widget(TuiClear, frame.area());
             }
             ui::draw(frame, app)
         })?;
-        last_context_visible =
-            app.context_explorer_active() || app.unwind_selector_active() || app.ps_popup_active();
+        last_context_visible = app.context_explorer_active()
+            || app.unwind_selector_active()
+            || app.ps_popup_active()
+            || app.state_live_view_active();
 
         if app.should_quit {
             break;
@@ -628,6 +656,7 @@ async fn run_event_loop(
                         if interaction_session_id(&notif)
                             .is_some_and(|session_id| session_id != app.session_id.as_str())
                         {
+                            let _ = app.apply_state_live_view_notification(&notif);
                             continue;
                         }
                         if notif.method == notifications::INTERACTION_NEEDED
@@ -970,6 +999,40 @@ fn handle_terminal_event(app: &mut app::App, event: Event) -> Option<AppAction> 
                 };
             }
 
+            if app.state_live_view_active() {
+                return match code {
+                    KeyCode::Esc => {
+                        app.close_state_live_view();
+                        None
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => {
+                        app.state_live_view_scroll_up(1);
+                        None
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        app.state_live_view_scroll_down(1);
+                        None
+                    }
+                    KeyCode::PageUp => {
+                        app.state_live_view_scroll_up(context_page_scroll_step(app));
+                        None
+                    }
+                    KeyCode::PageDown => {
+                        app.state_live_view_scroll_down(context_page_scroll_step(app));
+                        None
+                    }
+                    KeyCode::Home => {
+                        app.state_live_view_scroll_to_top();
+                        None
+                    }
+                    KeyCode::End => {
+                        app.state_live_view_scroll_to_bottom();
+                        None
+                    }
+                    _ => None,
+                };
+            }
+
             if app.context_explorer_active() {
                 return match code {
                     KeyCode::Esc => {
@@ -1241,6 +1304,28 @@ async fn execute_action(
             }
             app.set_phase(AgentPhase::Idle);
         }
+        AppAction::ShowSessionViewer { session_id } => {
+            match fetch_session_context(client, &session_id).await {
+                Ok(snapshot) => {
+                    if snapshot.state != "idle"
+                        && snapshot.state != "waiting"
+                        && snapshot.state != "paused"
+                        && snapshot.state != "destroyed"
+                    {
+                        app.open_state_live_view(format!("/state {session_id}"), snapshot);
+                    } else {
+                        app.open_context_explorer(snapshot);
+                    }
+                }
+                Err(error) => {
+                    app.push_message(app::ConversationEntry::Error(format!(
+                        "/state {session_id} failed: {error}"
+                    )));
+                    app.auto_scroll();
+                }
+            }
+            app.set_phase(AgentPhase::Idle);
+        }
         AppAction::ShowUnwind => {
             match fetch_session_context(client, &app.session_id).await {
                 Ok(snapshot) => app.open_unwind_selector(snapshot),
@@ -1383,16 +1468,22 @@ async fn execute_action(
                 Ok(context) => {
                     let plan_mode = context.plan_mode;
                     let candidates = app.switch_session_candidates.clone();
+                    let state_candidates = app.state_session_candidates.clone();
                     app.reset_for_new_session(session_id.clone(), plan_mode, None);
                     app.set_switch_session_candidates(candidates);
+                    app.set_state_session_candidates(state_candidates);
                     app.load_session_context(context);
                     app.push_message(app::ConversationEntry::AssistantText(format!(
                         "Switched to session {session_id}."
                     )));
                     if let Ok(sessions) = list_sessions(client).await {
                         app.set_switch_session_candidates(
-                            switch_session_candidates_from_summaries(sessions),
+                            switch_session_candidates_from_summaries(sessions.clone()),
                         );
+                        app.set_state_session_candidates(state_session_candidates_from_summaries(
+                            sessions,
+                            &app.session_id,
+                        ));
                     }
                 }
                 Err(error) => {

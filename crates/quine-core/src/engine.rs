@@ -1005,7 +1005,7 @@ impl SessionContext {
     }
 
     async fn snapshot(&self, session_id: SessionId) -> Option<PersistedSession> {
-        let state = PersistedSessionState::from_runtime(self.state)?;
+        let state = PersistedSessionState::from_runtime(self.state);
         let python_state = self
             .python_runtime
             .snapshot_group(&self.python_group)
@@ -1241,11 +1241,18 @@ enum RuntimeEvent {
         session_id: SessionId,
         parent_id: SessionId,
         status: ExitStatus,
+        snapshot: Box<PersistedSession>,
+    },
+    ChildInteractionNeeded {
+        target_session_id: SessionId,
+        child_session_id: SessionId,
+        request: InteractionRequest,
     },
     CheckpointHint,
 }
 
 type SessionRegistry = Arc<RwLock<HashMap<SessionId, SessionHandle>>>;
+type CompletedSessionRegistry = Arc<RwLock<HashMap<SessionId, PersistedSession>>>;
 type SharedSessionTree = Arc<RwLock<SessionTree>>;
 
 fn mailbox_matches_source(message: &MailboxMessage, source: &MessageSource) -> bool {
@@ -2196,6 +2203,7 @@ fn interrupt_session(
                 | CoreInput::Cancel { session_id: sid }
                 | CoreInput::Signal { session_id: sid, .. }
                 | CoreInput::ToolResult { session_id: sid, .. }
+                | CoreInput::UserMessage { session_id: sid, .. }
                 if *sid == session_id
         )
     });
@@ -2320,6 +2328,10 @@ async fn execute_concurrent_tool_batch(
         return Vec::new();
     }
     session.cancel_tx = Some(cancel_tx.clone());
+    let permission_runtime = Some(session.permission_context.snapshot(
+        session.last_permission_outcome.clone(),
+        session.pending_permission_approval.clone(),
+    ));
 
     let mut results: Vec<Option<CompletedConcurrentToolCall>> =
         std::iter::repeat_with(|| None).take(calls.len()).collect();
@@ -2327,6 +2339,7 @@ async fn execute_concurrent_tool_batch(
     for call in calls {
         let cancellation = cancellation.clone();
         let input_tx = io.input_tx.clone();
+        let call_permission_runtime = permission_runtime.clone();
         join_set.spawn(async move {
             let ctx = ExecutionContext {
                 session_id,
@@ -2337,6 +2350,7 @@ async fn execute_concurrent_tool_batch(
                 session_group: call.session_group,
                 python_runtime: call.python_runtime,
                 core_input: Some(input_tx),
+                permission_runtime: call_permission_runtime,
                 cancellation,
             };
             let started_at = std::time::Instant::now();
@@ -3143,6 +3157,13 @@ async fn execute_tool_call(
                 session.state = SessionState::Paused;
                 session.pending_permission_approval = Some(pending);
             }
+            let interaction_session_id = {
+                let mut current = session_id;
+                while let Some(parent_id) = engine.session_tree.parent_of(current) {
+                    current = parent_id;
+                }
+                current
+            };
             let _ = io
                 .output
                 .send(CoreOutput::SessionStateChanged {
@@ -3153,7 +3174,7 @@ async fn execute_tool_call(
             let _ = io
                 .output
                 .send(CoreOutput::InteractionNeeded {
-                    session_id,
+                    session_id: interaction_session_id,
                     request,
                 })
                 .await;
@@ -3163,7 +3184,7 @@ async fn execute_tool_call(
                     Some(CoreInput::InteractionResponse {
                         session_id: resp_sid,
                         response,
-                    }) if resp_sid == session_id => {
+                    }) if resp_sid == interaction_session_id => {
                         let choice = parse_permission_approval_response(&response);
                         if let Some(session) = sessions.get_mut(&session_id) {
                             session.state = SessionState::Streaming;
@@ -3543,6 +3564,7 @@ async fn execute_tool_call(
         cancellation,
         python_group,
         python_runtime,
+        permission_runtime,
     ) = {
         let Some(session) = sessions.get(&session_id) else {
             return ToolOutcome::Error {
@@ -3562,6 +3584,10 @@ async fn execute_tool_call(
             cancellation.clone(),
             session.python_group.clone(),
             Arc::clone(&session.python_runtime),
+            Some(session.permission_context.snapshot(
+                session.last_permission_outcome.clone(),
+                session.pending_permission_approval.clone(),
+            )),
         )
     };
 
@@ -3583,6 +3609,7 @@ async fn execute_tool_call(
             session_group: python_group.clone(),
             python_runtime: Arc::clone(&python_runtime),
             core_input: Some(io.input_tx.clone()),
+            permission_runtime: permission_runtime.clone(),
             cancellation: cancellation.clone(),
         };
 
@@ -3724,6 +3751,7 @@ async fn execute_tool_call(
             session_group: python_group,
             python_runtime,
             core_input: Some(io.input_tx.clone()),
+            permission_runtime: permission_runtime.clone(),
             cancellation: cancellation.clone(),
         };
 
@@ -4746,6 +4774,42 @@ struct SessionActor {
 }
 
 impl SessionActor {
+    async fn resolve_interaction_target(&self) -> SessionId {
+        let tree = self.session_tree.read().await;
+        let mut current = self.session_id;
+        while let Some(parent_id) = tree.parent_of(current) {
+            current = parent_id;
+        }
+        current
+    }
+
+    async fn emit_interaction_needed(&self, request: InteractionRequest) {
+        if self.parent_id.is_some() {
+            let target_session_id = self.resolve_interaction_target().await;
+            let _ = self
+                .runtime_event_tx
+                .send(RuntimeEvent::ChildInteractionNeeded {
+                    target_session_id,
+                    child_session_id: self.session_id,
+                    request,
+                })
+                .await;
+        } else {
+            let _ = self
+                .output
+                .send(CoreOutput::InteractionNeeded {
+                    session_id: self.session_id,
+                    request,
+                })
+                .await;
+        }
+    }
+
+    fn discard_deferred_user_messages(&mut self) {
+        self.deferred_commands
+            .retain(|command| !matches!(command, SessionCommand::UserMessage { .. }));
+    }
+
     async fn run(mut self) {
         while let Some(command) = self.next_command().await {
             if !self.handle_command(command).await {
@@ -5009,7 +5073,8 @@ impl SessionActor {
     }
 
     async fn interrupt(&mut self) {
-        if self.session.suspended_wait.is_some() {
+        let was_suspended_wait = self.session.suspended_wait.is_some();
+        if was_suspended_wait {
             let _ = self
                 .append_suspended_wait_result(ToolOutcome::Cancelled)
                 .await;
@@ -5024,6 +5089,7 @@ impl SessionActor {
         self.session.cancel_tx = None;
         self.session.pending_interaction.take();
         self.session.pending_permission_approval = None;
+        self.discard_deferred_user_messages();
         self.emit_state(SessionState::Idle).await;
         self.emit_checkpoint_hint().await;
     }
@@ -5106,6 +5172,12 @@ impl SessionActor {
                     session_id: self.session_id,
                     parent_id,
                     status,
+                    snapshot: Box::new(
+                        self.session
+                            .snapshot(self.session_id)
+                            .await
+                            .expect("destroyed child sessions must remain snapshotable"),
+                    ),
                 })
                 .await;
             false
@@ -5869,7 +5941,8 @@ impl SessionActor {
     async fn handle_control_command(&mut self, command: SessionCommand) -> bool {
         match command {
             SessionCommand::Cancel => {
-                if self.session.suspended_wait.is_some() {
+                let was_suspended_wait = self.session.suspended_wait.is_some();
+                if was_suspended_wait {
                     let _ = self
                         .append_suspended_wait_result(ToolOutcome::Cancelled)
                         .await;
@@ -5884,12 +5957,15 @@ impl SessionActor {
                 self.session.cancel_tx = None;
                 self.session.pending_interaction.take();
                 self.session.pending_permission_approval = None;
+                self.discard_deferred_user_messages();
+                self.emit_state(SessionState::Idle).await;
                 true
             }
             SessionCommand::Signal(
                 SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill,
             ) => {
-                if self.session.suspended_wait.is_some() {
+                let was_suspended_wait = self.session.suspended_wait.is_some();
+                if was_suspended_wait {
                     let _ = self
                         .append_suspended_wait_result(ToolOutcome::Cancelled)
                         .await;
@@ -5904,6 +5980,8 @@ impl SessionActor {
                 self.session.cancel_tx = None;
                 self.session.pending_interaction.take();
                 self.session.pending_permission_approval = None;
+                self.discard_deferred_user_messages();
+                self.emit_state(SessionState::Idle).await;
                 true
             }
             SessionCommand::MailboxMessage(message) => {
@@ -5980,13 +6058,7 @@ impl SessionActor {
                 let (pending, request) = build_permission_approval_request(&permission_outcome);
                 self.session.state = SessionState::Paused;
                 self.session.pending_permission_approval = Some(pending);
-                let _ = self
-                    .output
-                    .send(CoreOutput::InteractionNeeded {
-                        session_id: self.session_id,
-                        request,
-                    })
-                    .await;
+                self.emit_interaction_needed(request).await;
                 self.emit_state(SessionState::Paused).await;
                 loop {
                     match self.command_rx.recv().await {
@@ -6200,6 +6272,10 @@ impl SessionActor {
             let (req_tx, mut req_rx) =
                 mpsc::channel::<(InteractionRequest, oneshot::Sender<InteractionResponse>)>(1);
             let channel = InteractionChannel { request_tx: req_tx };
+            let permission_runtime = Some(self.session.permission_context.snapshot(
+                self.session.last_permission_outcome.clone(),
+                self.session.pending_permission_approval.clone(),
+            ));
             let ctx = ExecutionContext {
                 session_id: self.session_id,
                 filesystem,
@@ -6209,6 +6285,7 @@ impl SessionActor {
                 session_group: session_group.clone(),
                 python_runtime: Arc::clone(&python_runtime),
                 core_input: Some(self.core_input_tx.clone()),
+                permission_runtime: permission_runtime.clone(),
                 cancellation: cancellation.clone(),
             };
             let args = call.arguments.clone();
@@ -6241,10 +6318,7 @@ impl SessionActor {
                     }
                     interaction = req_rx.recv() => {
                         if let Some((request, reply_tx)) = interaction {
-                            let _ = self.output.send(CoreOutput::InteractionNeeded {
-                                session_id: self.session_id,
-                                request,
-                            }).await;
+                            self.emit_interaction_needed(request).await;
                             loop {
                                 match self.command_rx.recv().await {
                                     Some(SessionCommand::InteractionResponse(response)) => {
@@ -6274,6 +6348,10 @@ impl SessionActor {
             self.session.cancel_tx = None;
             outcome
         } else {
+            let permission_runtime = Some(self.session.permission_context.snapshot(
+                self.session.last_permission_outcome.clone(),
+                self.session.pending_permission_approval.clone(),
+            ));
             let ctx = ExecutionContext {
                 session_id: self.session_id,
                 filesystem,
@@ -6283,6 +6361,7 @@ impl SessionActor {
                 session_group,
                 python_runtime,
                 core_input: Some(self.core_input_tx.clone()),
+                permission_runtime: permission_runtime.clone(),
                 cancellation: cancellation.clone(),
             };
             let tool_future = tool.execute(call.arguments.clone(), &ctx);
@@ -6364,6 +6443,7 @@ impl SessionActor {
 
 async fn snapshot_registry_sessions(
     registry: &SessionRegistry,
+    completed_registry: &CompletedSessionRegistry,
     session_tree: &SharedSessionTree,
 ) -> CoreCheckpoint {
     let handles: Vec<SessionHandle> = registry.read().await.values().cloned().collect();
@@ -6381,12 +6461,14 @@ async fn snapshot_registry_sessions(
             }
         }
     }
+    persisted_sessions.extend(completed_registry.read().await.values().cloned());
     let tree = session_tree.read().await.snapshot();
     CoreCheckpoint::new(persisted_sessions, tree)
 }
 
 async fn snapshot_registry_session(
     registry: &SessionRegistry,
+    completed_registry: &CompletedSessionRegistry,
     session_tree: &SharedSessionTree,
     session_id: SessionId,
 ) -> CoreCheckpoint {
@@ -6404,6 +6486,8 @@ async fn snapshot_registry_session(
                 persisted_sessions.push(snapshot);
             }
         }
+    } else if let Some(snapshot) = completed_registry.read().await.get(&session_id).cloned() {
+        persisted_sessions.push(snapshot);
     }
     let tree = session_tree.read().await.snapshot();
     CoreCheckpoint::new(persisted_sessions, tree)
@@ -6411,10 +6495,11 @@ async fn snapshot_registry_session(
 
 async fn emit_checkpoint_request_for_registry(
     registry: &SessionRegistry,
+    completed_registry: &CompletedSessionRegistry,
     session_tree: &SharedSessionTree,
     output: &mpsc::Sender<CoreOutput>,
 ) {
-    let checkpoint = snapshot_registry_sessions(registry, session_tree).await;
+    let checkpoint = snapshot_registry_sessions(registry, completed_registry, session_tree).await;
     let _ = output
         .send(CoreOutput::CheckpointRequested { checkpoint })
         .await;
@@ -6423,6 +6508,7 @@ async fn emit_checkpoint_request_for_registry(
 #[derive(Clone)]
 struct SessionActorSpawner {
     registry: SessionRegistry,
+    completed_registry: CompletedSessionRegistry,
     session_tree: SharedSessionTree,
     output: mpsc::Sender<CoreOutput>,
     core_input_tx: mpsc::Sender<CoreInput>,
@@ -6452,6 +6538,10 @@ async fn spawn_session_actor(
                 session_group: session.persisted_config.session_group.clone(),
             },
         );
+    }
+    {
+        let mut completed_guard = spawner.completed_registry.write().await;
+        completed_guard.remove(&session_id);
     }
 
     let actor = SessionActor {
@@ -6565,10 +6655,13 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
         .map(|checkpoint| SessionTree::restore(checkpoint.session_tree.clone()))
         .unwrap_or_default();
     let registry: SessionRegistry = Arc::new(RwLock::new(HashMap::new()));
+    let completed_registry: CompletedSessionRegistry = Arc::new(RwLock::new(HashMap::new()));
     let session_tree: SharedSessionTree = Arc::new(RwLock::new(restored_tree));
     let (runtime_event_tx, mut runtime_event_rx) = mpsc::channel(256);
+    let mut pending_child_interactions: HashMap<SessionId, SessionId> = HashMap::new();
     let spawner = SessionActorSpawner {
         registry: Arc::clone(&registry),
+        completed_registry: Arc::clone(&completed_registry),
         session_tree: Arc::clone(&session_tree),
         output: handle.output.clone(),
         core_input_tx: handle.input_tx.clone(),
@@ -6616,8 +6709,9 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
         tokio::select! {
             maybe_event = runtime_event_rx.recv() => {
                 match maybe_event {
-                    Some(RuntimeEvent::ChildSessionFinished { session_id, parent_id, status }) => {
+                    Some(RuntimeEvent::ChildSessionFinished { session_id, parent_id, status, snapshot }) => {
                         registry.write().await.remove(&session_id);
+                        completed_registry.write().await.insert(session_id, *snapshot);
                         session_tree.write().await.record_exit(session_id, status.clone());
                         let _ = handle.output.send(CoreOutput::SessionStateChanged {
                             session_id,
@@ -6635,10 +6729,24 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                 status: status.clone(),
                             }).await;
                         }
-                        emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
+                        emit_checkpoint_request_for_registry(&registry, &completed_registry, &session_tree, &handle.output).await;
+                    }
+                    Some(RuntimeEvent::ChildInteractionNeeded {
+                        target_session_id,
+                        child_session_id,
+                        request,
+                    }) => {
+                        pending_child_interactions.insert(target_session_id, child_session_id);
+                        let _ = handle
+                            .output
+                            .send(CoreOutput::InteractionNeeded {
+                                session_id: target_session_id,
+                                request,
+                            })
+                            .await;
                     }
                     Some(RuntimeEvent::CheckpointHint) => {
-                        emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
+                        emit_checkpoint_request_for_registry(&registry, &completed_registry, &session_tree, &handle.output).await;
                     }
                     None => {}
                 }
@@ -6713,7 +6821,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                             session_id,
                                             state: SessionState::Idle,
                                         }).await;
-                                        emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
+                                        emit_checkpoint_request_for_registry(&registry, &completed_registry, &session_tree, &handle.output).await;
                                         let _ = reply.send(Ok(()));
                                     }
                                     Err(error) => {
@@ -6810,11 +6918,26 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         }
                     }
                     CoreInput::InteractionResponse { session_id, response } => {
-                        if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
-                            let _ = session_handle.command_tx.send(SessionCommand::InteractionResponse(response)).await;
+                        if let Some(child_session_id) = pending_child_interactions.remove(&session_id) {
+                            if let Some(session_handle) = registry.read().await.get(&child_session_id).cloned() {
+                                let _ = session_handle
+                                    .command_tx
+                                    .send(SessionCommand::InteractionResponse(response))
+                                    .await;
+                            }
+                        } else if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
+                            let _ = session_handle
+                                .command_tx
+                                .send(SessionCommand::InteractionResponse(response))
+                                .await;
                         }
                     }
                     CoreInput::Cancel { session_id } => {
+                        if let Some(child_session_id) = pending_child_interactions.remove(&session_id) {
+                            if let Some(child_handle) = registry.read().await.get(&child_session_id).cloned() {
+                                let _ = child_handle.command_tx.send(SessionCommand::Cancel).await;
+                            }
+                        }
                         if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
                             let _ = session_handle.command_tx.send(SessionCommand::Cancel).await;
                         }
@@ -6847,6 +6970,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         system_prompt,
                         prompt_behavior,
                         permission_rules,
+                        permission_runtime,
                         inheritance,
                         reply,
                     } => {
@@ -6879,7 +7003,11 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                                 persisted.config.system_prompt =
                                                     Some(system_prompt);
                                             }
-                                            persisted.permission_state = None;
+                                            if let Some(permission_runtime) = permission_runtime.clone() {
+                                                persisted.permission_state = Some(permission_runtime);
+                                            } else {
+                                                persisted.permission_state = None;
+                                            }
                                             persisted.status_report = None;
                                             Some(persisted)
                                         }
@@ -6954,6 +7082,19 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                 &inherited_provider,
                             )
                             .await
+                            .map(|mut session| {
+                                if let Some(permission_runtime) = permission_runtime.as_ref() {
+                                    session.permission_context =
+                                        PermissionContext::from_snapshot(permission_runtime);
+                                    session.last_permission_outcome =
+                                        permission_runtime.last_decision.clone();
+                                    session.pending_permission_approval =
+                                        permission_runtime.pending_approval.clone();
+                                } else {
+                                    session.permission_context.set_rules(permission_rules.clone());
+                                }
+                                session
+                            })
                         };
                         match session_result {
                             Ok(mut ctx) => {
@@ -6963,7 +7104,9 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                     inherited_session_group.as_deref(),
                                 );
                                 ctx.persisted_config.session_group = inherited_session_group;
-                                ctx.permission_context.set_rules(permission_rules);
+                                if permission_runtime.is_none() {
+                                    ctx.permission_context.set_rules(permission_rules);
+                                }
                                 session_tree.write().await.add_child(parent_id, child_id);
                                 match spawn_session_actor(
                                     &spawner,
@@ -6998,7 +7141,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                                                     .await;
                                             }
                                         }
-                                        emit_checkpoint_request_for_registry(&registry, &session_tree, &handle.output).await;
+                                        emit_checkpoint_request_for_registry(&registry, &completed_registry, &session_tree, &handle.output).await;
                                         let _ = reply.send(Ok(()));
                                     }
                                     Err(error) => {
@@ -7012,6 +7155,13 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         }
                     }
                     CoreInput::Signal { session_id, signal } => {
+                        if matches!(signal, SessionSignal::Stop | SessionSignal::Term | SessionSignal::Kill) {
+                            if let Some(child_session_id) = pending_child_interactions.remove(&session_id) {
+                                if let Some(child_handle) = registry.read().await.get(&child_session_id).cloned() {
+                                    let _ = child_handle.command_tx.send(SessionCommand::Signal(signal)).await;
+                                }
+                            }
+                        }
                         if let Some(session_handle) = registry.read().await.get(&session_id).cloned() {
                             let _ = session_handle.command_tx.send(SessionCommand::Signal(signal)).await;
                         }
@@ -7054,15 +7204,21 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                         let _ = reply.send(result);
                     }
                     CoreInput::RequestCheckpoint { reply } => {
-                        let checkpoint = snapshot_registry_sessions(&registry, &session_tree).await;
+                        let checkpoint = snapshot_registry_sessions(&registry, &completed_registry, &session_tree).await;
                         let _ = reply.send(checkpoint);
                     }
                     CoreInput::RequestSessionCheckpoint { session_id, reply } => {
                         let checkpoint =
-                            snapshot_registry_session(&registry, &session_tree, session_id).await;
+                            snapshot_registry_session(&registry, &completed_registry, &session_tree, session_id).await;
                         let _ = reply.send(checkpoint);
                     }
-                    CoreInput::WaitSession { parent_id, child_id, reply, non_blocking, timeout: _ } => {
+                    CoreInput::WaitSession {
+                        parent_id,
+                        child_id,
+                        reply,
+                        non_blocking,
+                        timeout,
+                    } => {
                         let tree = session_tree.read().await;
                         let result = if tree.parent_of(child_id) == Some(parent_id) {
                             tree.exit_status(child_id).cloned()
@@ -7076,15 +7232,29 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                             let _ = reply.send(Ok(None));
                         } else {
                             let (wait_tx, wait_rx) = oneshot::channel();
-                            let already_exited = session_tree.write().await.register_waiter(child_id, wait_tx);
+                            let already_exited = session_tree
+                                .write()
+                                .await
+                                .register_waiter(child_id, wait_tx);
                             if already_exited {
-                                let status = session_tree.read().await.exit_status(child_id).cloned();
+                                let status =
+                                    session_tree.read().await.exit_status(child_id).cloned();
                                 let _ = reply.send(Ok(status));
                             } else {
                                 tokio::spawn(async move {
-                                    let response = wait_rx.await
-                                        .map(Some)
-                                        .map_err(|_| "wait reply channel dropped".to_string());
+                                    let response = if let Some(timeout) = timeout {
+                                        match tokio::time::timeout(timeout, wait_rx).await {
+                                            Ok(Ok(status)) => Ok(Some(status)),
+                                            Ok(Err(_)) => {
+                                                Err("wait reply channel dropped".to_string())
+                                            }
+                                            Err(_) => Err("wait_child timed out".to_string()),
+                                        }
+                                    } else {
+                                        wait_rx.await
+                                            .map(Some)
+                                            .map_err(|_| "wait reply channel dropped".to_string())
+                                    };
                                     let _ = reply.send(response);
                                 });
                             }
@@ -7104,6 +7274,10 @@ mod tests {
     use super::*;
     use crate::channel::{create_channels, ChannelConfig};
     use crate::permission::types::PermissionMode;
+    use crate::permission::{
+        PermissionPromptBehavior, PermissionRule, PermissionRuleEffect, PermissionRuleSet,
+        PermissionRuntimeSnapshot, PermissionTarget,
+    };
     use crate::session::{ExitStatus, InheritanceFlags};
     use crate::SessionLlmConfig;
     use std::collections::VecDeque;
@@ -7117,6 +7291,29 @@ mod tests {
 
     use crate::memory::load_summary_metadata;
     use sha2::{Digest, Sha256};
+
+    fn inherited_permission_runtime() -> PermissionRuntimeSnapshot {
+        let mut rules = PermissionRuleSet::default();
+        rules.session.push(PermissionRule {
+            effect: PermissionRuleEffect::Deny,
+            scope: crate::permission::RuleScope::Workspace,
+            request_scope: None,
+            target: PermissionTarget::Tool {
+                name: "apply_patch".into(),
+            },
+            source_path: None,
+        });
+        PermissionRuntimeSnapshot {
+            mode: PermissionMode::AcceptEdits,
+            pre_plan_mode: Some(PermissionMode::Default),
+            rules,
+            workspace_root: PathBuf::from("/workspace"),
+            additional_allowed_roots: vec![PathBuf::from("/tmp/extra")],
+            prompt_behavior: PermissionPromptBehavior::Headless,
+            last_decision: None,
+            pending_approval: None,
+        }
+    }
 
     /// A mock LLM provider that returns a fixed text response.
     struct MockProvider {
@@ -9025,6 +9222,172 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
     }
 
     #[tokio::test]
+    async fn session_actor_cancel_discards_queued_user_messages_and_returns_idle() {
+        let parent_id = SessionId::new();
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let mut session = SessionContext::new(
+            parent_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                initial_messages: vec![Message::user("start subagent")],
+                archive_root: std::env::temp_dir().join("quine-core-actor-cancel-children"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
+                session_group: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.state = SessionState::Streaming;
+
+        let (_command_tx, command_rx) = tokio::sync::mpsc::channel(4);
+        let (output_tx, _output_rx) = tokio::sync::mpsc::channel(16);
+        let (core_input_tx, _core_input_rx) = tokio::sync::mpsc::channel(4);
+        let (runtime_event_tx, _runtime_event_rx) = tokio::sync::mpsc::channel(4);
+        let session_tree = Arc::new(RwLock::new(SessionTree::new()));
+        let mut actor = SessionActor {
+            session_id: parent_id,
+            parent_id: None,
+            session,
+            command_rx,
+            deferred_commands: VecDeque::from([SessionCommand::UserMessage {
+                content: "queued prompt".into(),
+                turn_id: "queued-turn".into(),
+            }]),
+            output: output_tx,
+            core_input_tx,
+            runtime_event_tx,
+            session_tree,
+            web_provider: Arc::new(NoopWebProvider),
+        };
+
+        assert!(actor.handle_control_command(SessionCommand::Cancel).await);
+
+        assert_eq!(actor.session.state, SessionState::Idle);
+        assert!(actor.session.interrupted);
+        assert!(actor.deferred_commands.is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_actor_cancel_wait_child_records_failed_tool_result_and_keeps_child_running() {
+        let parent_id = SessionId::new();
+        let child_id = SessionId::new();
+        let wait_tool_use_id = "toolu_wait_child_cancel";
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let mut session = SessionContext::new(
+            parent_id,
+            SessionInit {
+                system_prompt: None,
+                skills: Vec::new(),
+                working_directory: std::env::current_dir().unwrap_or_default(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                initial_messages: vec![
+                    Message::user("wait for child"),
+                    Message::assistant_tool_use(
+                        None,
+                        vec![quine_llm::ToolUseRequest {
+                            tool_use_id: wait_tool_use_id.into(),
+                            tool_name: "wait_child".into(),
+                            arguments: serde_json::json!({"child_id": format!("{child_id:?}")}),
+                        }],
+                    ),
+                ],
+                archive_root: std::env::temp_dir().join("quine-core-actor-cancel-wait-child"),
+                max_context_window: None,
+                prompt_memory_mode: PromptMemoryMode::Disabled,
+                agent_key: None,
+                team_key: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                model_profile: None,
+                session_group: None,
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+            },
+            &provider,
+        )
+        .await
+        .unwrap();
+        session.state = SessionState::Waiting;
+        session.suspended_wait = Some(SuspendedWait::ChildExit {
+            tool_use_id: wait_tool_use_id.into(),
+            child_id,
+            timeout_at: None,
+        });
+
+        let (_command_tx, command_rx) = tokio::sync::mpsc::channel(4);
+        let (output_tx, mut output_rx) = tokio::sync::mpsc::channel(16);
+        let (core_input_tx, mut core_input_rx) = tokio::sync::mpsc::channel(4);
+        let (runtime_event_tx, _runtime_event_rx) = tokio::sync::mpsc::channel(4);
+        let session_tree = Arc::new(RwLock::new(SessionTree::new()));
+        {
+            let mut tree = session_tree.write().await;
+            tree.add_child(parent_id, child_id);
+            tree.register_active_wait(parent_id, child_id).unwrap();
+        }
+        let mut actor = SessionActor {
+            session_id: parent_id,
+            parent_id: None,
+            session,
+            command_rx,
+            deferred_commands: VecDeque::from([SessionCommand::UserMessage {
+                content: "queued prompt".into(),
+                turn_id: "queued-turn".into(),
+            }]),
+            output: output_tx,
+            core_input_tx,
+            runtime_event_tx,
+            session_tree: Arc::clone(&session_tree),
+            web_provider: Arc::new(NoopWebProvider),
+        };
+
+        assert!(actor.handle_command(SessionCommand::Cancel).await);
+
+        assert_eq!(actor.session.state, SessionState::Idle);
+        assert!(actor.session.suspended_wait.is_none());
+        assert!(actor.deferred_commands.is_empty());
+        assert!(!session_tree
+            .read()
+            .await
+            .wait_would_cycle(child_id, parent_id));
+        assert!(
+            tokio::time::timeout(TokioDuration::from_millis(20), core_input_rx.recv())
+                .await
+                .is_err(),
+            "cancelling wait_child should not stop the child session"
+        );
+
+        let mut saw_cancelled_wait_result = false;
+        while let Ok(event) = output_rx.try_recv() {
+            if let CoreOutput::ToolResult {
+                tool_use_id,
+                tool_name,
+                content,
+                is_error,
+                ..
+            } = event
+            {
+                saw_cancelled_wait_result = tool_use_id == wait_tool_use_id
+                    && tool_name == "wait_child"
+                    && is_error
+                    && content == "Tool execution was cancelled";
+            }
+        }
+        assert!(saw_cancelled_wait_result);
+    }
+
+    #[tokio::test]
     async fn send_message_queues_resume_for_waiting_mailbox_session() {
         let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
         let waiting_id = SessionId::new();
@@ -10889,8 +11252,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 child_id,
                 task: "Reply with exactly one integer. No explanation.".into(),
                 system_prompt: None,
-                prompt_behavior: PermissionPromptBehavior::Interactive,
-                permission_rules: PermissionRuleSet::default(),
+                prompt_behavior: PermissionPromptBehavior::Headless,
+                permission_rules: inherited_permission_runtime().rules.clone(),
+                permission_runtime: Some(inherited_permission_runtime()),
                 inheritance: InheritanceFlags::default(),
                 reply: spawn_reply_tx,
             })
@@ -10926,6 +11290,80 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             }
             other => panic!("expected completed exit status, got {other:?}"),
         }
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wait_session_honors_timeout_for_running_child() {
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
+
+        let parent_id = SessionId::new();
+        let (create_reply_tx, create_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id: parent_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                session_group: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+                reply: create_reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(create_reply_rx.await.unwrap().is_ok());
+
+        let child_id = SessionId::new();
+        let (spawn_reply_tx, spawn_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::SpawnSession {
+                parent_id,
+                child_id,
+                task: String::new(),
+                system_prompt: None,
+                prompt_behavior: PermissionPromptBehavior::Headless,
+                permission_rules: PermissionRuleSet::default(),
+                permission_runtime: None,
+                inheritance: InheritanceFlags::default(),
+                reply: spawn_reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(spawn_reply_rx.await.unwrap().is_ok());
+
+        let (wait_reply_tx, wait_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::WaitSession {
+                parent_id,
+                child_id,
+                reply: wait_reply_tx,
+                non_blocking: false,
+                timeout: Some(TokioDuration::from_millis(20)),
+            })
+            .await
+            .unwrap();
+
+        let result = tokio::time::timeout(TokioDuration::from_secs(1), wait_reply_rx)
+            .await
+            .expect("wait session timeout should complete")
+            .unwrap();
+        assert!(matches!(result, Err(error) if error == "wait_child timed out"));
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();
@@ -10996,8 +11434,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 child_id,
                 task: String::new(),
                 system_prompt: None,
-                prompt_behavior: PermissionPromptBehavior::Interactive,
-                permission_rules: PermissionRuleSet::default(),
+                prompt_behavior: PermissionPromptBehavior::Headless,
+                permission_rules: inherited_permission_runtime().rules.clone(),
+                permission_runtime: Some(inherited_permission_runtime()),
                 inheritance: InheritanceFlags {
                     history: true,
                     ..Default::default()
@@ -11030,6 +11469,271 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                 MessageContent::Text(text) if text == "remember parent context"
             )
         }));
+        let permission_state = child.permission_state.expect("child permission state");
+        assert_eq!(permission_state.mode, PermissionMode::AcceptEdits);
+        assert_eq!(
+            permission_state.pre_plan_mode,
+            Some(PermissionMode::Default)
+        );
+        assert_eq!(
+            permission_state.prompt_behavior,
+            PermissionPromptBehavior::Headless
+        );
+        assert_eq!(
+            permission_state.additional_allowed_roots,
+            vec![PathBuf::from("/tmp/extra")]
+        );
+        assert_eq!(permission_state.rules.session.len(), 1);
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawn_session_without_history_inherits_parent_permission_runtime() {
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let provider: Arc<dyn LlmProvider> = Arc::new(MockProvider::empty());
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
+
+        let parent_id = SessionId::new();
+        let permission_runtime = inherited_permission_runtime();
+        let (create_reply_tx, create_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id: parent_id,
+                system_prompt: None,
+                working_directory: None,
+                skills: Vec::new(),
+                plan_mode: false,
+                prompt_behavior: permission_runtime.prompt_behavior,
+                permission_rules: permission_runtime.rules.clone(),
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                session_group: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+                reply: create_reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(create_reply_rx.await.unwrap().is_ok());
+
+        let child_id = SessionId::new();
+        let (spawn_reply_tx, spawn_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::SpawnSession {
+                parent_id,
+                child_id,
+                task: String::new(),
+                system_prompt: None,
+                prompt_behavior: permission_runtime.prompt_behavior,
+                permission_rules: permission_runtime.rules.clone(),
+                permission_runtime: Some(permission_runtime.clone()),
+                inheritance: InheritanceFlags::default(),
+                reply: spawn_reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(spawn_reply_rx.await.unwrap().is_ok());
+
+        let (checkpoint_reply_tx, checkpoint_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::RequestSessionCheckpoint {
+                session_id: child_id,
+                reply: checkpoint_reply_tx,
+            })
+            .await
+            .unwrap();
+        let checkpoint = checkpoint_reply_rx.await.unwrap();
+        let child = checkpoint
+            .sessions
+            .into_iter()
+            .find(|session| session.session_id == child_id)
+            .expect("child checkpoint");
+
+        let permission_state = child.permission_state.expect("child permission state");
+        assert_eq!(permission_state.mode, PermissionMode::AcceptEdits);
+        assert_eq!(
+            permission_state.pre_plan_mode,
+            Some(PermissionMode::Default)
+        );
+        assert_eq!(
+            permission_state.prompt_behavior,
+            PermissionPromptBehavior::Headless
+        );
+        assert_eq!(
+            permission_state.additional_allowed_roots,
+            vec![PathBuf::from("/tmp/extra")]
+        );
+        assert_eq!(permission_state.rules.session.len(), 1);
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn spawned_child_permission_prompt_is_routed_to_parent_session() {
+        struct SpawnChildApprovalProvider;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for SpawnChildApprovalProvider {
+            async fn send(
+                &self,
+                messages: &[Message],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+            {
+                let saw_bash_result = messages.iter().any(|message| {
+                    matches!(
+                        &message.content,
+                        quine_llm::MessageContent::ToolResult { tool_use_id, output, is_error }
+                            if tool_use_id == "tc_spawn_child_bash" && !is_error && output.contains("permission-prompt.txt")
+                    )
+                });
+                let saw_child_task = messages.iter().any(|message| {
+                    matches!(
+                        &message.content,
+                        quine_llm::MessageContent::Text(text)
+                            if text.contains("Use bash to run 'touch permission-prompt.txt' and then reply DONE")
+                    )
+                });
+
+                let events = if saw_bash_result {
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            text: "DONE".into(),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else if saw_child_task {
+                    vec![
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_spawn_child_bash".into(),
+                            tool_name: "bash".into(),
+                            arguments: serde_json::json!({"command": "touch permission-prompt.txt && echo permission-prompt.txt"}),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else {
+                    vec![Ok(LlmEvent::Done { usage: None })]
+                };
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let workspace = TempDir::new().unwrap();
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let provider: Arc<dyn LlmProvider> = Arc::new(SpawnChildApprovalProvider);
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
+
+        let parent_id = SessionId::new();
+        let (create_reply_tx, create_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id: parent_id,
+                system_prompt: None,
+                working_directory: Some(workspace.path().to_path_buf()),
+                skills: Vec::new(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                session_group: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+                reply: create_reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(create_reply_rx.await.unwrap().is_ok());
+        let _ = output.recv().await.unwrap();
+
+        let child_id = SessionId::new();
+        let (spawn_reply_tx, spawn_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::SpawnSession {
+                parent_id,
+                child_id,
+                task: "Use bash to run 'touch permission-prompt.txt' and then reply DONE".into(),
+                system_prompt: None,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
+                permission_runtime: None,
+                inheritance: InheritanceFlags::default(),
+                reply: spawn_reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(spawn_reply_rx.await.unwrap().is_ok());
+
+        let mut saw_parent_interaction = false;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
+                Ok(Some(CoreOutput::InteractionNeeded {
+                    session_id: interaction_session_id,
+                    ..
+                })) => {
+                    assert_eq!(interaction_session_id, parent_id);
+                    saw_parent_interaction = true;
+                    harness
+                        .input
+                        .send(CoreInput::InteractionResponse {
+                            session_id: parent_id,
+                            response: InteractionResponse {
+                                response: "approve once".into(),
+                                selected_indices: vec![0],
+                            },
+                        })
+                        .await
+                        .unwrap();
+                    break;
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timeout waiting for spawned child permission prompt on parent"),
+            }
+        }
+
+        assert!(
+            saw_parent_interaction,
+            "expected spawned child permission prompt on parent session"
+        );
+
+        let (wait_reply_tx, wait_reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::WaitSession {
+                parent_id,
+                child_id,
+                reply: wait_reply_tx,
+                non_blocking: false,
+                timeout: Some(TokioDuration::from_secs(10)),
+            })
+            .await
+            .unwrap();
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(10), wait_reply_rx)
+            .await
+            .expect("wait_child should complete")
+            .unwrap()
+            .expect("child should exit");
+        match status {
+            Some(ExitStatus::Success { output }) => assert_eq!(output, "DONE"),
+            other => panic!("expected successful child exit, got {other:?}"),
+        }
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();
@@ -13010,6 +13714,177 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             .unwrap();
 
         assert!(reply_rx.await.unwrap().is_ok());
+
+        harness.input.send(CoreInput::Shutdown).await.unwrap();
+        loop_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn child_permission_prompt_is_routed_to_parent_session() {
+        struct ParentSubagentApprovalProvider;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for ParentSubagentApprovalProvider {
+            async fn send(
+                &self,
+                messages: &[Message],
+                _tools: &[ToolDefinition],
+            ) -> anyhow::Result<Pin<Box<dyn futures::Stream<Item = anyhow::Result<LlmEvent>> + Send>>>
+            {
+                let saw_parent_subagent_result = messages.iter().any(|message| {
+                    matches!(
+                        &message.content,
+                        quine_llm::MessageContent::ToolResult { tool_use_id, output, is_error }
+                            if tool_use_id == "tc_subagent_parent" && !is_error && output.contains("DONE")
+                    )
+                });
+                let saw_child_bash_result = messages.iter().any(|message| {
+                    matches!(
+                        &message.content,
+                        quine_llm::MessageContent::ToolResult { tool_use_id, output, is_error }
+                            if tool_use_id == "tc_child_bash" && !is_error && output.contains("permission-prompt.txt")
+                    )
+                });
+                let saw_child_task = messages.iter().any(|message| {
+                    matches!(
+                        &message.content,
+                        quine_llm::MessageContent::Text(text)
+                            if text.contains("Use bash to run 'touch permission-prompt.txt' and then reply DONE")
+                    )
+                });
+
+                let events = if saw_parent_subagent_result {
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            text: "parent complete".into(),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else if saw_child_bash_result {
+                    vec![
+                        Ok(LlmEvent::TextDelta {
+                            text: "DONE".into(),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else if saw_child_task {
+                    vec![
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_child_bash".into(),
+                            tool_name: "bash".into(),
+                            arguments: serde_json::json!({"command": "touch permission-prompt.txt && echo permission-prompt.txt"}),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                } else {
+                    vec![
+                        Ok(LlmEvent::ToolCall {
+                            tool_use_id: "tc_subagent_parent".into(),
+                            tool_name: "subagent".into(),
+                            arguments: serde_json::json!({
+                                "task": "Use bash to run 'touch permission-prompt.txt' and then reply DONE"
+                            }),
+                        }),
+                        Ok(LlmEvent::Done { usage: None }),
+                    ]
+                };
+                Ok(Box::pin(futures::stream::iter(events)))
+            }
+        }
+
+        let workspace = TempDir::new().unwrap();
+        let (harness, core) = create_channels(ChannelConfig::default());
+        let mut output = harness.output;
+        let provider = Arc::new(ParentSubagentApprovalProvider);
+        let loop_handle = tokio::spawn(run_core_loop(core, provider.clone(), None));
+
+        let session_id = SessionId::new();
+        let (reply_tx, reply_rx) = oneshot::channel();
+        harness
+            .input
+            .send(CoreInput::CreateSession {
+                session_id,
+                system_prompt: None,
+                working_directory: Some(workspace.path().to_path_buf()),
+                skills: Vec::new(),
+                plan_mode: false,
+                prompt_behavior: PermissionPromptBehavior::Interactive,
+                permission_rules: PermissionRuleSet::default(),
+                initial_messages: Vec::new(),
+                agent_key: None,
+                team_key: None,
+                session_group: None,
+                memory_policy: MemoryPolicyConfig::default(),
+                session_llm: session_llm_config(provider.clone()),
+                auto_compact_threshold_percent: DEFAULT_AUTO_COMPACT_THRESHOLD_PERCENT,
+                status_report_min_tool_rounds: default_status_report_min_tool_rounds(),
+                reply: reply_tx,
+            })
+            .await
+            .unwrap();
+        assert!(reply_rx.await.unwrap().is_ok());
+        let _ = output.recv().await.unwrap();
+
+        harness
+            .input
+            .send(CoreInput::UserMessage {
+                session_id,
+                content: "delegate the file creation".into(),
+                turn_id: uuid::Uuid::new_v4().to_string(),
+            })
+            .await
+            .unwrap();
+
+        let mut saw_parent_interaction = false;
+        let mut saw_parent_text_complete = false;
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), output.recv()).await {
+                Ok(Some(CoreOutput::InteractionNeeded {
+                    session_id: interaction_session_id,
+                    ..
+                })) => {
+                    assert_eq!(
+                        interaction_session_id, session_id,
+                        "child approval should be routed to parent session"
+                    );
+                    saw_parent_interaction = true;
+                    harness
+                        .input
+                        .send(CoreInput::InteractionResponse {
+                            session_id,
+                            response: InteractionResponse {
+                                response: "approve once".into(),
+                                selected_indices: vec![0],
+                            },
+                        })
+                        .await
+                        .unwrap();
+                }
+                Ok(Some(CoreOutput::TextComplete {
+                    session_id: text_session_id,
+                    full_text,
+                })) if text_session_id == session_id => {
+                    assert_eq!(full_text, "parent complete");
+                    saw_parent_text_complete = true;
+                }
+                Ok(Some(CoreOutput::TurnComplete {
+                    session_id: complete_session_id,
+                    ..
+                })) if complete_session_id == session_id => break,
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => panic!("timeout waiting for child permission prompt on parent"),
+            }
+        }
+
+        assert!(
+            saw_parent_interaction,
+            "expected child permission prompt on parent session"
+        );
+        assert!(
+            saw_parent_text_complete,
+            "expected parent completion after approval"
+        );
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();

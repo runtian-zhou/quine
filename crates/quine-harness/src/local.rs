@@ -737,6 +737,7 @@ impl LocalHarness {
                             previous_checkpoint.as_ref(),
                         )
                         .await;
+                        let checkpoint = merge_checkpoint_update(previous_checkpoint, checkpoint);
                         storage
                             .commit_checkpoint(&checkpoint)
                             .await
@@ -768,29 +769,25 @@ impl LocalHarness {
                 CoreOutput::SessionStateChanged { session_id, state } => {
                     let now = Utc::now();
                     let mut guard = sessions.lock().await;
-                    if *state == quine_core::SessionState::Destroyed {
-                        guard.remove(session_id);
-                    } else {
-                        guard
-                            .entry(*session_id)
-                            .and_modify(|session| {
-                                session.state = *state;
-                                session.last_active_at = now;
-                            })
-                            .or_insert_with(|| SessionListing {
-                                state: *state,
-                                created_at: now,
-                                last_active_at: now,
-                                event_count: 0,
-                                title: None,
-                                summary: None,
-                                plan_mode: false,
-                                parent_id: None,
-                                model_profile: None,
-                                session_group: serialize_session_id(*session_id),
-                                scheduled_events: Vec::new(),
-                            });
-                    }
+                    guard
+                        .entry(*session_id)
+                        .and_modify(|session| {
+                            session.state = *state;
+                            session.last_active_at = now;
+                        })
+                        .or_insert_with(|| SessionListing {
+                            state: *state,
+                            created_at: now,
+                            last_active_at: now,
+                            event_count: 0,
+                            title: None,
+                            summary: None,
+                            plan_mode: false,
+                            parent_id: None,
+                            model_profile: None,
+                            session_group: serialize_session_id(*session_id),
+                            scheduled_events: Vec::new(),
+                        });
                 }
                 _ => {
                     if let Some(session_id) = core_output_session_id(&event) {
@@ -1114,18 +1111,44 @@ impl HarnessService for LocalHarness {
         &self,
         session_id: SessionId,
     ) -> Result<CoreCheckpoint, HarnessError> {
-        let sessions = self.sessions.lock().await;
-        if !sessions.contains_key(&session_id) {
-            return Err(HarnessError::SessionNotFound {
-                session_id: serde_json::to_value(session_id)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_default(),
-            });
-        }
-        drop(sessions);
+        let session_id_str = serde_json::to_value(session_id)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_default();
+        let session_is_live = self.sessions.lock().await.contains_key(&session_id);
 
-        let mut checkpoint = self.request_session_checkpoint(session_id).await?;
+        let mut checkpoint = if session_is_live {
+            self.request_session_checkpoint(session_id).await?
+        } else {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let checkpoint = self
+                    ._storage
+                    .load_latest_checkpoint()
+                    .await
+                    .map_err(|error| HarnessError::Internal {
+                        message: format!("failed to load checkpoint: {error}"),
+                    })?;
+                if let Some(checkpoint) = checkpoint {
+                    if session_context_from_checkpoint(
+                        &checkpoint,
+                        session_id,
+                        &HashMap::new(),
+                        None,
+                    )
+                    .is_some()
+                    {
+                        break checkpoint;
+                    }
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(HarnessError::SessionNotFound {
+                        session_id: session_id_str.clone(),
+                    });
+                }
+                tokio::task::yield_now().await;
+            }
+        };
 
         if session_context_from_checkpoint(&checkpoint, session_id, &HashMap::new(), None).is_none()
         {
@@ -1137,10 +1160,7 @@ impl HarnessService for LocalHarness {
                     message: format!("failed to load checkpoint: {error}"),
                 })?
                 .ok_or_else(|| HarnessError::SessionNotFound {
-                    session_id: serde_json::to_value(session_id)
-                        .ok()
-                        .and_then(|value| value.as_str().map(str::to_owned))
-                        .unwrap_or_default(),
+                    session_id: session_id_str.clone(),
                 })?;
         }
 
@@ -1161,10 +1181,7 @@ impl HarnessService for LocalHarness {
         .is_none()
         {
             return Err(HarnessError::SessionNotFound {
-                session_id: serde_json::to_value(session_id)
-                    .ok()
-                    .and_then(|value| value.as_str().map(str::to_owned))
-                    .unwrap_or_default(),
+                session_id: session_id_str,
             });
         }
 
@@ -1189,6 +1206,7 @@ impl HarnessService for LocalHarness {
                 system_prompt,
                 prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
                 permission_rules: quine_core::PermissionRuleSet::default(),
+                permission_runtime: None,
                 inheritance: InheritanceFlags::default(),
                 reply: reply_tx,
             })
@@ -1354,6 +1372,7 @@ impl HarnessService for LocalHarness {
                 system_prompt: None,
                 prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
                 permission_rules: quine_core::PermissionRuleSet::default(),
+                permission_runtime: None,
                 inheritance: InheritanceFlags {
                     history: true,
                     ..Default::default()
@@ -1706,6 +1725,48 @@ mod tests {
             result.unwrap().is_ok(),
             "health_check should not depend on a session snapshot"
         );
+    }
+
+    #[tokio::test]
+    async fn get_session_context_returns_busy_live_session() {
+        let provider = Arc::new(BlockingSubagentProvider::new());
+        let harness = LocalHarness::new(provider.clone(), Some(temp_storage()))
+            .await
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        write_allow_subagent_permission(workspace.path()).await;
+
+        let busy_session =
+            start_blocking_subagent_session(&harness, &provider, workspace.path().to_path_buf())
+                .await;
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            harness.get_session_context(busy_session),
+        )
+        .await;
+
+        assert!(
+            result.is_ok(),
+            "get_session_context timed out for a live busy session"
+        );
+        let checkpoint = result
+            .unwrap()
+            .expect("busy live session context should resolve");
+        let snapshot = session_context_from_checkpoint(
+            &checkpoint,
+            busy_session,
+            &HashMap::new(),
+            Some(harness._storage.root()),
+        )
+        .expect("busy live session snapshot should be present");
+        assert_eq!(snapshot.session_id, serialize_session_id(busy_session));
+        assert!(matches!(
+            snapshot.state.as_str(),
+            "streaming" | "awaiting_tool_result" | "waiting"
+        ));
+
+        harness.shutdown().await.unwrap();
     }
 
     #[test]
@@ -2475,6 +2536,65 @@ mod tests {
             Some(crate::storage::HistoryEntry::Text { role, text })
                 if role == "system" && text.contains("You are a helpful coding assistant")
         ));
+
+        harness.shutdown().await.unwrap();
+        let _ = fs::remove_dir_all(storage.root());
+    }
+
+    #[tokio::test]
+    async fn local_harness_get_session_context_for_completed_child_uses_checkpoint() {
+        let storage = temp_storage();
+        let harness = LocalHarness::new(Arc::new(EchoProvider), Some(storage.clone()))
+            .await
+            .unwrap();
+        let mut rx = harness.subscribe();
+        let parent_id = harness
+            .create_session(SessionConfig::default())
+            .await
+            .unwrap();
+
+        let child_id = harness
+            .spawn_child_session(Some(parent_id), Some("completed child".into()), None)
+            .await
+            .unwrap();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match rx.recv().await.unwrap() {
+                    CoreOutput::SessionStateChanged {
+                        session_id,
+                        state: SessionState::Destroyed,
+                    } if session_id == child_id => break,
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+
+        let checkpoint = harness.get_session_context(child_id).await.unwrap();
+        let snapshot = session_context_from_checkpoint(
+            &checkpoint,
+            child_id,
+            &HashMap::new(),
+            Some(storage.root()),
+        )
+        .expect("completed child snapshot should be available from checkpoint");
+
+        let parent_id_str = serialize_session_id(parent_id);
+        assert_eq!(snapshot.session_id, serialize_session_id(child_id));
+        assert_eq!(
+            snapshot.lineage.parent_id.as_deref(),
+            Some(parent_id_str.as_str())
+        );
+        assert_eq!(snapshot.state, "destroyed");
+        assert!(snapshot.history.iter().any(|entry| {
+            matches!(
+                entry,
+                crate::storage::HistoryEntry::Text { role, text }
+                    if role == "user" && text == "completed child"
+            )
+        }));
 
         harness.shutdown().await.unwrap();
         let _ = fs::remove_dir_all(storage.root());

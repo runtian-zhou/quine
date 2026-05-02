@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::filesystem::SessionFilesystem;
+use crate::permission::PermissionRuntimeSnapshot;
 use crate::python::PythonRuntime;
 use crate::session::SessionId;
 
@@ -238,6 +239,8 @@ pub struct ExecutionContext {
     pub python_runtime: Arc<PythonRuntime>,
     /// Sender for sending messages back to the core event loop (for spawn, signal, etc.).
     pub core_input: Option<mpsc::Sender<crate::channel::CoreInput>>,
+    /// Effective permission runtime snapshot for this tool execution.
+    pub permission_runtime: Option<PermissionRuntimeSnapshot>,
     /// Per-execution cancellation channel for immediate tool aborts.
     pub cancellation: CancellationChannel,
 }

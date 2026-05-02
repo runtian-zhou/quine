@@ -6,10 +6,12 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use quine_llm::{LlmEvent, LlmProvider, Message, WebProvider};
+use tokio::sync::oneshot;
 
 use super::{ExecutionContext, InteractionChannel, Tool, ToolError, ToolOutput, ToolRegistry};
+use crate::channel::CoreInput;
 use crate::filesystem::SessionFilesystem;
-use crate::session::SessionId;
+use crate::session::{ExitStatus, InheritanceFlags, SessionId};
 use crate::tool::{
     ask_user::AskUserTool, bash::BashTool, plan::PlanTool, read::ReadTool, web_open::WebOpenTool,
     web_search::WebSearchTool, write::WriteTool,
@@ -103,6 +105,10 @@ impl Tool for SubagentTool {
             context.working_directory.clone(),
             timeout,
             channel,
+            context.permission_runtime.clone(),
+            context.core_input.clone(),
+            context.session_id,
+            context.cancellation.clone(),
         )
         .await
         {
@@ -159,7 +165,24 @@ async fn run_subagent(
     working_directory: PathBuf,
     timeout: Duration,
     parent_channel: Option<InteractionChannel>,
+    permission_runtime: Option<crate::permission::PermissionRuntimeSnapshot>,
+    core_input: Option<tokio::sync::mpsc::Sender<CoreInput>>,
+    parent_session_id: SessionId,
+    cancellation: crate::tool::CancellationChannel,
 ) -> Result<String, String> {
+    if let Some(core_input) = core_input {
+        return run_subagent_via_harness(
+            task,
+            system_prompt,
+            timeout,
+            core_input,
+            parent_session_id,
+            permission_runtime.clone(),
+            cancellation,
+        )
+        .await;
+    }
+
     let result = tokio::time::timeout(
         timeout,
         run_subagent_inner(
@@ -167,9 +190,12 @@ async fn run_subagent(
             web_provider,
             task,
             system_prompt,
-            filesystem,
-            working_directory,
-            parent_channel,
+            SubagentRunContext {
+                filesystem,
+                working_directory,
+                parent_channel,
+                permission_runtime,
+            },
         ),
     )
     .await;
@@ -180,15 +206,148 @@ async fn run_subagent(
     }
 }
 
+async fn run_subagent_via_harness(
+    task: &str,
+    system_prompt: Option<&str>,
+    timeout: Duration,
+    core_input: tokio::sync::mpsc::Sender<CoreInput>,
+    parent_session_id: SessionId,
+    permission_runtime: Option<crate::permission::PermissionRuntimeSnapshot>,
+    cancellation: crate::tool::CancellationChannel,
+) -> Result<String, String> {
+    let child_id = SessionId::new();
+    let (spawn_reply_tx, spawn_reply_rx) = oneshot::channel();
+
+    core_input
+        .send(CoreInput::SpawnSession {
+            parent_id: parent_session_id,
+            child_id,
+            task: task.to_string(),
+            system_prompt: system_prompt.map(str::to_string),
+            prompt_behavior: permission_runtime
+                .as_ref()
+                .map(|snapshot| snapshot.prompt_behavior)
+                .unwrap_or(crate::permission::PermissionPromptBehavior::Interactive),
+            permission_rules: permission_runtime
+                .as_ref()
+                .map(|snapshot| snapshot.rules.clone())
+                .unwrap_or_default(),
+            permission_runtime,
+            inheritance: InheritanceFlags::default(),
+            reply: spawn_reply_tx,
+        })
+        .await
+        .map_err(|_| "core_input channel closed".to_string())?;
+
+    match spawn_reply_rx.await {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => return Err(format!("failed to spawn subagent session: {error}")),
+        Err(_) => return Err("subagent spawn reply channel dropped".to_string()),
+    }
+
+    let cancel_guard = ChildSessionCancelGuard::new(core_input.clone(), child_id);
+
+    let wait_future = async {
+        let (wait_reply_tx, wait_reply_rx) = oneshot::channel();
+        core_input
+            .send(CoreInput::WaitSession {
+                parent_id: parent_session_id,
+                child_id,
+                reply: wait_reply_tx,
+                non_blocking: false,
+                timeout: Some(timeout),
+            })
+            .await
+            .map_err(|_| "core_input channel closed".to_string())?;
+
+        match wait_reply_rx.await {
+            Ok(Ok(Some(ExitStatus::Success { output }))) => Ok(output),
+            Ok(Ok(Some(ExitStatus::Failed { error }))) => Err(error),
+            Ok(Ok(Some(ExitStatus::Killed))) => {
+                Err("subagent child session was killed".to_string())
+            }
+            Ok(Ok(Some(ExitStatus::Cancelled))) => {
+                Err("subagent child session was cancelled".to_string())
+            }
+            Ok(Ok(None)) => Err("subagent wait returned no exit status".to_string()),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err("subagent wait reply channel dropped".to_string()),
+        }
+    };
+
+    let result = tokio::select! {
+        result = wait_future => result,
+        _ = cancellation.cancelled() => {
+            let _ = core_input.send(CoreInput::Cancel { session_id: child_id }).await;
+            Err("subagent cancelled".to_string())
+        }
+    };
+
+    let result = if matches!(result, Err(ref error) if error == "wait_child timed out") {
+        let _ = core_input
+            .send(CoreInput::Cancel {
+                session_id: child_id,
+            })
+            .await;
+        Err(format!("subagent timed out after {}s", timeout.as_secs()))
+    } else {
+        result
+    };
+
+    cancel_guard.disarm();
+    result
+}
+
+struct ChildSessionCancelGuard {
+    core_input: tokio::sync::mpsc::Sender<CoreInput>,
+    child_id: SessionId,
+    armed: bool,
+}
+
+impl ChildSessionCancelGuard {
+    fn new(core_input: tokio::sync::mpsc::Sender<CoreInput>, child_id: SessionId) -> Self {
+        Self {
+            core_input,
+            child_id,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChildSessionCancelGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            let _ = self.core_input.try_send(CoreInput::Cancel {
+                session_id: self.child_id,
+            });
+        }
+    }
+}
+
+struct SubagentRunContext {
+    filesystem: Arc<dyn SessionFilesystem>,
+    working_directory: PathBuf,
+    parent_channel: Option<InteractionChannel>,
+    permission_runtime: Option<crate::permission::PermissionRuntimeSnapshot>,
+}
+
 async fn run_subagent_inner(
     provider: &dyn LlmProvider,
     web_provider: Arc<dyn WebProvider>,
     task: &str,
     system_prompt: Option<&str>,
-    filesystem: Arc<dyn SessionFilesystem>,
-    working_directory: PathBuf,
-    parent_channel: Option<InteractionChannel>,
+    run_context: SubagentRunContext,
 ) -> Result<String, String> {
+    let SubagentRunContext {
+        filesystem,
+        working_directory,
+        parent_channel,
+        permission_runtime,
+    } = run_context;
     let session_id = SessionId::new();
     let plan_store = crate::tool::plan::new_plan_store();
 
@@ -301,6 +460,7 @@ async fn run_subagent_inner(
                 session_group: session_id.to_string(),
                 python_runtime: crate::python::PythonRuntime::new(),
                 core_input: None,
+                permission_runtime: permission_runtime.clone(),
                 cancellation: crate::tool::CancellationChannel::never(),
             };
 
@@ -329,7 +489,12 @@ async fn run_subagent_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channel::CoreInput;
     use crate::filesystem::OverlayFilesystem;
+    use crate::permission::{
+        PermissionMode, PermissionPromptBehavior, PermissionRule, PermissionRuleEffect,
+        PermissionRuleSet, PermissionRuntimeSnapshot, PermissionTarget,
+    };
     use quine_llm::{NoopWebProvider, ToolDefinition};
     use std::pin::Pin;
     use std::sync::{
@@ -337,6 +502,30 @@ mod tests {
         Arc,
     };
     use tempfile::TempDir;
+    use tokio::sync::mpsc;
+
+    fn inherited_permission_runtime() -> PermissionRuntimeSnapshot {
+        let mut rules = PermissionRuleSet::default();
+        rules.session.push(PermissionRule {
+            effect: PermissionRuleEffect::Deny,
+            scope: crate::permission::RuleScope::Workspace,
+            request_scope: None,
+            target: PermissionTarget::Tool {
+                name: "apply_patch".into(),
+            },
+            source_path: None,
+        });
+        PermissionRuntimeSnapshot {
+            mode: PermissionMode::AcceptEdits,
+            pre_plan_mode: Some(PermissionMode::Default),
+            rules,
+            workspace_root: std::path::PathBuf::from("/workspace"),
+            additional_allowed_roots: vec![std::path::PathBuf::from("/tmp/extra")],
+            prompt_behavior: PermissionPromptBehavior::Headless,
+            last_decision: None,
+            pending_approval: None,
+        }
+    }
 
     async fn make_context() -> (TempDir, TempDir, ExecutionContext) {
         let base = TempDir::new().unwrap();
@@ -354,9 +543,38 @@ mod tests {
             session_group: String::new(),
             python_runtime: crate::python::PythonRuntime::new(),
             core_input: None,
+            permission_runtime: None,
             cancellation: crate::tool::CancellationChannel::never(),
         };
         (base, session_dir, ctx)
+    }
+
+    async fn make_context_with_core_input() -> (
+        TempDir,
+        TempDir,
+        mpsc::Receiver<CoreInput>,
+        ExecutionContext,
+    ) {
+        let base = TempDir::new().unwrap();
+        let session_dir = TempDir::new().unwrap();
+        let fs =
+            OverlayFilesystem::new(base.path().to_path_buf(), session_dir.path().to_path_buf())
+                .await
+                .unwrap();
+        let (core_input_tx, core_input_rx) = mpsc::channel(8);
+        let ctx = ExecutionContext {
+            session_id: SessionId::new(),
+            filesystem: Arc::new(fs),
+            working_directory: base.path().to_path_buf(),
+            interaction_channel: None,
+            plan_store: crate::tool::plan::new_plan_store(),
+            session_group: String::new(),
+            python_runtime: crate::python::PythonRuntime::new(),
+            core_input: Some(core_input_tx),
+            permission_runtime: Some(inherited_permission_runtime()),
+            cancellation: crate::tool::CancellationChannel::never(),
+        };
+        (base, session_dir, core_input_rx, ctx)
     }
 
     /// Mock provider that returns a fixed text response (no tool calls).
@@ -423,6 +641,217 @@ mod tests {
             };
             Ok(Box::pin(futures::stream::iter(events)))
         }
+    }
+
+    #[tokio::test]
+    async fn subagent_uses_harness_spawn_and_wait_when_core_input_available() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(TextProvider::new("unused in harness path"));
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
+        let (_base, _session, mut core_input_rx, ctx) = make_context_with_core_input().await;
+        let parent_session_id = ctx.session_id;
+
+        let exec = tokio::spawn(async move {
+            tool.execute(serde_json::json!({"task": "compute a result"}), &ctx)
+                .await
+                .unwrap()
+        });
+
+        let child_id = match core_input_rx.recv().await.unwrap() {
+            CoreInput::SpawnSession {
+                parent_id,
+                child_id,
+                task,
+                system_prompt,
+                prompt_behavior,
+                permission_rules,
+                permission_runtime,
+                inheritance,
+                reply,
+                ..
+            } => {
+                assert_eq!(parent_id, parent_session_id);
+                assert_eq!(task, "compute a result");
+                assert!(system_prompt.is_none());
+                assert_eq!(prompt_behavior, PermissionPromptBehavior::Headless);
+                assert_eq!(permission_rules.session.len(), 1);
+                let permission_runtime =
+                    permission_runtime.expect("permission runtime should propagate");
+                assert_eq!(permission_runtime.mode, PermissionMode::AcceptEdits);
+                assert_eq!(
+                    permission_runtime.prompt_behavior,
+                    PermissionPromptBehavior::Headless
+                );
+                assert!(!inheritance.history);
+                assert!(inheritance.filesystem);
+                reply.send(Ok(())).unwrap();
+                child_id
+            }
+            other => panic!("expected SpawnSession, got {other:?}"),
+        };
+
+        match core_input_rx.recv().await.unwrap() {
+            CoreInput::WaitSession {
+                parent_id,
+                child_id: waited_child_id,
+                non_blocking,
+                timeout,
+                reply,
+            } => {
+                assert_eq!(parent_id, parent_session_id);
+                assert_eq!(waited_child_id, child_id);
+                assert!(!non_blocking);
+                assert_eq!(timeout, Some(Duration::from_secs(DEFAULT_TIMEOUT_SECS)));
+                reply
+                    .send(Ok(Some(ExitStatus::Success {
+                        output: "HARNESS_SUBAGENT_RESULT_42".into(),
+                    })))
+                    .unwrap();
+            }
+            other => panic!("expected WaitSession, got {other:?}"),
+        }
+
+        let result = exec.await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.content, "HARNESS_SUBAGENT_RESULT_42");
+    }
+
+    #[tokio::test]
+    async fn subagent_harness_timeout_cancels_child_session() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(TextProvider::new("unused in harness path"));
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
+        let (_base, _session, mut core_input_rx, ctx) = make_context_with_core_input().await;
+
+        let exec = tokio::spawn(async move {
+            tool.execute(
+                serde_json::json!({"task": "compute a result", "timeout": 1}),
+                &ctx,
+            )
+            .await
+            .unwrap()
+        });
+
+        let child_id = match core_input_rx.recv().await.unwrap() {
+            CoreInput::SpawnSession {
+                child_id, reply, ..
+            } => {
+                reply.send(Ok(())).unwrap();
+                child_id
+            }
+            other => panic!("expected SpawnSession, got {other:?}"),
+        };
+
+        match core_input_rx.recv().await.unwrap() {
+            CoreInput::WaitSession { reply, .. } => {
+                reply.send(Err("wait_child timed out".into())).unwrap();
+            }
+            other => panic!("expected WaitSession, got {other:?}"),
+        }
+
+        match core_input_rx.recv().await.unwrap() {
+            CoreInput::Cancel { session_id } => assert_eq!(session_id, child_id),
+            other => panic!("expected child Cancel, got {other:?}"),
+        }
+
+        let result = exec.await.unwrap();
+        assert!(result.is_error);
+        assert_eq!(result.content, "subagent timed out after 1s");
+    }
+
+    #[tokio::test]
+    async fn dropped_subagent_harness_wait_cancels_child_session() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(TextProvider::new("unused in harness path"));
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
+        let (_base, _session, mut core_input_rx, ctx) = make_context_with_core_input().await;
+
+        let exec = tokio::spawn(async move {
+            let _ = tool
+                .execute(serde_json::json!({"task": "compute a result"}), &ctx)
+                .await;
+        });
+
+        let child_id = match core_input_rx.recv().await.unwrap() {
+            CoreInput::SpawnSession {
+                child_id, reply, ..
+            } => {
+                reply.send(Ok(())).unwrap();
+                child_id
+            }
+            other => panic!("expected SpawnSession, got {other:?}"),
+        };
+
+        match core_input_rx.recv().await.unwrap() {
+            CoreInput::WaitSession { .. } => {}
+            other => panic!("expected WaitSession, got {other:?}"),
+        }
+
+        exec.abort();
+        let _ = exec.await;
+
+        let cancel = tokio::time::timeout(Duration::from_millis(100), core_input_rx.recv())
+            .await
+            .expect("dropped subagent should cancel child session")
+            .expect("child cancel should be sent");
+        assert!(matches!(
+            cancel,
+            CoreInput::Cancel { session_id } if session_id == child_id
+        ));
+    }
+
+    #[tokio::test]
+    async fn subagent_propagates_parent_permission_runtime_to_spawned_child() {
+        let provider: Arc<dyn LlmProvider> = Arc::new(TextProvider::new("unused in harness path"));
+        let tool = SubagentTool::new(provider, Arc::new(NoopWebProvider));
+        let (_base, _session, mut core_input_rx, ctx) = make_context_with_core_input().await;
+
+        let exec = tokio::spawn(async move {
+            tool.execute(serde_json::json!({"task": "compute a result"}), &ctx)
+                .await
+                .unwrap()
+        });
+
+        let child_id = match core_input_rx.recv().await.unwrap() {
+            CoreInput::SpawnSession {
+                prompt_behavior,
+                permission_rules,
+                permission_runtime,
+                reply,
+                child_id,
+                ..
+            } => {
+                assert_eq!(prompt_behavior, PermissionPromptBehavior::Headless);
+                assert_eq!(permission_rules.session.len(), 1);
+                let permission_runtime =
+                    permission_runtime.expect("permission runtime should propagate");
+                assert_eq!(permission_runtime.mode, PermissionMode::AcceptEdits);
+                assert_eq!(
+                    permission_runtime.pre_plan_mode,
+                    Some(PermissionMode::Default)
+                );
+                assert_eq!(
+                    permission_runtime.additional_allowed_roots,
+                    vec![std::path::PathBuf::from("/tmp/extra")]
+                );
+                reply.send(Ok(())).unwrap();
+                child_id
+            }
+            other => panic!("expected SpawnSession, got {other:?}"),
+        };
+
+        match core_input_rx.recv().await.unwrap() {
+            CoreInput::WaitSession { reply, .. } => {
+                reply
+                    .send(Ok(Some(ExitStatus::Success {
+                        output: "ok".into(),
+                    })))
+                    .unwrap();
+            }
+            other => panic!("expected WaitSession, got {other:?}"),
+        }
+
+        let result = exec.await.unwrap();
+        assert!(!result.is_error);
+        assert_eq!(result.content, "ok");
+        assert_ne!(child_id, SessionId::new());
     }
 
     #[tokio::test]
@@ -600,6 +1029,7 @@ mod tests {
             session_group: String::new(),
             python_runtime: crate::python::PythonRuntime::new(),
             core_input: None,
+            permission_runtime: None,
             cancellation: crate::tool::CancellationChannel::never(),
         };
 
