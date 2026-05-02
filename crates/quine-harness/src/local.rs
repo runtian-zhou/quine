@@ -1750,7 +1750,9 @@ mod tests {
             result.is_ok(),
             "get_session_context timed out for a live busy session"
         );
-        let checkpoint = result.unwrap().expect("busy live session context should resolve");
+        let checkpoint = result
+            .unwrap()
+            .expect("busy live session context should resolve");
         let snapshot = session_context_from_checkpoint(
             &checkpoint,
             busy_session,

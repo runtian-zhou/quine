@@ -292,11 +292,21 @@ mod tests {
                 assert_eq!(task, "delegate this");
                 assert!(system_prompt.is_none());
                 assert_eq!(prompt_behavior, PermissionPromptBehavior::Headless);
-                let permission_runtime = permission_runtime.expect("permission runtime should propagate");
+                let permission_runtime =
+                    permission_runtime.expect("permission runtime should propagate");
                 assert_eq!(permission_runtime.mode, PermissionMode::AcceptEdits);
-                assert_eq!(permission_runtime.pre_plan_mode, Some(PermissionMode::Default));
-                assert_eq!(permission_runtime.prompt_behavior, PermissionPromptBehavior::Headless);
-                assert_eq!(permission_runtime.additional_allowed_roots, vec![std::path::PathBuf::from("/tmp/extra")]);
+                assert_eq!(
+                    permission_runtime.pre_plan_mode,
+                    Some(PermissionMode::Default)
+                );
+                assert_eq!(
+                    permission_runtime.prompt_behavior,
+                    PermissionPromptBehavior::Headless
+                );
+                assert_eq!(
+                    permission_runtime.additional_allowed_roots,
+                    vec![std::path::PathBuf::from("/tmp/extra")]
+                );
                 assert_eq!(permission_runtime.rules.session.len(), 1);
                 assert!(!inheritance.history);
                 assert!(inheritance.filesystem);

@@ -1241,7 +1241,7 @@ enum RuntimeEvent {
         session_id: SessionId,
         parent_id: SessionId,
         status: ExitStatus,
-        snapshot: PersistedSession,
+        snapshot: Box<PersistedSession>,
     },
     ChildInteractionNeeded {
         target_session_id: SessionId,
@@ -2328,12 +2328,10 @@ async fn execute_concurrent_tool_batch(
         return Vec::new();
     }
     session.cancel_tx = Some(cancel_tx.clone());
-    let permission_runtime = Some(
-        session.permission_context.snapshot(
-            session.last_permission_outcome.clone(),
-            session.pending_permission_approval.clone(),
-        ),
-    );
+    let permission_runtime = Some(session.permission_context.snapshot(
+        session.last_permission_outcome.clone(),
+        session.pending_permission_approval.clone(),
+    ));
 
     let mut results: Vec<Option<CompletedConcurrentToolCall>> =
         std::iter::repeat_with(|| None).take(calls.len()).collect();
@@ -3586,12 +3584,10 @@ async fn execute_tool_call(
             cancellation.clone(),
             session.python_group.clone(),
             Arc::clone(&session.python_runtime),
-            Some(
-                session.permission_context.snapshot(
-                    session.last_permission_outcome.clone(),
-                    session.pending_permission_approval.clone(),
-                ),
-            ),
+            Some(session.permission_context.snapshot(
+                session.last_permission_outcome.clone(),
+                session.pending_permission_approval.clone(),
+            )),
         )
     };
 
@@ -3757,7 +3753,6 @@ async fn execute_tool_call(
             core_input: Some(io.input_tx.clone()),
             permission_runtime: permission_runtime.clone(),
             cancellation: cancellation.clone(),
-
         };
 
         let tool_future = tool.execute(call.arguments.clone(), &ctx);
@@ -5177,11 +5172,12 @@ impl SessionActor {
                     session_id: self.session_id,
                     parent_id,
                     status,
-                    snapshot: self
-                        .session
-                        .snapshot(self.session_id)
-                        .await
-                        .expect("destroyed child sessions must remain snapshotable"),
+                    snapshot: Box::new(
+                        self.session
+                            .snapshot(self.session_id)
+                            .await
+                            .expect("destroyed child sessions must remain snapshotable"),
+                    ),
                 })
                 .await;
             false
@@ -6276,14 +6272,10 @@ impl SessionActor {
             let (req_tx, mut req_rx) =
                 mpsc::channel::<(InteractionRequest, oneshot::Sender<InteractionResponse>)>(1);
             let channel = InteractionChannel { request_tx: req_tx };
-            let permission_runtime = Some(
-                self.session
-                    .permission_context
-                    .snapshot(
-                        self.session.last_permission_outcome.clone(),
-                        self.session.pending_permission_approval.clone(),
-                    ),
-            );
+            let permission_runtime = Some(self.session.permission_context.snapshot(
+                self.session.last_permission_outcome.clone(),
+                self.session.pending_permission_approval.clone(),
+            ));
             let ctx = ExecutionContext {
                 session_id: self.session_id,
                 filesystem,
@@ -6293,9 +6285,8 @@ impl SessionActor {
                 session_group: session_group.clone(),
                 python_runtime: Arc::clone(&python_runtime),
                 core_input: Some(self.core_input_tx.clone()),
-            permission_runtime: permission_runtime.clone(),
-            cancellation: cancellation.clone(),
-
+                permission_runtime: permission_runtime.clone(),
+                cancellation: cancellation.clone(),
             };
             let args = call.arguments.clone();
             let mut tool_handle = tokio::spawn(async move { tool.execute(args, &ctx).await });
@@ -6357,14 +6348,10 @@ impl SessionActor {
             self.session.cancel_tx = None;
             outcome
         } else {
-            let permission_runtime = Some(
-                self.session
-                    .permission_context
-                    .snapshot(
-                        self.session.last_permission_outcome.clone(),
-                        self.session.pending_permission_approval.clone(),
-                    ),
-            );
+            let permission_runtime = Some(self.session.permission_context.snapshot(
+                self.session.last_permission_outcome.clone(),
+                self.session.pending_permission_approval.clone(),
+            ));
             let ctx = ExecutionContext {
                 session_id: self.session_id,
                 filesystem,
@@ -6374,9 +6361,8 @@ impl SessionActor {
                 session_group,
                 python_runtime,
                 core_input: Some(self.core_input_tx.clone()),
-            permission_runtime: permission_runtime.clone(),
-            cancellation: cancellation.clone(),
-
+                permission_runtime: permission_runtime.clone(),
+                cancellation: cancellation.clone(),
             };
             let tool_future = tool.execute(call.arguments.clone(), &ctx);
             tokio::pin!(tool_future);
@@ -6725,7 +6711,7 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
                 match maybe_event {
                     Some(RuntimeEvent::ChildSessionFinished { session_id, parent_id, status, snapshot }) => {
                         registry.write().await.remove(&session_id);
-                        completed_registry.write().await.insert(session_id, snapshot);
+                        completed_registry.write().await.insert(session_id, *snapshot);
                         session_tree.write().await.record_exit(session_id, status.clone());
                         let _ = handle.output.send(CoreOutput::SessionStateChanged {
                             session_id,
@@ -7287,11 +7273,11 @@ async fn run_core_loop_with_compaction_and_wait_notifier(
 mod tests {
     use super::*;
     use crate::channel::{create_channels, ChannelConfig};
+    use crate::permission::types::PermissionMode;
     use crate::permission::{
         PermissionPromptBehavior, PermissionRule, PermissionRuleEffect, PermissionRuleSet,
         PermissionRuntimeSnapshot, PermissionTarget,
     };
-    use crate::permission::types::PermissionMode;
     use crate::session::{ExitStatus, InheritanceFlags};
     use crate::SessionLlmConfig;
     use std::collections::VecDeque;
@@ -11485,9 +11471,18 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
         }));
         let permission_state = child.permission_state.expect("child permission state");
         assert_eq!(permission_state.mode, PermissionMode::AcceptEdits);
-        assert_eq!(permission_state.pre_plan_mode, Some(PermissionMode::Default));
-        assert_eq!(permission_state.prompt_behavior, PermissionPromptBehavior::Headless);
-        assert_eq!(permission_state.additional_allowed_roots, vec![PathBuf::from("/tmp/extra")]);
+        assert_eq!(
+            permission_state.pre_plan_mode,
+            Some(PermissionMode::Default)
+        );
+        assert_eq!(
+            permission_state.prompt_behavior,
+            PermissionPromptBehavior::Headless
+        );
+        assert_eq!(
+            permission_state.additional_allowed_roots,
+            vec![PathBuf::from("/tmp/extra")]
+        );
         assert_eq!(permission_state.rules.session.len(), 1);
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
@@ -11564,9 +11559,18 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
         let permission_state = child.permission_state.expect("child permission state");
         assert_eq!(permission_state.mode, PermissionMode::AcceptEdits);
-        assert_eq!(permission_state.pre_plan_mode, Some(PermissionMode::Default));
-        assert_eq!(permission_state.prompt_behavior, PermissionPromptBehavior::Headless);
-        assert_eq!(permission_state.additional_allowed_roots, vec![PathBuf::from("/tmp/extra")]);
+        assert_eq!(
+            permission_state.pre_plan_mode,
+            Some(PermissionMode::Default)
+        );
+        assert_eq!(
+            permission_state.prompt_behavior,
+            PermissionPromptBehavior::Headless
+        );
+        assert_eq!(
+            permission_state.additional_allowed_roots,
+            vec![PathBuf::from("/tmp/extra")]
+        );
         assert_eq!(permission_state.rules.session.len(), 1);
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
@@ -11602,7 +11606,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
 
                 let events = if saw_bash_result {
                     vec![
-                        Ok(LlmEvent::TextDelta { text: "DONE".into() }),
+                        Ok(LlmEvent::TextDelta {
+                            text: "DONE".into(),
+                        }),
                         Ok(LlmEvent::Done { usage: None }),
                     ]
                 } else if saw_child_task {
@@ -13756,7 +13762,9 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
                     ]
                 } else if saw_child_bash_result {
                     vec![
-                        Ok(LlmEvent::TextDelta { text: "DONE".into() }),
+                        Ok(LlmEvent::TextDelta {
+                            text: "DONE".into(),
+                        }),
                         Ok(LlmEvent::Done { usage: None }),
                     ]
                 } else if saw_child_task {
@@ -13869,8 +13877,14 @@ Run `cargo test` from the workspace root to execute the Rust test suite.
             }
         }
 
-        assert!(saw_parent_interaction, "expected child permission prompt on parent session");
-        assert!(saw_parent_text_complete, "expected parent completion after approval");
+        assert!(
+            saw_parent_interaction,
+            "expected child permission prompt on parent session"
+        );
+        assert!(
+            saw_parent_text_complete,
+            "expected parent completion after approval"
+        );
 
         harness.input.send(CoreInput::Shutdown).await.unwrap();
         loop_handle.await.unwrap();

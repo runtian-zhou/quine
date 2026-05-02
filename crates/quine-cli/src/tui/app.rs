@@ -2004,7 +2004,9 @@ impl App {
         let Some(view) = self.state_live_view.as_mut() else {
             return false;
         };
-        if notification_session_id(notif).is_some_and(|session_id| session_id == view.app.session_id) {
+        if notification_session_id(notif)
+            .is_some_and(|session_id| session_id == view.app.session_id)
+        {
             view.app.apply_notification(notif);
             return true;
         }
@@ -4448,13 +4450,21 @@ mod tests {
         app.open_state_live_view("/state child".into(), snapshot);
         app.state_live_view_scroll_up(3);
         assert_eq!(
-            app.state_live_view.as_ref().expect("state live view").app.scroll_offset,
+            app.state_live_view
+                .as_ref()
+                .expect("state live view")
+                .app
+                .scroll_offset,
             3
         );
 
         app.state_live_view_scroll_down(2);
         assert_eq!(
-            app.state_live_view.as_ref().expect("state live view").app.scroll_offset,
+            app.state_live_view
+                .as_ref()
+                .expect("state live view")
+                .app
+                .scroll_offset,
             1
         );
 
@@ -4469,7 +4479,11 @@ mod tests {
 
         app.state_live_view_scroll_to_bottom();
         assert_eq!(
-            app.state_live_view.as_ref().expect("state live view").app.scroll_offset,
+            app.state_live_view
+                .as_ref()
+                .expect("state live view")
+                .app
+                .scroll_offset,
             0
         );
     }

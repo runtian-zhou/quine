@@ -190,10 +190,12 @@ async fn run_subagent(
             web_provider,
             task,
             system_prompt,
-            filesystem,
-            working_directory,
-            parent_channel,
-            permission_runtime,
+            SubagentRunContext {
+                filesystem,
+                working_directory,
+                parent_channel,
+                permission_runtime,
+            },
         ),
     )
     .await;
@@ -326,16 +328,26 @@ impl Drop for ChildSessionCancelGuard {
     }
 }
 
+struct SubagentRunContext {
+    filesystem: Arc<dyn SessionFilesystem>,
+    working_directory: PathBuf,
+    parent_channel: Option<InteractionChannel>,
+    permission_runtime: Option<crate::permission::PermissionRuntimeSnapshot>,
+}
+
 async fn run_subagent_inner(
     provider: &dyn LlmProvider,
     web_provider: Arc<dyn WebProvider>,
     task: &str,
     system_prompt: Option<&str>,
-    filesystem: Arc<dyn SessionFilesystem>,
-    working_directory: PathBuf,
-    parent_channel: Option<InteractionChannel>,
-    permission_runtime: Option<crate::permission::PermissionRuntimeSnapshot>,
+    run_context: SubagentRunContext,
 ) -> Result<String, String> {
+    let SubagentRunContext {
+        filesystem,
+        working_directory,
+        parent_channel,
+        permission_runtime,
+    } = run_context;
     let session_id = SessionId::new();
     let plan_store = crate::tool::plan::new_plan_store();
 
@@ -662,9 +674,13 @@ mod tests {
                 assert!(system_prompt.is_none());
                 assert_eq!(prompt_behavior, PermissionPromptBehavior::Headless);
                 assert_eq!(permission_rules.session.len(), 1);
-                let permission_runtime = permission_runtime.expect("permission runtime should propagate");
+                let permission_runtime =
+                    permission_runtime.expect("permission runtime should propagate");
                 assert_eq!(permission_runtime.mode, PermissionMode::AcceptEdits);
-                assert_eq!(permission_runtime.prompt_behavior, PermissionPromptBehavior::Headless);
+                assert_eq!(
+                    permission_runtime.prompt_behavior,
+                    PermissionPromptBehavior::Headless
+                );
                 assert!(!inheritance.history);
                 assert!(inheritance.filesystem);
                 reply.send(Ok(())).unwrap();
@@ -804,10 +820,17 @@ mod tests {
             } => {
                 assert_eq!(prompt_behavior, PermissionPromptBehavior::Headless);
                 assert_eq!(permission_rules.session.len(), 1);
-                let permission_runtime = permission_runtime.expect("permission runtime should propagate");
+                let permission_runtime =
+                    permission_runtime.expect("permission runtime should propagate");
                 assert_eq!(permission_runtime.mode, PermissionMode::AcceptEdits);
-                assert_eq!(permission_runtime.pre_plan_mode, Some(PermissionMode::Default));
-                assert_eq!(permission_runtime.additional_allowed_roots, vec![std::path::PathBuf::from("/tmp/extra")]);
+                assert_eq!(
+                    permission_runtime.pre_plan_mode,
+                    Some(PermissionMode::Default)
+                );
+                assert_eq!(
+                    permission_runtime.additional_allowed_roots,
+                    vec![std::path::PathBuf::from("/tmp/extra")]
+                );
                 reply.send(Ok(())).unwrap();
                 child_id
             }

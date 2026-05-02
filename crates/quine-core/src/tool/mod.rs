@@ -26,8 +26,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::filesystem::SessionFilesystem;
-use crate::python::PythonRuntime;
 use crate::permission::PermissionRuntimeSnapshot;
+use crate::python::PythonRuntime;
 use crate::session::SessionId;
 
 /// Errors from tool execution.

@@ -1233,7 +1233,11 @@ fn draw_status_notice_overlay(frame: &mut Frame, app: &App) {
 }
 
 /// Render the scrollable conversation view.
-fn draw_state_live_view(frame: &mut Frame, area: Rect, state_live_view: &mut StateLiveViewState) -> u16 {
+fn draw_state_live_view(
+    frame: &mut Frame,
+    area: Rect,
+    state_live_view: &mut StateLiveViewState,
+) -> u16 {
     let popup_area = centered_rect(92, 88, area);
     frame.render_widget(Clear, popup_area);
     let block = Block::default()
