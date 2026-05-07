@@ -1357,7 +1357,7 @@ impl HarnessService for LocalHarness {
         &self,
         session_id: SessionId,
         content: String,
-        _system_prompt: Option<String>,
+        system_prompt: Option<String>,
         delay: Duration,
         cadence: Option<Duration>,
     ) -> Result<(), HarnessError> {
@@ -1369,7 +1369,7 @@ impl HarnessService for LocalHarness {
                 parent_id: session_id,
                 child_id,
                 task: String::new(),
-                system_prompt: None,
+                system_prompt,
                 prompt_behavior: quine_core::PermissionPromptBehavior::Interactive,
                 permission_rules: quine_core::PermissionRuleSet::default(),
                 permission_runtime: None,
